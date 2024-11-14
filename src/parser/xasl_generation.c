@@ -635,6 +635,9 @@ int pt_prepare_corr_subquery_hash_result_cache (PARSER_CONTEXT * parser, PT_NODE
 static int pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type);
 static PT_NODE *pt_check_corr_subquery_not_cachable_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
 							  int *continue_walk);
+static bool pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info);
+static PT_NODE *pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg,
+						     int *continue_walk);
 
 static void
 pt_init_xasl_supp_info ()
@@ -9956,6 +9959,71 @@ pt_to_regu_reserved_name (PARSER_CONTEXT * parser, PT_NODE * attr)
   return regu;
 }
 
+static PT_NODE *
+pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  bool *exists = (bool *) arg;
+  if (PT_IS_NAME_NODE (node))
+    {
+      if (PT_NAME_INFO_IS_FLAGED (node, PT_NAME_INFO_CORRELATED))
+	{
+	  *exists = true;
+	  *continue_walk = PT_STOP_WALK;
+	}
+    }
+  return node;
+}
+
+static bool
+pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info)
+{
+  UINTPTR spec_id_attr = attr->info.name.spec_id;
+  PT_NODE *class_spec = table_info->class_spec;
+  PT_NODE *derived_table;
+  int attr_index, i;
+  PT_NODE *cur_node;
+  bool cachable = true, exists = false;
+
+  if (!class_spec->info.spec.derived_table)
+    {
+      return true;
+    }
+
+  derived_table = class_spec->info.spec.derived_table;
+
+  /* 현재 스펙에 있지만, 이 쿼리를 실행하는 실질적인 스펙의 attr이 correlated 컬럼인 경우, 캐시를 실행하지 않아야한다.
+   * 이걸 알아보는 방법은, derived table이 있을 경우 거기에 현재 attr에 
+   * 해당하는 attr이 correlated 플래그가 찍혀있는지
+   * 확인해보면 된다. 플래그가 찍혀있을 경우, 해당 쿼리는 아예 실행을 안하면 안되고 
+   * (aptr로 연결된 derived table을 실행해야 key가 나오기 때문에)
+   * 실행을 해야만 하기 때문에, 서브쿼리 캐시를 비활성화해야한다. */
+
+  attr_index = 0;
+  for (cur_node = table_info->attribute_list; cur_node; cur_node = cur_node->next, attr_index++)
+    {
+      if (pt_str_compare (cur_node->info.name.original, attr->info.name.original, CASE_INSENSITIVE) == 0)
+	{
+	  break;
+	}
+    }
+
+  for (cur_node = derived_table->info.query.q.select.list, i = 0; cur_node; cur_node = cur_node->next, i++)
+    {
+      if (i == attr_index)
+	{
+	  break;
+	}
+    }
+
+  /* 이렇게되면, cur_node는 derived_table에 존재하는 attr에 해당되는 column의 PT_NODE를 가르키게 된다.
+   * 이제, table의 spec_id와 derived_table의 spec_id, 또 next로 연결된 모든 spec_id와 연관이 없는 spec_id를 지닌 PT_NAME이 나오면
+   * 이 쿼리는 caching 불가하다. */
+
+  parser_walk_tree (parser, cur_node, pt_check_correlated_subquery_exists, (void *) &exists, NULL, NULL);
+
+  return !exists;
+}
+
 /*
  * pt_attribute_to_regu () - Convert an attribute spec into a REGU_VARIABLE
  *   return:
@@ -10117,6 +10185,11 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 		    }
 		}
 	    }
+
+	  if (!pt_check_is_cachable_regu_variable (parser, attr, table_info))
+	    {
+	      REGU_VARIABLE_SET_FLAG (regu, REGU_VARIABLE_DERIVED_COL_CORRELATED);
+	    }
 	}
       else
 	{
@@ -10126,6 +10199,7 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 	      /* The attribute is correlated variable. Find it in an enclosing scope(s). Note that this subquery has
 	       * also just been determined to be a correlated subquery. */
 	      REGU_VARIABLE_SET_FLAG (regu, REGU_VARIABLE_CORRELATED);
+	      PT_NAME_INFO_SET_FLAG (attr, PT_NAME_INFO_CORRELATED);
 	      if (symbols->stack == NULL)
 		{
 		  if (!pt_has_error (parser))
@@ -27638,6 +27712,10 @@ pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type)
       switch (regu_src->type)
 	{
 	case TYPE_CONSTANT:
+	  if (REGU_VARIABLE_IS_FLAGED (regu_src, REGU_VARIABLE_DERIVED_COL_CORRELATED))
+	    {
+	      return ER_FAILED;
+	    }
 	  if (!REGU_VARIABLE_IS_FLAGED (regu_src, REGU_VARIABLE_CORRELATED))
 	    {
 	      break;

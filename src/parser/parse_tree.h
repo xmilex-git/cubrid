@@ -2784,11 +2784,12 @@ struct pt_name_info
 #define PT_NAME_DEFAULTF_ACCEPTS   4096	/* name of table/column that default function accepts: real table's, cte's */
 #define PT_NAME_INFO_USER_SPECIFIED 8192	/* resolved_name is added to original_name to make user_specified_name. */
 #define PT_NAME_INFO_SERVER_SPECIFIED 16384	/* server name is specified for dblink */
+#define PT_NAME_INFO_CORRELATED 0x8000	/* correlated attr */
 
-  short flag;
-#define PT_NAME_INFO_IS_FLAGED(e, f)    ((e)->info.name.flag & (short) (f))
-#define PT_NAME_INFO_SET_FLAG(e, f)     (e)->info.name.flag |= (short) (f)
-#define PT_NAME_INFO_CLEAR_FLAG(e, f)   (e)->info.name.flag &= (short) ~(f)
+  int flag;
+#define PT_NAME_INFO_IS_FLAGED(e, f)    ((e)->info.name.flag & (int) (f))
+#define PT_NAME_INFO_SET_FLAG(e, f)     (e)->info.name.flag |= (int) (f)
+#define PT_NAME_INFO_CLEAR_FLAG(e, f)   (e)->info.name.flag &= (int) ~(f)
   short location;		/* 0: WHERE; n: join condition of n-th FROM */
   short tag_click_counter;	/* 0: normal name, 1: click counter name */
   PT_NODE *indx_key_limit;	/* key limits for index name */
