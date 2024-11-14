@@ -9982,9 +9982,9 @@ pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TAB
   PT_NODE *derived_table;
   int attr_index, i;
   PT_NODE *cur_node;
-  bool cachable = true, exists = false;
+  bool cachable = true, exists = false, found = false;
 
-  if (!class_spec->info.spec.derived_table)
+  if (!class_spec->info.spec.derived_table || class_spec->info.spec.derived_table->node_type != PT_SELECT)
     {
       return true;
     }
@@ -10003,8 +10003,14 @@ pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TAB
     {
       if (pt_str_compare (cur_node->info.name.original, attr->info.name.original, CASE_INSENSITIVE) == 0)
 	{
+	  found = true;
 	  break;
 	}
+    }
+
+  if (!found)
+    {
+      return true;
     }
 
   for (cur_node = derived_table->info.query.q.select.list, i = 0; cur_node; cur_node = cur_node->next, i++)
