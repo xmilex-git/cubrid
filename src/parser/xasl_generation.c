@@ -9960,16 +9960,13 @@ pt_to_regu_reserved_name (PARSER_CONTEXT * parser, PT_NODE * attr)
 }
 
 /*
- * pt_check_correlated_subquery_exists () - Checks if a parse tree contains a correlated subquery.
+ * pt_check_correlated_subquery_exists () - Checks if a parse tree contains a PT_NAME node with the PT_NAME_INFO_CORRELATED flag.
  *
  * return           : The same parse tree node.
  * parser (in)      : Parser context.
  * node (in)        : Current parse tree node being examined.
- * arg (in/out)     : Pointer to a bool flag; set to true if a correlated subquery is found.
- * continue_walk (out) : Control flag for tree traversal; set to PT_STOP_WALK if a correlated subquery is found.
- * 
- * NOTE: This function is used during tree traversal to identify the presence of correlated subqueries.
- * If a correlated column is detected, it sets the flag and stops further traversal.
+ * arg (in/out)     : Pointer to a bool flag; set to true if a correlated PT_NAME node is found.
+ * continue_walk (out) : Control flag for tree traversal; set to PT_STOP_WALK if such a node is found.
  */
 
 static PT_NODE *

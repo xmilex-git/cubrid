@@ -2768,22 +2768,22 @@ struct pt_name_info
   unsigned short correlation_level;	/* for correlated attributes */
   char hidden_column;		/* used for updates and deletes for the class OID column */
 
-#define PT_NAME_INFO_DOT_SPEC        1	/* x, y of x.y.z */
-#define PT_NAME_INFO_DOT_NAME        2	/* z of x.y.z */
-#define PT_NAME_INFO_STAR            4	/* * */
-#define PT_NAME_INFO_DOT_STAR        8	/* classname.* */
-#define PT_NAME_INFO_CONSTANT       16
-#define PT_NAME_INFO_EXTERNAL       32	/* in case of TEXT type at attr definition or attr.object at attr description */
-#define PT_NAME_INFO_DESC           64	/* DESC on an index column name */
-#define PT_NAME_INFO_FILL_DEFAULT  128	/* whether default_value should be filled in */
-#define PT_NAME_INFO_GENERATED_OID 256	/* set when a PT_NAME node that maps to an OID is generated internally for
-					 * statement processing and execution */
-#define PT_NAME_ALLOW_REUSABLE_OID 512	/* ignore the REUSABLE_OID restrictions for this name */
-#define PT_NAME_GENERATED_DERIVED_SPEC 1024	/* attribute generated from derived spec */
-#define PT_NAME_FOR_UPDATE	   2048	/* Table name in FOR UPDATE clause */
-#define PT_NAME_DEFAULTF_ACCEPTS   4096	/* name of table/column that default function accepts: real table's, cte's */
-#define PT_NAME_INFO_USER_SPECIFIED 8192	/* resolved_name is added to original_name to make user_specified_name. */
-#define PT_NAME_INFO_SERVER_SPECIFIED 16384	/* server name is specified for dblink */
+#define PT_NAME_INFO_DOT_SPEC        0x1	/* x, y of x.y.z */
+#define PT_NAME_INFO_DOT_NAME        0x2	/* z of x.y.z */
+#define PT_NAME_INFO_STAR            0x4	/* * */
+#define PT_NAME_INFO_DOT_STAR        0x8	/* classname.* */
+#define PT_NAME_INFO_CONSTANT       0x10
+#define PT_NAME_INFO_EXTERNAL       0x20	/* in case of TEXT type at attr definition or attr.object at attr description */
+#define PT_NAME_INFO_DESC           0x40	/* DESC on an index column name */
+#define PT_NAME_INFO_FILL_DEFAULT  0x80	/* whether default_value should be filled in */
+#define PT_NAME_INFO_GENERATED_OID 0x100	/* set when a PT_NAME node that maps to an OID is generated internally for
+						 * statement processing and execution */
+#define PT_NAME_ALLOW_REUSABLE_OID 0x200	/* ignore the REUSABLE_OID restrictions for this name */
+#define PT_NAME_GENERATED_DERIVED_SPEC 0x400	/* attribute generated from derived spec */
+#define PT_NAME_FOR_UPDATE	   0x800	/* Table name in FOR UPDATE clause */
+#define PT_NAME_DEFAULTF_ACCEPTS   0x1000	/* name of table/column that default function accepts: real table's, cte's */
+#define PT_NAME_INFO_USER_SPECIFIED 0x2000	/* resolved_name is added to original_name to make user_specified_name. */
+#define PT_NAME_INFO_SERVER_SPECIFIED 0x4000	/* server name is specified for dblink */
 #define PT_NAME_INFO_CORRELATED 0x8000	/* correlated attr */
 
   int flag;
