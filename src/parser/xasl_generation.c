@@ -635,7 +635,7 @@ int pt_prepare_corr_subquery_hash_result_cache (PARSER_CONTEXT * parser, PT_NODE
 static int pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type);
 static PT_NODE *pt_check_corr_subquery_not_cachable_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
 							  int *continue_walk);
-static bool pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info);
+static bool pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info);
 static PT_NODE *pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg,
 						     int *continue_walk);
 
@@ -9985,21 +9985,23 @@ pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * node, vo
 }
 
 /* 
- * pt_check_is_cachable_regu_variable () - Determines if a regu variable is eligible for subquery caching.
+ * pt_check_derived_column_correlated () - Determines if derived column correlated.
  * 
  * return          : true if the regu variable is cachable, false otherwise.
  * parser (in)     : Parser context.
  * attr (in)       : Parse tree node representing the attribute.
  * table_info (in) : Information about the table containing the attribute.
  * 
- * NOTE: This function checks whether the attribute in a derived table is correlated with outer queries.
- * If it is correlated, subquery caching is disabled because the attribute depends on variables from the outer query.
- * The function examines the derived table's select list to find the corresponding attribute and checks for correlation.
- * 
+ * NOTE: This function checks whether the derived column of the corresponding attribute is correlated with 
+ * an outer table when attempting to perform correlated scalar subquery caching. 
+ * If it is correlated, then before each execution of the XASL for the connected correlated subquery, 
+ * the query for the derived table connected via aptr (which has been converted into an inline view) must be executed first. 
+ * This is necessary to obtain the value of the column from the outer table that corresponds to the key used in the correlated subquery cache. 
+ * Therefore, caching is not possible with the current XASL structure.
  */
 
 static bool
-pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info)
+pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info)
 {
   UINTPTR spec_id_attr = attr->info.name.spec_id;
   PT_NODE *class_spec = table_info->class_spec;
@@ -10205,7 +10207,7 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 		}
 	    }
 
-	  if (!pt_check_is_cachable_regu_variable (parser, attr, table_info))
+	  if (!pt_check_derived_column_correlated (parser, attr, table_info))
 	    {
 	      REGU_VARIABLE_SET_FLAG (regu, REGU_VARIABLE_DERIVED_COL_CORRELATED);
 	    }
