@@ -27648,6 +27648,7 @@ pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type)
 	    {
 	      if (!regu_var_list_p)
 		{
+		  assert (false);
 		  return ER_FAILED;
 		}
 	      regu_src = &regu_var_list_p->value;
