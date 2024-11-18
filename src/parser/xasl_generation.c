@@ -636,7 +636,7 @@ static int pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p,
 static PT_NODE *pt_check_corr_subquery_not_cachable_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
 							  int *continue_walk);
 static bool pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info);
-static PT_NODE *pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg,
+static PT_NODE *pt_is_correlated_name_node (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg,
 						     int *continue_walk);
 
 static void
@@ -9960,7 +9960,7 @@ pt_to_regu_reserved_name (PARSER_CONTEXT * parser, PT_NODE * attr)
 }
 
 /*
- * pt_check_correlated_subquery_exists () - Checks if a parse tree contains a PT_NAME node with the PT_NAME_INFO_CORRELATED flag.
+ * pt_is_correlated_name_node () - Checks if a parse tree contains a PT_NAME node with the PT_NAME_INFO_CORRELATED flag.
  *
  * return           : The same parse tree node.
  * parser (in)      : Parser context.
@@ -9970,7 +9970,7 @@ pt_to_regu_reserved_name (PARSER_CONTEXT * parser, PT_NODE * attr)
  */
 
 static PT_NODE *
-pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+pt_is_correlated_name_node (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
 {
   bool *exists = (bool *) arg;
   if (PT_IS_NAME_NODE (node))
@@ -10012,7 +10012,7 @@ pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TAB
 
   if (!class_spec->info.spec.derived_table || class_spec->info.spec.derived_table->node_type != PT_SELECT)
     {
-      return true;
+      return false;
     }
 
   derived_table = class_spec->info.spec.derived_table;
@@ -10029,7 +10029,7 @@ pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TAB
 
   if (!found)
     {
-      return true;
+      return false;
     }
 
   for (cur_node = derived_table->info.query.q.select.list, i = 0; cur_node; cur_node = cur_node->next, i++)
@@ -10040,9 +10040,9 @@ pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TAB
 	}
     }
 
-  parser_walk_tree (parser, cur_node, pt_check_correlated_subquery_exists, (void *) &exists, NULL, NULL);
+  parser_walk_tree (parser, cur_node, pt_is_correlated_name_node, (void *) &exists, NULL, NULL);
 
-  return !exists;
+  return exists;
 }
 
 /*
@@ -10207,7 +10207,7 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 		}
 	    }
 
-	  if (!pt_check_derived_column_correlated (parser, attr, table_info))
+	  if (pt_check_derived_column_correlated (parser, attr, table_info))
 	    {
 	      REGU_VARIABLE_SET_FLAG (regu, REGU_VARIABLE_DERIVED_COL_CORRELATED);
 	    }
