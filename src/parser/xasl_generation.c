@@ -636,8 +636,7 @@ static int pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p,
 static PT_NODE *pt_check_corr_subquery_not_cachable_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
 							  int *continue_walk);
 static bool pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info);
-static PT_NODE *pt_is_correlated_name_node (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg,
-						     int *continue_walk);
+static PT_NODE *pt_is_correlated_name_node (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg, int *continue_walk);
 
 static void
 pt_init_xasl_supp_info ()
