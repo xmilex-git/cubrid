@@ -9959,6 +9959,19 @@ pt_to_regu_reserved_name (PARSER_CONTEXT * parser, PT_NODE * attr)
   return regu;
 }
 
+/*
+ * pt_check_correlated_subquery_exists () - Checks if a parse tree contains a correlated subquery.
+ *
+ * return           : The same parse tree node.
+ * parser (in)      : Parser context.
+ * node (in)        : Current parse tree node being examined.
+ * arg (in/out)     : Pointer to a bool flag; set to true if a correlated subquery is found.
+ * continue_walk (out) : Control flag for tree traversal; set to PT_STOP_WALK if a correlated subquery is found.
+ * 
+ * NOTE: This function is used during tree traversal to identify the presence of correlated subqueries.
+ * If a correlated column is detected, it sets the flag and stops further traversal.
+ */
+
 static PT_NODE *
 pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
 {
@@ -9973,6 +9986,20 @@ pt_check_correlated_subquery_exists (PARSER_CONTEXT * parser, PT_NODE * node, vo
     }
   return node;
 }
+
+/* 
+ * pt_check_is_cachable_regu_variable () - Determines if a regu variable is eligible for subquery caching.
+ * 
+ * return          : true if the regu variable is cachable, false otherwise.
+ * parser (in)     : Parser context.
+ * attr (in)       : Parse tree node representing the attribute.
+ * table_info (in) : Information about the table containing the attribute.
+ * 
+ * NOTE: This function checks whether the attribute in a derived table is correlated with outer queries.
+ * If it is correlated, subquery caching is disabled because the attribute depends on variables from the outer query.
+ * The function examines the derived table's select list to find the corresponding attribute and checks for correlation.
+ * 
+ */
 
 static bool
 pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info)
@@ -9990,13 +10017,6 @@ pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TAB
     }
 
   derived_table = class_spec->info.spec.derived_table;
-
-  /* 현재 스펙에 있지만, 이 쿼리를 실행하는 실질적인 스펙의 attr이 correlated 컬럼인 경우, 캐시를 실행하지 않아야한다.
-   * 이걸 알아보는 방법은, derived table이 있을 경우 거기에 현재 attr에 
-   * 해당하는 attr이 correlated 플래그가 찍혀있는지
-   * 확인해보면 된다. 플래그가 찍혀있을 경우, 해당 쿼리는 아예 실행을 안하면 안되고 
-   * (aptr로 연결된 derived table을 실행해야 key가 나오기 때문에)
-   * 실행을 해야만 하기 때문에, 서브쿼리 캐시를 비활성화해야한다. */
 
   attr_index = 0;
   for (cur_node = table_info->attribute_list; cur_node; cur_node = cur_node->next, attr_index++)
@@ -10020,10 +10040,6 @@ pt_check_is_cachable_regu_variable (PARSER_CONTEXT * parser, PT_NODE * attr, TAB
 	  break;
 	}
     }
-
-  /* 이렇게되면, cur_node는 derived_table에 존재하는 attr에 해당되는 column의 PT_NODE를 가르키게 된다.
-   * 이제, table의 spec_id와 derived_table의 spec_id, 또 next로 연결된 모든 spec_id와 연관이 없는 spec_id를 지닌 PT_NAME이 나오면
-   * 이 쿼리는 caching 불가하다. */
 
   parser_walk_tree (parser, cur_node, pt_check_correlated_subquery_exists, (void *) &exists, NULL, NULL);
 
