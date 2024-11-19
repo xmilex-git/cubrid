@@ -27572,9 +27572,11 @@ pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type)
 	      regu_var_list_p = regu_var_list_p->next;
 	    }
 	}
-      if (xasl_src->type == BUILDVALUE_PROC)
+      if (xasl_src->type == BUILDVALUE_PROC || xasl_src->type == BUILDLIST_PROC)
 	{
-	  AGGREGATE_TYPE *agg_list = xasl_src->proc.buildvalue.agg_list;
+	  AGGREGATE_TYPE *agg_list =
+	    (xasl_src->type ==
+	     BUILDVALUE_PROC) ? xasl_src->proc.buildvalue.agg_list : xasl_src->proc.buildlist.g_agg_list;
 	  while (agg_list)
 	    {
 	      regu_var_list_p = agg_list->operands;
