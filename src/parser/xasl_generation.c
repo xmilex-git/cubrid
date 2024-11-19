@@ -635,8 +635,6 @@ int pt_prepare_corr_subquery_hash_result_cache (PARSER_CONTEXT * parser, PT_NODE
 static int pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type);
 static PT_NODE *pt_check_corr_subquery_not_cachable_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
 							  int *continue_walk);
-static bool pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info);
-static PT_NODE *pt_is_correlated_name_node (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg, int *continue_walk);
 
 static void
 pt_init_xasl_supp_info ()
@@ -9959,92 +9957,6 @@ pt_to_regu_reserved_name (PARSER_CONTEXT * parser, PT_NODE * attr)
 }
 
 /*
- * pt_is_correlated_name_node () - Checks if a parse tree contains a PT_NAME node with the PT_NAME_INFO_CORRELATED flag.
- *
- * return           : The same parse tree node.
- * parser (in)      : Parser context.
- * node (in)        : Current parse tree node being examined.
- * arg (in/out)     : Pointer to a bool flag; set to true if a correlated PT_NAME node is found.
- * continue_walk (out) : Control flag for tree traversal; set to PT_STOP_WALK if such a node is found.
- */
-
-static PT_NODE *
-pt_is_correlated_name_node (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
-{
-  bool *exists = (bool *) arg;
-  if (PT_IS_NAME_NODE (node))
-    {
-      if (PT_NAME_INFO_IS_FLAGED (node, PT_NAME_INFO_CORRELATED))
-	{
-	  *exists = true;
-	  *continue_walk = PT_STOP_WALK;
-	}
-    }
-  return node;
-}
-
-/* 
- * pt_check_derived_column_correlated () - Determines if derived column correlated.
- * 
- * return          : true if the regu variable is cachable, false otherwise.
- * parser (in)     : Parser context.
- * attr (in)       : Parse tree node representing the attribute.
- * table_info (in) : Information about the table containing the attribute.
- * 
- * NOTE: This function checks whether the derived column of the corresponding attribute is correlated with 
- * an outer table when attempting to perform correlated scalar subquery caching. 
- * If it is correlated, then before each execution of the XASL for the connected correlated subquery, 
- * the query for the derived table connected via aptr (which has been converted into an inline view) must be executed first. 
- * This is necessary to obtain the value of the column from the outer table that corresponds to the key used in the correlated subquery cache. 
- * Therefore, caching is not possible with the current XASL structure.
- */
-
-static bool
-pt_check_derived_column_correlated (PARSER_CONTEXT * parser, PT_NODE * attr, TABLE_INFO * table_info)
-{
-  UINTPTR spec_id_attr = attr->info.name.spec_id;
-  PT_NODE *class_spec = table_info->class_spec;
-  PT_NODE *derived_table;
-  int attr_index, i;
-  PT_NODE *cur_node;
-  bool cachable = true, exists = false, found = false;
-
-  if (!class_spec->info.spec.derived_table || class_spec->info.spec.derived_table->node_type != PT_SELECT)
-    {
-      return false;
-    }
-
-  derived_table = class_spec->info.spec.derived_table;
-
-  attr_index = 0;
-  for (cur_node = table_info->attribute_list; cur_node; cur_node = cur_node->next, attr_index++)
-    {
-      if (pt_str_compare (cur_node->info.name.original, attr->info.name.original, CASE_INSENSITIVE) == 0)
-	{
-	  found = true;
-	  break;
-	}
-    }
-
-  if (!found)
-    {
-      return false;
-    }
-
-  for (cur_node = derived_table->info.query.q.select.list, i = 0; cur_node; cur_node = cur_node->next, i++)
-    {
-      if (i == attr_index)
-	{
-	  break;
-	}
-    }
-
-  parser_walk_tree (parser, cur_node, pt_is_correlated_name_node, (void *) &exists, NULL, NULL);
-
-  return exists;
-}
-
-/*
  * pt_attribute_to_regu () - Convert an attribute spec into a REGU_VARIABLE
  *   return:
  *   parser(in):
@@ -10204,11 +10116,6 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 			}
 		    }
 		}
-	    }
-
-	  if (pt_check_derived_column_correlated (parser, attr, table_info))
-	    {
-	      REGU_VARIABLE_SET_FLAG (regu, REGU_VARIABLE_DERIVED_COL_CORRELATED);
 	    }
 	}
       else
@@ -27665,6 +27572,29 @@ pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type)
 	      regu_var_list_p = regu_var_list_p->next;
 	    }
 	}
+      if (xasl_src->type == BUILDVALUE_PROC)
+	{
+	  AGGREGATE_TYPE *agg_list = xasl_src->proc.buildvalue.agg_list;
+	  while (agg_list)
+	    {
+	      regu_var_list_p = agg_list->operands;
+	      while (regu_var_list_p)
+		{
+		  ret = pt_make_sq_cache_key_struct (key_struct, (void *) &regu_var_list_p->value, SQ_TYPE_REGU_VAR);
+		  if (ret == ER_FAILED)
+		    {
+		      return ER_FAILED;
+		    }
+		  else
+		    {
+		      cnt += ret;
+		    }
+		  regu_var_list_p = regu_var_list_p->next;
+		}
+	      agg_list = agg_list->next;
+	    }
+
+	}
       break;
     case SQ_TYPE_PRED:
       pred_src = (PRED_EXPR *) p;
@@ -27733,10 +27663,6 @@ pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type)
       switch (regu_src->type)
 	{
 	case TYPE_CONSTANT:
-	  if (REGU_VARIABLE_IS_FLAGED (regu_src, REGU_VARIABLE_DERIVED_COL_CORRELATED))
-	    {
-	      return ER_FAILED;
-	    }
 	  if (!REGU_VARIABLE_IS_FLAGED (regu_src, REGU_VARIABLE_CORRELATED))
 	    {
 	      break;
