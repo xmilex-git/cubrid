@@ -285,6 +285,7 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/vacuum.c
   ${QUERY_DIR}/xasl_cache.c
   ${QUERY_DIR}/xasl_to_stream.c
+  ${QUERY_DIR}/parallel_heap_scan.cpp
   )
 set(QUERY_HEADERS
   ${QUERY_DIR}/query_aggregate.hpp
