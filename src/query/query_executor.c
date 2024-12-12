@@ -81,7 +81,7 @@
 #include "xasl_analytic.hpp"
 #include "xasl_predicate.hpp"
 #include "subquery_cache.h"
-
+#include "parallel_heap_scan.hpp"
 #include <vector>
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -413,8 +413,7 @@ static int qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, X
 				    QFILE_TUPLE_RECORD * tplrec);
 static void qexec_failure_line (int line, XASL_STATE * xasl_state);
 static void qexec_reset_regu_variable (REGU_VARIABLE * var);
-static void qexec_reset_regu_variable_list (REGU_VARIABLE_LIST list);
-static void qexec_reset_pred_expr (PRED_EXPR * pred);
+
 static int qexec_clear_xasl_head (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static int qexec_clear_arith_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ARITH_TYPE * list, bool is_final);
 static int qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE * regu_var, bool is_final);
@@ -1918,6 +1917,7 @@ qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCES
 	case S_HEAP_SCAN_RECORD_INFO:
 	case S_CLASS_ATTR_SCAN:
 	case S_HEAP_SAMPLING_SCAN:
+	case S_PARALLEL_HEAP_SCAN:
 	  pg_cnt += qexec_clear_regu_list (thread_p, xasl_p, p->s_id.s.hsid.scan_pred.regu_list, is_final);
 	  pg_cnt += qexec_clear_regu_list (thread_p, xasl_p, p->s_id.s.hsid.rest_regu_list, is_final);
 
@@ -9104,6 +9104,12 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 	  /* open a sequential heap file scan */
 	  scan_type = S_HEAP_SCAN;
 	  indx_info = NULL;
+#if defined(SERVER_MODE)
+	  if (!mvcc_select_lock_needed)
+	    {
+	      scan_type = S_PARALLEL_HEAP_SCAN;
+	    }
+#endif
 	}
       else if (curr_spec->access == ACCESS_METHOD_SEQUENTIAL_RECORD_INFO)
 	{
@@ -9158,6 +9164,25 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 					    curr_spec->s.cls_node.cache_rest, scan_type,
 					    curr_spec->s.cls_node.cache_reserved,
 					    curr_spec->s.cls_node.cls_regu_list_reserved, false);
+	  if (error_code != NO_ERROR)
+	    {
+	      ASSERT_ERROR ();
+	      goto exit_on_error;
+	    }
+	}
+      else if (scan_type == S_PARALLEL_HEAP_SCAN)
+	{
+	  error_code =
+	    scan_open_parallel_heap_scan (thread_p, s_id, mvcc_select_lock_needed, scan_op_type, fixed, grouped,
+					  curr_spec->single_fetch, curr_spec->s_dbval, val_list, vd,
+					  &ACCESS_SPEC_CLS_OID (curr_spec), &ACCESS_SPEC_HFID (curr_spec),
+					  curr_spec->s.cls_node.cls_regu_list_pred, curr_spec->where_pred,
+					  curr_spec->s.cls_node.cls_regu_list_rest,
+					  curr_spec->s.cls_node.num_attrs_pred, curr_spec->s.cls_node.attrids_pred,
+					  curr_spec->s.cls_node.cache_pred, curr_spec->s.cls_node.num_attrs_rest,
+					  curr_spec->s.cls_node.attrids_rest, curr_spec->s.cls_node.cache_rest,
+					  scan_type, curr_spec->s.cls_node.cache_reserved,
+					  curr_spec->s.cls_node.cls_regu_list_reserved, false);
 	  if (error_code != NO_ERROR)
 	    {
 	      ASSERT_ERROR ();
@@ -10162,6 +10187,19 @@ qexec_reset_regu_variable (REGU_VARIABLE * var)
     default:
       break;
     }
+}
+
+void 
+reset_pred_or_regu_var_list (void * object, bool is_pred)
+{
+	if(is_pred)
+	{
+		qexec_reset_pred_expr((PRED_EXPR*)object);
+	}
+	else 
+	{
+		qexec_reset_regu_variable_list((REGU_VARIABLE_LIST)object);
+	}
 }
 
 /*

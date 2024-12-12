@@ -51,6 +51,7 @@
 #include "xasl.h"
 #include "query_hash_scan.h"
 #include "statistics.h"
+#include "parallel_heap_scan.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -4158,7 +4159,9 @@ scan_start_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	  hsidp->caches_inited = true;
 	}
       break;
-
+    case S_PARALLEL_HEAP_SCAN:
+      scan_start_parallel_heap_scan (thread_p, scan_id);
+      break;
     case S_HEAP_PAGE_SCAN:
       VPID_SET_NULL (&scan_id->s.hpsid.curr_vpid);
       break;
@@ -4403,6 +4406,10 @@ scan_reset_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
 	}
       break;
 
+    case S_PARALLEL_HEAP_SCAN:
+      scan_reset_scan_block_parallel_heap_scan (thread_p, s_id);
+      break;
+
     case S_INDX_SCAN:
       if (s_id->grouped)
 	{
@@ -4535,6 +4542,7 @@ scan_next_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
     case S_HEAP_SCAN_RECORD_INFO:
     case S_HEAP_PAGE_SCAN:
     case S_HEAP_SAMPLING_SCAN:
+    case S_PARALLEL_HEAP_SCAN:
       if (s_id->grouped)
 	{
 	  /* grouped, fixed scan */
@@ -4719,6 +4727,10 @@ scan_end_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	}
       break;
 
+    case S_PARALLEL_HEAP_SCAN:
+      scan_end_parallel_heap_scan (thread_p, scan_id);
+      break;
+
     case S_CLASS_ATTR_SCAN:
       /* do not free attr_cache here. xs_clear_access_spec_list() will free attr_caches. */
       break;
@@ -4809,6 +4821,10 @@ scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
     case S_CLASS_ATTR_SCAN:
     case S_VALUES_SCAN:
     case S_HEAP_SAMPLING_SCAN:
+      break;
+
+    case S_PARALLEL_HEAP_SCAN:
+      scan_close_parallel_heap_scan (thread_p, scan_id);
       break;
 
     case S_INDX_SCAN:
@@ -5109,6 +5125,9 @@ scan_next_scan_local (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
     case S_HEAP_SCAN_RECORD_INFO:
     case S_HEAP_SAMPLING_SCAN:
       status = scan_next_heap_scan (thread_p, scan_id);
+      break;
+    case S_PARALLEL_HEAP_SCAN:
+      status = scan_next_parallel_heap_scan (thread_p, scan_id);
       break;
 
     case S_HEAP_PAGE_SCAN:
