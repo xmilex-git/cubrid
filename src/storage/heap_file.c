@@ -8245,8 +8245,7 @@ heap_next_1page (THREAD_ENTRY * thread_p, const HFID * hfid, const VPID * vpid, 
 	  if (scan_cache->page_watcher.pgptr == NULL)
 	    {
 	      scan_cache->page_watcher.pgptr =
-		heap_scan_pb_lock_and_fetch (thread_p, vpid, OLD_PAGE, S_LOCK, scan_cache,
-					     &scan_cache->page_watcher);
+		heap_scan_pb_lock_and_fetch (thread_p, vpid, OLD_PAGE, S_LOCK, scan_cache, &scan_cache->page_watcher);
 
 	      if (scan_cache->page_watcher.pgptr == NULL)
 		{

@@ -120,7 +120,7 @@ struct heap_scan_id
   sampling_info sampling;	/* for sampling statistics */
 };				/* Regular Heap File Scan Identifier */
 
-class parallel_heap_scan_master;  /* forward declaration */
+class parallel_heap_scan_master;	/* forward declaration */
 typedef struct parallel_heap_scan_id PARALLEL_HEAP_SCAN_ID;
 struct parallel_heap_scan_id
 {

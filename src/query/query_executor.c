@@ -10207,17 +10207,17 @@ qexec_reset_regu_variable (REGU_VARIABLE * var)
     }
 }
 
-void 
-reset_pred_or_regu_var_list (void * object, bool is_pred)
+void
+reset_pred_or_regu_var_list (void *object, bool is_pred)
 {
-	if(is_pred)
-	{
-		qexec_reset_pred_expr((PRED_EXPR*)object);
-	}
-	else 
-	{
-		qexec_reset_regu_variable_list((REGU_VARIABLE_LIST)object);
-	}
+  if (is_pred)
+    {
+      qexec_reset_pred_expr ((PRED_EXPR *) object);
+    }
+  else
+    {
+      qexec_reset_regu_variable_list ((REGU_VARIABLE_LIST) object);
+    }
 }
 
 /*
