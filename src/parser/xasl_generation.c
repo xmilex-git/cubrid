@@ -27626,10 +27626,6 @@ pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type)
 	  regu_var_list_p = regu_src->value.sp_ptr->args;
 	  while (regu_var_list_p)
 	    {
-	      if (!regu_var_list_p)
-		{
-		  return ER_FAILED;
-		}
 	      regu_src = &regu_var_list_p->value;
 	      ret = pt_make_sq_cache_key_struct (key_struct, (void *) regu_src, SQ_TYPE_REGU_VAR);
 	      if (ret == ER_FAILED)
