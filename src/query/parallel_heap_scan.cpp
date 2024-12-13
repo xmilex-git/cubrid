@@ -183,8 +183,21 @@ void parallel_heap_scan_result_queue_entry::init (THREAD_ENTRY *thread_p, int n_
 }
 void parallel_heap_scan_result_queue_entry::clear ()
 {
-  db_value_clear_array (&pred_val_array);
-  db_value_clear_array (&rest_val_array);
+  int i;
+  for (i = 0; i < pred_val_array.size; i++)
+    {
+      if (DB_NEED_CLEAR (&pred_val_array.vals[i]))
+	{
+	  pr_clear_value (&pred_val_array.vals[i]);
+	}
+    }
+  for (i = 0; i < rest_val_array.size; i++)
+    {
+      if (DB_NEED_CLEAR (&rest_val_array.vals[i]))
+	{
+	  pr_clear_value (&rest_val_array.vals[i]);
+	}
+    }
   scan_code = S_END;
   valid = false;
   curr_oid = {0,0,0};
@@ -627,7 +640,13 @@ SCAN_CODE parallel_heap_scan_master::get_result (THREAD_ENTRY *thread_p, SCAN_ID
 		}
 	      else
 		{
+		  bool need_signal = m_context->m_result_queue[i].var.waiting;
 		  lock.unlock();
+
+		  if (need_signal)
+		    {
+		      m_context->m_result_queue[i].var.cond.notify_one();
+		    }
 		  continue;
 		}
 	    }
@@ -1383,10 +1402,13 @@ scan_next_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
 int
 scan_reset_scan_block_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
 {
+  HL_HEAPID orig_heap_id;
   if (scan_id->s.phsid.master->m_is_reset_once)
     {
+      orig_heap_id = db_change_private_heap (thread_p, 0);
       scan_id->s.phsid.master->reset (scan_id);
       //scan_id->s.phsid.master->reset(scan_id); //WHY???????????
+      db_change_private_heap (thread_p, orig_heap_id);
     }
   else
     {
