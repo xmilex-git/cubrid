@@ -9121,7 +9121,10 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 #if defined(SERVER_MODE)
 	  if (!mvcc_select_lock_needed)
 	    {
-	      scan_type = S_PARALLEL_HEAP_SCAN;
+	      if (curr_spec->s.cls_node.hfid.hpgid > (1 << 12))	/* Only for User table */
+		{
+		  scan_type = S_PARALLEL_HEAP_SCAN;
+		}
 	    }
 #endif
 	}
