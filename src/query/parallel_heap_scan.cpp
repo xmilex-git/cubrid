@@ -224,6 +224,7 @@ class parallel_heap_scan_result_queue
 	std::mutex mutex;
 	std::condition_variable cond;
     };
+    std::atomic<bool> is_scan_ended;
     parallel_heap_scan_result_queue_variable var;
 
     void init (THREAD_ENTRY *thread_p, int n_pred, int n_rest);
@@ -248,6 +249,7 @@ parallel_heap_scan_result_queue::parallel_heap_scan_result_queue()
 {
   var.start = var.end = 0;
   var.waiting = false;
+  is_scan_ended = false;
 }
 
 void parallel_heap_scan_result_queue::init (THREAD_ENTRY *thread_p, int n_pred, int n_rest)
@@ -260,6 +262,7 @@ void parallel_heap_scan_result_queue::init (THREAD_ENTRY *thread_p, int n_pred, 
   std::unique_lock<std::mutex> (var.mutex);
   var.start = var.end = 0;
   var.waiting = false;
+  is_scan_ended = false;
 }
 
 void parallel_heap_scan_result_queue::clear ()
@@ -274,6 +277,7 @@ void parallel_heap_scan_result_queue::clear ()
     }
   var.start = var.end = 0;
   var.waiting = false;
+  is_scan_ended = false;
 }
 
 bool parallel_heap_scan_result_queue::isFull ()
@@ -412,16 +416,17 @@ class parallel_heap_scan_context : public cubthread::entry_manager
     std::atomic<std::uint64_t> m_tasks_executed;
     std::atomic<std::uint64_t> m_tasks_started;
     parallel_heap_scan_result_queue *m_result_queue;
+    std::atomic<std::uint64_t> scan_ended_queue_count;
     int m_has_error;
     SCAN_ID *m_scan_id;
     int m_orig_tran_index;
     REGU_VARIABLE_LIST orig_pred_list;
     REGU_VARIABLE_LIST orig_rest_list;
-
     class locked_vpid
     {
       public:
 	VPID vpid;
+	bool is_ended;
 	std::mutex mutex;
     } m_locked_vpid;
 
@@ -452,7 +457,7 @@ class parallel_heap_scan_task : public cubthread::entry_task
     {
       m_result_queue = queue;
     }
-    SCAN_CODE page_next (THREAD_ENTRY *thread_p, HFID *hfid);
+    SCAN_CODE page_next (THREAD_ENTRY *thread_p, HFID *hfid, VPID *vpid);
 };
 
 parallel_heap_scan_context::parallel_heap_scan_context (SCAN_ID *scan_id, int tran_index,
@@ -461,10 +466,12 @@ parallel_heap_scan_context::parallel_heap_scan_context (SCAN_ID *scan_id, int tr
   m_scan_id = scan_id;
   m_orig_tran_index = tran_index;
   VPID_SET_NULL (&m_locked_vpid.vpid);
+  m_locked_vpid.is_ended = false;
   m_result_queue = new parallel_heap_scan_result_queue[parallelism] {parallel_heap_scan_result_queue()};
   m_tasks_started = 0;
   m_tasks_executed = 0;
   m_has_error = NO_ERROR;
+  scan_ended_queue_count = 0;
 }
 
 parallel_heap_scan_context::~parallel_heap_scan_context()
@@ -479,21 +486,30 @@ void parallel_heap_scan_context::set_regu_vars (REGU_VARIABLE_LIST pred_list,
   orig_rest_list = rest_list;
 }
 
-SCAN_CODE parallel_heap_scan_task::page_next (THREAD_ENTRY *thread_p, HFID *hfid)
+SCAN_CODE parallel_heap_scan_task::page_next (THREAD_ENTRY *thread_p, HFID *hfid, VPID *vpid)
 {
   std::unique_lock<std::mutex> lock (m_context->m_locked_vpid.mutex);
-  SCAN_CODE page_scan_code = heap_page_next (thread_p, NULL, hfid, &m_context->m_locked_vpid.vpid, NULL);
-  if (page_scan_code == S_END)
+  if (m_context->m_locked_vpid.is_ended)
     {
-      lock.unlock();
       return S_END;
     }
-  return page_scan_code;
+  else
+    {
+      SCAN_CODE page_scan_code = heap_page_next (thread_p, NULL, hfid, &m_context->m_locked_vpid.vpid, NULL);
+      VPID_COPY (vpid, &m_context->m_locked_vpid.vpid);
+      if (page_scan_code == S_END)
+	{
+	  m_context->m_locked_vpid.is_ended = true;
+	  return S_END;
+	}
+      return page_scan_code;
+    }
 }
 
 void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 {
   int tran_index = m_context->m_orig_tran_index;
+  int ret = NO_ERROR;
   THREAD_ENTRY *thread_p = &thread_ref;
   SCAN_ID *scan_id, *orig_scan_id = m_context->m_scan_id;
   PARALLEL_HEAP_SCAN_ID *phsidp = &orig_scan_id->s.phsid;
@@ -521,7 +537,8 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 			       PH_PRED_EXPR, hsidp->pred_attrs.attr_cache);
   link_attr_cache (thread_p, hsidp->scan_pred.regu_list, phsidp->pred_attrs.attr_cache, hsidp->pred_attrs.attr_cache);
   link_attr_cache (thread_p, hsidp->rest_regu_list, phsidp->rest_attrs.attr_cache, hsidp->rest_attrs.attr_cache);
-  scan_start_scan (thread_p, scan_id);
+  hsidp->caches_inited = false;
+  ret = scan_start_scan (thread_p, scan_id);
   reset_pred_or_regu_var_list (hsidp->scan_pred.pred_expr, true);
   reset_pred_or_regu_var_list (hsidp->scan_pred.regu_list, false);
   reset_pred_or_regu_var_list (hsidp->rest_regu_list, false);
@@ -532,8 +549,8 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 
   while (TRUE)
     {
-      page_scan_code = page_next (thread_p, &hfid);
-      VPID_COPY (&vpid, &m_context->m_locked_vpid.vpid);
+      page_scan_code = page_next (thread_p, &hfid, &vpid);
+
       if (page_scan_code == S_END)
 	{
 	  m_result_queue->enqueue (hsidp, page_scan_code);
@@ -600,63 +617,103 @@ SCAN_CODE parallel_heap_scan_master::get_result (THREAD_ENTRY *thread_p, SCAN_ID
   SCAN_CODE scan_code;
   int result = FALSE;
   int timeout_count = 0;
-  for (int i = 0; i < parallelism; i++)
+  if (m_context->scan_ended_queue_count == parallelism)
     {
-      std::unique_lock<std::mutex> lock (m_context->m_result_queue[i].var.mutex, std::try_to_lock);
-      if (lock.owns_lock())
-	{
-	  result = m_context->m_result_queue[i].dequeue_without_lock (&scan_id->s.phsid, &scan_code);
-	  if (result == TRUE)
-	    {
-	      return scan_code;
-	    }
-	  else
-	    {
-	      lock.unlock();
-	      continue;
-	    }
-	}
-      else
-	{
-	  continue;
-	}
+      return S_END;
     }
 
-  while (result == FALSE)
+  for (int i = 0; i < parallelism; i++)
     {
-      for (int i=0; i<parallelism; i++)
+      if (!m_context->m_result_queue[i].is_scan_ended)
 	{
-	  if (timeout_count > 100)
-	    {
-	      return S_ERROR;
-	    }
 	  std::unique_lock<std::mutex> lock (m_context->m_result_queue[i].var.mutex, std::try_to_lock);
 	  if (lock.owns_lock())
 	    {
 	      result = m_context->m_result_queue[i].dequeue_without_lock (&scan_id->s.phsid, &scan_code);
 	      if (result == TRUE)
 		{
+		  if (scan_code == S_END)
+		    {
+		      lock.unlock();
+		      m_context->scan_ended_queue_count++;
+		      m_context->m_result_queue[i].is_scan_ended = true;
+		      result = FALSE;
+		      continue;
+		    }
 		  return scan_code;
 		}
 	      else
 		{
-		  bool need_signal = m_context->m_result_queue[i].var.waiting;
 		  lock.unlock();
-
-		  if (need_signal)
-		    {
-		      m_context->m_result_queue[i].var.cond.notify_one();
-		    }
 		  continue;
 		}
 	    }
 	  else
 	    {
-	      thread_sleep (10);
-	      timeout_count++;
+	      continue;
 	    }
 	}
 
+    }
+
+  if (m_context->scan_ended_queue_count == parallelism)
+    {
+      return S_END;
+    }
+
+  while (result == FALSE)
+    {
+      for (int i=0; i<parallelism; i++)
+	{
+	  if (!m_context->m_result_queue[i].is_scan_ended)
+	    {
+	      if (timeout_count > 100)
+		{
+		  return S_ERROR;
+		}
+	      std::unique_lock<std::mutex> lock (m_context->m_result_queue[i].var.mutex, std::try_to_lock);
+	      if (lock.owns_lock())
+		{
+		  result = m_context->m_result_queue[i].dequeue_without_lock (&scan_id->s.phsid, &scan_code);
+		  if (result == TRUE)
+		    {
+		      if (scan_code == S_END)
+			{
+			  lock.unlock();
+			  m_context->scan_ended_queue_count++;
+			  m_context->m_result_queue[i].is_scan_ended = true;
+			  result = FALSE;
+			  continue;
+			}
+		      return scan_code;
+		    }
+		  else
+		    {
+		      bool need_signal = m_context->m_result_queue[i].var.waiting;
+		      lock.unlock();
+
+		      if (need_signal)
+			{
+			  m_context->m_result_queue[i].var.cond.notify_one();
+			}
+		      continue;
+		    }
+		}
+	      else
+		{
+		  thread_sleep (10);
+		  timeout_count++;
+		}
+	    }
+	  else
+	    {
+	      continue;
+	    }
+	}
+      if (m_context->scan_ended_queue_count == parallelism)
+	{
+	  return S_END;
+	}
     }
   return S_ERROR;
 }
@@ -665,6 +722,7 @@ void parallel_heap_scan_master::start (THREAD_ENTRY *thread_p)
 {
   //std::unique_ptr<parallel_heap_scan_task> task = NULL;
   m_context->set_regu_vars (m_scan_id->s.phsid.scan_pred.regu_list, m_scan_id->s.phsid.rest_regu_list);
+  m_context->scan_ended_queue_count = 0;
   for (int i = 0; i < parallelism; i++)
     {
       m_context->m_result_queue[i].init (thread_p,
@@ -676,7 +734,6 @@ void parallel_heap_scan_master::start (THREAD_ENTRY *thread_p)
 void parallel_heap_scan_master::reset (SCAN_ID *scan_id)
 {
   std::unique_ptr<parallel_heap_scan_task> task = NULL;
-  int retired_result_queue_count = 0;
   while (m_context->m_tasks_executed < m_context->m_tasks_started)
     {
       thread_sleep (10);
@@ -686,8 +743,10 @@ void parallel_heap_scan_master::reset (SCAN_ID *scan_id)
     {
       m_context->m_result_queue[i].clear();
     }
+  m_context->scan_ended_queue_count = 0;
   std::unique_lock<std::mutex> lock (m_context->m_locked_vpid.mutex);
   VPID_SET_NULL (&m_context->m_locked_vpid.vpid);
+  m_context->m_locked_vpid.is_ended = false;
   scan_id->single_fetched = false;
   scan_id->null_fetched = false;
   scan_id->position = (scan_id->direction == S_FORWARD) ? S_BEFORE : S_AFTER;
@@ -1155,7 +1214,8 @@ scan_next_heap_scan_1page_internal (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, VP
     {
       COPY_OID (&retry_oid, &hsidp->curr_oid);
       object_get_status = OBJ_GET_WITHOUT_LOCK;
-
+      assert (hsidp->pred_attrs.attr_cache->last_classrepr != NULL);
+      assert (hsidp->rest_attrs.attr_cache->last_classrepr != NULL);
 restart_scan_oid:
 
       /* get next object */
