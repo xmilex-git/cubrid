@@ -1095,16 +1095,6 @@ attr_cache_clone (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src)
 {
   heap_cache_attrinfo *dest = (heap_cache_attrinfo *) HP_ALLOC (thread_p, sizeof (heap_cache_attrinfo));
   *dest = *src;
-  if (src->num_values > 0)
-    {
-      dest->values = (HEAP_ATTRVALUE *) HP_ALLOC (thread_p, sizeof (HEAP_ATTRVALUE) * src->num_values);
-      for (int i = 0; i < src->num_values; i++)
-	{
-	  dest->values[i] = src->values[i];
-	}
-    }
-
-
   return dest;
 }
 
@@ -1115,19 +1105,6 @@ attr_cache_free (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src)
     {
       return;
     }
-  if (src->num_values > 0)
-    {
-      for (int i = 0; i < src->num_values; i++)
-	{
-	  if (DB_NEED_CLEAR (&src->values[i].dbvalue))
-	    {
-	      pr_clear_value (&src->values[i].dbvalue);
-	    }
-	}
-
-      HP_FREE (thread_p, src->values);
-    }
-
   HP_FREE (thread_p, src);
 }
 
@@ -1214,8 +1191,6 @@ scan_next_heap_scan_1page_internal (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, VP
     {
       COPY_OID (&retry_oid, &hsidp->curr_oid);
       object_get_status = OBJ_GET_WITHOUT_LOCK;
-      assert (hsidp->pred_attrs.attr_cache->last_classrepr != NULL);
-      assert (hsidp->rest_attrs.attr_cache->last_classrepr != NULL);
 restart_scan_oid:
 
       /* get next object */
