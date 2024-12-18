@@ -12204,6 +12204,7 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
   OUTPTR_LIST *output_val_list = NULL;
   REGU_VARIABLE_LIST regu_var_list = NULL;
   DB_VALUE **db_values_array_p = NULL;
+  bool is_parallel_heap_scan_callable = true;
 
   assert (parser != NULL);
 
@@ -12259,10 +12260,12 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
 	      if (PT_IS_VALUE_QUERY (spec))
 		{
 		  scan_type = TARGET_REGUVAL_LIST;
+		  is_parallel_heap_scan_callable = false;
 		}
 	      else if (spec->info.spec.meta_class == PT_META_CLASS)
 		{
 		  scan_type = TARGET_CLASS_ATTR;
+		  is_parallel_heap_scan_callable = false;
 		}
 	      else
 		{
@@ -12568,6 +12571,10 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
 	      if (spec->info.spec.flag & PT_SPEC_FLAG_FOR_UPDATE_CLAUSE)
 		{
 		  access->flags = (ACCESS_SPEC_FLAG) (access->flags | ACCESS_SPEC_FLAG_FOR_UPDATE);
+		}
+	      if(!is_parallel_heap_scan_callable)
+		{
+		  access->flags = (ACCESS_SPEC_FLAG) (access->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
 		}
 
 	      access->next = access_list;

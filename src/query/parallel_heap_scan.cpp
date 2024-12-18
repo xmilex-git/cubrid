@@ -68,8 +68,6 @@ enum ph_pred_expr_types
 };
 
 static int regu_var_list_len (REGU_VARIABLE_LIST list);
-static REGU_VARIABLE_LIST regu_var_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST list);
-static void regu_var_list_free (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST head);
 static void *
 pred_expr_clone (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_expr_types type,
 		 heap_cache_attrinfo *attr_info);
@@ -80,6 +78,20 @@ static void link_attr_cache (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST node,hea
 			     heap_cache_attrinfo *new_attr_info);
 static SCAN_CODE scan_next_heap_scan_1page_internal (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, VPID *curr_vpid);
 
+static void arith_list_free (THREAD_ENTRY *thread_p, ARITH_TYPE *src);
+static void regu_list_free (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src);
+static void regu_val_list_free (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src);
+static void regu_var_free (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, bool free_self);
+static int regu_list_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST list);
+static int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var);
+static int pred_clear (THREAD_ENTRY *thread_p, PRED_EXPR *pred);
+static int arith_list_clear (THREAD_ENTRY *thread_p, ARITH_TYPE *list);
+static void pos_desc_clear (THREAD_ENTRY *thread_p, QFILE_TUPLE_VALUE_POSITION *pos_desc);
+static int regu_val_list_clear (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *list);
+ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src);
+REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src);
+REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src);
+REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src);
 
 /*************************************************************************************************/
 /* parallel_heap_scan_result_queue_entry */
@@ -99,10 +111,36 @@ class parallel_heap_scan_result_queue_entry
     void init (THREAD_ENTRY *thread_p, int n_pred_val, int n_rest_val);
     void clear ();
 
+    ~parallel_heap_scan_result_queue_entry();
+    parallel_heap_scan_result_queue_entry();
+
   private:
     void capture_regu_var_list (REGU_VARIABLE_LIST list, DB_VALUE_ARRAY *dbvalue_array);
     void copy_to_regu_var_list (DB_VALUE_ARRAY *dbvalue_array, REGU_VARIABLE_LIST list);
 };
+
+parallel_heap_scan_result_queue_entry::parallel_heap_scan_result_queue_entry()
+{
+  pred_val_array.size = 0;
+  pred_val_array.vals = NULL;
+  rest_val_array.size = 0;
+  rest_val_array.vals = NULL;
+  valid = false;
+  scan_code = S_END;
+  curr_oid = {0,0,0};
+}
+
+parallel_heap_scan_result_queue_entry::~parallel_heap_scan_result_queue_entry()
+{
+  if (pred_val_array.size > 0)
+    {
+      HP_FREE (NULL, pred_val_array.vals);
+    }
+  if (rest_val_array.size > 0)
+    {
+      HP_FREE (NULL, rest_val_array.vals);
+    }
+}
 
 void parallel_heap_scan_result_queue_entry::capture_regu_var_list (REGU_VARIABLE_LIST list,
     DB_VALUE_ARRAY *dbvalue_array)
@@ -126,10 +164,7 @@ void parallel_heap_scan_result_queue_entry::copy_to_regu_var_list (DB_VALUE_ARRA
       assert (iter);
       if (!DB_IS_NULL (iter->value.vfetch_to))
 	{
-	  if (DB_NEED_CLEAR (iter->value.vfetch_to))
-	    {
-	      pr_clear_value (iter->value.vfetch_to);
-	    }
+	  pr_clear_value (iter->value.vfetch_to);
 	}
       db_value_clone (&dbvalue_array->vals[i], iter->value.vfetch_to);
       iter = iter->next;
@@ -186,17 +221,11 @@ void parallel_heap_scan_result_queue_entry::clear ()
   int i;
   for (i = 0; i < pred_val_array.size; i++)
     {
-      if (DB_NEED_CLEAR (&pred_val_array.vals[i]))
-	{
-	  pr_clear_value (&pred_val_array.vals[i]);
-	}
+      pr_clear_value (&pred_val_array.vals[i]);
     }
   for (i = 0; i < rest_val_array.size; i++)
     {
-      if (DB_NEED_CLEAR (&rest_val_array.vals[i]))
-	{
-	  pr_clear_value (&rest_val_array.vals[i]);
-	}
+      pr_clear_value (&rest_val_array.vals[i]);
     }
   scan_code = S_END;
   valid = false;
@@ -204,7 +233,6 @@ void parallel_heap_scan_result_queue_entry::clear ()
 }
 
 /*************************************************************************************************/
-
 /* parallel_heap_scan_result_queue */
 class parallel_heap_scan_result_queue
 {
@@ -529,8 +557,8 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 		       phsidp->rest_attrs.num_attrs, phsidp->rest_attrs.attr_ids, phsidp->rest_attrs.attr_cache,
 		       S_HEAP_SCAN, phsidp->cache_recordinfo, phsidp->recordinfo_regu_list, false);
 
-  hsidp->scan_pred.regu_list = regu_var_list_clone (thread_p, m_context->orig_pred_list);
-  hsidp->rest_regu_list = regu_var_list_clone (thread_p, m_context->orig_rest_list);
+  hsidp->scan_pred.regu_list = regu_list_clone (thread_p, m_context->orig_pred_list);
+  hsidp->rest_regu_list = regu_list_clone (thread_p, m_context->orig_rest_list);
   hsidp->pred_attrs.attr_cache = attr_cache_clone (thread_p, phsidp->pred_attrs.attr_cache);
   hsidp->rest_attrs.attr_cache = attr_cache_clone (thread_p, phsidp->rest_attrs.attr_cache);
   hsidp->scan_pred.pred_expr = (PRED_EXPR *)pred_expr_clone (thread_p, (void *)phsidp->scan_pred.pred_expr, NULL,
@@ -581,9 +609,12 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
       heap_attrinfo_end (thread_p, hsidp->rest_attrs.attr_cache);
       hsidp->caches_inited = false;
     }
+  pred_clear (thread_p, hsidp->scan_pred.pred_expr);
+  regu_list_clear (thread_p, hsidp->scan_pred.regu_list);
+  regu_list_clear (thread_p, hsidp->rest_regu_list);
 
-  regu_var_list_free (thread_p, hsidp->scan_pred.regu_list);
-  regu_var_list_free (thread_p, hsidp->rest_regu_list);
+  regu_list_free (thread_p, hsidp->scan_pred.regu_list);
+  regu_list_free (thread_p, hsidp->rest_regu_list);
   pred_expr_free (thread_p, hsidp->scan_pred.pred_expr);
   attr_cache_free (thread_p, hsidp->pred_attrs.attr_cache);
   attr_cache_free (thread_p, hsidp->rest_attrs.attr_cache);
@@ -610,6 +641,7 @@ parallel_heap_scan_master::~parallel_heap_scan_master()
     {
       thread_get_manager()->destroy_worker_pool (m_workpool);
     }
+  delete m_context;
 }
 
 SCAN_CODE parallel_heap_scan_master::get_result (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
@@ -795,89 +827,402 @@ static int regu_var_list_len (REGU_VARIABLE_LIST list)
   return len;
 }
 
-static REGU_VARIABLE_LIST regu_var_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src)
+int pred_clear (THREAD_ENTRY *thread_p, PRED_EXPR *pr)
 {
-  REGU_VARIABLE_LIST dest_head = NULL;
-  REGU_VARIABLE_LIST dest_tail = NULL;
+  int pg_cnt;
+  PRED_EXPR *expr;
 
-  REGU_VARIABLE_LIST current = src;
+  pg_cnt = 0;
+
+  if (pr == NULL)
+    {
+      return pg_cnt;
+    }
+
+  switch (pr->type)
+    {
+    case T_PRED:
+      pg_cnt += pred_clear (thread_p, pr->pe.m_pred.lhs);
+      for (expr = pr->pe.m_pred.rhs; expr && expr->type == T_PRED; expr = expr->pe.m_pred.rhs)
+	{
+	  pg_cnt += pred_clear (thread_p, expr->pe.m_pred.lhs);
+	}
+      pg_cnt += pred_clear (thread_p, expr);
+      break;
+    case T_EVAL_TERM:
+      switch (pr->pe.m_eval_term.et_type)
+	{
+	case T_COMP_EVAL_TERM:
+	{
+	  COMP_EVAL_TERM *et_comp = &pr->pe.m_eval_term.et.et_comp;
+
+	  pg_cnt += regu_var_clear (thread_p, et_comp->lhs);
+	  pg_cnt += regu_var_clear (thread_p, et_comp->rhs);
+	}
+	break;
+	case T_ALSM_EVAL_TERM:
+	{
+	  ALSM_EVAL_TERM *et_alsm = &pr->pe.m_eval_term.et.et_alsm;
+
+	  pg_cnt += regu_var_clear (thread_p, et_alsm->elem);
+	  pg_cnt += regu_var_clear (thread_p, et_alsm->elemset);
+	}
+	break;
+	case T_LIKE_EVAL_TERM:
+	{
+	  LIKE_EVAL_TERM *et_like = &pr->pe.m_eval_term.et.et_like;
+
+	  pg_cnt += regu_var_clear (thread_p, et_like->src);
+	  pg_cnt += regu_var_clear (thread_p, et_like->pattern);
+	  pg_cnt += regu_var_clear (thread_p, et_like->esc_char);
+	}
+	break;
+	case T_RLIKE_EVAL_TERM:
+	{
+	  RLIKE_EVAL_TERM *et_rlike = &pr->pe.m_eval_term.et.et_rlike;
+
+	  pg_cnt += regu_var_clear (thread_p, et_rlike->src);
+	  pg_cnt += regu_var_clear (thread_p, et_rlike->pattern);
+	  pg_cnt += regu_var_clear (thread_p, et_rlike->case_sensitive);
+
+	  /* free memory of compiled regex */
+	  if (et_rlike->compiled_regex)
+	    {
+	      delete et_rlike->compiled_regex;
+	      et_rlike->compiled_regex = NULL;
+	    }
+	}
+	break;
+	}
+      break;
+    case T_NOT_TERM:
+      pg_cnt += pred_clear (thread_p, pr->pe.m_not_term);
+      break;
+    }
+
+  return pg_cnt;
+}
+
+int arith_list_clear (THREAD_ENTRY *thread_p, ARITH_TYPE *list)
+{
+  int pg_cnt = 0;
+
+  if (list == NULL)
+    {
+      return NO_ERROR;
+    }
+
+  /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
+  list->domain = list->original_domain;
+  pr_clear_value (list->value);
+  pg_cnt += regu_var_clear (thread_p, list->leftptr);
+  pg_cnt += regu_var_clear (thread_p, list->rightptr);
+  pg_cnt += regu_var_clear (thread_p, list->thirdptr);
+  pg_cnt += pred_clear (thread_p, list->pred);
+
+  if (list->rand_seed != NULL)
+    {
+      free_and_init (list->rand_seed);
+    }
+
+  return pg_cnt;
+}
+
+void pos_desc_clear (THREAD_ENTRY *thread_p, QFILE_TUPLE_VALUE_POSITION *pos_desc)
+{
+  pos_desc->dom = pos_desc->original_domain;
+}
+
+int regu_list_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST list)
+{
+  REGU_VARIABLE_LIST p;
+  int pg_cnt;
+
+  pg_cnt = 0;
+  for (p = list; p; p = p->next)
+    {
+      pg_cnt += regu_var_clear (thread_p, &p->value);
+    }
+
+  return pg_cnt;
+}
+
+int regu_val_list_clear (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *list)
+{
+  REGU_VALUE_ITEM *list_node;
+  int pg_cnt = 0;
+  for (list_node = list->regu_list; list_node; list_node = list_node->next)
+    {
+      pg_cnt += regu_var_clear (thread_p, list_node->value);
+    }
+  return pg_cnt;
+}
+
+int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
+{
+  int pg_cnt;
+
+  pg_cnt = 0;
+  if (!regu_var)
+    {
+      return pg_cnt;
+    }
+
+  /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
+  regu_var->domain = regu_var->original_domain;
+
+  switch (regu_var->type)
+    {
+    case TYPE_ATTR_ID:		/* fetch object attribute value */
+    case TYPE_SHARED_ATTR_ID:
+    case TYPE_CLASS_ATTR_ID:
+      regu_var->value.attr_descr.cache_dbvalp = NULL;
+      break;
+    case TYPE_CONSTANT:
+      //(void) pr_clear_value (regu_var->value.dbvalptr);
+      break;
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      pg_cnt += arith_list_clear (thread_p, regu_var->value.arithptr);
+      break;
+    case TYPE_SP:
+      pr_clear_value (regu_var->value.sp_ptr->value);
+      pg_cnt += regu_list_clear (thread_p, regu_var->value.sp_ptr->args);
+
+      delete regu_var->value.sp_ptr->sig;
+      regu_var->value.sp_ptr->sig = nullptr;
+
+      break;
+    case TYPE_FUNC:
+      pr_clear_value (regu_var->value.funcp->value);
+      pg_cnt += regu_list_clear (thread_p, regu_var->value.funcp->operand);
+      if (regu_var->value.funcp->tmp_obj != NULL)
+	{
+	  switch (regu_var->value.funcp->ftype)
+	    {
+	    case F_REGEXP_COUNT:
+	    case F_REGEXP_INSTR:
+	    case F_REGEXP_LIKE:
+	    case F_REGEXP_REPLACE:
+	    case F_REGEXP_SUBSTR:
+	    {
+	      if (regu_var->value.funcp->tmp_obj->compiled_regex)
+		{
+		  delete regu_var->value.funcp->tmp_obj->compiled_regex;
+		  regu_var->value.funcp->tmp_obj->compiled_regex = NULL;
+		}
+	    }
+	    break;
+	    default:
+	      // any member of union func_tmp_obj may have been erased
+	      assert (false);
+	      break;
+	    }
+
+	  delete regu_var->value.funcp->tmp_obj;
+	  regu_var->value.funcp->tmp_obj = NULL;
+	}
+
+      break;
+    case TYPE_REGUVAL_LIST:
+      pg_cnt += regu_val_list_clear (thread_p, regu_var->value.reguval_list);
+      break;
+    case TYPE_DBVAL:
+      (void) pr_clear_value (&regu_var->value.dbval);
+      break;
+    case TYPE_REGU_VAR_LIST:
+      pg_cnt += regu_list_clear (thread_p, regu_var->value.regu_var_list);
+      break;
+    case TYPE_POSITION:
+      pos_desc_clear (thread_p, &regu_var->value.pos_descr);
+      break;
+    default:
+      break;
+    }
+
+  if (regu_var->vfetch_to != NULL)
+    {
+      pr_clear_value (regu_var->vfetch_to);
+    }
+
+  return pg_cnt;
+}
+
+ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src)
+{
   if (!src)
     {
       return NULL;
     }
 
-  while (current)
+  ARITH_TYPE *dest = (ARITH_TYPE *) HP_ALLOC (thread_p, sizeof (ARITH_TYPE));
+  if (dest == NULL)
     {
-      REGU_VARIABLE_LIST new_node =
-	      (REGU_VARIABLE_LIST) HP_ALLOC (thread_p, sizeof (struct regu_variable_list_node));
-      if (!new_node)
+      return NULL;
+    }
+
+  *dest = *src;
+
+  dest->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
+  if (dest->value == NULL)
+    {
+      HP_FREE (thread_p, dest);
+      return NULL;
+    }
+  pr_clone_value (src->value, dest->value);
+
+  dest->leftptr = regu_var_clone (thread_p, src->leftptr);
+  dest->rightptr = regu_var_clone (thread_p, src->rightptr);
+  dest->thirdptr = regu_var_clone (thread_p, src->thirdptr);
+
+  if (src->rand_seed)
+    {
+      dest->rand_seed = (struct drand48_data *) HP_ALLOC (thread_p, sizeof (struct drand48_data));
+      if (dest->rand_seed)
 	{
-	  REGU_VARIABLE_LIST temp = dest_head;
-	  while (temp)
-	    {
-	      REGU_VARIABLE_LIST next = temp->next;
-	      if (temp->value.vfetch_to)
-		{
-		  if (DB_NEED_CLEAR (temp->value.vfetch_to))
-		    {
-		      pr_clear_value (temp->value.vfetch_to);
-		    }
-		  HP_FREE (thread_p, temp->value.vfetch_to);
-		}
-	      HP_FREE (thread_p, temp);
-	      temp = next;
-	    }
-	  return NULL;
+	  *dest->rand_seed = *src->rand_seed;
+	}
+    }
+
+  return dest;
+
+}
+
+REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src)
+{
+  if (!src)
+    {
+      return NULL;
+    }
+
+  REGU_VARIABLE_LIST head = NULL;
+  REGU_VARIABLE_LIST tail = NULL;
+  REGU_VARIABLE_LIST curr_src = src;
+
+  while (curr_src)
+    {
+      REGU_VARIABLE_LIST curr_dest = (REGU_VARIABLE_LIST) HP_ALLOC (thread_p, sizeof (regu_variable_list_node));
+      curr_dest->next = NULL;
+      REGU_VARIABLE *cloned = regu_var_clone (thread_p, &curr_src->value);
+      if (cloned != NULL)
+	{
+	  curr_dest->value = *cloned;
+	  HP_FREE (thread_p, cloned);
 	}
 
-      new_node->value = current->value;
-      new_node->value.vfetch_to = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
-
-      /* should we clone value? */
-      pr_clone_value (current->value.vfetch_to, new_node->value.vfetch_to);
-      if (current->value.type == TYPE_ATTR_ID || current->value.type == TYPE_CLASS_ATTR_ID
-	  || current->value.type == TYPE_SHARED_ATTR_ID)
+      if (!head)
 	{
-	  new_node->value.value.attr_descr.cache_dbvalp = nullptr;
-	}
-      new_node->next = NULL;
-
-      if (dest_tail)
-	{
-	  dest_tail->next = new_node;
+	  head = curr_dest;
+	  tail = curr_dest;
 	}
       else
 	{
-	  dest_head = new_node;
+	  tail->next = curr_dest;
+	  tail = curr_dest;
 	}
-      dest_tail = new_node;
 
-      current = current->next;
+      curr_src = curr_src->next;
     }
 
-  return dest_head;
+  return head;
 }
 
-void
-regu_var_list_free (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST head)
+REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src)
 {
-  REGU_VARIABLE_LIST current = head;
-  while (current)
+  if (!src)
     {
-      REGU_VARIABLE_LIST next = current->next;
-
-      if (current->value.vfetch_to)
-	{
-	  if (DB_NEED_CLEAR (current->value.vfetch_to))
-	    {
-	      pr_clear_value (current->value.vfetch_to);
-	    }
-	  HP_FREE (thread_p, current->value.vfetch_to);
-	}
-      HP_FREE (thread_p, current);
-
-      current = next;
+      return NULL;
     }
+
+  REGU_VALUE_LIST *dest = (REGU_VALUE_LIST *) HP_ALLOC (thread_p, sizeof (REGU_VALUE_LIST));
+  *dest = *src;
+  dest->regu_list = NULL;
+  dest->current_value = NULL;
+
+  if (src->count > 0)
+    {
+      REGU_VALUE_ITEM *curr_src = src->regu_list;
+      REGU_VALUE_ITEM *curr_dest = NULL;
+      REGU_VALUE_ITEM *prev_dest = NULL;
+
+      for (int i = 0; i < src->count; i++)
+	{
+	  curr_dest = (REGU_VALUE_ITEM *) HP_ALLOC (thread_p, sizeof (REGU_VALUE_ITEM));
+	  curr_dest->value = regu_var_clone (thread_p, curr_src->value);
+	  curr_dest->next = NULL;
+
+	  if (prev_dest == NULL)
+	    {
+	      dest->regu_list = curr_dest;
+	    }
+	  else
+	    {
+	      prev_dest->next = curr_dest;
+	    }
+	  prev_dest = curr_dest;
+	  curr_src = curr_src->next;
+	}
+    }
+
+  return dest;
+}
+
+REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src)
+{
+  REGU_VARIABLE *dest;
+  if (!src)
+    {
+      return NULL;
+    }
+  dest = (REGU_VARIABLE *) HP_ALLOC (thread_p, sizeof (REGU_VARIABLE));
+
+
+  *dest = *src;
+
+  switch (src->type)
+    {
+    case TYPE_ATTR_ID:		/* fetch object attribute value */
+    case TYPE_SHARED_ATTR_ID:
+    case TYPE_CLASS_ATTR_ID:
+      dest->value.attr_descr.cache_dbvalp = NULL;
+      break;
+    case TYPE_CONSTANT:
+      dest->value.dbvalptr = src->value.dbvalptr;
+      break;
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      dest->value.arithptr = arith_list_clone (thread_p, src->value.arithptr);
+      break;
+    case TYPE_SP:
+      dest->value.sp_ptr->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
+      pr_clone_value (src->value.sp_ptr->value, dest->value.sp_ptr->value);
+      dest->value.sp_ptr->args = regu_list_clone (thread_p, src->value.sp_ptr->args);
+      break;
+    case TYPE_FUNC:
+      dest->value.funcp->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
+      pr_clone_value (src->value.funcp->value, dest->value.funcp->value);
+      dest->value.funcp->operand = regu_list_clone (thread_p, src->value.funcp->operand);
+      break;
+    case TYPE_DBVAL:
+      pr_clone_value (&src->value.dbval, &dest->value.dbval);
+      break;
+    case TYPE_REGUVAL_LIST:
+      dest->value.reguval_list = regu_val_list_clone (thread_p, src->value.reguval_list);
+      break;
+    case TYPE_REGU_VAR_LIST:
+      dest->value.regu_var_list = regu_list_clone (thread_p, src->value.regu_var_list);
+      break;
+    default:
+      break;
+    }
+
+  if (src->vfetch_to != NULL)
+    {
+      dest->vfetch_to = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
+      pr_clone_value (src->vfetch_to, dest->vfetch_to);
+    }
+
+  return dest;
 }
 
 static void *
@@ -1000,18 +1345,9 @@ pred_expr_clone (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_exp
       break;
     case PH_REGU_VAR:
       src_regu_var = (regu_variable_node *) src;
-      dest_regu_var = (regu_variable_node *) HP_ALLOC (thread_p, sizeof (regu_variable_node));
-      *dest_regu_var = *src_regu_var;
-      if (src_regu_var->vfetch_to)
-	{
-	  dest_regu_var->vfetch_to = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
-	  /* should we clone value? */
-	  pr_clone_value (src_regu_var->vfetch_to, dest_regu_var->vfetch_to);
-	}
-
-
-      if (src_regu_var->type == TYPE_ATTR_ID || src_regu_var->type == TYPE_CLASS_ATTR_ID
-	  || src_regu_var->type == TYPE_SHARED_ATTR_ID)
+      dest_regu_var = regu_var_clone (thread_p, src_regu_var);
+      if (dest_regu_var->type == TYPE_ATTR_ID || dest_regu_var->type == TYPE_SHARED_ATTR_ID
+	  || dest_regu_var->type == TYPE_CLASS_ATTR_ID)
 	{
 	  dest_regu_var->value.attr_descr.cache_dbvalp = NULL;
 	  dest_regu_var->value.attr_descr.cache_attrinfo = attr_info;
@@ -1024,6 +1360,113 @@ pred_expr_clone (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_exp
     }
   return ret;
 }
+
+static void
+arith_list_free (THREAD_ENTRY *thread_p, ARITH_TYPE *src)
+{
+  if (!src)
+    {
+      return;
+    }
+
+  if (src->value)
+    {
+      pr_clear_value (src->value);
+      HP_FREE (thread_p, src->value);
+    }
+
+  regu_var_free (thread_p, src->leftptr, true);
+  regu_var_free (thread_p, src->rightptr, true);
+  regu_var_free (thread_p, src->thirdptr, true);
+
+  if (src->rand_seed)
+    {
+      HP_FREE (thread_p, src->rand_seed);
+    }
+
+  HP_FREE (thread_p, src);
+}
+
+static void
+regu_list_free (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src)
+{
+  if (!src)
+    {
+      return;
+    }
+
+  REGU_VARIABLE_LIST curr = src;
+  REGU_VARIABLE_LIST next;
+
+  while (curr)
+    {
+      next = curr->next;
+      regu_var_free (thread_p, &curr->value, false);
+      HP_FREE (thread_p, curr);
+      curr = next;
+    }
+}
+
+static void
+regu_val_list_free (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src)
+{
+  if (!src)
+    {
+      return;
+    }
+
+  REGU_VALUE_ITEM *curr = src->regu_list;
+  REGU_VALUE_ITEM *next;
+
+  while (curr)
+    {
+      next = curr->next;
+      regu_var_free (thread_p, curr->value, true);
+      HP_FREE (thread_p, curr);
+      curr = next;
+    }
+
+  HP_FREE (thread_p, src);
+}
+
+static void
+regu_var_free (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, bool free_self)
+{
+  if (!src)
+    {
+      return;
+    }
+
+  switch (src->type)
+    {
+    case TYPE_CONSTANT:
+      pr_clear_value (src->value.dbvalptr);
+      break;
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      arith_list_free (thread_p, src->value.arithptr);
+      break;
+    case TYPE_REGUVAL_LIST:
+      regu_val_list_free (thread_p, src->value.reguval_list);
+      break;
+    case TYPE_REGU_VAR_LIST:
+      regu_list_free (thread_p, src->value.regu_var_list);
+      break;
+    default:
+      break;
+    }
+
+  if (src->vfetch_to)
+    {
+      pr_clear_value (src->vfetch_to);
+      HP_FREE (thread_p, src->vfetch_to);
+    }
+  if (free_self)
+    {
+      HP_FREE (thread_p, src);
+    }
+}
+
 
 static void
 pred_expr_free (THREAD_ENTRY *thread_p, PRED_EXPR *src)
@@ -1044,41 +1487,111 @@ pred_expr_free (THREAD_ENTRY *thread_p, PRED_EXPR *src)
 	case T_COMP_EVAL_TERM:
 	{
 	  COMP_EVAL_TERM *comp_term = &src->pe.m_eval_term.et.et_comp;
-	  HP_FREE (thread_p, comp_term->lhs->vfetch_to);
-	  HP_FREE (thread_p, comp_term->lhs);
-	  HP_FREE (thread_p, comp_term->rhs->vfetch_to);
-	  HP_FREE (thread_p, comp_term->rhs);
+	  if (comp_term->lhs)
+	    {
+	      if (comp_term->lhs->vfetch_to)
+		{
+		  pr_clear_value (comp_term->lhs->vfetch_to);
+		  HP_FREE (thread_p, comp_term->lhs->vfetch_to);
+		}
+	      HP_FREE (thread_p, comp_term->lhs);
+	    }
+	  if (comp_term->rhs)
+	    {
+	      if (comp_term->rhs->vfetch_to)
+		{
+		  pr_clear_value (comp_term->rhs->vfetch_to);
+		  HP_FREE (thread_p, comp_term->rhs->vfetch_to);
+		}
+	      HP_FREE (thread_p, comp_term->rhs);
+	    }
 	}
 	break;
 	case T_ALSM_EVAL_TERM:
 	{
 	  ALSM_EVAL_TERM *alsm_term = &src->pe.m_eval_term.et.et_alsm;
-	  HP_FREE (thread_p, alsm_term->elem->vfetch_to);
-	  HP_FREE (thread_p, alsm_term->elem);
-	  HP_FREE (thread_p, alsm_term->elemset->vfetch_to);
-	  HP_FREE (thread_p, alsm_term->elemset);
+	  if (alsm_term->elem)
+	    {
+	      if (alsm_term->elem->vfetch_to)
+		{
+		  pr_clear_value (alsm_term->elem->vfetch_to);
+		  HP_FREE (thread_p, alsm_term->elem->vfetch_to);
+		}
+	      HP_FREE (thread_p, alsm_term->elem);
+	    }
+	  if (alsm_term->elemset)
+	    {
+	      if (alsm_term->elemset->vfetch_to)
+		{
+		  pr_clear_value (alsm_term->elemset->vfetch_to);
+		  HP_FREE (thread_p, alsm_term->elemset->vfetch_to);
+		}
+	      HP_FREE (thread_p, alsm_term->elemset);
+	    }
 	}
 	break;
 	case T_LIKE_EVAL_TERM:
 	{
 	  LIKE_EVAL_TERM *like_term = &src->pe.m_eval_term.et.et_like;
-	  HP_FREE (thread_p, like_term->src->vfetch_to);
-	  HP_FREE (thread_p, like_term->src);
-	  HP_FREE (thread_p, like_term->pattern->vfetch_to);
-	  HP_FREE (thread_p, like_term->pattern);
-	  HP_FREE (thread_p, like_term->esc_char->vfetch_to);
-	  HP_FREE (thread_p, like_term->esc_char);
+	  if (like_term->src)
+	    {
+	      if (like_term->src->vfetch_to)
+		{
+		  pr_clear_value (like_term->src->vfetch_to);
+		  HP_FREE (thread_p, like_term->src->vfetch_to);
+		}
+	      HP_FREE (thread_p, like_term->src);
+	    }
+	  if (like_term->pattern)
+	    {
+	      if (like_term->pattern->vfetch_to)
+		{
+		  pr_clear_value (like_term->pattern->vfetch_to);
+		  HP_FREE (thread_p, like_term->pattern->vfetch_to);
+		}
+	      HP_FREE (thread_p, like_term->pattern);
+	    }
+	  if (like_term->esc_char)
+	    {
+	      if (like_term->esc_char->vfetch_to)
+		{
+		  pr_clear_value (like_term->esc_char->vfetch_to);
+		  HP_FREE (thread_p, like_term->esc_char->vfetch_to);
+		}
+	      HP_FREE (thread_p, like_term->esc_char);
+	    }
 	}
 	break;
 	case T_RLIKE_EVAL_TERM:
 	{
 	  RLIKE_EVAL_TERM *rlike_term = &src->pe.m_eval_term.et.et_rlike;
-	  HP_FREE (thread_p, rlike_term->src->vfetch_to);
-	  HP_FREE (thread_p, rlike_term->src);
-	  HP_FREE (thread_p, rlike_term->pattern->vfetch_to);
-	  HP_FREE (thread_p, rlike_term->pattern);
-	  HP_FREE (thread_p, rlike_term->case_sensitive->vfetch_to);
-	  HP_FREE (thread_p, rlike_term->case_sensitive);
+	  if (rlike_term->src)
+	    {
+	      if (rlike_term->src->vfetch_to)
+		{
+		  pr_clear_value (rlike_term->src->vfetch_to);
+		  HP_FREE (thread_p, rlike_term->src->vfetch_to);
+		}
+	      HP_FREE (thread_p, rlike_term->src);
+	    }
+	  if (rlike_term->pattern)
+	    {
+	      if (rlike_term->pattern->vfetch_to)
+		{
+		  pr_clear_value (rlike_term->pattern->vfetch_to);
+		  HP_FREE (thread_p, rlike_term->pattern->vfetch_to);
+		}
+	      HP_FREE (thread_p, rlike_term->pattern);
+	    }
+	  if (rlike_term->case_sensitive)
+	    {
+	      if (rlike_term->case_sensitive->vfetch_to)
+		{
+		  pr_clear_value (rlike_term->case_sensitive->vfetch_to);
+		  HP_FREE (thread_p, rlike_term->case_sensitive->vfetch_to);
+		}
+	      HP_FREE (thread_p, rlike_term->case_sensitive);
+	    }
 	}
 	break;
 	}
@@ -1461,7 +1974,10 @@ scan_end_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
 void
 scan_close_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
 {
+  HL_HEAPID orig_heap_id;
+  orig_heap_id = db_change_private_heap (thread_p, 0);
   delete scan_id->s.phsid.master;
+  db_change_private_heap (thread_p, orig_heap_id);
 }
 
 int
