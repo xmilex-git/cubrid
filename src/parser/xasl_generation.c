@@ -9985,11 +9985,11 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 
 	      for (table_info = symbols->table_info; table_info != NULL; table_info = table_info->next)
 		{
+		  PT_SPEC_FLAG flag = table_info->class_spec->info.spec.flag;
 		  if (table_info->class_spec)
 		    {
 		      table_info->class_spec->info.spec.flag =
-			(PT_SPEC_FLAG) (table_info->class_spec->info.
-					spec.flag | PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+			(PT_SPEC_FLAG) (flag | PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
 		    }
 		}
 
