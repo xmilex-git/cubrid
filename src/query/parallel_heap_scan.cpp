@@ -74,8 +74,11 @@ pred_expr_clone (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_exp
 static void pred_expr_free (THREAD_ENTRY *thread_p, PRED_EXPR *src);
 static heap_cache_attrinfo *attr_cache_clone (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src);
 static void attr_cache_free (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src);
-static void link_attr_cache (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST node,heap_cache_attrinfo *old_attr_info,
+static void link_attr_cache (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST node, heap_cache_attrinfo *old_attr_info,
 			     heap_cache_attrinfo *new_attr_info);
+static void link_attr_cache_for_regu_var (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var,
+    heap_cache_attrinfo *old_attr_info,
+    heap_cache_attrinfo *new_attr_info);
 static SCAN_CODE scan_next_heap_scan_1page_internal (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, VPID *curr_vpid);
 
 static void arith_list_free (THREAD_ENTRY *thread_p, ARITH_TYPE *src);
@@ -88,10 +91,10 @@ static int pred_clear (THREAD_ENTRY *thread_p, PRED_EXPR *pred);
 static int arith_list_clear (THREAD_ENTRY *thread_p, ARITH_TYPE *list);
 static void pos_desc_clear (THREAD_ENTRY *thread_p, QFILE_TUPLE_VALUE_POSITION *pos_desc);
 static int regu_val_list_clear (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *list);
-ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src);
-REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src);
-REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src);
-REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src);
+ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src, heap_cache_attrinfo *new_attr_info);
+REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, heap_cache_attrinfo *new_attr_info);
+REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src, heap_cache_attrinfo *new_attr_info);
+REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *, heap_cache_attrinfo *new_attr_info);
 
 /*************************************************************************************************/
 /* parallel_heap_scan_result_queue_entry */
@@ -556,15 +559,12 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 		       phsidp->pred_attrs.num_attrs, phsidp->pred_attrs.attr_ids, phsidp->pred_attrs.attr_cache,
 		       phsidp->rest_attrs.num_attrs, phsidp->rest_attrs.attr_ids, phsidp->rest_attrs.attr_cache,
 		       S_HEAP_SCAN, phsidp->cache_recordinfo, phsidp->recordinfo_regu_list, false);
-
-  hsidp->scan_pred.regu_list = regu_list_clone (thread_p, m_context->orig_pred_list);
-  hsidp->rest_regu_list = regu_list_clone (thread_p, m_context->orig_rest_list);
   hsidp->pred_attrs.attr_cache = attr_cache_clone (thread_p, phsidp->pred_attrs.attr_cache);
   hsidp->rest_attrs.attr_cache = attr_cache_clone (thread_p, phsidp->rest_attrs.attr_cache);
+  hsidp->scan_pred.regu_list = regu_list_clone (thread_p, m_context->orig_pred_list, hsidp->pred_attrs.attr_cache);
+  hsidp->rest_regu_list = regu_list_clone (thread_p, m_context->orig_rest_list, hsidp->rest_attrs.attr_cache);
   hsidp->scan_pred.pred_expr = (PRED_EXPR *)pred_expr_clone (thread_p, (void *)phsidp->scan_pred.pred_expr, NULL,
 			       PH_PRED_EXPR, hsidp->pred_attrs.attr_cache);
-  link_attr_cache (thread_p, hsidp->scan_pred.regu_list, phsidp->pred_attrs.attr_cache, hsidp->pred_attrs.attr_cache);
-  link_attr_cache (thread_p, hsidp->rest_regu_list, phsidp->rest_attrs.attr_cache, hsidp->rest_attrs.attr_cache);
   hsidp->caches_inited = false;
   ret = scan_start_scan (thread_p, scan_id);
   reset_pred_or_regu_var_list (hsidp->scan_pred.pred_expr, true);
@@ -1048,7 +1048,7 @@ int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
   return pg_cnt;
 }
 
-ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src)
+ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src, heap_cache_attrinfo *new_attr_info)
 {
   if (!src)
     {
@@ -1071,9 +1071,9 @@ ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src)
     }
   pr_clone_value (src->value, dest->value);
 
-  dest->leftptr = regu_var_clone (thread_p, src->leftptr);
-  dest->rightptr = regu_var_clone (thread_p, src->rightptr);
-  dest->thirdptr = regu_var_clone (thread_p, src->thirdptr);
+  dest->leftptr = regu_var_clone (thread_p, src->leftptr, new_attr_info);
+  dest->rightptr = regu_var_clone (thread_p, src->rightptr, new_attr_info);
+  dest->thirdptr = regu_var_clone (thread_p, src->thirdptr, new_attr_info);
 
   if (src->rand_seed)
     {
@@ -1088,7 +1088,7 @@ ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src)
 
 }
 
-REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src)
+REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src, heap_cache_attrinfo *new_attr_info)
 {
   if (!src)
     {
@@ -1103,7 +1103,7 @@ REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST s
     {
       REGU_VARIABLE_LIST curr_dest = (REGU_VARIABLE_LIST) HP_ALLOC (thread_p, sizeof (regu_variable_list_node));
       curr_dest->next = NULL;
-      REGU_VARIABLE *cloned = regu_var_clone (thread_p, &curr_src->value);
+      REGU_VARIABLE *cloned = regu_var_clone (thread_p, &curr_src->value, new_attr_info);
       if (cloned != NULL)
 	{
 	  curr_dest->value = *cloned;
@@ -1127,7 +1127,7 @@ REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST s
   return head;
 }
 
-REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src)
+REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src, heap_cache_attrinfo *new_attr_info)
 {
   if (!src)
     {
@@ -1148,7 +1148,7 @@ REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *s
       for (int i = 0; i < src->count; i++)
 	{
 	  curr_dest = (REGU_VALUE_ITEM *) HP_ALLOC (thread_p, sizeof (REGU_VALUE_ITEM));
-	  curr_dest->value = regu_var_clone (thread_p, curr_src->value);
+	  curr_dest->value = regu_var_clone (thread_p, curr_src->value, new_attr_info);
 	  curr_dest->next = NULL;
 
 	  if (prev_dest == NULL)
@@ -1167,7 +1167,7 @@ REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *s
   return dest;
 }
 
-REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src)
+REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, heap_cache_attrinfo *new_attr_info)
 {
   REGU_VARIABLE *dest;
   if (!src)
@@ -1185,32 +1185,33 @@ REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src)
     case TYPE_SHARED_ATTR_ID:
     case TYPE_CLASS_ATTR_ID:
       dest->value.attr_descr.cache_dbvalp = NULL;
+      dest->value.attr_descr.cache_attrinfo = new_attr_info;
       break;
     case TYPE_CONSTANT:
       dest->value.dbvalptr = src->value.dbvalptr;
       break;
     case TYPE_INARITH:
     case TYPE_OUTARITH:
-      dest->value.arithptr = arith_list_clone (thread_p, src->value.arithptr);
+      dest->value.arithptr = arith_list_clone (thread_p, src->value.arithptr, new_attr_info);
       break;
     case TYPE_SP:
       dest->value.sp_ptr->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
       pr_clone_value (src->value.sp_ptr->value, dest->value.sp_ptr->value);
-      dest->value.sp_ptr->args = regu_list_clone (thread_p, src->value.sp_ptr->args);
+      dest->value.sp_ptr->args = regu_list_clone (thread_p, src->value.sp_ptr->args, new_attr_info);
       break;
     case TYPE_FUNC:
       dest->value.funcp->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
       pr_clone_value (src->value.funcp->value, dest->value.funcp->value);
-      dest->value.funcp->operand = regu_list_clone (thread_p, src->value.funcp->operand);
+      dest->value.funcp->operand = regu_list_clone (thread_p, src->value.funcp->operand, new_attr_info);
       break;
     case TYPE_DBVAL:
       pr_clone_value (&src->value.dbval, &dest->value.dbval);
       break;
     case TYPE_REGUVAL_LIST:
-      dest->value.reguval_list = regu_val_list_clone (thread_p, src->value.reguval_list);
+      dest->value.reguval_list = regu_val_list_clone (thread_p, src->value.reguval_list, new_attr_info);
       break;
     case TYPE_REGU_VAR_LIST:
-      dest->value.regu_var_list = regu_list_clone (thread_p, src->value.regu_var_list);
+      dest->value.regu_var_list = regu_list_clone (thread_p, src->value.regu_var_list, new_attr_info);
       break;
     default:
       break;
@@ -1345,12 +1346,11 @@ pred_expr_clone (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_exp
       break;
     case PH_REGU_VAR:
       src_regu_var = (regu_variable_node *) src;
-      dest_regu_var = regu_var_clone (thread_p, src_regu_var);
+      dest_regu_var = regu_var_clone (thread_p, src_regu_var, attr_info);
       if (dest_regu_var->type == TYPE_ATTR_ID || dest_regu_var->type == TYPE_SHARED_ATTR_ID
 	  || dest_regu_var->type == TYPE_CLASS_ATTR_ID)
 	{
 	  dest_regu_var->value.attr_descr.cache_dbvalp = NULL;
-	  dest_regu_var->value.attr_descr.cache_attrinfo = attr_info;
 	}
       ret = (void *) dest_regu_var;
       break;
@@ -1640,6 +1640,24 @@ link_attr_cache (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST node,heap_cache_attr
 	    }
 	}
       node = node->next;
+    }
+}
+
+static void link_attr_cache_for_regu_var (THREAD_ENTRY *thread_p, REGU_VARIABLE *node,
+    heap_cache_attrinfo *old_attr_info,
+    heap_cache_attrinfo *new_attr_info)
+{
+  if (node->type == TYPE_ATTR_ID || node->type == TYPE_CLASS_ATTR_ID
+      || node->type == TYPE_SHARED_ATTR_ID)
+    {
+      if (node->value.attr_descr.cache_attrinfo == old_attr_info)
+	{
+	  node->value.attr_descr.cache_attrinfo = new_attr_info;
+	}
+      else
+	{
+	  assert (false);
+	}
     }
 }
 

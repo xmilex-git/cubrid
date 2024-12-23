@@ -9982,6 +9982,19 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 	      /* The attribute is correlated variable. Find it in an enclosing scope(s). Note that this subquery has
 	       * also just been determined to be a correlated subquery. */
 	      REGU_VARIABLE_SET_FLAG (regu, REGU_VARIABLE_CORRELATED);
+
+	      for (table_info = symbols->table_info; table_info != NULL; table_info = table_info->next)
+		{
+		  if (table_info->class_spec)
+		    {
+		      table_info->class_spec->info.spec.flag =
+			(PT_SPEC_FLAG) (table_info->class_spec->info.spec.
+					flag | PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+		    }
+		}
+
+	      table_info = NULL;
+
 	      if (symbols->stack == NULL)
 		{
 		  if (!pt_has_error (parser))
@@ -12572,7 +12585,7 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
 		{
 		  access->flags = (ACCESS_SPEC_FLAG) (access->flags | ACCESS_SPEC_FLAG_FOR_UPDATE);
 		}
-	      if (!is_parallel_heap_scan_callable)
+	      if (!is_parallel_heap_scan_callable || (spec->info.spec.flag & PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN))
 		{
 		  access->flags = (ACCESS_SPEC_FLAG) (access->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
 		}
@@ -14286,6 +14299,7 @@ ptqo_to_scan_proc (PARSER_CONTEXT * parser, QO_PLAN * plan, XASL_NODE * xasl, PT
 
   if (spec != NULL)
     {
+      spec->info.spec.flag = (PT_SPEC_FLAG) (spec->info.spec.flag | PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
       xasl->spec_list = pt_to_spec_list (parser, spec, where_key_part, where_part, plan, info, NULL, where_hash_part);
       if (xasl->spec_list == NULL)
 	{

@@ -1741,7 +1741,8 @@ typedef enum
   PT_SPEC_FLAG_MVCC_ASSIGN_REEV = 0x800,	/* the spec is used in UPDATE assignment reevaluation */
   PT_SPEC_FLAG_DOESNT_HAVE_UNIQUE = 0x1000,	/* the spec was checked and does not have any uniques */
   PT_SPEC_FLAG_SAMPLING_SCAN = 0x2000,	/* spec for sampling scan */
-  PT_SPEC_FLAG_REFERENCED_AT_ODKU = 0x4000	/* spec for odku assignment */
+  PT_SPEC_FLAG_REFERENCED_AT_ODKU = 0x4000,	/* spec for odku assignment */
+  PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN = 0x8000	/* spec for not for parallel heap scan */
 } PT_SPEC_FLAG;
 
 typedef enum
