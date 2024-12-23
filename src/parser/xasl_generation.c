@@ -9988,8 +9988,8 @@ pt_attribute_to_regu (PARSER_CONTEXT * parser, PT_NODE * attr)
 		  if (table_info->class_spec)
 		    {
 		      table_info->class_spec->info.spec.flag =
-			(PT_SPEC_FLAG) (table_info->class_spec->info.spec.
-					flag | PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+			(PT_SPEC_FLAG) (table_info->class_spec->info.
+					spec.flag | PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
 		    }
 		}
 
