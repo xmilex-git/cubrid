@@ -196,6 +196,7 @@ int parallel_heap_scan_checker::check (REGU_VARIABLE *src)
       break;
     case TYPE_SP:
       cnt+=check (src->value.sp_ptr->args);
+      cnt++;
       break;
     case TYPE_FUNC:
       cnt+=check (src->value.funcp->operand);
@@ -1620,6 +1621,7 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
   hsidp->scan_pred.pred_expr = mapper->copy_and_map (thread_p, phsidp->scan_pred.pred_expr);
   scan_id->vd = mapper->copy_and_map (thread_p, orig_scan_id->vd);
   hsidp->caches_inited = false;
+  scan_id->scan_stats
   ret = scan_start_scan (thread_p, scan_id);
   /* phsidp->scan_pred.pred_expr, phsidp->pred_attrs.attr_cache phsidp->rest_attrs.attr_cache 를 독립적으로 운용해야함 */
 
