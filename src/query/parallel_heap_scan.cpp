@@ -512,20 +512,23 @@ void xasl_memory_mapper::clear_and_free (heap_cache_attrinfo *attr_cache)
 
 void xasl_memory_mapper::clear_and_free (val_descr *orig_vd, val_descr *vd)
 {
-  if (!vd || !vd->dbval_ptr || vd->dbval_cnt == 0)
+  if (!vd)
     {
       return;
     }
-
-  for (int i = 0; i < vd->dbval_cnt; i++)
+  if (vd->dbval_ptr && vd->dbval_cnt > 0)
     {
-      pr_clear_value (&vd->dbval_ptr[i]);
-      db_value_map.erase (&orig_vd->dbval_ptr[i]);
+      for (int i = 0; i < vd->dbval_cnt; i++)
+	{
+	  pr_clear_value (&vd->dbval_ptr[i]);
+	  db_value_map.erase (&orig_vd->dbval_ptr[i]);
+	}
+      HP_FREE (NULL, vd->dbval_ptr);
+      allocated_db_value_cnt -= vd->dbval_cnt;
+      vd->dbval_ptr = nullptr;
+      vd->dbval_cnt = 0;
     }
-  HP_FREE (NULL, vd->dbval_ptr);
-  allocated_db_value_cnt -= vd->dbval_cnt;
-  vd->dbval_ptr = nullptr;
-  vd->dbval_cnt = 0;
+  HP_FREE (NULL, vd);
   mapped_vd = nullptr;
 }
 
@@ -628,21 +631,25 @@ xasl_memory_mapper::~xasl_memory_mapper()
 val_descr *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, val_descr *vd)
 {
   val_descr *dest = nullptr;
-  if (!vd || !vd->dbval_ptr || vd->dbval_cnt == 0)
+  if (!vd)
     {
       return nullptr;
     }
 
   dest = (val_descr *) HP_ALLOC (thread_p, sizeof (val_descr));
   memcpy (dest, vd, sizeof (val_descr));
-  dest->dbval_ptr = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE) * vd->dbval_cnt);
-  memset (dest->dbval_ptr, 0, sizeof (DB_VALUE) * vd->dbval_cnt);
-  for (int i = 0; i < vd->dbval_cnt; i++)
+  if (vd->dbval_ptr && vd->dbval_cnt > 0)
     {
-      pr_clone_value (&vd->dbval_ptr[i], &dest->dbval_ptr[i]);
-      db_value_map[&vd->dbval_ptr[i]] = &dest->dbval_ptr[i];
-      allocated_db_value_cnt++;
+      dest->dbval_ptr = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE) * vd->dbval_cnt);
+      memset (dest->dbval_ptr, 0, sizeof (DB_VALUE) * vd->dbval_cnt);
+      for (int i = 0; i < vd->dbval_cnt; i++)
+	{
+	  pr_clone_value (&vd->dbval_ptr[i], &dest->dbval_ptr[i]);
+	  db_value_map[&vd->dbval_ptr[i]] = &dest->dbval_ptr[i];
+	  allocated_db_value_cnt++;
+	}
     }
+
   mapped_vd = dest;
   return mapped_vd;
 }
@@ -1361,11 +1368,12 @@ int parallel_heap_scan_result_queue::enqueue (HEAP_SCAN_ID *hsidp, SCAN_CODE sca
       var.waiting = true;
       var.cond.wait (lock);
       var.waiting = false;
+      if (is_scan_ended)
+	{
+	  return -1;
+	}
     }
-  if (is_scan_ended)
-    {
-      return -1;
-    }
+
 
   var.end = (var.end + 1) % HP_RESULT_QUEUE_SIZE;
   if (entries[var.end].valid)
@@ -1904,6 +1912,18 @@ void parallel_heap_scan_master::end()
   while (m_context->m_tasks_executed < m_context->m_tasks_started)
     {
       thread_sleep (10);
+      for (int i = 0; i < parallelism; i++)
+	{
+	  m_context->m_result_queue[i].is_scan_ended = true;
+	  m_context->scan_ended_queue_count++;
+	  std::unique_lock<std::mutex> lock (m_context->m_result_queue[i].var.mutex);
+	  bool is_waiting = m_context->m_result_queue[i].var.waiting;
+	  lock.unlock();
+	  if (is_waiting)
+	    {
+	      m_context->m_result_queue[i].var.cond.notify_one();
+	    }
+	}
     }
   m_is_start_once = false;
   m_is_reset_once = false;
