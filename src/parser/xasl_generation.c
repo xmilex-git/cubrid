@@ -13306,6 +13306,14 @@ pt_set_connect_by_xasl (PARSER_CONTEXT * parser, PT_NODE * select_node, XASL_NOD
   /* set the CONNECT BY pointer and flag */
   xasl->connect_by_ptr = connect_by_xasl;
   XASL_SET_FLAG (xasl, XASL_HAS_CONNECT_BY);
+  for (ACCESS_SPEC_TYPE * specp = connect_by_xasl->spec_list; specp; specp = specp->next)
+    {
+      specp->flags = (ACCESS_SPEC_FLAG) (specp->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+    }
+  for (ACCESS_SPEC_TYPE * specp = xasl->spec_list; specp; specp = specp->next)
+    {
+      specp->flags = (ACCESS_SPEC_FLAG) (specp->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+    }
 
   /* make regu vars for use for pseudo-columns values fetching */
 

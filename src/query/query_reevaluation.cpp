@@ -50,6 +50,7 @@ namespace cubquery
     switch (sid.type)
       {
       case S_HEAP_SCAN:
+      case S_PARALLEL_HEAP_SCAN:
 	// no range & key
 	range_filter = filter_info ();
 	key_filter = filter_info ();

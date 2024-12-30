@@ -9118,15 +9118,10 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 	  /* open a sequential heap file scan */
 	  scan_type = S_HEAP_SCAN;
 	  indx_info = NULL;
-#if defined(SERVER_MODE)
-	  if (!mvcc_select_lock_needed)
+	  if (scan_check_parallel_heap_scan_possible (thread_p, (void *) curr_spec, mvcc_select_lock_needed))
 	    {
-	      if (!oid_is_cached_class_oid (&curr_spec->s.cls_node.cls_oid) && !(curr_spec->flags & ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN))	/* Only for User table */
-		{
-		  scan_type = S_PARALLEL_HEAP_SCAN;
-		}
+	      scan_type = S_PARALLEL_HEAP_SCAN;
 	    }
-#endif
 	}
       else if (curr_spec->access == ACCESS_METHOD_SEQUENTIAL_RECORD_INFO)
 	{

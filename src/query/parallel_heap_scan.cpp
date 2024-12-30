@@ -26,6 +26,7 @@
 #include <string.h>
 #include <assert.h>
 #include "parallel_heap_scan.hpp"
+#include "error_context.hpp"
 
 #include "thread_entry_task.hpp"
 #include "memory_alloc.h"
@@ -40,12 +41,18 @@
 #include "query_executor.h"
 #include "xasl_predicate.hpp"
 
+#define START_END_LOG 1
+
+#if START_END_LOG
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
-#define HP_USE_PRIVATE_ALLOC 0  // 0으로 설정하면 malloc 사용
+#define HP_USE_PRIVATE_ALLOC 0 // 0으로 설정하면 malloc 사용
 
 #if HP_USE_PRIVATE_ALLOC
 #define HP_ALLOC(thrd, size) db_private_alloc(thrd, size)
@@ -55,46 +62,1015 @@
 #define HP_FREE(thrd, ptr) free(ptr)
 #endif
 
+#define ALLOC_FREE_LOG 0 //alloc free log
+
 enum ph_pred_expr_types
 {
-  PH_PRED_EXPR = 1,
-  PH_PRED = 1 << 1,
-  PH_EVAL_TERM = 1 << 2,
-  PH_COMP_EVAL_TERM = 1 << 3,
-  PH_ALSM_EVAL_TERM = 1 << 4,
-  PH_LIKE_EVAL_TERM = 1 << 5,
-  PH_RLIKE_EVAL_TERM = 1 << 6,
-  PH_REGU_VAR = 1 << 7
+  PH_PRED_EXPR,
+  PH_PRED,
+  PH_EVAL_TERM,
+  PH_COMP_EVAL_TERM,
+  PH_ALSM_EVAL_TERM,
+  PH_LIKE_EVAL_TERM,
+  PH_RLIKE_EVAL_TERM,
+  PH_REGU_VAR
 };
 
-static int regu_var_list_len (REGU_VARIABLE_LIST list);
-static void *
-pred_expr_clone (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_expr_types type,
-		 heap_cache_attrinfo *attr_info);
-static void pred_expr_free (THREAD_ENTRY *thread_p, PRED_EXPR *src);
-static heap_cache_attrinfo *attr_cache_clone (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src);
-static void attr_cache_free (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src);
-static void link_attr_cache (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST node, heap_cache_attrinfo *old_attr_info,
-			     heap_cache_attrinfo *new_attr_info);
-static void link_attr_cache_for_regu_var (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var,
-    heap_cache_attrinfo *old_attr_info,
-    heap_cache_attrinfo *new_attr_info);
+static int regu_var_list_len (struct regu_variable_list_node   *list);
+
 static SCAN_CODE scan_next_heap_scan_1page_internal (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, VPID *curr_vpid);
 
-static void arith_list_free (THREAD_ENTRY *thread_p, ARITH_TYPE *src);
-static void regu_list_free (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src);
-static void regu_val_list_free (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src);
-static void regu_var_free (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, bool free_self);
-static int regu_list_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST list);
+
+static int regu_list_clear (THREAD_ENTRY *thread_p, struct regu_variable_list_node   *list);
 static int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var);
 static int pred_clear (THREAD_ENTRY *thread_p, PRED_EXPR *pred);
 static int arith_list_clear (THREAD_ENTRY *thread_p, ARITH_TYPE *list);
 static void pos_desc_clear (THREAD_ENTRY *thread_p, QFILE_TUPLE_VALUE_POSITION *pos_desc);
 static int regu_val_list_clear (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *list);
-ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src, heap_cache_attrinfo *new_attr_info);
-REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, heap_cache_attrinfo *new_attr_info);
-REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src, heap_cache_attrinfo *new_attr_info);
-REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *, heap_cache_attrinfo *new_attr_info);
+
+/***********************************************************************************************/
+class parallel_heap_scan_checker
+{
+  public:
+    int check (REGU_VARIABLE *src);
+    int check (PRED_EXPR *src);
+    int check (struct regu_variable_list_node   *src);
+    int check (ARITH_TYPE *src);
+    int check (PRED *src);
+    int check (EVAL_TERM *src);
+    int check (COMP_EVAL_TERM *src);
+    int check (ALSM_EVAL_TERM *src);
+    int check (LIKE_EVAL_TERM *src);
+    int check (RLIKE_EVAL_TERM *src);
+
+    void add_not_parallel_heap_scan_flag (XASL_NODE *xasl);
+};
+
+void parallel_heap_scan_checker::add_not_parallel_heap_scan_flag (XASL_NODE *xasl)
+{
+  ACCESS_SPEC_TYPE *curr_spec;
+  XASL_NODE *xaslp;
+  if (xasl->spec_list)
+    {
+      curr_spec = xasl->spec_list;
+      while (curr_spec)
+	{
+	  curr_spec->flags = (ACCESS_SPEC_FLAG) (curr_spec->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+	  curr_spec = curr_spec->next;
+	}
+    }
+  if (xasl->merge_spec)
+    {
+      curr_spec = xasl->merge_spec;
+      while (curr_spec)
+	{
+	  curr_spec->flags = (ACCESS_SPEC_FLAG) (curr_spec->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+	  curr_spec = curr_spec->next;
+	}
+    }
+  if (xasl->aptr_list)
+    {
+      xaslp = xasl->aptr_list;
+      while (xaslp)
+	{
+	  add_not_parallel_heap_scan_flag (xaslp);
+	  xaslp = xaslp->next;
+	}
+    }
+  if (xasl->dptr_list)
+    {
+      xaslp = xasl->dptr_list;
+      while (xaslp)
+	{
+	  add_not_parallel_heap_scan_flag (xaslp);
+	  xaslp = xaslp->next;
+	}
+    }
+  if (xasl->scan_ptr)
+    {
+      xaslp = xasl->scan_ptr;
+      while (xaslp)
+	{
+	  add_not_parallel_heap_scan_flag (xaslp);
+	  xaslp = xaslp->next;
+	}
+    }
+}
+
+int parallel_heap_scan_checker::check (ARITH_TYPE *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  int cnt = 0;
+  cnt += check (src->leftptr);
+  cnt += check (src->rightptr);
+  cnt += check (src->thirdptr);
+  return cnt;
+}
+
+int parallel_heap_scan_checker::check (REGU_VARIABLE *src)
+{
+  int cnt = 0;
+  if (!src)
+    {
+      return 0;
+    }
+  if (src->xasl)
+    {
+      cnt++;
+      add_not_parallel_heap_scan_flag (src->xasl);
+    }
+  switch (src->type)
+    {
+    case TYPE_ATTR_ID:		/* fetch object attribute value */
+    case TYPE_SHARED_ATTR_ID:
+    case TYPE_CLASS_ATTR_ID:
+      break;
+    case TYPE_CONSTANT:
+      break;
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      cnt += check (src->value.arithptr);
+      break;
+    case TYPE_SP:
+      cnt+=check (src->value.sp_ptr->args);
+      break;
+    case TYPE_FUNC:
+      cnt+=check (src->value.funcp->operand);
+      break;
+    case TYPE_DBVAL:
+      break;
+    case TYPE_REGUVAL_LIST:
+      cnt++;
+      break;
+    case TYPE_REGU_VAR_LIST:
+      cnt+=check (src->value.regu_var_list);
+      break;
+    default:
+      break;
+    }
+  return cnt;
+}
+
+int parallel_heap_scan_checker::check (PRED_EXPR *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+
+  switch (src->type)
+    {
+    case T_PRED:
+      return check (&src->pe.m_pred);
+      break;
+    case T_EVAL_TERM:
+      return check (&src->pe.m_eval_term);
+      break;
+    case T_NOT_TERM:
+      return check (src->pe.m_not_term);
+      break;
+    default:
+      return 0;
+      break;
+    }
+}
+
+int parallel_heap_scan_checker::check (PRED *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  return check (src->lhs) + check (src->rhs);
+}
+
+int parallel_heap_scan_checker::check (EVAL_TERM *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  int cnt = 0;
+  switch (src->et_type)
+    {
+    case T_COMP_EVAL_TERM:
+      cnt += check (&src->et.et_comp);
+      break;
+    case T_ALSM_EVAL_TERM:
+      cnt += check (&src->et.et_alsm);
+      break;
+    case T_LIKE_EVAL_TERM:
+      cnt += check (&src->et.et_like);
+      break;
+    case T_RLIKE_EVAL_TERM:
+      cnt += check (&src->et.et_rlike);
+      break;
+    default:
+      break;
+    }
+  return cnt;
+}
+
+int parallel_heap_scan_checker::check (COMP_EVAL_TERM *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  return check (src->lhs) + check (src->rhs);
+}
+
+int parallel_heap_scan_checker::check (ALSM_EVAL_TERM *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  return check (src->elem) + check (src->elemset);
+}
+
+int parallel_heap_scan_checker::check (LIKE_EVAL_TERM *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  return check (src->src) + check (src->pattern) + check (src->esc_char);
+}
+
+int parallel_heap_scan_checker::check (RLIKE_EVAL_TERM *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  return check (src->src) + check (src->pattern) + check (src->case_sensitive);
+}
+
+int parallel_heap_scan_checker::check (struct regu_variable_list_node   *src)
+{
+  if (!src)
+    {
+      return 0;
+    }
+  int cnt = 0;
+  struct regu_variable_list_node   *curr = src;
+  while (curr)
+    {
+      cnt += check (&curr->value);
+      curr = curr->next;
+    }
+  return cnt;
+}
+
+
+
+int
+scan_check_parallel_heap_scan_possible (THREAD_ENTRY *thread_p, void *spec,
+					bool mvcc_select_lock_needed)
+{
+#if defined(SERVER_MODE)
+  ACCESS_SPEC_TYPE *curr_spec = (ACCESS_SPEC_TYPE *)spec;
+  if (!mvcc_select_lock_needed)
+    {
+      if (thread_p->private_heap_id != 0)
+	{
+	  if (!oid_is_cached_class_oid (&curr_spec->s.cls_node.cls_oid)
+	      && ! (curr_spec->flags & ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN) && ! curr_spec->parts)	/* Only for User table */
+	    {
+	      int cnt = 0;
+	      parallel_heap_scan_checker checker;
+	      cnt += checker.check (curr_spec->s.cls_node.cls_regu_list_pred);
+	      cnt += checker.check (curr_spec->where_pred);
+	      cnt += checker.check (curr_spec->s.cls_node.cls_regu_list_rest);
+	      if (cnt == 0)
+		{
+		  return true;
+		}
+	    }
+	}
+    }
+#endif
+  return false;
+}
+
+/*************************************************************************************************/
+/* xasl_memory_mapper (for attr_cache and regu_var, db_value) */
+class xasl_memory_mapper
+{
+  public:
+    REGU_VARIABLE *copy_and_map (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var);
+    PRED_EXPR *copy_and_map (THREAD_ENTRY *thread_p, PRED_EXPR *pred);
+    struct regu_variable_list_node *copy_and_map (THREAD_ENTRY *thread_p, struct regu_variable_list_node *regu_list);
+    DB_VALUE *copy_and_map (THREAD_ENTRY *thread_p, DB_VALUE *db_value);
+    ARITH_TYPE *copy_and_map (THREAD_ENTRY *thread_p, ARITH_TYPE *arith_list);
+    heap_cache_attrinfo *copy_and_map (THREAD_ENTRY *thread_p, heap_cache_attrinfo *attr_cache);
+    struct function_node *copy_and_map (THREAD_ENTRY *thread_p, struct function_node *func);
+    SP_TYPE *copy_and_map (THREAD_ENTRY *thread_p, SP_TYPE *sp);
+    val_descr *copy_and_map (THREAD_ENTRY *thread_p, val_descr *vd);
+    void clear_and_free (val_descr *orig_vd, val_descr *vd);
+    ~xasl_memory_mapper();
+    xasl_memory_mapper()
+    {
+      allocated_attr_cache_cnt = 0;
+      allocated_regu_var_cnt = 0;
+      allocated_db_value_cnt = 0;
+      allocated_pred_expr_cnt = 0;
+      allocated_arith_cnt = 0;
+      allocated_regu_var_list_cnt = 0;
+      allocated_function_node_cnt = 0;
+      allocated_sp_cnt = 0;
+    }
+  private:
+    int allocated_attr_cache_cnt;
+    int allocated_regu_var_cnt;
+    int allocated_db_value_cnt;
+    int allocated_pred_expr_cnt;
+    int allocated_arith_cnt;
+    int allocated_regu_var_list_cnt;
+    int allocated_function_node_cnt;
+    int allocated_sp_cnt;
+    std::map<heap_cache_attrinfo *, heap_cache_attrinfo *> attr_cache_map;
+    std::map<REGU_VARIABLE *, REGU_VARIABLE *> regu_var_map;
+    std::map<DB_VALUE *, DB_VALUE *> db_value_map;
+    std::map<ARITH_TYPE *, ARITH_TYPE *> arith_type_map;
+    std::map<PRED_EXPR *, PRED_EXPR *> pred_expr_map;
+    std::map<struct regu_variable_list_node *, struct regu_variable_list_node *> regu_var_list_map;
+    std::map<struct function_node *, struct function_node *> function_node_map;
+    std::map<SP_TYPE *, SP_TYPE *> sp_map;
+    val_descr *mapped_vd;
+
+
+    void clear_and_free (REGU_VARIABLE *regu_var);
+    void clear_and_free (PRED_EXPR *pred);
+    void clear_and_free (struct regu_variable_list_node *regu_list);
+    void clear_and_free (DB_VALUE *db_value);
+    void clear_and_free (ARITH_TYPE *arith_list);
+    void clear_and_free (heap_cache_attrinfo *attr_cache);
+    void clear_and_free (struct function_node *func);
+    void clear_and_free (SP_TYPE *sp);
+
+    void *copy_and_map_pred_expr (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_expr_types type);
+};
+
+void xasl_memory_mapper::clear_and_free (SP_TYPE *sp)
+{
+  memset (sp, 0, sizeof (SP_TYPE));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : sp %p\n", sp);
+#endif
+  HP_FREE (NULL, sp);
+  allocated_sp_cnt--;
+}
+
+void xasl_memory_mapper::clear_and_free (struct function_node *func)
+{
+  memset (func, 0, sizeof (struct function_node));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : function_node %p\n", func);
+#endif
+  HP_FREE (NULL, func);
+  allocated_function_node_cnt--;
+}
+
+void xasl_memory_mapper::clear_and_free ( REGU_VARIABLE *regu_var)
+{
+  memset (regu_var, 0, sizeof (REGU_VARIABLE));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : regu_var %p\n", regu_var);
+#endif
+  HP_FREE (NULL, regu_var);
+  allocated_regu_var_cnt--;
+}
+void xasl_memory_mapper::clear_and_free (PRED_EXPR *pred)
+{
+  if (pred->type == T_EVAL_TERM && pred->pe.m_eval_term.et_type == T_RLIKE_EVAL_TERM)
+    {
+      RLIKE_EVAL_TERM *et_rlike = &pred->pe.m_eval_term.et.et_rlike;
+      if (et_rlike->compiled_regex)
+	{
+	  delete et_rlike->compiled_regex;
+	  et_rlike->compiled_regex = NULL;
+	}
+    }
+
+  memset (pred, 0, sizeof (PRED_EXPR));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : pred %p\n", pred);
+#endif
+  HP_FREE (NULL, pred);
+  allocated_pred_expr_cnt--;
+}
+
+void xasl_memory_mapper::clear_and_free ( struct regu_variable_list_node   *regu_list)
+{
+  memset (regu_list, 0, sizeof (struct regu_variable_list_node));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : regu_var_list %p\n", regu_list);
+#endif
+  HP_FREE (NULL, regu_list);
+  allocated_regu_var_list_cnt--;
+}
+void xasl_memory_mapper::clear_and_free ( DB_VALUE *db_value)
+{
+  pr_clear_value (db_value);
+  memset (db_value, 0, sizeof (DB_VALUE));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : db_value %p\n", db_value);
+#endif
+  HP_FREE (NULL, db_value);
+  allocated_db_value_cnt--;
+}
+void xasl_memory_mapper::clear_and_free (ARITH_TYPE *arith_list)
+{
+  if (arith_list->rand_seed)
+    {
+      HP_FREE (NULL, arith_list->rand_seed);
+      arith_list->rand_seed = NULL;
+    }
+  memset (arith_list, 0, sizeof (ARITH_TYPE));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : arith_list %p\n", arith_list);
+#endif
+  HP_FREE (NULL, arith_list);
+  allocated_arith_cnt--;
+}
+void xasl_memory_mapper::clear_and_free (heap_cache_attrinfo *attr_cache)
+{
+  heap_attrinfo_end (NULL, attr_cache);
+  memset (attr_cache, 0, sizeof (heap_cache_attrinfo));
+  HP_FREE (NULL, attr_cache);
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : attr_cache %p\n", attr_cache);
+#endif
+  allocated_attr_cache_cnt--;
+}
+
+void xasl_memory_mapper::clear_and_free (val_descr *orig_vd, val_descr *vd)
+{
+  if (!vd || !vd->dbval_ptr || vd->dbval_cnt == 0)
+    {
+      return;
+    }
+
+  for (int i = 0; i < vd->dbval_cnt; i++)
+    {
+      pr_clear_value (&vd->dbval_ptr[i]);
+      db_value_map.erase (&orig_vd->dbval_ptr[i]);
+    }
+  HP_FREE (NULL, vd->dbval_ptr);
+  allocated_db_value_cnt -= vd->dbval_cnt;
+  vd->dbval_ptr = nullptr;
+  vd->dbval_cnt = 0;
+  mapped_vd = nullptr;
+}
+
+xasl_memory_mapper::~xasl_memory_mapper()
+{
+  // DB_VALUE 메모리 해제
+  for (auto &pair : db_value_map)
+    {
+      DB_VALUE *value = pair.second;  // second만 해제
+      if (value != nullptr)
+	{
+	  clear_and_free (value);
+	}
+    }
+  db_value_map.clear();
+
+  // heap_cache_attrinfo 메모리 해제
+  for (auto &pair : attr_cache_map)
+    {
+      heap_cache_attrinfo *cache = pair.second;  // second만 해제 (first는 원본)
+      if (cache != nullptr)
+	{
+	  clear_and_free (cache);
+	}
+    }
+  attr_cache_map.clear();
+
+  // REGU_VARIABLE 메모리 해제
+  for (auto &pair : regu_var_map)
+    {
+      REGU_VARIABLE *var = pair.second;  // second만 해제
+      if (var != nullptr)
+	{
+	  clear_and_free (var);
+	}
+    }
+  regu_var_map.clear();
+
+  // ARITH_TYPE 메모리 해제
+  for (auto &pair : arith_type_map)
+    {
+      ARITH_TYPE *arith = pair.second;  // second만 해제
+      if (arith != nullptr)
+	{
+	  clear_and_free (arith);
+	}
+    }
+  arith_type_map.clear();
+
+  for (auto &pair : pred_expr_map)
+    {
+      PRED_EXPR *pred = pair.second;  // second만 해제
+      if (pred != nullptr)
+	{
+	  clear_and_free (pred);
+	}
+    }
+  pred_expr_map.clear();
+
+  for (auto &pair : regu_var_list_map)
+    {
+      struct regu_variable_list_node *list = pair.second;   // second만 해제
+      if (list != nullptr)
+	{
+	  clear_and_free (list);
+	}
+    }
+  regu_var_list_map.clear();
+
+  for (auto &pair : function_node_map)
+    {
+      struct function_node *func = pair.second;  // second만 해제
+      if (func != nullptr)
+	{
+	  clear_and_free (func);
+	}
+    }
+  function_node_map.clear();
+
+  for (auto &pair : sp_map)
+    {
+      SP_TYPE *sp = pair.second;  // second만 해제
+      if (sp != nullptr)
+	{
+	  clear_and_free (sp);
+	}
+    }
+  sp_map.clear();
+
+  assert (allocated_attr_cache_cnt == 0);
+  assert (allocated_regu_var_cnt == 0);
+  assert (allocated_db_value_cnt == 0);
+  assert (allocated_pred_expr_cnt == 0);
+  assert (allocated_arith_cnt == 0);
+  assert (allocated_regu_var_list_cnt == 0);
+  assert (allocated_function_node_cnt == 0);
+  assert (allocated_sp_cnt == 0);
+}
+
+val_descr *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, val_descr *vd)
+{
+  val_descr *dest = nullptr;
+  if (!vd || !vd->dbval_ptr || vd->dbval_cnt == 0)
+    {
+      return nullptr;
+    }
+
+  dest = (val_descr *) HP_ALLOC (thread_p, sizeof (val_descr));
+  memcpy (dest, vd, sizeof (val_descr));
+  dest->dbval_ptr = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE) * vd->dbval_cnt);
+  memset (dest->dbval_ptr, 0, sizeof (DB_VALUE) * vd->dbval_cnt);
+  for (int i = 0; i < vd->dbval_cnt; i++)
+    {
+      pr_clone_value (&vd->dbval_ptr[i], &dest->dbval_ptr[i]);
+      db_value_map[&vd->dbval_ptr[i]] = &dest->dbval_ptr[i];
+      allocated_db_value_cnt++;
+    }
+  mapped_vd = dest;
+  return mapped_vd;
+}
+
+struct function_node *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, struct function_node *func)
+{
+  struct function_node *dest = nullptr;
+  if (!func)
+    {
+      return NULL;
+    }
+  auto it = xasl_memory_mapper::function_node_map.find (func);
+  if (it != xasl_memory_mapper::function_node_map.end())
+    {
+      dest = it->second;
+    }
+  else
+    {
+      dest = (struct function_node *) HP_ALLOC (thread_p, sizeof (struct function_node));
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "allocated : function_node %p, size %zu\n", dest, sizeof (struct function_node));
+#endif
+      *dest = *func;
+      dest->value = copy_and_map (thread_p, func->value);
+      dest->operand = copy_and_map (thread_p, func->operand);
+      function_node_map[func] = dest;
+      allocated_function_node_cnt++;
+    }
+  return dest;
+}
+
+REGU_VARIABLE *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
+{
+  REGU_VARIABLE *src = regu_var, *dest = nullptr;
+  if (!regu_var)
+    {
+      return NULL;
+    }
+  auto it = xasl_memory_mapper::regu_var_map.find (src);
+  if (it != xasl_memory_mapper::regu_var_map.end())
+    {
+      dest = it->second;
+    }
+  else
+    {
+      dest = (REGU_VARIABLE *) HP_ALLOC (thread_p, sizeof (REGU_VARIABLE));
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "allocated : regu_var %p, size %zu\n", dest, sizeof (REGU_VARIABLE));
+#endif
+      *dest = *src;
+      regu_var_map[src] = dest;
+      allocated_regu_var_cnt++;
+      switch (src->type)
+	{
+	case TYPE_ATTR_ID:		/* fetch object attribute value */
+	case TYPE_SHARED_ATTR_ID:
+	case TYPE_CLASS_ATTR_ID:
+	  dest->value.attr_descr.cache_dbvalp = NULL;
+	  dest->value.attr_descr.cache_attrinfo = copy_and_map (thread_p, src->value.attr_descr.cache_attrinfo);
+	  break;
+	case TYPE_CONSTANT:
+	  dest->value.dbvalptr = copy_and_map (thread_p, src->value.dbvalptr);
+	  break;
+	case TYPE_INARITH:
+	case TYPE_OUTARITH:
+	  dest->value.arithptr = copy_and_map (thread_p, src->value.arithptr);
+	  break;
+	case TYPE_SP:
+	  dest->value.sp_ptr = copy_and_map (thread_p, src->value.sp_ptr);
+	  break;
+	case TYPE_FUNC:
+	  dest->value.funcp = copy_and_map (thread_p, src->value.funcp);
+	  break;
+	case TYPE_DBVAL:
+	  pr_clone_value (&src->value.dbval, &dest->value.dbval);
+	  break;
+	case TYPE_REGUVAL_LIST:
+	  assert (false);
+	  break;
+	case TYPE_REGU_VAR_LIST:
+	  dest->value.regu_var_list = copy_and_map (thread_p, src->value.regu_var_list);
+	  break;
+	default:
+	  break;
+	}
+
+      if (src->vfetch_to != NULL)
+	{
+	  dest->vfetch_to = copy_and_map (thread_p, src->vfetch_to);
+	}
+    }
+  return dest;
+}
+
+PRED_EXPR *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, PRED_EXPR *src)
+{
+  PRED_EXPR *dest = nullptr;
+  dest = (PRED_EXPR *) copy_and_map_pred_expr (thread_p, src, dest, PH_PRED_EXPR);
+  return dest;
+}
+
+void *xasl_memory_mapper::copy_and_map_pred_expr (THREAD_ENTRY *thread_p, void *src, void *dest,
+    enum ph_pred_expr_types type)
+{
+  void *ret = nullptr;
+  PRED_EXPR *src_pred_expr;
+  PRED_EXPR *dest_pred_expr;
+  PRED *src_pred;
+  PRED *dest_pred;
+  EVAL_TERM *src_eval_term;
+  EVAL_TERM *dest_eval_term;
+  COMP_EVAL_TERM *src_comp_eval_term;
+  COMP_EVAL_TERM *dest_comp_eval_term;
+  ALSM_EVAL_TERM *src_alsm_eval_term;
+  ALSM_EVAL_TERM *dest_alsm_eval_term;
+  LIKE_EVAL_TERM *src_like_eval_term;
+  LIKE_EVAL_TERM *dest_like_eval_term;
+  RLIKE_EVAL_TERM *src_rlike_eval_term;
+  RLIKE_EVAL_TERM *dest_rlike_eval_term;
+  regu_variable_node *src_regu_var;
+  regu_variable_node *dest_regu_var;
+
+  if (!src)
+    {
+      return NULL;
+    }
+  switch (type)
+    {
+    case PH_PRED_EXPR:
+    {
+      src_pred_expr = (PRED_EXPR *) src;
+      auto it = xasl_memory_mapper::pred_expr_map.find (src_pred_expr);
+      if (it != xasl_memory_mapper::pred_expr_map.end())
+	{
+	  dest = (void *) it->second;
+	  return dest;
+	}
+      else
+	{
+	  dest_pred_expr = (PRED_EXPR *) HP_ALLOC (thread_p, sizeof (PRED_EXPR));
+#if ALLOC_FREE_LOG
+	  er_log_debug (ARG_FILE_LINE, "allocated : pred %p, size %zu\n", dest_pred_expr, sizeof (PRED_EXPR));
+#endif
+	  *dest_pred_expr = *src_pred_expr;
+	  pred_expr_map[src_pred_expr] = dest_pred_expr;
+	  allocated_pred_expr_cnt++;
+	  switch (src_pred_expr->type)
+	    {
+	    case T_PRED:
+	      copy_and_map_pred_expr (thread_p, (void *)&src_pred_expr->pe.m_pred, (void *)&dest_pred_expr->pe.m_pred, PH_PRED);
+	      break;
+	    case T_EVAL_TERM:
+	      copy_and_map_pred_expr (thread_p, (void *)&src_pred_expr->pe.m_eval_term, (void *)&dest_pred_expr->pe.m_eval_term,
+				      PH_EVAL_TERM);
+	      break;
+	    case T_NOT_TERM:
+	      dest_pred_expr->pe.m_not_term = (PRED_EXPR *) copy_and_map_pred_expr (thread_p, (void *)src_pred_expr->pe.m_not_term,
+					      (void *)dest_pred_expr->pe.m_not_term, PH_PRED_EXPR);
+	      break;
+	    default:
+	      assert (false);
+	      break;
+	    }
+	  ret = (void *) dest_pred_expr;
+	}
+    }
+
+    break;
+    case PH_PRED:
+      src_pred = (PRED *) src;
+      dest_pred = (PRED *) dest;
+      *dest_pred = *src_pred;
+      dest_pred->lhs = (PRED_EXPR *) copy_and_map_pred_expr (thread_p, (void *)src_pred->lhs, (void *)dest_pred->lhs,
+		       PH_PRED_EXPR);
+      dest_pred->rhs = (PRED_EXPR *) copy_and_map_pred_expr (thread_p, (void *)src_pred->rhs, (void *)dest_pred->rhs,
+		       PH_PRED_EXPR);
+      break;
+    case PH_EVAL_TERM:
+      src_eval_term = (EVAL_TERM *) src;
+      dest_eval_term = (EVAL_TERM *) dest;
+      switch (src_eval_term->et_type)
+	{
+	case T_COMP_EVAL_TERM:
+	  copy_and_map_pred_expr (thread_p, (void *)&src_eval_term->et.et_comp, (void *)&dest_eval_term->et.et_comp,
+				  PH_COMP_EVAL_TERM);
+	  break;
+	case T_ALSM_EVAL_TERM:
+	  copy_and_map_pred_expr (thread_p, (void *)&src_eval_term->et.et_alsm, (void *)&dest_eval_term->et.et_alsm,
+				  PH_ALSM_EVAL_TERM);
+	  break;
+	case T_LIKE_EVAL_TERM:
+	  copy_and_map_pred_expr (thread_p, (void *)&src_eval_term->et.et_like, (void *)&dest_eval_term->et.et_like,
+				  PH_LIKE_EVAL_TERM);
+	  break;
+	case T_RLIKE_EVAL_TERM:
+	  copy_and_map_pred_expr (thread_p, (void *)&src_eval_term->et.et_rlike, (void *)&dest_eval_term->et.et_rlike,
+				  PH_RLIKE_EVAL_TERM);
+	  break;
+	}
+      break;
+    case PH_COMP_EVAL_TERM:
+      src_comp_eval_term = (COMP_EVAL_TERM *) src;
+      dest_comp_eval_term = (COMP_EVAL_TERM *) dest;
+      dest_comp_eval_term->lhs = copy_and_map (thread_p, src_comp_eval_term->lhs);
+      dest_comp_eval_term->rhs = copy_and_map (thread_p, src_comp_eval_term->rhs);
+      break;
+    case PH_ALSM_EVAL_TERM:
+      src_alsm_eval_term = (ALSM_EVAL_TERM *) src;
+      dest_alsm_eval_term = (ALSM_EVAL_TERM *) dest;
+      dest_alsm_eval_term->elem = copy_and_map (thread_p, src_alsm_eval_term->elem);
+      dest_alsm_eval_term->elemset = copy_and_map (thread_p, src_alsm_eval_term->elemset);
+      break;
+    case PH_LIKE_EVAL_TERM:
+      src_like_eval_term = (LIKE_EVAL_TERM *) src;
+      dest_like_eval_term = (LIKE_EVAL_TERM *) dest;
+      dest_like_eval_term->src = copy_and_map (thread_p, src_like_eval_term->src);
+      dest_like_eval_term->pattern = copy_and_map (thread_p, src_like_eval_term->pattern);
+      dest_like_eval_term->esc_char = copy_and_map (thread_p, src_like_eval_term->esc_char);
+      break;
+    case PH_RLIKE_EVAL_TERM:
+      src_rlike_eval_term = (RLIKE_EVAL_TERM *) src;
+      dest_rlike_eval_term = (RLIKE_EVAL_TERM *) dest;
+      dest_rlike_eval_term->src = copy_and_map (thread_p, src_rlike_eval_term->src);
+      dest_rlike_eval_term->pattern = copy_and_map (thread_p, src_rlike_eval_term->pattern);
+      dest_rlike_eval_term->case_sensitive = copy_and_map (thread_p, src_rlike_eval_term->case_sensitive);
+      break;
+    case PH_REGU_VAR:
+      src_regu_var = (regu_variable_node *) src;
+      dest_regu_var = copy_and_map (thread_p, src_regu_var);
+      ret = (void *) dest_regu_var;
+      break;
+    default:
+      assert (false);
+      break;
+    }
+  return ret;
+}
+
+struct regu_variable_list_node *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p,
+    struct regu_variable_list_node *src_list)
+{
+  struct regu_variable_list_node *dest_list = nullptr;
+  if (!src_list)
+    {
+      return nullptr;
+    }
+
+  auto it = xasl_memory_mapper::regu_var_list_map.find (src_list);
+  if (it != xasl_memory_mapper::regu_var_list_map.end())
+    {
+      dest_list = it->second;
+    }
+  else
+    {
+      REGU_VARIABLE *src = &src_list->value;
+      dest_list = (struct regu_variable_list_node *) HP_ALLOC (thread_p, sizeof (struct regu_variable_list_node));
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "allocated : regu_var_list %p, size %zu\n", dest_list,
+		    sizeof (struct regu_variable_list_node));
+#endif
+      *dest_list = *src_list;
+      regu_var_list_map[src_list] = dest_list;
+      allocated_regu_var_list_cnt++;
+      REGU_VARIABLE *dest = &dest_list->value;
+      switch (src->type)
+	{
+	case TYPE_ATTR_ID:		/* fetch object attribute value */
+	case TYPE_SHARED_ATTR_ID:
+	case TYPE_CLASS_ATTR_ID:
+	  dest->value.attr_descr.cache_dbvalp = NULL;
+	  dest->value.attr_descr.cache_attrinfo = copy_and_map (thread_p, src->value.attr_descr.cache_attrinfo);
+	  break;
+	case TYPE_CONSTANT:
+	  dest->value.dbvalptr = copy_and_map (thread_p, src->value.dbvalptr);
+	  break;
+	case TYPE_INARITH:
+	case TYPE_OUTARITH:
+	  dest->value.arithptr = copy_and_map (thread_p, src->value.arithptr);
+	  break;
+	case TYPE_SP:
+	  dest->value.sp_ptr = copy_and_map (thread_p, src->value.sp_ptr);
+	  break;
+	case TYPE_FUNC:
+	  dest->value.funcp = copy_and_map (thread_p, src->value.funcp);
+	  break;
+	case TYPE_DBVAL:
+	  pr_clone_value (&src->value.dbval, &dest->value.dbval);
+	  break;
+	case TYPE_REGUVAL_LIST:
+	  assert (false);
+	  break;
+	case TYPE_REGU_VAR_LIST:
+	  dest->value.regu_var_list = copy_and_map (thread_p, src->value.regu_var_list);
+	  break;
+	default:
+	  break;
+	}
+
+      if (src->vfetch_to != NULL)
+	{
+	  dest->vfetch_to = copy_and_map (thread_p, src->vfetch_to);
+	}
+      if (src_list->next)
+	{
+	  dest_list->next = copy_and_map (thread_p, src_list->next);
+	}
+      else
+	{
+	  dest_list->next = NULL;
+	}
+    }
+  return dest_list;
+}
+
+DB_VALUE *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, DB_VALUE *db_value)
+{
+  DB_VALUE *dest = nullptr;
+  if (!db_value)
+    {
+      return NULL;
+    }
+  DB_TYPE src_dbtype;
+  auto it = db_value_map.find (db_value);
+  if (it != db_value_map.end())
+    {
+      dest = it->second;
+    }
+  else
+    {
+      dest = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "allocated : db_value %p, size %zu\n", dest, sizeof (DB_VALUE));
+#endif
+      pr_clone_value (db_value, dest);
+      db_value_map[db_value] = dest;
+      allocated_db_value_cnt++;
+    }
+  return dest;
+}
+ARITH_TYPE *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, ARITH_TYPE *src)
+{
+  ARITH_TYPE *dest = nullptr;
+  if (!src)
+    {
+      return nullptr;
+    }
+  auto it = arith_type_map.find (src);
+  if (it != arith_type_map.end())
+    {
+      dest = it->second;
+    }
+  else
+    {
+      dest = (ARITH_TYPE *) HP_ALLOC (thread_p, sizeof (ARITH_TYPE));
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "allocated : arith_type %p, size %zu\n", dest, sizeof (ARITH_TYPE));
+#endif
+      *dest = *src;
+      dest->value = copy_and_map (thread_p, src->value);
+      dest->leftptr = copy_and_map (thread_p, src->leftptr);
+      dest->rightptr = copy_and_map (thread_p, src->rightptr);
+      dest->thirdptr = copy_and_map (thread_p, src->thirdptr);
+      dest->pred = copy_and_map (thread_p, src->pred);
+      arith_type_map[src] = dest;
+      allocated_arith_cnt++;
+
+      if (src->rand_seed)
+	{
+	  dest->rand_seed = (struct drand48_data *) HP_ALLOC (thread_p, sizeof (struct drand48_data));
+	  if (dest->rand_seed)
+	    {
+	      *dest->rand_seed = *src->rand_seed;
+	    }
+	}
+    }
+  return dest;
+}
+
+SP_TYPE *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, SP_TYPE *sp)
+{
+  SP_TYPE *dest = nullptr;
+  if (!sp)
+    {
+      return nullptr;
+    }
+  auto it = sp_map.find (sp);
+  if (it != sp_map.end())
+    {
+      dest = it->second;
+    }
+  else
+    {
+      dest = (SP_TYPE *) HP_ALLOC (thread_p, sizeof (SP_TYPE));
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "allocated : sp %p, size %zu\n", dest, sizeof (SP_TYPE));
+#endif
+      *dest = *sp;
+      dest->args = copy_and_map (thread_p, sp->args);
+      dest->value = copy_and_map (thread_p, sp->value);
+      sp_map[sp] = dest;
+      allocated_sp_cnt++;
+    }
+  return dest;
+}
+
+heap_cache_attrinfo *xasl_memory_mapper::copy_and_map (THREAD_ENTRY *thread_p, heap_cache_attrinfo *attr_cache)
+{
+  heap_cache_attrinfo *dest = nullptr;
+  if (!attr_cache)
+    {
+      return NULL;
+    }
+  auto it = attr_cache_map.find (attr_cache);
+  if (it != attr_cache_map.end())
+    {
+      dest = it->second;
+    }
+  else
+    {
+      dest = (heap_cache_attrinfo *) HP_ALLOC (thread_p, sizeof (heap_cache_attrinfo));
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "allocated : heap_cache_attrinfo %p, size %zu\n", dest, sizeof (heap_cache_attrinfo));
+#endif
+      memset (dest, 0, sizeof (heap_cache_attrinfo));
+      attr_cache_map[attr_cache] = dest;
+      allocated_attr_cache_cnt++;
+    }
+  return dest;
+}
 
 /*************************************************************************************************/
 /* parallel_heap_scan_result_queue_entry */
@@ -107,10 +1083,10 @@ class parallel_heap_scan_result_queue_entry
     OID curr_oid;
     bool valid;
 
-    void capture_pred_regu_var_list (REGU_VARIABLE_LIST list);
-    void capture_rest_regu_var_list (REGU_VARIABLE_LIST list);
-    void copy_to_pred_regu_var_list (REGU_VARIABLE_LIST list);
-    void copy_to_rest_regu_var_list (REGU_VARIABLE_LIST list);
+    void capture_pred_regu_var_list (struct regu_variable_list_node   *list);
+    void capture_rest_regu_var_list (struct regu_variable_list_node   *list);
+    void copy_to_pred_regu_var_list (struct regu_variable_list_node   *list);
+    void copy_to_rest_regu_var_list (struct regu_variable_list_node   *list);
     void init (THREAD_ENTRY *thread_p, int n_pred_val, int n_rest_val);
     void clear ();
 
@@ -118,8 +1094,8 @@ class parallel_heap_scan_result_queue_entry
     parallel_heap_scan_result_queue_entry();
 
   private:
-    void capture_regu_var_list (REGU_VARIABLE_LIST list, DB_VALUE_ARRAY *dbvalue_array);
-    void copy_to_regu_var_list (DB_VALUE_ARRAY *dbvalue_array, REGU_VARIABLE_LIST list);
+    void capture_regu_var_list (struct regu_variable_list_node   *list, DB_VALUE_ARRAY *dbvalue_array);
+    void copy_to_regu_var_list (DB_VALUE_ARRAY *dbvalue_array, struct regu_variable_list_node   *list);
 };
 
 parallel_heap_scan_result_queue_entry::parallel_heap_scan_result_queue_entry()
@@ -135,62 +1111,94 @@ parallel_heap_scan_result_queue_entry::parallel_heap_scan_result_queue_entry()
 
 parallel_heap_scan_result_queue_entry::~parallel_heap_scan_result_queue_entry()
 {
-  if (pred_val_array.size > 0)
+  // 먼저 값들을 정리
+  if (pred_val_array.vals != nullptr)
     {
+      for (int i = 0; i < pred_val_array.size; i++)
+	{
+	  pr_clear_value (&pred_val_array.vals[i]);
+	}
       HP_FREE (NULL, pred_val_array.vals);
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "free : %p\n", pred_val_array.vals);
+#endif
+      pred_val_array.vals = nullptr;
     }
-  if (rest_val_array.size > 0)
+
+  if (rest_val_array.vals != nullptr)
     {
+      for (int i = 0; i < rest_val_array.size; i++)
+	{
+	  pr_clear_value (&rest_val_array.vals[i]);
+	}
       HP_FREE (NULL, rest_val_array.vals);
+#if ALLOC_FREE_LOG
+      er_log_debug (ARG_FILE_LINE, "free : %p\n", rest_val_array.vals);
+#endif
+      rest_val_array.vals = nullptr;
     }
 }
 
-void parallel_heap_scan_result_queue_entry::capture_regu_var_list (REGU_VARIABLE_LIST list,
+void parallel_heap_scan_result_queue_entry::capture_regu_var_list (struct regu_variable_list_node   *list,
     DB_VALUE_ARRAY *dbvalue_array)
 {
-  REGU_VARIABLE_LIST iter = list;
-  for (int i = 0; i < dbvalue_array->size; i++)
+  if (dbvalue_array == nullptr || dbvalue_array->vals == nullptr)
     {
-      assert (iter);
-      db_value_clone (iter->value.vfetch_to, &dbvalue_array->vals[i]);
+      return;
+    }
+
+  struct regu_variable_list_node   *iter = list;
+  for (int i = 0; i < dbvalue_array->size && iter != nullptr; i++)
+    {
+      if (iter->value.vfetch_to != nullptr)
+	{
+	  db_value_clone (iter->value.vfetch_to, &dbvalue_array->vals[i]);
+	}
       iter = iter->next;
     }
   return;
 }
 
 void parallel_heap_scan_result_queue_entry::copy_to_regu_var_list (DB_VALUE_ARRAY *dbvalue_array,
-    REGU_VARIABLE_LIST list)
+    struct regu_variable_list_node   *list)
 {
-  REGU_VARIABLE_LIST iter = list;
-  for (int i = 0; i < dbvalue_array->size; i++)
+  if (dbvalue_array == nullptr || dbvalue_array->vals == nullptr || list == nullptr)
     {
-      assert (iter);
-      if (!DB_IS_NULL (iter->value.vfetch_to))
+      return;
+    }
+
+  struct regu_variable_list_node   *iter = list;
+  for (int i = 0; i < dbvalue_array->size && iter != nullptr; i++)
+    {
+      if (iter->value.vfetch_to != nullptr)
 	{
-	  pr_clear_value (iter->value.vfetch_to);
+	  if (!DB_IS_NULL (iter->value.vfetch_to))
+	    {
+	      pr_clear_value (iter->value.vfetch_to);
+	    }
+	  pr_clone_value (&dbvalue_array->vals[i], iter->value.vfetch_to);
 	}
-      db_value_clone (&dbvalue_array->vals[i], iter->value.vfetch_to);
       iter = iter->next;
     }
   return;
 }
 
-void parallel_heap_scan_result_queue_entry::capture_pred_regu_var_list (REGU_VARIABLE_LIST list)
+void parallel_heap_scan_result_queue_entry::capture_pred_regu_var_list (struct regu_variable_list_node   *list)
 {
   capture_regu_var_list (list, &pred_val_array);
 }
 
-void parallel_heap_scan_result_queue_entry::capture_rest_regu_var_list (REGU_VARIABLE_LIST list)
+void parallel_heap_scan_result_queue_entry::capture_rest_regu_var_list (struct regu_variable_list_node   *list)
 {
   capture_regu_var_list (list, &rest_val_array);
 }
 
-void parallel_heap_scan_result_queue_entry::copy_to_pred_regu_var_list (REGU_VARIABLE_LIST list)
+void parallel_heap_scan_result_queue_entry::copy_to_pred_regu_var_list (struct regu_variable_list_node   *list)
 {
   copy_to_regu_var_list (&pred_val_array, list);
 }
 
-void parallel_heap_scan_result_queue_entry::copy_to_rest_regu_var_list (REGU_VARIABLE_LIST list)
+void parallel_heap_scan_result_queue_entry::copy_to_rest_regu_var_list (struct regu_variable_list_node   *list)
 {
   copy_to_regu_var_list (&rest_val_array, list);
 }
@@ -198,23 +1206,38 @@ void parallel_heap_scan_result_queue_entry::copy_to_rest_regu_var_list (REGU_VAR
 void parallel_heap_scan_result_queue_entry::init (THREAD_ENTRY *thread_p, int n_pred_val, int n_rest_val)
 {
   pred_val_array.size = n_pred_val;
+  rest_val_array.size = n_rest_val;
+
+  // 초기화
+  pred_val_array.vals = nullptr;
+  rest_val_array.vals = nullptr;
+
   if (n_pred_val > 0)
     {
       pred_val_array.vals = (DB_VALUE *)HP_ALLOC (thread_p, n_pred_val * sizeof (DB_VALUE));
+      if (pred_val_array.vals != nullptr)
+	{
+#if ALLOC_FREE_LOG
+	  er_log_debug (ARG_FILE_LINE, "allocated : %p\n", pred_val_array.vals);
+#endif
+	  // 새로 할당된 메모리 초기화
+	  memset (pred_val_array.vals, 0, n_pred_val * sizeof (DB_VALUE));
+	}
     }
-  else
-    {
-      pred_val_array.vals = NULL;
-    }
-  rest_val_array.size = n_rest_val;
+
   if (n_rest_val > 0)
     {
       rest_val_array.vals = (DB_VALUE *)HP_ALLOC (thread_p, n_rest_val * sizeof (DB_VALUE));
+      if (rest_val_array.vals != nullptr)
+	{
+#if ALLOC_FREE_LOG
+	  er_log_debug (ARG_FILE_LINE, "allocated : %p\n", rest_val_array.vals);
+#endif
+	  // 새로 할당된 메모리 초기화
+	  memset (rest_val_array.vals, 0, n_rest_val * sizeof (DB_VALUE));
+	}
     }
-  else
-    {
-      rest_val_array.vals = NULL;
-    }
+
   scan_code = S_END;
   valid = false;
   curr_oid = {0,0,0};
@@ -338,6 +1361,10 @@ int parallel_heap_scan_result_queue::enqueue (HEAP_SCAN_ID *hsidp, SCAN_CODE sca
       var.cond.wait (lock);
       var.waiting = false;
     }
+  if (is_scan_ended)
+    {
+      return -1;
+    }
 
   var.end = (var.end + 1) % HP_RESULT_QUEUE_SIZE;
   if (entries[var.end].valid)
@@ -448,11 +1475,13 @@ class parallel_heap_scan_context : public cubthread::entry_manager
     std::atomic<std::uint64_t> m_tasks_started;
     parallel_heap_scan_result_queue *m_result_queue;
     std::atomic<std::uint64_t> scan_ended_queue_count;
-    int m_has_error;
+    std::atomic<bool> m_has_error;
+    std::atomic<cuberr::er_message *> m_error_msg;
     SCAN_ID *m_scan_id;
     int m_orig_tran_index;
-    REGU_VARIABLE_LIST orig_pred_list;
-    REGU_VARIABLE_LIST orig_rest_list;
+    THREAD_ENTRY *m_orig_thread_p;
+    struct regu_variable_list_node   *orig_pred_list;
+    struct regu_variable_list_node   *orig_rest_list;
     class locked_vpid
     {
       public:
@@ -463,7 +1492,7 @@ class parallel_heap_scan_context : public cubthread::entry_manager
 
     parallel_heap_scan_context (SCAN_ID *scan_id, int tran_index, int parallelism);
     ~parallel_heap_scan_context();
-    void set_regu_vars (REGU_VARIABLE_LIST pred_list, REGU_VARIABLE_LIST rest_list);
+    void set_regu_vars (struct regu_variable_list_node   *pred_list, struct regu_variable_list_node   *rest_list);
 };
 
 class parallel_heap_scan_task : public cubthread::entry_task
@@ -501,17 +1530,23 @@ parallel_heap_scan_context::parallel_heap_scan_context (SCAN_ID *scan_id, int tr
   m_result_queue = new parallel_heap_scan_result_queue[parallelism] {parallel_heap_scan_result_queue()};
   m_tasks_started = 0;
   m_tasks_executed = 0;
-  m_has_error = NO_ERROR;
+  m_has_error = false;
+  m_error_msg = nullptr;
   scan_ended_queue_count = 0;
 }
 
 parallel_heap_scan_context::~parallel_heap_scan_context()
 {
   delete[] m_result_queue;
+  if (m_error_msg)
+    {
+      delete m_error_msg;
+      m_error_msg = nullptr;
+    }
 }
 
-void parallel_heap_scan_context::set_regu_vars (REGU_VARIABLE_LIST pred_list,
-    REGU_VARIABLE_LIST rest_list)
+void parallel_heap_scan_context::set_regu_vars (struct regu_variable_list_node   *pred_list,
+    struct regu_variable_list_node   *rest_list)
 {
   orig_pred_list = pred_list;
   orig_rest_list = rest_list;
@@ -545,13 +1580,32 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
   SCAN_ID *scan_id, *orig_scan_id = m_context->m_scan_id;
   PARALLEL_HEAP_SCAN_ID *phsidp = &orig_scan_id->s.phsid;
   SCAN_CODE page_scan_code, rec_scan_code;
+  int orig_tran_index = thread_p->tran_index;
+  css_conn_entry *orig_conn_entry = thread_p->conn_entry;
   VPID vpid;
   HFID hfid;
+  if (m_context->m_has_error)
+    {
+      m_context->m_tasks_executed++;
+#if START_END_LOG
+      er_log_debug (ARG_FILE_LINE, "parallel heap scan thread %ld finished caused by error", syscall (SYS_gettid));
+#endif
+      return;
+    }
+#if !HP_USE_PRIVATE_ALLOC
   HL_HEAPID orig_heap_id = db_change_private_heap (thread_p, 0);
+#endif
+  xasl_memory_mapper *mapper = new xasl_memory_mapper();
   scan_id = (SCAN_ID *) HP_ALLOC (thread_p, sizeof (SCAN_ID));
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "allocated : %p\n", scan_id);
+#endif
   HEAP_SCAN_ID *hsidp = &scan_id->s.hsid;
   thread_p->tran_index = tran_index;
-
+  thread_p->conn_entry = m_context->m_orig_thread_p->conn_entry;
+#if START_END_LOG
+  er_log_debug (ARG_FILE_LINE, "parallel heap scan thread %ld started.", syscall (SYS_gettid));
+#endif
   scan_open_heap_scan (thread_p, scan_id, orig_scan_id->mvcc_select_lock_needed, orig_scan_id->scan_op_type,
 		       orig_scan_id->fixed, orig_scan_id->grouped, orig_scan_id->single_fetch, orig_scan_id->join_dbval,
 		       orig_scan_id->val_list, orig_scan_id->vd, &phsidp->cls_oid, &phsidp->hfid,
@@ -559,17 +1613,14 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 		       phsidp->pred_attrs.num_attrs, phsidp->pred_attrs.attr_ids, phsidp->pred_attrs.attr_cache,
 		       phsidp->rest_attrs.num_attrs, phsidp->rest_attrs.attr_ids, phsidp->rest_attrs.attr_cache,
 		       S_HEAP_SCAN, phsidp->cache_recordinfo, phsidp->recordinfo_regu_list, false);
-  hsidp->pred_attrs.attr_cache = attr_cache_clone (thread_p, phsidp->pred_attrs.attr_cache);
-  hsidp->rest_attrs.attr_cache = attr_cache_clone (thread_p, phsidp->rest_attrs.attr_cache);
-  hsidp->scan_pred.regu_list = regu_list_clone (thread_p, m_context->orig_pred_list, hsidp->pred_attrs.attr_cache);
-  hsidp->rest_regu_list = regu_list_clone (thread_p, m_context->orig_rest_list, hsidp->rest_attrs.attr_cache);
-  hsidp->scan_pred.pred_expr = (PRED_EXPR *)pred_expr_clone (thread_p, (void *)phsidp->scan_pred.pred_expr, NULL,
-			       PH_PRED_EXPR, hsidp->pred_attrs.attr_cache);
+  hsidp->pred_attrs.attr_cache = mapper->copy_and_map (thread_p, phsidp->pred_attrs.attr_cache);
+  hsidp->rest_attrs.attr_cache = mapper->copy_and_map (thread_p, phsidp->rest_attrs.attr_cache);
+  hsidp->scan_pred.regu_list = mapper->copy_and_map (thread_p, phsidp->scan_pred.regu_list);
+  hsidp->rest_regu_list = mapper->copy_and_map (thread_p, phsidp->rest_regu_list);
+  hsidp->scan_pred.pred_expr = mapper->copy_and_map (thread_p, phsidp->scan_pred.pred_expr);
+  scan_id->vd = mapper->copy_and_map (thread_p, orig_scan_id->vd);
   hsidp->caches_inited = false;
   ret = scan_start_scan (thread_p, scan_id);
-  reset_pred_or_regu_var_list (hsidp->scan_pred.pred_expr, true);
-  reset_pred_or_regu_var_list (hsidp->scan_pred.regu_list, false);
-  reset_pred_or_regu_var_list (hsidp->rest_regu_list, false);
   /* phsidp->scan_pred.pred_expr, phsidp->pred_attrs.attr_cache phsidp->rest_attrs.attr_cache 를 독립적으로 운용해야함 */
 
   hfid = phsidp->hfid;
@@ -577,6 +1628,10 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 
   while (TRUE)
     {
+      if (m_context->m_has_error || m_result_queue->is_scan_ended)
+	{
+	  break;
+	}
       page_scan_code = page_next (thread_p, &hfid, &vpid);
 
       if (page_scan_code == S_END)
@@ -587,8 +1642,25 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 
       while (TRUE)
 	{
+	  if (m_context->m_has_error || m_result_queue->is_scan_ended)
+	    {
+	      break;
+	    }
 	  rec_scan_code = scan_next_heap_scan_1page_internal (thread_p, scan_id, &vpid);
-	  assert (rec_scan_code == S_SUCCESS || rec_scan_code == S_END);
+	  //assert (rec_scan_code == S_SUCCESS || rec_scan_code == S_END);
+	  if (rec_scan_code == S_ERROR)
+	    {
+	      if (m_context->m_has_error || m_result_queue->is_scan_ended)
+		{
+		  break;
+		}
+	      m_context->m_has_error = true;
+	      cuberr::er_message *error_msg = new cuberr::er_message (false);
+	      cuberr::er_message &crt_error = cuberr::context::get_thread_local_context ().get_current_error_level ();
+	      error_msg->swap (crt_error);
+	      m_context->m_error_msg.exchange (error_msg);
+	      break;
+	    }
 	  if (rec_scan_code == S_END)
 	    {
 	      break;
@@ -603,24 +1675,22 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 
   scan_end_scan (thread_p, scan_id);
   scan_close_scan (thread_p, scan_id);
-  if (hsidp->caches_inited)
-    {
-      heap_attrinfo_end (thread_p, hsidp->pred_attrs.attr_cache);
-      heap_attrinfo_end (thread_p, hsidp->rest_attrs.attr_cache);
-      hsidp->caches_inited = false;
-    }
-  pred_clear (thread_p, hsidp->scan_pred.pred_expr);
-  regu_list_clear (thread_p, hsidp->scan_pred.regu_list);
-  regu_list_clear (thread_p, hsidp->rest_regu_list);
-
-  regu_list_free (thread_p, hsidp->scan_pred.regu_list);
-  regu_list_free (thread_p, hsidp->rest_regu_list);
-  pred_expr_free (thread_p, hsidp->scan_pred.pred_expr);
-  attr_cache_free (thread_p, hsidp->pred_attrs.attr_cache);
-  attr_cache_free (thread_p, hsidp->rest_attrs.attr_cache);
+  mapper->clear_and_free (orig_scan_id->vd, scan_id->vd);
+  delete mapper;
   HP_FREE (thread_p, scan_id);
+#if ALLOC_FREE_LOG
+  er_log_debug (ARG_FILE_LINE, "free : %p\n", scan_id);
+#endif
+  scan_id = NULL;
+#if !HP_USE_PRIVATE_ALLOC
   db_change_private_heap (thread_p, orig_heap_id);
+#endif
   m_context->m_tasks_executed++;
+  thread_p->tran_index = orig_tran_index;
+  thread_p->conn_entry = orig_conn_entry;
+#if START_END_LOG
+  er_log_debug (ARG_FILE_LINE, "parallel heap scan thread %ld finished.", syscall (SYS_gettid));
+#endif
 }
 
 parallel_heap_scan_master::parallel_heap_scan_master (int tran_index, SCAN_ID *scan_id, size_t pool_size,
@@ -695,6 +1765,10 @@ SCAN_CODE parallel_heap_scan_master::get_result (THREAD_ENTRY *thread_p, SCAN_ID
 
   while (result == FALSE)
     {
+      if (m_context->m_has_error)
+	{
+	  break;
+	}
       for (int i=0; i<parallelism; i++)
 	{
 	  if (!m_context->m_result_queue[i].is_scan_ended)
@@ -753,6 +1827,9 @@ SCAN_CODE parallel_heap_scan_master::get_result (THREAD_ENTRY *thread_p, SCAN_ID
 void parallel_heap_scan_master::start (THREAD_ENTRY *thread_p)
 {
   //std::unique_ptr<parallel_heap_scan_task> task = NULL;
+  m_context->m_has_error = false;
+  m_context->m_error_msg = nullptr;
+  m_context->m_orig_thread_p = thread_p;
   m_context->set_regu_vars (m_scan_id->s.phsid.scan_pred.regu_list, m_scan_id->s.phsid.rest_regu_list);
   m_context->scan_ended_queue_count = 0;
   for (int i = 0; i < parallelism; i++)
@@ -766,6 +1843,7 @@ void parallel_heap_scan_master::start (THREAD_ENTRY *thread_p)
 void parallel_heap_scan_master::reset (SCAN_ID *scan_id)
 {
   std::unique_ptr<parallel_heap_scan_task> task = NULL;
+  assert (m_context->m_has_error == false);
   while (m_context->m_tasks_executed < m_context->m_tasks_started)
     {
       thread_sleep (10);
@@ -804,7 +1882,23 @@ void parallel_heap_scan_master::end()
 {
   if (m_context->m_has_error)
     {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_IB_ERROR_ABORT, 0);
+      m_is_start_once = false;
+      m_is_reset_once = false;
+      m_context->m_has_error = false;
+      m_context->m_error_msg = nullptr;
+      return;
+    }
+  for (int i = 0; i < parallelism; i++)
+    {
+      m_context->m_result_queue[i].is_scan_ended = true;
+      m_context->scan_ended_queue_count++;
+      std::unique_lock<std::mutex> lock (m_context->m_result_queue[i].var.mutex);
+      bool is_waiting = m_context->m_result_queue[i].var.waiting;
+      lock.unlock();
+      if (is_waiting)
+	{
+	  m_context->m_result_queue[i].var.cond.notify_one();
+	}
     }
   while (m_context->m_tasks_executed < m_context->m_tasks_started)
     {
@@ -817,10 +1911,10 @@ void parallel_heap_scan_master::end()
 /*************************************************************************************************/
 /* public functions */
 
-static int regu_var_list_len (REGU_VARIABLE_LIST list)
+static int regu_var_list_len (struct regu_variable_list_node   *list)
 {
   int len = 0;
-  for (REGU_VARIABLE_LIST iter = list; iter; iter = iter->next)
+  for (struct regu_variable_list_node   *iter = list; iter; iter = iter->next)
     {
       len++;
     }
@@ -914,11 +2008,11 @@ int arith_list_clear (THREAD_ENTRY *thread_p, ARITH_TYPE *list)
 
   /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
   list->domain = list->original_domain;
-  pr_clear_value (list->value);
-  pg_cnt += regu_var_clear (thread_p, list->leftptr);
-  pg_cnt += regu_var_clear (thread_p, list->rightptr);
-  pg_cnt += regu_var_clear (thread_p, list->thirdptr);
-  pg_cnt += pred_clear (thread_p, list->pred);
+  //pr_clear_value (list->value);
+  //pg_cnt += regu_var_clear (thread_p, list->leftptr);
+  //pg_cnt += regu_var_clear (thread_p, list->rightptr);
+  //pg_cnt += regu_var_clear (thread_p, list->thirdptr);
+  //pg_cnt += pred_clear (thread_p, list->pred);
 
   if (list->rand_seed != NULL)
     {
@@ -933,15 +2027,15 @@ void pos_desc_clear (THREAD_ENTRY *thread_p, QFILE_TUPLE_VALUE_POSITION *pos_des
   pos_desc->dom = pos_desc->original_domain;
 }
 
-int regu_list_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST list)
+int regu_list_clear (THREAD_ENTRY *thread_p, struct regu_variable_list_node   *list)
 {
-  REGU_VARIABLE_LIST p;
+  struct regu_variable_list_node   *p;
   int pg_cnt;
 
   pg_cnt = 0;
   for (p = list; p; p = p->next)
     {
-      pg_cnt += regu_var_clear (thread_p, &p->value);
+      //pg_cnt += regu_var_clear (thread_p, &p->value);
     }
 
   return pg_cnt;
@@ -967,7 +2061,7 @@ int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
     {
       return pg_cnt;
     }
-
+  er_log_debug (ARG_FILE_LINE, "clear regu_var : %p, type : %d\n", regu_var, regu_var->type);
   /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
   regu_var->domain = regu_var->original_domain;
 
@@ -986,7 +2080,7 @@ int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
       pg_cnt += arith_list_clear (thread_p, regu_var->value.arithptr);
       break;
     case TYPE_SP:
-      pr_clear_value (regu_var->value.sp_ptr->value);
+      //pr_clear_value (regu_var->value.sp_ptr->value);
       pg_cnt += regu_list_clear (thread_p, regu_var->value.sp_ptr->args);
 
       delete regu_var->value.sp_ptr->sig;
@@ -994,7 +2088,7 @@ int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
 
       break;
     case TYPE_FUNC:
-      pr_clear_value (regu_var->value.funcp->value);
+      //pr_clear_value (regu_var->value.funcp->value);
       pg_cnt += regu_list_clear (thread_p, regu_var->value.funcp->operand);
       if (regu_var->value.funcp->tmp_obj != NULL)
 	{
@@ -1028,7 +2122,6 @@ int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
       pg_cnt += regu_val_list_clear (thread_p, regu_var->value.reguval_list);
       break;
     case TYPE_DBVAL:
-      (void) pr_clear_value (&regu_var->value.dbval);
       break;
     case TYPE_REGU_VAR_LIST:
       pg_cnt += regu_list_clear (thread_p, regu_var->value.regu_var_list);
@@ -1040,625 +2133,7 @@ int regu_var_clear (THREAD_ENTRY *thread_p, REGU_VARIABLE *regu_var)
       break;
     }
 
-  if (regu_var->vfetch_to != NULL)
-    {
-      pr_clear_value (regu_var->vfetch_to);
-    }
-
   return pg_cnt;
-}
-
-ARITH_TYPE *arith_list_clone (THREAD_ENTRY *thread_p, ARITH_TYPE *src, heap_cache_attrinfo *new_attr_info)
-{
-  if (!src)
-    {
-      return NULL;
-    }
-
-  ARITH_TYPE *dest = (ARITH_TYPE *) HP_ALLOC (thread_p, sizeof (ARITH_TYPE));
-  if (dest == NULL)
-    {
-      return NULL;
-    }
-
-  *dest = *src;
-
-  dest->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
-  if (dest->value == NULL)
-    {
-      HP_FREE (thread_p, dest);
-      return NULL;
-    }
-  pr_clone_value (src->value, dest->value);
-
-  dest->leftptr = regu_var_clone (thread_p, src->leftptr, new_attr_info);
-  dest->rightptr = regu_var_clone (thread_p, src->rightptr, new_attr_info);
-  dest->thirdptr = regu_var_clone (thread_p, src->thirdptr, new_attr_info);
-
-  if (src->rand_seed)
-    {
-      dest->rand_seed = (struct drand48_data *) HP_ALLOC (thread_p, sizeof (struct drand48_data));
-      if (dest->rand_seed)
-	{
-	  *dest->rand_seed = *src->rand_seed;
-	}
-    }
-
-  return dest;
-
-}
-
-REGU_VARIABLE_LIST regu_list_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src, heap_cache_attrinfo *new_attr_info)
-{
-  if (!src)
-    {
-      return NULL;
-    }
-
-  REGU_VARIABLE_LIST head = NULL;
-  REGU_VARIABLE_LIST tail = NULL;
-  REGU_VARIABLE_LIST curr_src = src;
-
-  while (curr_src)
-    {
-      REGU_VARIABLE_LIST curr_dest = (REGU_VARIABLE_LIST) HP_ALLOC (thread_p, sizeof (regu_variable_list_node));
-      curr_dest->next = NULL;
-      REGU_VARIABLE *cloned = regu_var_clone (thread_p, &curr_src->value, new_attr_info);
-      if (cloned != NULL)
-	{
-	  curr_dest->value = *cloned;
-	  HP_FREE (thread_p, cloned);
-	}
-
-      if (!head)
-	{
-	  head = curr_dest;
-	  tail = curr_dest;
-	}
-      else
-	{
-	  tail->next = curr_dest;
-	  tail = curr_dest;
-	}
-
-      curr_src = curr_src->next;
-    }
-
-  return head;
-}
-
-REGU_VALUE_LIST *regu_val_list_clone (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src, heap_cache_attrinfo *new_attr_info)
-{
-  if (!src)
-    {
-      return NULL;
-    }
-
-  REGU_VALUE_LIST *dest = (REGU_VALUE_LIST *) HP_ALLOC (thread_p, sizeof (REGU_VALUE_LIST));
-  *dest = *src;
-  dest->regu_list = NULL;
-  dest->current_value = NULL;
-
-  if (src->count > 0)
-    {
-      REGU_VALUE_ITEM *curr_src = src->regu_list;
-      REGU_VALUE_ITEM *curr_dest = NULL;
-      REGU_VALUE_ITEM *prev_dest = NULL;
-
-      for (int i = 0; i < src->count; i++)
-	{
-	  curr_dest = (REGU_VALUE_ITEM *) HP_ALLOC (thread_p, sizeof (REGU_VALUE_ITEM));
-	  curr_dest->value = regu_var_clone (thread_p, curr_src->value, new_attr_info);
-	  curr_dest->next = NULL;
-
-	  if (prev_dest == NULL)
-	    {
-	      dest->regu_list = curr_dest;
-	    }
-	  else
-	    {
-	      prev_dest->next = curr_dest;
-	    }
-	  prev_dest = curr_dest;
-	  curr_src = curr_src->next;
-	}
-    }
-
-  return dest;
-}
-
-REGU_VARIABLE *regu_var_clone (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, heap_cache_attrinfo *new_attr_info)
-{
-  REGU_VARIABLE *dest;
-  if (!src)
-    {
-      return NULL;
-    }
-  dest = (REGU_VARIABLE *) HP_ALLOC (thread_p, sizeof (REGU_VARIABLE));
-
-
-  *dest = *src;
-
-  switch (src->type)
-    {
-    case TYPE_ATTR_ID:		/* fetch object attribute value */
-    case TYPE_SHARED_ATTR_ID:
-    case TYPE_CLASS_ATTR_ID:
-      dest->value.attr_descr.cache_dbvalp = NULL;
-      dest->value.attr_descr.cache_attrinfo = new_attr_info;
-      break;
-    case TYPE_CONSTANT:
-      dest->value.dbvalptr = src->value.dbvalptr;
-      break;
-    case TYPE_INARITH:
-    case TYPE_OUTARITH:
-      dest->value.arithptr = arith_list_clone (thread_p, src->value.arithptr, new_attr_info);
-      break;
-    case TYPE_SP:
-      dest->value.sp_ptr->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
-      pr_clone_value (src->value.sp_ptr->value, dest->value.sp_ptr->value);
-      dest->value.sp_ptr->args = regu_list_clone (thread_p, src->value.sp_ptr->args, new_attr_info);
-      break;
-    case TYPE_FUNC:
-      dest->value.funcp->value = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
-      pr_clone_value (src->value.funcp->value, dest->value.funcp->value);
-      dest->value.funcp->operand = regu_list_clone (thread_p, src->value.funcp->operand, new_attr_info);
-      break;
-    case TYPE_DBVAL:
-      pr_clone_value (&src->value.dbval, &dest->value.dbval);
-      break;
-    case TYPE_REGUVAL_LIST:
-      dest->value.reguval_list = regu_val_list_clone (thread_p, src->value.reguval_list, new_attr_info);
-      break;
-    case TYPE_REGU_VAR_LIST:
-      dest->value.regu_var_list = regu_list_clone (thread_p, src->value.regu_var_list, new_attr_info);
-      break;
-    default:
-      break;
-    }
-
-  if (src->vfetch_to != NULL)
-    {
-      dest->vfetch_to = (DB_VALUE *) HP_ALLOC (thread_p, sizeof (DB_VALUE));
-      pr_clone_value (src->vfetch_to, dest->vfetch_to);
-    }
-
-  return dest;
-}
-
-static void *
-pred_expr_clone (THREAD_ENTRY *thread_p, void *src, void *dest, enum ph_pred_expr_types type,
-		 heap_cache_attrinfo *attr_info)
-{
-  void *ret = nullptr;
-  PRED_EXPR *src_pred_expr;
-  PRED_EXPR *dest_pred_expr;
-  PRED *src_pred;
-  PRED *dest_pred;
-  EVAL_TERM *src_eval_term;
-  EVAL_TERM *dest_eval_term;
-  COMP_EVAL_TERM *src_comp_eval_term;
-  COMP_EVAL_TERM *dest_comp_eval_term;
-  ALSM_EVAL_TERM *src_alsm_eval_term;
-  ALSM_EVAL_TERM *dest_alsm_eval_term;
-  LIKE_EVAL_TERM *src_like_eval_term;
-  LIKE_EVAL_TERM *dest_like_eval_term;
-  RLIKE_EVAL_TERM *src_rlike_eval_term;
-  RLIKE_EVAL_TERM *dest_rlike_eval_term;
-  regu_variable_node *src_regu_var;
-  regu_variable_node *dest_regu_var;
-  if (!src)
-    {
-      return NULL;
-    }
-  switch (type)
-    {
-    case PH_PRED_EXPR:
-      src_pred_expr = (PRED_EXPR *) src;
-      dest_pred_expr = (PRED_EXPR *) HP_ALLOC (thread_p, sizeof (PRED_EXPR));
-      *dest_pred_expr = *src_pred_expr;
-      switch (src_pred_expr->type)
-	{
-	case T_PRED:
-	  pred_expr_clone (thread_p, (void *)&src_pred_expr->pe.m_pred, (void *)&dest_pred_expr->pe.m_pred, PH_PRED, attr_info);
-	  break;
-	case T_EVAL_TERM:
-	  pred_expr_clone (thread_p, (void *)&src_pred_expr->pe.m_eval_term, (void *)&dest_pred_expr->pe.m_eval_term,
-			   PH_EVAL_TERM, attr_info);
-	  break;
-	case T_NOT_TERM:
-	  dest_pred_expr->pe.m_not_term = (PRED_EXPR *) pred_expr_clone (thread_p, (void *)src_pred_expr->pe.m_not_term,
-					  (void *)dest_pred_expr->pe.m_not_term, PH_PRED_EXPR, attr_info);
-	  break;
-	default:
-	  assert (false);
-	  break;
-	}
-      ret = (void *) dest_pred_expr;
-      break;
-    case PH_PRED:
-      src_pred = (PRED *) src;
-      dest_pred = (PRED *) dest;
-      *dest_pred = *src_pred;
-      dest_pred->lhs = (PRED_EXPR *) pred_expr_clone (thread_p, (void *)src_pred->lhs, (void *)dest_pred->lhs, PH_PRED_EXPR,
-		       attr_info);
-      dest_pred->rhs = (PRED_EXPR *) pred_expr_clone (thread_p, (void *)src_pred->rhs, (void *)dest_pred->rhs, PH_PRED_EXPR,
-		       attr_info);
-      break;
-    case PH_EVAL_TERM:
-      src_eval_term = (EVAL_TERM *) src;
-      dest_eval_term = (EVAL_TERM *) dest;
-      switch (src_eval_term->et_type)
-	{
-	case T_COMP_EVAL_TERM:
-	  pred_expr_clone (thread_p, (void *)&src_eval_term->et.et_comp, (void *)&dest_eval_term->et.et_comp, PH_COMP_EVAL_TERM,
-			   attr_info);
-	  break;
-	case T_ALSM_EVAL_TERM:
-	  pred_expr_clone (thread_p, (void *)&src_eval_term->et.et_alsm, (void *)&dest_eval_term->et.et_alsm, PH_ALSM_EVAL_TERM,
-			   attr_info);
-	  break;
-	case T_LIKE_EVAL_TERM:
-	  pred_expr_clone (thread_p, (void *)&src_eval_term->et.et_like, (void *)&dest_eval_term->et.et_like, PH_LIKE_EVAL_TERM,
-			   attr_info);
-	  break;
-	case T_RLIKE_EVAL_TERM:
-	  pred_expr_clone (thread_p, (void *)&src_eval_term->et.et_rlike, (void *)&dest_eval_term->et.et_rlike,
-			   PH_RLIKE_EVAL_TERM, attr_info);
-	  break;
-	}
-      break;
-    case PH_COMP_EVAL_TERM:
-      src_comp_eval_term = (COMP_EVAL_TERM *) src;
-      dest_comp_eval_term = (COMP_EVAL_TERM *) dest;
-      dest_comp_eval_term->lhs = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_comp_eval_term->lhs,
-				 (void *)dest_comp_eval_term->lhs, PH_REGU_VAR, attr_info);
-      dest_comp_eval_term->rhs = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_comp_eval_term->rhs,
-				 (void *)dest_comp_eval_term->rhs, PH_REGU_VAR, attr_info);
-      break;
-    case PH_ALSM_EVAL_TERM:
-      src_alsm_eval_term = (ALSM_EVAL_TERM *) src;
-      dest_alsm_eval_term = (ALSM_EVAL_TERM *) dest;
-      dest_alsm_eval_term->elem = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_alsm_eval_term->elem,
-				  (void *)dest_alsm_eval_term->elem, PH_REGU_VAR, attr_info);
-      dest_alsm_eval_term->elemset = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_alsm_eval_term->elemset,
-				     (void *)dest_alsm_eval_term->elemset, PH_REGU_VAR, attr_info);
-      break;
-    case PH_LIKE_EVAL_TERM:
-      src_like_eval_term = (LIKE_EVAL_TERM *) src;
-      dest_like_eval_term = (LIKE_EVAL_TERM *) dest;
-      dest_like_eval_term->src = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_like_eval_term->src,
-				 (void *)dest_like_eval_term->src, PH_REGU_VAR, attr_info);
-      dest_like_eval_term->pattern = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_like_eval_term->pattern,
-				     (void *)dest_like_eval_term->pattern, PH_REGU_VAR, attr_info);
-      dest_like_eval_term->esc_char = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_like_eval_term->esc_char,
-				      (void *)dest_like_eval_term->esc_char, PH_REGU_VAR, attr_info);
-      break;
-    case PH_RLIKE_EVAL_TERM:
-      src_rlike_eval_term = (RLIKE_EVAL_TERM *) src;
-      dest_rlike_eval_term = (RLIKE_EVAL_TERM *) dest;
-      dest_rlike_eval_term->src = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_rlike_eval_term->src,
-				  (void *)dest_rlike_eval_term->src, PH_REGU_VAR, attr_info);
-      dest_rlike_eval_term->pattern = (regu_variable_node *) pred_expr_clone (thread_p, (void *)src_rlike_eval_term->pattern,
-				      (void *)dest_rlike_eval_term->pattern, PH_REGU_VAR, attr_info);
-      dest_rlike_eval_term->case_sensitive = (regu_variable_node *) pred_expr_clone (thread_p,
-					     (void *)src_rlike_eval_term->case_sensitive, (void *)dest_rlike_eval_term->case_sensitive, PH_REGU_VAR, attr_info);
-      break;
-    case PH_REGU_VAR:
-      src_regu_var = (regu_variable_node *) src;
-      dest_regu_var = regu_var_clone (thread_p, src_regu_var, attr_info);
-      if (dest_regu_var->type == TYPE_ATTR_ID || dest_regu_var->type == TYPE_SHARED_ATTR_ID
-	  || dest_regu_var->type == TYPE_CLASS_ATTR_ID)
-	{
-	  dest_regu_var->value.attr_descr.cache_dbvalp = NULL;
-	}
-      ret = (void *) dest_regu_var;
-      break;
-    default:
-      assert (false);
-      break;
-    }
-  return ret;
-}
-
-static void
-arith_list_free (THREAD_ENTRY *thread_p, ARITH_TYPE *src)
-{
-  if (!src)
-    {
-      return;
-    }
-
-  if (src->value)
-    {
-      pr_clear_value (src->value);
-      HP_FREE (thread_p, src->value);
-    }
-
-  regu_var_free (thread_p, src->leftptr, true);
-  regu_var_free (thread_p, src->rightptr, true);
-  regu_var_free (thread_p, src->thirdptr, true);
-
-  if (src->rand_seed)
-    {
-      HP_FREE (thread_p, src->rand_seed);
-    }
-
-  HP_FREE (thread_p, src);
-}
-
-static void
-regu_list_free (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST src)
-{
-  if (!src)
-    {
-      return;
-    }
-
-  REGU_VARIABLE_LIST curr = src;
-  REGU_VARIABLE_LIST next;
-
-  while (curr)
-    {
-      next = curr->next;
-      regu_var_free (thread_p, &curr->value, false);
-      HP_FREE (thread_p, curr);
-      curr = next;
-    }
-}
-
-static void
-regu_val_list_free (THREAD_ENTRY *thread_p, REGU_VALUE_LIST *src)
-{
-  if (!src)
-    {
-      return;
-    }
-
-  REGU_VALUE_ITEM *curr = src->regu_list;
-  REGU_VALUE_ITEM *next;
-
-  while (curr)
-    {
-      next = curr->next;
-      regu_var_free (thread_p, curr->value, true);
-      HP_FREE (thread_p, curr);
-      curr = next;
-    }
-
-  HP_FREE (thread_p, src);
-}
-
-static void
-regu_var_free (THREAD_ENTRY *thread_p, REGU_VARIABLE *src, bool free_self)
-{
-  if (!src)
-    {
-      return;
-    }
-
-  switch (src->type)
-    {
-    case TYPE_CONSTANT:
-      pr_clear_value (src->value.dbvalptr);
-      break;
-    case TYPE_INARITH:
-    case TYPE_OUTARITH:
-      arith_list_free (thread_p, src->value.arithptr);
-      break;
-    case TYPE_REGUVAL_LIST:
-      regu_val_list_free (thread_p, src->value.reguval_list);
-      break;
-    case TYPE_REGU_VAR_LIST:
-      regu_list_free (thread_p, src->value.regu_var_list);
-      break;
-    default:
-      break;
-    }
-
-  if (src->vfetch_to)
-    {
-      pr_clear_value (src->vfetch_to);
-      HP_FREE (thread_p, src->vfetch_to);
-    }
-  if (free_self)
-    {
-      HP_FREE (thread_p, src);
-    }
-}
-
-
-static void
-pred_expr_free (THREAD_ENTRY *thread_p, PRED_EXPR *src)
-{
-  if (!src)
-    {
-      return;
-    }
-  switch (src->type)
-    {
-    case T_PRED:
-      pred_expr_free (thread_p, src->pe.m_pred.lhs);
-      pred_expr_free (thread_p, src->pe.m_pred.rhs);
-      break;
-    case T_EVAL_TERM:
-      switch (src->pe.m_eval_term.et_type)
-	{
-	case T_COMP_EVAL_TERM:
-	{
-	  COMP_EVAL_TERM *comp_term = &src->pe.m_eval_term.et.et_comp;
-	  if (comp_term->lhs)
-	    {
-	      if (comp_term->lhs->vfetch_to)
-		{
-		  pr_clear_value (comp_term->lhs->vfetch_to);
-		  HP_FREE (thread_p, comp_term->lhs->vfetch_to);
-		}
-	      HP_FREE (thread_p, comp_term->lhs);
-	    }
-	  if (comp_term->rhs)
-	    {
-	      if (comp_term->rhs->vfetch_to)
-		{
-		  pr_clear_value (comp_term->rhs->vfetch_to);
-		  HP_FREE (thread_p, comp_term->rhs->vfetch_to);
-		}
-	      HP_FREE (thread_p, comp_term->rhs);
-	    }
-	}
-	break;
-	case T_ALSM_EVAL_TERM:
-	{
-	  ALSM_EVAL_TERM *alsm_term = &src->pe.m_eval_term.et.et_alsm;
-	  if (alsm_term->elem)
-	    {
-	      if (alsm_term->elem->vfetch_to)
-		{
-		  pr_clear_value (alsm_term->elem->vfetch_to);
-		  HP_FREE (thread_p, alsm_term->elem->vfetch_to);
-		}
-	      HP_FREE (thread_p, alsm_term->elem);
-	    }
-	  if (alsm_term->elemset)
-	    {
-	      if (alsm_term->elemset->vfetch_to)
-		{
-		  pr_clear_value (alsm_term->elemset->vfetch_to);
-		  HP_FREE (thread_p, alsm_term->elemset->vfetch_to);
-		}
-	      HP_FREE (thread_p, alsm_term->elemset);
-	    }
-	}
-	break;
-	case T_LIKE_EVAL_TERM:
-	{
-	  LIKE_EVAL_TERM *like_term = &src->pe.m_eval_term.et.et_like;
-	  if (like_term->src)
-	    {
-	      if (like_term->src->vfetch_to)
-		{
-		  pr_clear_value (like_term->src->vfetch_to);
-		  HP_FREE (thread_p, like_term->src->vfetch_to);
-		}
-	      HP_FREE (thread_p, like_term->src);
-	    }
-	  if (like_term->pattern)
-	    {
-	      if (like_term->pattern->vfetch_to)
-		{
-		  pr_clear_value (like_term->pattern->vfetch_to);
-		  HP_FREE (thread_p, like_term->pattern->vfetch_to);
-		}
-	      HP_FREE (thread_p, like_term->pattern);
-	    }
-	  if (like_term->esc_char)
-	    {
-	      if (like_term->esc_char->vfetch_to)
-		{
-		  pr_clear_value (like_term->esc_char->vfetch_to);
-		  HP_FREE (thread_p, like_term->esc_char->vfetch_to);
-		}
-	      HP_FREE (thread_p, like_term->esc_char);
-	    }
-	}
-	break;
-	case T_RLIKE_EVAL_TERM:
-	{
-	  RLIKE_EVAL_TERM *rlike_term = &src->pe.m_eval_term.et.et_rlike;
-	  if (rlike_term->src)
-	    {
-	      if (rlike_term->src->vfetch_to)
-		{
-		  pr_clear_value (rlike_term->src->vfetch_to);
-		  HP_FREE (thread_p, rlike_term->src->vfetch_to);
-		}
-	      HP_FREE (thread_p, rlike_term->src);
-	    }
-	  if (rlike_term->pattern)
-	    {
-	      if (rlike_term->pattern->vfetch_to)
-		{
-		  pr_clear_value (rlike_term->pattern->vfetch_to);
-		  HP_FREE (thread_p, rlike_term->pattern->vfetch_to);
-		}
-	      HP_FREE (thread_p, rlike_term->pattern);
-	    }
-	  if (rlike_term->case_sensitive)
-	    {
-	      if (rlike_term->case_sensitive->vfetch_to)
-		{
-		  pr_clear_value (rlike_term->case_sensitive->vfetch_to);
-		  HP_FREE (thread_p, rlike_term->case_sensitive->vfetch_to);
-		}
-	      HP_FREE (thread_p, rlike_term->case_sensitive);
-	    }
-	}
-	break;
-	}
-      break;
-    case T_NOT_TERM:
-      pred_expr_free (thread_p, src->pe.m_not_term);
-      break;
-    }
-  HP_FREE (thread_p, src);
-}
-
-static heap_cache_attrinfo *
-attr_cache_clone (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src)
-{
-  heap_cache_attrinfo *dest = (heap_cache_attrinfo *) HP_ALLOC (thread_p, sizeof (heap_cache_attrinfo));
-  *dest = *src;
-  return dest;
-}
-
-static void
-attr_cache_free (THREAD_ENTRY *thread_p, heap_cache_attrinfo *src)
-{
-  if (!src)
-    {
-      return;
-    }
-  HP_FREE (thread_p, src);
-}
-
-static void
-link_attr_cache (THREAD_ENTRY *thread_p, REGU_VARIABLE_LIST node,heap_cache_attrinfo *old_attr_info,
-		 heap_cache_attrinfo *new_attr_info)
-{
-  while (node)
-    {
-      if (node->value.type == TYPE_ATTR_ID || node->value.type == TYPE_CLASS_ATTR_ID
-	  || node->value.type == TYPE_SHARED_ATTR_ID)
-	{
-	  if (node->value.value.attr_descr.cache_attrinfo == old_attr_info)
-	    {
-	      node->value.value.attr_descr.cache_attrinfo = new_attr_info;
-	    }
-	  else
-	    {
-	      assert (false);
-	    }
-	}
-      node = node->next;
-    }
-}
-
-static void link_attr_cache_for_regu_var (THREAD_ENTRY *thread_p, REGU_VARIABLE *node,
-    heap_cache_attrinfo *old_attr_info,
-    heap_cache_attrinfo *new_attr_info)
-{
-  if (node->type == TYPE_ATTR_ID || node->type == TYPE_CLASS_ATTR_ID
-      || node->type == TYPE_SHARED_ATTR_ID)
-    {
-      if (node->value.attr_descr.cache_attrinfo == old_attr_info)
-	{
-	  node->value.attr_descr.cache_attrinfo = new_attr_info;
-	}
-      else
-	{
-	  assert (false);
-	}
-    }
 }
 
 typedef enum
@@ -1684,7 +2159,7 @@ scan_next_heap_scan_1page_internal (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, VP
   LOG_LSA ref_lsa;
   bool is_peeking;
   OBJECT_GET_STATUS object_get_status;
-  regu_variable_list_node *p;
+  struct regu_variable_list_node *p;
 
   hsidp = &scan_id->s.hsid;
   if (scan_id->mvcc_select_lock_needed)
@@ -1957,12 +2432,28 @@ restart_scan_oid:
 SCAN_CODE
 scan_next_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
 {
+  SCAN_CODE ret;
   if (!scan_id->s.phsid.master->m_is_start_once)
     {
       scan_id->s.phsid.master->start_tasks (scan_id);
       scan_id->s.phsid.master->m_is_start_once = true;
     }
-  return scan_id->s.phsid.master->get_result (thread_p, scan_id);
+  ret = scan_id->s.phsid.master->get_result (thread_p, scan_id);
+  if (ret == S_ERROR)
+    {
+      cuberr::er_message *error_msg = nullptr;
+      while (error_msg == nullptr)
+	{
+	  error_msg = scan_id->s.phsid.master->m_context->m_error_msg.exchange (nullptr);
+	}
+      assert (scan_id->s.phsid.master->m_context->m_has_error);
+      cuberr::er_message &crt_error = cuberr::context::get_thread_local_context ().get_current_error_level ();
+      crt_error.swap (*error_msg);
+      delete error_msg;
+      return S_ERROR;
+    }
+
+  return ret;
 }
 
 int
@@ -2012,11 +2503,11 @@ scan_open_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id,
 			      int grouped, QPROC_SINGLE_FETCH single_fetch, DB_VALUE *join_dbval,
 			      val_list_node *val_list, VAL_DESCR *vd,
 			      /* fields of HEAP_SCAN_ID */
-			      OID *cls_oid, HFID *hfid, regu_variable_list_node *regu_list_pred,
-			      PRED_EXPR *pr, regu_variable_list_node *regu_list_rest, int num_attrs_pred,
+			      OID *cls_oid, HFID *hfid,  struct regu_variable_list_node *regu_list_pred,
+			      PRED_EXPR *pr,  struct regu_variable_list_node *regu_list_rest, int num_attrs_pred,
 			      ATTR_ID *attrids_pred, HEAP_CACHE_ATTRINFO *cache_pred, int num_attrs_rest,
 			      ATTR_ID *attrids_rest, HEAP_CACHE_ATTRINFO *cache_rest, SCAN_TYPE scan_type,
-			      DB_VALUE **cache_recordinfo, regu_variable_list_node *regu_list_recordinfo,
+			      DB_VALUE **cache_recordinfo,  struct regu_variable_list_node *regu_list_recordinfo,
 			      bool is_partition_table)
 {
   int ret;
@@ -2027,6 +2518,9 @@ scan_open_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id,
 			     val_list, vd, cls_oid, hfid, regu_list_pred, pr, regu_list_rest, num_attrs_pred, attrids_pred, cache_pred,
 			     num_attrs_rest, attrids_rest, cache_rest, S_HEAP_SCAN, cache_recordinfo, regu_list_recordinfo, is_partition_table);
   scan_id->type = S_PARALLEL_HEAP_SCAN;
+#if START_END_LOG
+  er_log_debug (ARG_FILE_LINE, "parallel heap scan main thread %ld", syscall (SYS_gettid));
+#endif
 
   scan_id->s.phsid.master = new parallel_heap_scan_master (thread_p->tran_index, scan_id, HP_PARALLELISM,
       HP_PARALLELISM, HP_PARALLELISM);

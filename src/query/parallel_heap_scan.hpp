@@ -26,7 +26,7 @@
 #include "scan_manager.h"
 #include "thread_manager.hpp"
 
-#define HP_PARALLELISM 2
+#define HP_PARALLELISM 1
 #define HP_RESULT_QUEUE_SIZE 11
 
 
@@ -79,4 +79,7 @@ scan_open_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id,
 			      bool is_partition_table);
 extern int
 scan_start_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id);
+
+extern int
+scan_check_parallel_heap_scan_possible (THREAD_ENTRY *thread_p, void *spec, bool mvcc_select_lock_needed);
 #endif /* _PARALLEL_HEAP_SCAN_H_ */
