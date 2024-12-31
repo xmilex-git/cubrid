@@ -7819,7 +7819,7 @@ scan_print_stats_json (SCAN_ID * scan_id, json_t * scan_stats)
       json_object_set_new (scan, "readrows", json_integer (scan_id->scan_stats.read_rows));
       json_object_set_new (scan, "rows", json_integer (scan_id->scan_stats.qualified_rows));
 
-      if (scan_id->type == S_HEAP_SCAN)
+      if (scan_id->type == S_HEAP_SCAN || scan_id->type == S_PARALLEL_HEAP_SCAN)
 	{
 	  if (scan_id->scan_stats.agl)
 	    {

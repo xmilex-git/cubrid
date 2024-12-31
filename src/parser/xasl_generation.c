@@ -18647,6 +18647,32 @@ pt_to_insert_xasl (PARSER_CONTEXT * parser, PT_NODE * statement)
 	  xasl->aptr_list->sub_host_var_count = aptr_statement->sub_host_var_count;
 	  xasl->aptr_list->sub_host_var_index = aptr_statement->sub_host_var_index;
 	}
+      if (xasl != NULL && xasl->aptr_list != NULL)
+	{
+	  ACCESS_SPEC_TYPE *specp;
+	  XASL_NODE *xptr1, *xptr2;
+	  for (xptr1 = xasl->aptr_list; xptr1; xptr1 = xptr1->next)
+	    {
+	      for (specp = xptr1->spec_list; specp; specp = specp->next)
+		{
+		  if (specp->access == ACCESS_METHOD_SEQUENTIAL)
+		    {
+		      specp->flags = (ACCESS_SPEC_FLAG) (specp->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+		    }
+		}
+	      for (xptr2 = xptr1->scan_ptr; xptr2; xptr2 = xptr2->next)
+		{
+		  for (specp = xptr2->spec_list; specp; specp = specp->next)
+		    {
+		      if (specp->access == ACCESS_METHOD_SEQUENTIAL)
+			{
+			  specp->flags =
+			    (ACCESS_SPEC_FLAG) (specp->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
+			}
+		    }
+		}
+	    }
+	}
     }
   else
     {

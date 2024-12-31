@@ -182,6 +182,7 @@ int parallel_heap_scan_checker::check (REGU_VARIABLE *src)
       cnt++;
       add_not_parallel_heap_scan_flag (src->xasl);
     }
+
   switch (src->type)
     {
     case TYPE_ATTR_ID:		/* fetch object attribute value */
