@@ -26,7 +26,7 @@
 #include "scan_manager.h"
 #include "thread_manager.hpp"
 
-#define HP_PARALLELISM 1
+
 #define HP_RESULT_QUEUE_SIZE 21
 
 
