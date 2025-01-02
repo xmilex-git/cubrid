@@ -1409,6 +1409,7 @@ typedef UINT64 PT_HINT_ENUM;
 #define  PT_HINT_LEADING  0x2000000000ULL	/* force specific table to join left-to-right */
 #define  PT_HINT_NO_SUBQUERY_CACHE 0x4000000000ULL	/* don't use the subquery result cache */
 #define  PT_HINT_NO_USE_HASH  0x8000000000ULL	/* disable hash-join */
+#define  PT_HINT_NO_PARALLEL_HEAP_SCAN  0x10000000000ULL	/* disable parallel heap scan */
 
 /* Codes for error messages */
 typedef enum

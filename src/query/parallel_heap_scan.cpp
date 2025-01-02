@@ -40,6 +40,7 @@
 #include "heap_attrinfo.h"
 #include "query_executor.h"
 #include "xasl_predicate.hpp"
+#include "system_parameter.h"
 
 #define START_END_LOG 1
 
@@ -336,6 +337,12 @@ scan_check_parallel_heap_scan_possible (THREAD_ENTRY *thread_p, void *spec,
 {
 #if defined(SERVER_MODE)
   ACCESS_SPEC_TYPE *curr_spec = (ACCESS_SPEC_TYPE *)spec;
+  int parallel_heap_scan_threads = prm_get_integer_value (PRM_ID_PARALLEL_HEAP_SCAN_THREADS);
+  if (parallel_heap_scan_threads == 0)
+    {
+      return false;
+    }
+
   if (!mvcc_select_lock_needed)
     {
       if (thread_p->private_heap_id != 0)
@@ -1657,7 +1664,6 @@ void parallel_heap_scan_task::execute (cubthread::entry &thread_ref)
 	      break;
 	    }
 	  rec_scan_code = scan_next_heap_scan_1page_internal (thread_p, scan_id, &vpid);
-	  //assert (rec_scan_code == S_SUCCESS || rec_scan_code == S_END);
 	  if (rec_scan_code == S_ERROR)
 	    {
 	      if (m_context->m_has_error || m_result_queue->is_scan_ended)
@@ -2533,6 +2539,7 @@ scan_open_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id,
 			      bool is_partition_table)
 {
   int ret;
+  int parallel_heap_scan_threads = prm_get_integer_value (PRM_ID_PARALLEL_HEAP_SCAN_THREADS);
   assert (scan_type == S_PARALLEL_HEAP_SCAN);
   scan_id->type = S_HEAP_SCAN;
   ret = scan_open_heap_scan (thread_p, scan_id, mvcc_select_lock_needed, scan_op_type, fixed, grouped, single_fetch,
@@ -2544,7 +2551,7 @@ scan_open_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id,
   er_log_debug (ARG_FILE_LINE, "parallel heap scan main thread %ld", syscall (SYS_gettid));
 #endif
 
-  scan_id->s.phsid.master = new parallel_heap_scan_master (thread_p->tran_index, scan_id, HP_PARALLELISM,
-      HP_PARALLELISM, HP_PARALLELISM);
+  scan_id->s.phsid.master = new parallel_heap_scan_master (thread_p->tran_index, scan_id, parallel_heap_scan_threads,
+      parallel_heap_scan_threads, parallel_heap_scan_threads);
   return ret;
 }

@@ -12585,7 +12585,8 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
 		{
 		  access->flags = (ACCESS_SPEC_FLAG) (access->flags | ACCESS_SPEC_FLAG_FOR_UPDATE);
 		}
-	      if (!is_parallel_heap_scan_callable || (spec->info.spec.flag & PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN))
+	      if (!is_parallel_heap_scan_callable
+		  || PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN))
 		{
 		  access->flags = (ACCESS_SPEC_FLAG) (access->flags | ACCESS_SPEC_FLAG_NOT_FOR_PARALLEL_HEAP_SCAN);
 		}
