@@ -552,6 +552,12 @@ exit:
     return m_out_args;
   }
 
+  std::vector <std::reference_wrapper <DB_VALUE>> &
+      executor::get_args ()
+  {
+    return m_args;
+  }
+
   execution_stack *
   executor::get_stack ()
   {

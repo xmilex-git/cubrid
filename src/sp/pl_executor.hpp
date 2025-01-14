@@ -83,6 +83,7 @@ namespace cubpl
 
       // getter
       std::vector <DB_VALUE> &get_out_args ();
+      std::vector <std::reference_wrapper <DB_VALUE>> &get_args ();
       execution_stack *get_stack ();
 
     private:

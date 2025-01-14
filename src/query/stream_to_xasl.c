@@ -6084,7 +6084,7 @@ stx_build_sp_type (THREAD_ENTRY * thread_p, char *ptr, SP_TYPE * sp)
 	  return NULL;
 	}
     }
-
+  sp->cache = NULL;
   return ptr;
 }
 

@@ -2143,7 +2143,6 @@ jsp_make_pl_signature (PARSER_CONTEXT *parser, PT_NODE *node, PT_NODE *subquery_
 	    goto exit;
 	  }
 
-#if defined (CS_MODE)
 	sig.auth = db_private_strdup (NULL, auth_name);
 	if (directive & SP_DIRECTIVE_ENUM::SP_DIRECTIVE_DETERMINISTIC)
 	  {
@@ -2153,7 +2152,6 @@ jsp_make_pl_signature (PARSER_CONTEXT *parser, PT_NODE *node, PT_NODE *subquery_
 	  {
 	    sig.is_deterministic = false;
 	  }
-#endif
 
 	sig.result_type = result_type;
 	if (! (directive & SP_DIRECTIVE_ENUM::SP_DIRECTIVE_RIGHTS_CALLER))

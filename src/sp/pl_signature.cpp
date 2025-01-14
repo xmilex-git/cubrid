@@ -196,7 +196,7 @@ namespace cubpl
       }
 
     serializator.pack_int (result_type);
-
+    serializator.pack_bool (is_deterministic);
     // arg
     arg.pack (serializator);
 
@@ -252,6 +252,7 @@ namespace cubpl
       }
 
     deserializator.unpack_int (result_type);
+    deserializator.unpack_bool (is_deterministic);
 
     arg.unpack (deserializator);
 
@@ -327,7 +328,7 @@ namespace cubpl
       }
 
     size += serializator.get_packed_int_size (size); /* result_type */
-
+    size += serializator.get_packed_bool_size (size); // is_deterministic
     size += arg.get_packed_size (serializator, size); // arg
 
     if (PL_TYPE_IS_METHOD (type))

@@ -361,6 +361,7 @@ set(SP_SOURCES
   ${SP_DIR}/pl_sr_jvm.cpp
   ${SP_DIR}/sp_catalog.cpp
   ${SP_DIR}/sp_code.cpp
+  ${SP_DIR}/pl_result_cache.cpp
   )
 
 set(SP_HEADERS

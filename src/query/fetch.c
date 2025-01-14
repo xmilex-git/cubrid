@@ -55,6 +55,7 @@
 #include "thread_entry.hpp"
 #include "subquery_cache.h"
 #include "pl_executor.hpp"
+#include "pl_result_cache.hpp"
 
 #include "dbtype.h"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -4103,6 +4104,23 @@ fetch_peek_dbval (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto exit_on_error;
 	  }
 
+#if defined(SERVER_MODE)
+	cubpl::result_cache::key cache_key;
+	if (regu_var->value.sp_ptr->sig->is_deterministic)
+	  {
+	    if (regu_var->value.sp_ptr->cache == NULL)
+	      {
+		regu_var->value.sp_ptr->cache = new cubpl::result_cache ();
+	      }
+	    cache_key = cubpl::result_cache::make_key (executor.get_args ());
+	    if (regu_var->value.sp_ptr->cache->get (cache_key, *regu_var->value.sp_ptr->value))
+	      {
+		*peek_dbval = regu_var->value.sp_ptr->value;
+		break;
+	      }
+	  }
+#endif
+
 	error = executor.execute (*regu_var->value.sp_ptr->value);
 	if (error != NO_ERROR)
 	  {
@@ -4111,6 +4129,12 @@ fetch_peek_dbval (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto exit_on_error;
 	  }
 
+#if defined(SERVER_MODE)
+	if (regu_var->value.sp_ptr->sig->is_deterministic)
+	  {
+	    regu_var->value.sp_ptr->cache->put (cache_key, *regu_var->value.sp_ptr->value);
+	  }
+#endif
 	*peek_dbval = regu_var->value.sp_ptr->value;
       }
       break;
