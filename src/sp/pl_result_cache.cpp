@@ -1,6 +1,7 @@
 #include "pl_result_cache.hpp"
 #include "dbtype.h"
 #include "object_representation.h"
+#include "memory_hash.h"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 namespace cubpl
@@ -103,90 +104,32 @@ namespace cubpl
 	switch (DB_VALUE_TYPE (&value))
 	  {
 	  case DB_TYPE_NULL:
-	    value_hash = 0;
-	    break;
 	  case DB_TYPE_INTEGER:
-	    value_hash = std::hash<int> {} (db_get_int (&value));
-	    break;
 	  case DB_TYPE_SHORT:
-	    value_hash = std::hash<short> {} (db_get_short (&value));
-	    break;
 	  case DB_TYPE_BIGINT:
-	  {
-	    DB_BIGINT bigint = db_get_bigint (&value);
-	    unsigned int x = bigint >> 32;
-	    unsigned int y = (unsigned int) bigint;
-	    value_hash = x ^ y;
-	  }
-	  break;
 	  case DB_TYPE_FLOAT:
-	    value_hash = std::hash<float> {} (db_get_float (&value));
-	    break;
 	  case DB_TYPE_DOUBLE:
-	    value_hash = std::hash<double> {} (db_get_double (&value));
-	    break;
 	  case DB_TYPE_NUMERIC:
-	    value_hash = std::hash<DB_C_NUMERIC> {} (db_get_numeric (&value));
-	    break;
 	  case DB_TYPE_CHAR:
 	  case DB_TYPE_NCHAR:
 	  case DB_TYPE_VARCHAR:
 	  case DB_TYPE_VARNCHAR:
-	    value_hash = std::hash<std::string> {} (db_get_string (&value));
-	    break;
 	  case DB_TYPE_TIME:
-	    value_hash = std::hash<unsigned int> {} (*db_get_time (&value));
-	    break;
 	  case DB_TYPE_TIMESTAMP:
 	  case DB_TYPE_TIMESTAMPLTZ:
-	    value_hash = std::hash<DB_TIMESTAMP> {} (*db_get_timestamp (&value));
-	    break;
 	  case DB_TYPE_TIMESTAMPTZ:
-	    value_hash = std::hash<DB_TIMESTAMP> {} (db_get_timestamptz (&value)->timestamp);
-	    break;
 	  case DB_TYPE_DATETIME:
 	  case DB_TYPE_DATETIMELTZ:
-	  {
-	    DB_DATETIME *datetime = db_get_datetime (&value);
-	    value_hash = std::hash<unsigned int> {} (datetime->date ^ datetime->time);
-	  }
-	  break;
 	  case DB_TYPE_DATETIMETZ:
-	  {
-	    DB_DATETIMETZ *dt_tz = db_get_datetimetz (&value);
-	    value_hash = std::hash<unsigned int> {} (dt_tz->datetime.date ^ dt_tz->datetime.time);
-	  }
-	  break;
 	  case DB_TYPE_DATE:
-	    value_hash = std::hash<unsigned int> {} (*db_get_date (&value));
-	    break;
 	  case DB_TYPE_MONETARY:
-	    value_hash = std::hash<double> {} (db_get_monetary (&value)->amount);
-	    break;
 	  case DB_TYPE_SET:
 	  case DB_TYPE_MULTISET:
 	  case DB_TYPE_SEQUENCE:
-	  {
-	    DB_SET *set = db_get_set (&value);
-	    DB_VALUE temp;
-	    value_hash = 0;
-	    if (db_set_get (set, 0, &temp) == NO_ERROR)
-	      {
-		result_cache::key_hash hasher;
-		result_cache::key temp_key;
-		temp_key.push_back (temp);
-		value_hash = hasher (temp_key);
-		db_value_clear (&temp);
-	      }
-	  }
-	  break;
 	  case DB_TYPE_OBJECT:
-	    value_hash = std::hash<DB_OBJECT *> {} (db_get_object (&value));
-	    break;
 	  case DB_TYPE_OID:
 	  {
-	    OID *oid = db_get_oid (&value);
-	    value_hash = std::hash<unsigned int> {} (oid->volid ^ oid->pageid ^ oid->slotid);
+	    value_hash = static_cast<std::size_t> (mht_valhash (&value, INT_MAX));
 	  }
 	  break;
 	  default:
