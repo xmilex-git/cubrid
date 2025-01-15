@@ -6084,7 +6084,9 @@ stx_build_sp_type (THREAD_ENTRY * thread_p, char *ptr, SP_TYPE * sp)
 	  return NULL;
 	}
     }
+#if defined (SERVER_MODE)
   sp->cache = NULL;
+#endif
   return ptr;
 }
 

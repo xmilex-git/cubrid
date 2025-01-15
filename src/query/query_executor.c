@@ -1593,11 +1593,13 @@ qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE
     case TYPE_SP:
       pr_clear_value (regu_var->value.sp_ptr->value);
       pg_cnt += qexec_clear_regu_list (thread_p, xasl_p, regu_var->value.sp_ptr->args, is_final);
+#if defined (SERVER_MODE)
       if (regu_var->value.sp_ptr->cache)
 	{
 	  delete regu_var->value.sp_ptr->cache;
 	  regu_var->value.sp_ptr->cache = nullptr;
 	}
+#endif
       if (is_final)
 	{
 	  delete regu_var->value.sp_ptr->sig;

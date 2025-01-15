@@ -39,7 +39,9 @@ namespace cubxasl
     cubpl::pl_signature *sig;
     regu_variable_list_node *args;
     DB_VALUE *value; // return value
+#if defined (SERVER_MODE)
     cubpl::result_cache *cache;
+#endif
   };
 };
 
