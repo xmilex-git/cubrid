@@ -1,12 +1,35 @@
+/*
+ * Copyright 2008 Search Solution Corporation
+ * Copyright 2016 CUBRID Corporation
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ */
+
+/*
+ * pl_result_cache.cpp
+ */
+
+#ident "$Id$"
 #include "pl_result_cache.hpp"
 #include "dbtype.h"
 #include "object_representation.h"
 #include "memory_hash.h"
+#include "system_parameter.h"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 namespace cubpl
 {
-
   std::size_t result_cache::key::get_memory_size() const
   {
     std::size_t total_size = sizeof (key);
@@ -25,7 +48,7 @@ namespace cubpl
   result_cache::result_cache()
   {
     m_total_memory = sizeof (result_cache);
-    m_max_memory = 16 * 1024 * 1024; // 16MB
+    m_max_memory = static_cast<std::size_t> (prm_get_bigint_value (PRM_ID_MAX_SP_CACHE_SIZE));
     m_is_enabled = true;
     m_cache_hit = 0;
     m_cache_miss = 0;

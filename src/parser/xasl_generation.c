@@ -27638,33 +27638,7 @@ pt_make_sq_cache_key_struct (QPROC_DB_VALUE_LIST key_struct, void *p, int type)
 	    }
 	  break;
 	case TYPE_SP:
-	  /* The value of regu_src->value.sp_ptr->sig->is_deterministic is interpreted as follows
-	   * 0: PT_AUTHID_OWNER + PT_NOT_DETERMINISTIC
-	   * 1: PT_AUTHID_CALLER + PT_NOT_DETERMINISTIC
-	   * 2: PT_AUTHID_OWNER + PT_DETERMINISTIC
-	   * 3: PT_AUTHID_CALLER + PT_DETERMINISTIC
-	   */
-	  if (regu_src->value.sp_ptr->sig->is_deterministic == false)
-	    {
-	      return ER_FAILED;
-	    }
-
-	  regu_var_list_p = regu_src->value.sp_ptr->args;
-
-	  while (regu_var_list_p)
-	    {
-	      regu_src = &regu_var_list_p->value;
-	      ret = pt_make_sq_cache_key_struct (key_struct, (void *) regu_src, SQ_TYPE_REGU_VAR);
-	      if (ret == ER_FAILED)
-		{
-		  return ER_FAILED;
-		}
-	      else
-		{
-		  cnt += ret;
-		}
-	      regu_var_list_p = regu_var_list_p->next;
-	    }
+	  return ER_FAILED;
 	  break;
 	case TYPE_POSITION:
 	case TYPE_LIST_ID:

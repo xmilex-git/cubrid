@@ -759,6 +759,8 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_MAX_SUBQUERY_CACHE_SIZE    "max_subquery_cache_size"
 
+#define PRM_NAME_MAX_SP_CACHE_SIZE         "max_sp_cache_size"
+
 #define PRM_NAME_ORACLE_STYLE_DIVIDE "oracle_style_divide"
 
 #define PRM_NAME_ENABLE_MEMORY_MONITORING "enable_memory_monitoring"
@@ -2472,6 +2474,12 @@ static UINT64 prm_max_subquery_cache_size_default = 2 * 1024 * 1024;	/* 2 MB */
 static UINT64 prm_max_subquery_cache_size_lower = 0;	/* 0 */
 static UINT64 prm_max_subquery_cache_size_upper = 16 * 1024 * 1024;	/* 16 MB */
 static unsigned int prm_max_subquery_cache_size_flag = 0;
+
+UINT64 PRM_MAX_SP_CACHE_SIZE = 2 * 1024 * 1024;	/* 2 MB */
+static UINT64 prm_max_sp_cache_size_default = 2 * 1024 * 1024;	/* 2 MB */
+static UINT64 prm_max_sp_cache_size_lower = 0;	/* 0 */
+static UINT64 prm_max_sp_cache_size_upper = 16 * 1024 * 1024;	/* 16 MB */
+static unsigned int prm_max_sp_cache_size_flag = 0;
 
 typedef int (*DUP_PRM_FUNC) (void *, SYSPRM_DATATYPE, void *, SYSPRM_DATATYPE);
 
@@ -6463,6 +6471,18 @@ SYSPRM_PARAM prm_Def[] = {
    (void *) &PRM_MAX_SUBQUERY_CACHE_SIZE,
    (void *) &prm_max_subquery_cache_size_upper,
    (void *) &prm_max_subquery_cache_size_lower,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_MAX_SP_CACHE_SIZE,
+   PRM_NAME_MAX_SP_CACHE_SIZE,
+   (PRM_FOR_SERVER | PRM_USER_CHANGE | PRM_SIZE_UNIT),
+   PRM_BIGINT,
+   &prm_max_sp_cache_size_flag,
+   (void *) &prm_max_sp_cache_size_default,
+   (void *) &PRM_MAX_SP_CACHE_SIZE,
+   (void *) &prm_max_sp_cache_size_upper,
+   (void *) &prm_max_sp_cache_size_lower,
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
