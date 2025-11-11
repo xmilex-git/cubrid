@@ -482,7 +482,21 @@ namespace parallel_heap_scan
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
       {
 	scan_code = m_result_handler->read (m_thread_p, m_xasl->list_id);
-	if (m_g_agg_domain_resolve_need)
+	if (scan_code == S_ERROR)
+	  {
+	    m_worker_manager->release_workers (m_parallelism);
+	    m_worker_manager = nullptr;
+	    HL_HEAPID heap_id = db_change_private_heap (m_thread_p, 0);
+	    QPROC_DB_VALUE_LIST valp = m_xasl->val_list->valp;
+	    valp = m_xasl->val_list->valp;
+	    for (int i = 0; i < m_xasl->val_list->val_cnt; i++)
+	      {
+		pr_clear_value (valp->val);
+		valp = valp->next;
+	      }
+	    db_change_private_heap (m_thread_p, heap_id);
+	  }
+	else if (m_g_agg_domain_resolve_need)
 	  {
 	    std::vector<DB_VALUE> dbval_container (m_xasl->val_list->val_cnt);
 	    QPROC_DB_VALUE_LIST valp = m_xasl->val_list->valp;
@@ -577,8 +591,11 @@ namespace parallel_heap_scan
   {
     int err_code = NO_ERROR;
     m_interrupt.set_code (parallel_query::interrupt::interrupt_code::JOB_ENDED);
-    m_worker_manager->release_workers (m_parallelism);
-    m_worker_manager = nullptr;
+    if (m_worker_manager != nullptr)
+      {
+	m_worker_manager->release_workers (m_parallelism);
+	m_worker_manager = nullptr;
+      }
     if (m_on_trace)
       {
 	if (m_thread_p->m_px_orig_thread_entry != m_thread_p)

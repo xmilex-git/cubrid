@@ -253,6 +253,20 @@ namespace cubxasl
 	  }
       }
 
+    if (xasl->type == MERGE_PROC)
+      {
+	result = iterate_xasl_tree (xasl->proc.merge.insert_xasl, func, default_value);
+	if (result != default_value)
+	  {
+	    return result;
+	  }
+	result = iterate_xasl_tree (xasl->proc.merge.update_xasl, func, default_value);
+	if (result != default_value)
+	  {
+	    return result;
+	  }
+      }
+
     return default_value;
   }
 }

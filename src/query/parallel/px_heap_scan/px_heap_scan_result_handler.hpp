@@ -89,6 +89,7 @@ namespace parallel_heap_scan
       VAL_LIST *orig_val_list_for_agg_domain_resolve;
       int active_results;
       bool g_agg_domain_resolve_need;
+      std::mutex g_agg_domain_resolve_mutex;
       bool is_list_id_domain_resolved;
   };
 
@@ -118,6 +119,7 @@ namespace parallel_heap_scan
       VAL_DESCR *vd;
       VAL_LIST *val_list_for_agg_domain_resolve;
       std::vector<DB_VALUE> dbvals_for_agg_domain_resolve;
+      bool g_agg_domain_resolved;
   };
 
   class xasl_snapshot_tls

@@ -19156,6 +19156,8 @@ pt_to_insert_xasl (PARSER_CONTEXT * parser, PT_NODE * statement)
       xasl->query_alias = statement->alias_print;
     }
 
+  scan_check_parallel_heap_scan_possible (xasl);
+
   return xasl;
 }
 
@@ -25915,6 +25917,8 @@ pt_to_merge_xasl (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE ** non_n
 
   /* set TDE flag */
   XASL_SET_FLAG (xasl, xptr->flag & XASL_INCLUDES_TDE_CLASS);
+
+  scan_check_parallel_heap_scan_possible (xasl);
 
   return xasl;
 }

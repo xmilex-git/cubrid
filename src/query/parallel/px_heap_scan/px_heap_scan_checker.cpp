@@ -538,10 +538,26 @@ namespace parallel_heap_scan
 	    setter.set (xasl->proc.hashjoin.inner.xasl, subquery_result);
 	  }
 	break;
+      case MERGE_PROC:
+	if (xasl->proc.merge.insert_xasl)
+	  {
+	    setter.set_cannot_parallel_recursive (xasl->proc.merge.insert_xasl);
+	  }
+	if (xasl->proc.merge.update_xasl)
+	  {
+	    setter.set_cannot_parallel_recursive (xasl->proc.merge.update_xasl);
+	  }
+	result = CHECK_RESULT::CANNOT_PARALLEL;
+	break;
+      case INSERT_PROC:
+	if (xasl->proc.insert.odku)
+	  {
+	    result = CHECK_RESULT::CANNOT_PARALLEL;
+	  }
+	break;
       case UNION_PROC:
       case DIFFERENCE_PROC:
       case INTERSECTION_PROC:
-      case INSERT_PROC:
       case MERGELIST_PROC:
 	break;
       case OBJFETCH_PROC:
@@ -549,7 +565,6 @@ namespace parallel_heap_scan
       case DELETE_PROC:
       case CONNECTBY_PROC:
       case DO_PROC:
-      case MERGE_PROC:
       case BUILD_SCHEMA_PROC:
       case SCAN_PROC:
       default:
@@ -726,6 +741,16 @@ namespace parallel_heap_scan
 	    set_cannot_parallel_recursive (xasl->proc.hashjoin.inner.xasl);
 	  }
 	break;
+      case MERGE_PROC:
+	if (xasl->proc.merge.insert_xasl)
+	  {
+	    set_cannot_parallel_recursive (xasl->proc.merge.insert_xasl);
+	  }
+	if (xasl->proc.merge.update_xasl)
+	  {
+	    set_cannot_parallel_recursive (xasl->proc.merge.update_xasl);
+	  }
+	break;
       case UNION_PROC:
       case DIFFERENCE_PROC:
       case INTERSECTION_PROC:
@@ -733,10 +758,8 @@ namespace parallel_heap_scan
       case MERGELIST_PROC:
       case UPDATE_PROC:
       case DELETE_PROC:
-      case INSERT_PROC:
       case CONNECTBY_PROC:
       case DO_PROC:
-      case MERGE_PROC:
       case BUILD_SCHEMA_PROC:
       case SCAN_PROC:
       default:
