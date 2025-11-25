@@ -4303,7 +4303,7 @@ scan_start_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
     case S_LIST_SCAN:
       llsidp = &scan_id->s.llsid;
       /* open list file scan */
-      if (qfile_open_list_scan (llsidp->list_id, &llsidp->lsid) != NO_ERROR)
+      if (qfile_open_list_scan (llsidp->list_id, &llsidp->lsid, true) != NO_ERROR)
 	{
 	  goto exit_on_error;
 	}
@@ -4478,7 +4478,7 @@ scan_reset_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
       qfile_close_scan (thread_p, &s_id->s.llsid.lsid);
 
       /* open list file scan for this outer row */
-      if (qfile_open_list_scan (s_id->s.llsid.list_id, &s_id->s.llsid.lsid) != NO_ERROR)
+      if (qfile_open_list_scan (s_id->s.llsid.list_id, &s_id->s.llsid.lsid, true) != NO_ERROR)
 	{
 	  status = S_ERROR;
 	  break;
@@ -5924,7 +5924,7 @@ scan_next_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	      if (SCAN_IS_INDEX_COVERED (isidp))
 		{
 		  qfile_close_list (thread_p, isidp->indx_cov.list_id);
-		  if (qfile_open_list_scan (isidp->indx_cov.list_id, isidp->indx_cov.lsid) != NO_ERROR)
+		  if (qfile_open_list_scan (isidp->indx_cov.list_id, isidp->indx_cov.lsid, true) != NO_ERROR)
 		    {
 		      return S_ERROR;
 		    }
@@ -6060,7 +6060,7 @@ scan_next_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 		      if (SCAN_IS_INDEX_COVERED (isidp))
 			{
 			  qfile_close_list (thread_p, isidp->indx_cov.list_id);
-			  if (qfile_open_list_scan (isidp->indx_cov.list_id, isidp->indx_cov.lsid) != NO_ERROR)
+			  if (qfile_open_list_scan (isidp->indx_cov.list_id, isidp->indx_cov.lsid, true) != NO_ERROR)
 			    {
 			      return S_ERROR;
 			    }

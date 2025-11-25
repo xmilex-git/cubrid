@@ -5313,8 +5313,8 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       SORT_CMP_FUNC *cmp_fn;
 
       /* open scan on partial list */
-      if (qfile_open_list_scan (gbstate.agg_hash_context->part_list_id, &gbstate.agg_hash_context->part_scan_id) !=
-	  NO_ERROR)
+      if (qfile_open_list_scan (gbstate.agg_hash_context->part_list_id, &gbstate.agg_hash_context->part_scan_id, true)
+	  != NO_ERROR)
 	{
 	  GOTO_EXIT_ON_ERROR;
 	}
@@ -5364,8 +5364,8 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       gbstate.agg_hash_context->part_list_id = NULL;
 
       /* reopen scan on newly sorted list */
-      if (qfile_open_list_scan (gbstate.agg_hash_context->sorted_part_list_id, &gbstate.agg_hash_context->part_scan_id)
-	  != NO_ERROR)
+      if (qfile_open_list_scan
+	  (gbstate.agg_hash_context->sorted_part_list_id, &gbstate.agg_hash_context->part_scan_id, true) != NO_ERROR)
 	{
 	  GOTO_EXIT_ON_ERROR;
 	}
@@ -5387,7 +5387,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
   /*
    * Open a scan on the unsorted input file
    */
-  if (qfile_open_list_scan (list_id, &input_scan_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id, &input_scan_id, true) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -6020,8 +6020,8 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
   inner_sid.status = S_CLOSED;
 
   /* open a scan on the outer(inner) list file */
-  if (qfile_open_list_scan (outer_list_idp, &outer_sid) != NO_ERROR
-      || qfile_open_list_scan (inner_list_idp, &inner_sid) != NO_ERROR)
+  if (qfile_open_list_scan (outer_list_idp, &outer_sid, true) != NO_ERROR
+      || qfile_open_list_scan (inner_list_idp, &inner_sid, true) != NO_ERROR)
     {
       goto exit_on_error;
     }
@@ -16619,7 +16619,7 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
       db_make_int (level_valp, level_value);
 
       /* start parents list scanner */
-      if (qfile_open_list_scan (listfile1, &lfscan_id) != NO_ERROR)
+      if (qfile_open_list_scan (listfile1, &lfscan_id, false) != NO_ERROR)
 	{
 	  GOTO_EXIT_ON_ERROR;
 	}
@@ -16919,7 +16919,7 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 		}
 
 	      /* scan listfile2_tmp and add indexes to tuples, then add them to listfile2 */
-	      if (qfile_open_list_scan (listfile2_tmp, &lfscan_id_lst2tmp) != NO_ERROR)
+	      if (qfile_open_list_scan (listfile2_tmp, &lfscan_id_lst2tmp, false) != NO_ERROR)
 		{
 		  GOTO_EXIT_ON_ERROR;
 		}
@@ -17727,7 +17727,7 @@ qexec_check_for_cycle (THREAD_ENTRY * thread_p, OUTPTR_LIST * outptr_list, QFILE
   QFILE_TUPLE_POSITION p_pos;
   int length;
 
-  if (qfile_open_list_scan (list_id_p, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id_p, &s_id, false) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -18272,11 +18272,11 @@ qexec_recalc_tuples_parent_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID *
     }
   memset ((void *) pos_info_p, 0, sizeof (PARENT_POS_INFO));
 
-  if (qfile_open_list_scan (list_id_p, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id_p, &s_id, false) != NO_ERROR)
     {
       goto exit_on_error;
     }
-  if (qfile_open_list_scan (list_id_p, &prev_s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id_p, &prev_s_id, false) != NO_ERROR)
     {
       goto exit_on_error;
     }
@@ -18629,7 +18629,7 @@ qexec_iterate_connect_by_results (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
   bool qualified;
   XASL_NODE *xptr, *last_xasl;
 
-  if (qfile_open_list_scan (xasl->connect_by_ptr->list_id, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (xasl->connect_by_ptr->list_id, &s_id, false) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -20359,7 +20359,7 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
   /*
    * Open a scan on the unsorted input file
    */
-  if (qfile_open_list_scan (list_id, &input_scan_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id, &input_scan_id, false) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -20827,7 +20827,7 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
   /*
    * Open a scan on the unsorted input file
    */
-  if (qfile_open_list_scan (list_id, &input_scan_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id, &input_scan_id, true) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -20836,7 +20836,7 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
   /*
    * open a scan on the intermediate file
    */
-  if (qfile_open_list_scan (analytic_state.interm_file, &interm_scan_id) != NO_ERROR)
+  if (qfile_open_list_scan (analytic_state.interm_file, &interm_scan_id, false) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -22618,12 +22618,12 @@ qexec_analytic_update_group_result (THREAD_ENTRY * thread_p, ANALYTIC_STATE * an
   for (i = 0; i < analytic_state->func_count; i++)
     {
       if (qfile_open_list_scan (analytic_state->func_state_list[i].group_list_id,
-				&analytic_state->func_state_list[i].group_scan_id) != NO_ERROR)
+				&analytic_state->func_state_list[i].group_scan_id, true) != NO_ERROR)
 	{
 	  return ER_FAILED;
 	}
       if (qfile_open_list_scan (analytic_state->func_state_list[i].value_list_id,
-				&analytic_state->func_state_list[i].value_scan_id) != NO_ERROR)
+				&analytic_state->func_state_list[i].value_scan_id, true) != NO_ERROR)
 	{
 	  qfile_close_scan (thread_p, &analytic_state->func_state_list[i].group_scan_id);
 	  return ER_FAILED;
@@ -22640,7 +22640,7 @@ qexec_analytic_update_group_result (THREAD_ENTRY * thread_p, ANALYTIC_STATE * an
     }
 
   /* open scan on intermediate file */
-  if (qfile_open_list_scan (analytic_state->interm_file, &interm_scan_id) != NO_ERROR)
+  if (qfile_open_list_scan (analytic_state->interm_file, &interm_scan_id, true) != NO_ERROR)
     {
       qfile_close_scan (thread_p, &analytic_state->func_state_list[i].group_scan_id);
       qfile_close_scan (thread_p, &analytic_state->func_state_list[i].value_scan_id);

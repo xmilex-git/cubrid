@@ -1410,7 +1410,7 @@ qdata_finalize_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
 		  pr_type_p = list_id_p->type_list.domp[0]->type;
 
 		  /* scan list file, accumulating total for sum/avg */
-		  error = qfile_open_list_scan (list_id_p, &scan_id);
+		  error = qfile_open_list_scan (list_id_p, &scan_id, true);
 		  if (error != NO_ERROR)
 		    {
 		      ASSERT_ERROR ();

@@ -819,7 +819,7 @@ qdata_finalize_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p,
 	  pr_type_p = list_id_p->type_list.domp[0]->type;
 
 	  /* scan list file, accumulating total for sum/avg */
-	  if (qfile_open_list_scan (list_id_p, &scan_id) != NO_ERROR)
+	  if (qfile_open_list_scan (list_id_p, &scan_id, true) != NO_ERROR)
 	    {
 	      qfile_close_list (thread_p, list_id_p);
 	      qfile_destroy_list (thread_p, list_id_p);

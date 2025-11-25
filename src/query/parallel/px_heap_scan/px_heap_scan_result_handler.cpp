@@ -578,7 +578,7 @@ namespace parallel_heap_scan
 
 	    if (unlikely (m_.current_read_spec->list_scan_id_opened == false))
 	      {
-		qfile_open_list_scan (list_id_p, list_scan_id_p);
+		qfile_open_list_scan (list_id_p, list_scan_id_p,true);
 		m_.current_read_spec->list_scan_id_opened = true;
 	      }
 	    if (unlikely (!list_closed && list_scan_id_p->position == S_ON))

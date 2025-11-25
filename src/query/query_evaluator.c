@@ -571,7 +571,7 @@ eval_some_list_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_ID * l
       return V_FALSE;		/* empty set */
     }
 
-  if (qfile_open_list_scan (list_id, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id, &s_id, true) != NO_ERROR)
     {
       return V_ERROR;
     }
@@ -714,7 +714,7 @@ eval_item_card_sort_list (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_I
   PRIM_SET_NULL (&list_val);
   card = 0;
 
-  if (qfile_open_list_scan (list_id, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id, &s_id, true) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -933,7 +933,7 @@ eval_sub_sort_list_to_multi_set (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_i
       return V_TRUE;		/* empty set */
     }
 
-  if (qfile_open_list_scan (list_id, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id, &s_id, true) != NO_ERROR)
     {
       return V_ERROR;
     }
@@ -1109,7 +1109,7 @@ eval_sub_sort_list_to_sort_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_i
       return V_TRUE;		/* empty set */
     }
 
-  if (qfile_open_list_scan (list_id1, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id1, &s_id, true) != NO_ERROR)
     {
       return V_ERROR;
     }

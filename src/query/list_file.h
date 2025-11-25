@@ -217,7 +217,7 @@ extern SCAN_CODE qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_
 						 QFILE_TUPLE_POSITION * ls_tplpos, QFILE_TUPLE_RECORD * tplrec,
 						 int peek);
 extern int qfile_start_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * s_id);
-extern int qfile_open_list_scan (QFILE_LIST_ID * list_id, QFILE_LIST_SCAN_ID * s_id);
+extern int qfile_open_list_scan (QFILE_LIST_ID * list_id, QFILE_LIST_SCAN_ID * s_id, bool is_read_only);
 extern SCAN_CODE qfile_scan_list_next (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * s_id, QFILE_TUPLE_RECORD * tplrec,
 				       int peek);
 extern SCAN_CODE qfile_scan_list_prev (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * s_id, QFILE_TUPLE_RECORD * tplrec,

@@ -6419,7 +6419,7 @@ qdata_get_single_tuple_from_list_id (THREAD_ENTRY * thread_p, qfile_list_id * li
 
   if (tuple_count == 1)
     {
-      error_code = qfile_open_list_scan (list_id_p, &scan_id);
+      error_code = qfile_open_list_scan (list_id_p, &scan_id, true);
       if (error_code != NO_ERROR)
 	{
 	  return error_code;
@@ -7112,7 +7112,7 @@ qdata_convert_table_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABL
    * xd_dbvals_to_set for the contrasting case.
    */
   setobj_put_domain (setobj_p, domain_p);
-  if (qfile_open_list_scan (list_id_p, &scan_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id_p, &scan_id, true) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -7232,7 +7232,7 @@ qdata_evaluate_connect_by_root (THREAD_ENTRY * thread_p, void *xasl_p, regu_vari
 
   list_id_p = xptr->list_id;
 
-  if (qfile_open_list_scan (list_id_p, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id_p, &s_id, false) != NO_ERROR)
     {
       return false;
     }
@@ -7356,7 +7356,7 @@ qdata_evaluate_qprior (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node
 
   list_id_p = xptr->list_id;
 
-  if (qfile_open_list_scan (list_id_p, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id_p, &s_id, false) != NO_ERROR)
     {
       return false;
     }
@@ -7533,7 +7533,7 @@ qdata_evaluate_sys_connect_by_path (THREAD_ENTRY * thread_p, void *xasl_p, regu_
 
   list_id_p = xptr->list_id;
 
-  if (qfile_open_list_scan (list_id_p, &s_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id_p, &s_id, false) != NO_ERROR)
     {
       goto error2;
     }

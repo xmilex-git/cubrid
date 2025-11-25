@@ -1582,7 +1582,7 @@ sort_listfile_execute (cubthread::entry & thread_ref, SORT_PARAM * sort_param)
       SORT_INFO *sort_info_p = (SORT_INFO *) sort_param->get_arg;
 
       /* open splitted temp file for read */
-      if (qfile_open_list_scan (sort_info_p->input_file, sort_info_p->s_id->s_id) != NO_ERROR)
+      if (qfile_open_list_scan (sort_info_p->input_file, sort_info_p->s_id->s_id, true) != NO_ERROR)
 	{
 	  px_status = PX_ERR_FAILED;
 	  goto cleanup;
@@ -4948,7 +4948,7 @@ sort_end_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
       scan_id_p = sort_info_p->s_id->s_id;
 
       /* open origin temp file for read */
-      if (qfile_open_list_scan (sort_info_p->input_file, scan_id_p) != NO_ERROR)
+      if (qfile_open_list_scan (sort_info_p->input_file, scan_id_p, true) != NO_ERROR)
 	{
 	  return ER_FAILED;
 	}

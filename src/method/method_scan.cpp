@@ -151,7 +151,7 @@ namespace cubscan
     scanner::open ()
     {
       int error = NO_ERROR;
-      error = qfile_open_list_scan (m_list_id, &m_scan_id);
+      error = qfile_open_list_scan (m_list_id, &m_scan_id, false);
 
       // connect
       m_method_group->begin ();

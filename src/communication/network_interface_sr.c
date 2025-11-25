@@ -5043,7 +5043,7 @@ stran_can_end_after_query_execution (THREAD_ENTRY * thread_p, int query_flag, QF
       return NO_ERROR;
     }
 
-  if (qfile_open_list_scan (list_id, &scan_id) != NO_ERROR)
+  if (qfile_open_list_scan (list_id, &scan_id, false) != NO_ERROR)
     {
       return ER_FAILED;
     }

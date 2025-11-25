@@ -509,6 +509,7 @@ struct qfile_list_scan_id
   int curr_tplno;		/* current tuple number */
   QFILE_TUPLE_RECORD tplrec;	/* used for overflow tuple peeking */
   QFILE_LIST_ID list_id;	/* list file identifier */
+  bool is_read_only;
 };
 
 /* list file flag; denoting type and/or operation of the list file */

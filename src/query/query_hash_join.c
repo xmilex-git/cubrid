@@ -515,7 +515,7 @@ hjoin_outer_fill_null_values (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manage
       goto error_exit;
     }
 
-  error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id);
+  error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id, true);
   if (error != NO_ERROR)
     {
       goto error_exit;
@@ -640,7 +640,7 @@ hjoin_execute_internal (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HAS
   assert (build != NULL);
   assert (probe != NULL);
 
-  error = qfile_open_list_scan (build->list_id, &build->list_scan_id);
+  error = qfile_open_list_scan (build->list_id, &build->list_scan_id, true);
   if (error != NO_ERROR)
     {
       goto error_exit;
@@ -652,7 +652,7 @@ hjoin_execute_internal (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HAS
       goto error_exit;
     }
 
-  error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id);
+  error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id, true);
   if (error != NO_ERROR)
     {
       goto error_exit;
@@ -1664,7 +1664,7 @@ hjoin_split_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
   is_outer_join = IS_OUTER_JOIN_TYPE (manager->join_type);
 
-  error = qfile_open_list_scan (list_id, &list_scan_id);
+  error = qfile_open_list_scan (list_id, &list_scan_id, true);
   if (error != NO_ERROR)
     {
       goto error_exit;

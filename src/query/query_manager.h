@@ -42,7 +42,10 @@ struct xasl_cache_ent;
 #define qmgr_free_old_page_and_init(thread_p, page_p, tfile_vfidp) \
   do \
     { \
-      qmgr_free_old_page ((thread_p), (page_p), (tfile_vfidp)); \
+      if ((page_p) != NULL) \
+        { \
+          qmgr_free_old_page ((thread_p), (page_p), (tfile_vfidp)); \
+        } \
       (page_p) = NULL; \
     } \
   while (0)
@@ -50,7 +53,10 @@ struct xasl_cache_ent;
 #define qmgr_free_old_page_ro_and_init(thread_p, page_p, tfile_vfidp) \
   do \
     { \
-      qmgr_free_old_page_read_only ((thread_p), (page_p), (tfile_vfidp)); \
+      if ((page_p) != NULL) \
+        { \
+          qmgr_free_old_page_read_only ((thread_p), (page_p), (tfile_vfidp)); \
+        } \
       (page_p) = NULL; \
     } \
   while (0)
