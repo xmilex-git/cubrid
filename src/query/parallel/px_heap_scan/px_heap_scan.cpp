@@ -364,6 +364,19 @@ namespace parallel_heap_scan
   template <RESULT_TYPE result_type>
   manager<result_type>::~manager()
   {
+    if (m_vd != nullptr)
+      {
+	if (m_vd->dbval_cnt > 0)
+	  {
+	    for (int i = 0; i < m_vd->dbval_cnt; i++)
+	      {
+		pr_clear_value (&m_vd->dbval_ptr[i]);
+	      }
+	    db_private_free (m_thread_p, m_vd->dbval_ptr);
+	  }
+	db_private_free (m_thread_p, m_vd);
+	m_vd = nullptr;
+      }
     if (m_input_handler != nullptr)
       {
 	m_input_handler->~input_handler();
@@ -510,6 +523,32 @@ namespace parallel_heap_scan
       }
     m_result_handler_read_initialized = false;
     m_task_started = false;
+
+    /* vd handling for thread-safety */
+    {
+      VAL_DESCR *vd_p = (VAL_DESCR *)db_private_alloc (m_thread_p, sizeof (VAL_DESCR));
+      if (vd_p == nullptr)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 0);
+	  return ER_FAILED;
+	}
+      memcpy (vd_p, m_vd, sizeof (VAL_DESCR));
+      if (m_vd->dbval_cnt > 0)
+	{
+	  vd_p->dbval_ptr = (DB_VALUE *)db_private_alloc (m_thread_p, sizeof (DB_VALUE) * m_vd->dbval_cnt);
+	  if (vd_p->dbval_ptr == nullptr)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 0);
+	      return ER_FAILED;
+	    }
+	  for (int i = 0; i < m_vd->dbval_cnt; i++)
+	    {
+	      pr_clone_value (&m_vd->dbval_ptr[i], &vd_p->dbval_ptr[i]);
+	    }
+	}
+      m_vd = vd_p;
+    }
+
     return NO_ERROR;
   }
 
