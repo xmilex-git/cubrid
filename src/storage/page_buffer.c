@@ -349,13 +349,13 @@ enum
 
 union pgbuf_latch_wait_fcnt
 {
-  uint64_t impl;
   struct
   {
-    uint16_t latch_mode;
+    PGBUF_LATCH_MODE latch_mode;
     bool wait_thread_exists;
     int32_t fcnt;
   } st_impl;
+  uint64_t impl;
 };
 typedef union pgbuf_latch_wait_fcnt PGBUF_LATCH_WAIT_FCNT;
 /* *INDENT-OFF* */
