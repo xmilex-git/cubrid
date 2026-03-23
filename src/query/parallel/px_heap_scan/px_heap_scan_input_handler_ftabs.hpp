@@ -44,14 +44,17 @@ namespace parallel_heap_scan
       SCAN_CODE get_next_vpid_with_fix (THREAD_ENTRY *thread_p, VPID *vpid);
       int initialize (THREAD_ENTRY *thread_p, HFID *hfid, SCAN_ID *scan_id);
       int finalize (THREAD_ENTRY *thread_p);
+      void prefetch_sectors (THREAD_ENTRY *thread_p);
 
     private:
-      thread_local static VPID m_tl_vpid;
       thread_local static HEAP_SCANCACHE *m_tl_scan_cache;
       thread_local static PGBUF_WATCHER m_tl_old_page_watcher;
       thread_local static ftab_set *m_tl_ftab_set;
-      thread_local static size_t m_tl_pgoffset;
-      thread_local static FILE_PARTIAL_SECTOR m_tl_ftab;
+
+      thread_local static std::queue<VPID> *m_tl_non_io_vpid_queue;
+      thread_local static std::unordered_set<VPID> *m_tl_io_vpid_set;
+      thread_local static bool m_tl_prefetch_ended;
+
       ftab_set m_ftab_set;
       std::vector<ftab_set> m_splited_ftab_set;
       std::atomic_int m_splited_ftab_set_idx;

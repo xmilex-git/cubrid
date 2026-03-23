@@ -20,6 +20,7 @@
  * page_buffer.c - Page buffer management module (at the server)
  */
 
+#include <pthread.h>
 #ident "$Id$"
 
 #include "config.h"
@@ -64,6 +65,7 @@
 #include "numeric_opfunc.h"
 #include "dbtype.h"
 #include "scope_exit.hpp"
+#include "bit.h"
 
 #if defined(SERVER_MODE)
 #include "connection_error.h"
@@ -7799,7 +7801,7 @@ pgbuf_lock_page (THREAD_ENTRY * thread_p, PGBUF_BUFFER_HASH * hash_anchor, const
    * thread. cur_thrd_entry->index : thread entry index cur_thrd_entry->tran_index : transaction entry index */
 
   /* vpid is not found in the Buffer Lock Chain */
-  cur_buffer_lock = &(pgbuf_Pool.buf_lock_table[cur_thrd_entry->index]);
+  cur_buffer_lock = (PGBUF_BUFFER_LOCK *) malloc (sizeof (PGBUF_BUFFER_LOCK));
   cur_buffer_lock->vpid = *vpid;
   cur_buffer_lock->next_wait_thrd = NULL;
   cur_buffer_lock->lock_next = hash_anchor->lock_next;
@@ -7891,6 +7893,7 @@ pgbuf_unlock_page (THREAD_ENTRY * thread_p, PGBUF_BUFFER_HASH * hash_anchor, con
 	  cur_thrd_entry->next_wait_thrd = NULL;
 	  pgbuf_wakeup_uncond (cur_thrd_entry);
 	}
+      free_and_init (cur_buffer_lock);
     }
   else
     {
@@ -16940,3 +16943,115 @@ exit_on_error:
 
   return error;
 }
+
+#if SERVER_MODE
+
+int
+pgbuf_prefetch_sector (THREAD_ENTRY * thread_p, UINTPTR sector_p, UINTPTR out_sector_p,
+		       iouring::manager * iouring_manager_p)
+{
+  using namespace iouring;
+  int error_code = NO_ERROR;
+  VPID vpid;
+  FILE_PARTIAL_SECTOR sector = *((FILE_PARTIAL_SECTOR *) sector_p);
+  FILE_PARTIAL_SECTOR *out_sector = (FILE_PARTIAL_SECTOR *) out_sector_p;
+  PGBUF_BUFFER_HASH *hash_anchor;
+  PGBUF_BCB *bufptr;
+  bool buf_lock_acquired;
+  PGBUF_ATOMIC_LATCH_IMPL impl;
+  return_code ret;
+
+  vpid.volid = sector.vsid.volid;
+  vpid.pageid = SECTOR_FIRST_PAGEID (sector.vsid.sectid);
+  out_sector->vsid = sector.vsid;
+  out_sector->page_bitmap = 0;
+
+  for (int i = 0; i < DISK_SECTOR_NPAGES; i++)
+    {
+      if (bit64_is_set (sector.page_bitmap, i))
+	{
+	  vpid.pageid = SECTOR_FIRST_PAGEID (sector.vsid.sectid) + i;
+	  hash_anchor = &pgbuf_Pool.buf_hash_table[PGBUF_HASH_VALUE (&vpid)];
+	  buf_lock_acquired = false;
+	  bufptr = pgbuf_search_hash_chain (thread_p, hash_anchor, &vpid);
+
+	  if (bufptr == NULL)
+	    {
+	      /* set bit in out_sector */
+	      out_sector->page_bitmap = bit64_set (out_sector->page_bitmap, i);
+	      /* should prefetch */
+	      if (pgbuf_lock_page (thread_p, hash_anchor, &vpid) != PGBUF_LOCK_HOLDER)
+		{
+		  /* some other doing misc things.. */
+		  continue;
+		}
+	      bufptr = pgbuf_allocate_bcb (thread_p, &vpid);
+	      bufptr->vpid = vpid;
+	      assert (!pgbuf_bcb_avoid_victim (bufptr));
+	      impl = get_impl (&bufptr->atomic_latch);
+	      impl.impl.latch_mode = PGBUF_NO_LATCH;
+	      impl.impl.waiter_exists = false;
+	      impl.impl.fcnt = 0;
+	      bufptr->atomic_latch.store (impl.raw);
+	      pgbuf_bcb_update_flags (thread_p, bufptr, 0, PGBUF_BCB_ASYNC_FLUSH_REQ);	/* todo: why this?? */
+	      pgbuf_bcb_check_and_reset_fix_and_avoid_dealloc (bufptr, ARG_FILE_LINE);
+	      LSA_SET_NULL (&bufptr->oldest_unflush_lsa);
+	      perfmon_inc_stat (thread_p, PSTAT_PB_NUM_IOREADS);
+
+	      ret = iouring_manager_p->add_read_req ((UINTPTR) bufptr, &bufptr->iopage_buffer->iopage,
+						     fileio_get_volume_descriptor (vpid.volid), IO_PAGESIZE,
+						     (off_t) IO_PAGESIZE * vpid.pageid);
+	      PGBUF_BCB_UNLOCK (bufptr);
+	      if (ret != return_code::SUCCESS)
+		{
+		  /* There was an error in reading the page. Clean the buffer... since it may have been corrupted */
+		  ASSERT_ERROR ();
+
+		  /* bufptr->mutex will be released in following function. */
+		  pgbuf_put_bcb_into_invalid_list (thread_p, bufptr);
+
+		  /*
+		   * Now, caller is not holding any mutex.
+		   * the last argument of pgbuf_unlock_page () is true that
+		   * means hash_mutex must be held before unlocking page.
+		   */
+		  (void) pgbuf_unlock_page (thread_p, hash_anchor, &vpid, true);
+
+		  PGBUF_BCB_CHECK_MUTEX_LEAKS ();
+		}
+	    }
+	  else
+	    {
+	      PGBUF_BCB_UNLOCK (bufptr);
+	    }
+	}
+    }
+
+  return error_code;
+}
+
+int
+pgbuf_get_prefetched_vpid (THREAD_ENTRY * thread_p, VPID * vpid, iouring::manager * iouring_manager_p)
+{
+  using namespace iouring;
+  int error_code = NO_ERROR;
+  return_code ret;
+  UINT64 key;
+  PGBUF_BCB *bufptr;
+  PGBUF_BUFFER_HASH *hash_anchor;
+
+  ret = iouring_manager_p->wait_read_req (&key);
+  if (ret != return_code::SUCCESS)
+    {
+      return ER_FAILED;
+    }
+  bufptr = (PGBUF_BCB *) key;
+  *vpid = bufptr->vpid;
+  hash_anchor = &pgbuf_Pool.buf_hash_table[PGBUF_HASH_VALUE (vpid)];
+  pgbuf_insert_into_hash_chain (thread_p, hash_anchor, bufptr);
+  (void) pgbuf_unlock_page (thread_p, hash_anchor, vpid, false);
+
+  return error_code;
+}
+
+#endif

@@ -29,6 +29,13 @@
 #include "storage_common.h"
 #include "bit.h"
 #include "file_manager.h"
+#include "io_uring.hpp"
+#include <exception>
+#include <unordered_set>
+#include "thread_compat.hpp"
+#include "vpid.hpp"
+#include "vpid_utilities.hpp"
+
 
 #if !defined(NDEBUG)
 #include <sys/syscall.h>
@@ -43,10 +50,50 @@ namespace parallel_heap_scan
   thread_local HEAP_SCANCACHE *input_handler_ftabs::m_tl_scan_cache = NULL;
   thread_local PGBUF_WATCHER input_handler_ftabs::m_tl_old_page_watcher = {0};
   thread_local ftab_set *input_handler_ftabs::m_tl_ftab_set = NULL;
-  thread_local VPID input_handler_ftabs::m_tl_vpid = {-1,0};
-  thread_local size_t input_handler_ftabs::m_tl_pgoffset = 0;
-  thread_local FILE_PARTIAL_SECTOR input_handler_ftabs::m_tl_ftab = {0};
+  thread_local std::queue<VPID> *input_handler_ftabs::m_tl_non_io_vpid_queue = NULL;
+  thread_local std::unordered_set<VPID> *input_handler_ftabs::m_tl_io_vpid_set = NULL;
+  thread_local bool input_handler_ftabs::m_tl_prefetch_ended = false;
+  thread_local iouring::manager *tl_io_uring_manager = NULL;
+  const int IO_URING_PREFETCH_SECTORS = 16; /* 1024 request of page / 64 page per sector */
 
+  void input_handler_ftabs::prefetch_sectors (THREAD_ENTRY *thread_p)
+  {
+    FILE_PARTIAL_SECTOR sec = {{ -1, -1 }, 0};
+    FILE_PARTIAL_SECTOR *sec_p = &sec;
+    FILE_PARTIAL_SECTOR output = {{-1, -1}, 0};
+    FILE_PARTIAL_SECTOR *out_p = &output;
+
+    for (int i = 0; i < IO_URING_PREFETCH_SECTORS; i++)
+      {
+	sec = m_tl_ftab_set->get_prefetch_next();
+	if (VSID_IS_NULL (&sec.vsid))
+	  {
+	    m_tl_prefetch_ended = true;
+	    break;
+	  }
+	pgbuf_prefetch_sector (thread_p, (UINTPTR)sec_p, (UINTPTR)out_p, tl_io_uring_manager);
+	VPID start_vpid = {SECTOR_FIRST_PAGEID (sec.vsid.sectid), sec.vsid.volid};
+	VPID vpid = start_vpid;
+	for (int i = 0; i < DISK_SECTOR_NPAGES; i++)
+	  {
+	    if (bit64_is_set (sec.page_bitmap, i))
+	      {
+		vpid.pageid = start_vpid.pageid + i;
+		if (bit64_is_set (output.page_bitmap, i))
+		  {
+		    /* io prefetched pages */
+		    m_tl_io_vpid_set->insert (vpid);
+		  }
+		else
+		  {
+		    /* on data buffer pages */
+		    m_tl_non_io_vpid_queue->push (vpid);
+		  }
+	      }
+	  }
+      }
+    tl_io_uring_manager->submit();
+  }
 
   int input_handler_ftabs::initialize (THREAD_ENTRY *thread_p, HFID *hfid, SCAN_ID *scan_id)
   {
@@ -61,8 +108,29 @@ namespace parallel_heap_scan
 	return ER_FAILED;
       }
     m_tl_ftab_set = &m_splited_ftab_set[idx];
-    m_tl_vpid = {-1,0};
-    m_tl_pgoffset = 0;
+
+    try
+      {
+	m_tl_non_io_vpid_queue = new std::queue<VPID> ();
+	m_tl_io_vpid_set = new std::unordered_set<VPID> ();
+	m_tl_io_vpid_set->reserve (iouring::IO_URING_DEFAULT_QUEUE_SIZE);
+	tl_io_uring_manager = new iouring::manager ();
+      }
+    catch (...)
+      {
+	er_set (ER_FATAL_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		sizeof (VPID) * iouring::IO_URING_DEFAULT_QUEUE_SIZE);
+	return ER_FAILED;
+      }
+    tl_io_uring_manager->initialize();
+
+    m_tl_prefetch_ended = false;
+    prefetch_sectors (thread_p);
+#if !defined(NDEBUG)
+    size_t io_vpid_size = m_tl_io_vpid_set->size();
+    size_t non_io_vpid_size = m_tl_non_io_vpid_queue->size();
+#endif
+
     return NO_ERROR;
   }
 
@@ -96,83 +164,88 @@ namespace parallel_heap_scan
   SCAN_CODE input_handler_ftabs::get_next_vpid_with_fix (THREAD_ENTRY *thread_p, VPID *vpid)
   {
     SCAN_CODE ret = S_SUCCESS;
-    int error_code = NO_ERROR;
+    VPID curr_vpid;
+    int error_code;
+    size_t io_vpid_size, non_io_vpid_size;
+    bool is_valid_page = false;
 
-    bool found = false;
-    while (!found)
+
+
+    if (m_tl_scan_cache->page_watcher.pgptr != NULL)
       {
-	if (VPID_ISNULL (&m_tl_vpid))
-	  {
-	    m_tl_ftab = m_tl_ftab_set->get_next();
-	    if (VSID_IS_NULL (&m_tl_ftab.vsid))
-	      {
-		if (m_tl_old_page_watcher.pgptr != NULL)
-		  {
-		    pgbuf_ordered_unfix (thread_p, &m_tl_old_page_watcher);
-		  }
-		return S_END;
-	      }
-	    m_tl_pgoffset = 0;
-	    m_tl_vpid.volid = m_tl_ftab.vsid.volid;
-	    m_tl_vpid.pageid = SECTOR_FIRST_PAGEID (m_tl_ftab.vsid.sectid);
-	    if (m_tl_vpid.volid == m_hfid.vfid.volid && m_tl_vpid.pageid == m_hfid.vfid.fileid)
-	      {
-		/* skip heap header page */
-		m_tl_pgoffset++;
-		m_tl_vpid.pageid++;
-	      }
-	  }
-
-	for (; m_tl_pgoffset < DISK_SECTOR_NPAGES; m_tl_pgoffset++, m_tl_vpid.pageid++)
-	  {
-	    if (bit64_is_set (m_tl_ftab.page_bitmap, (int) m_tl_pgoffset))
-	      {
-		found = true;
-
-		if (m_tl_scan_cache->page_watcher.pgptr != NULL)
-		  {
-		    pgbuf_replace_watcher (thread_p, &m_tl_scan_cache->page_watcher, &m_tl_old_page_watcher);
-		  }
-#if defined(NDEBUG)
-		error_code = pgbuf_ordered_fix_release (thread_p, &m_tl_vpid, OLD_PAGE_PREVENT_DEALLOC, PGBUF_LATCH_READ,
-							&m_tl_scan_cache->page_watcher, true);
-#else
-		error_code = pgbuf_ordered_fix_debug (thread_p, &m_tl_vpid, OLD_PAGE_PREVENT_DEALLOC, PGBUF_LATCH_READ,
-						      &m_tl_scan_cache->page_watcher, true, ARG_FILE_LINE_FUNC);
-#endif
-		if (m_tl_old_page_watcher.pgptr != NULL)
-		  {
-		    pgbuf_ordered_unfix (thread_p, &m_tl_old_page_watcher);
-		  }
-
-		if (error_code != NO_ERROR)
-		  {
-		    return S_ERROR;
-		  }
-
-		if (m_tl_scan_cache->page_watcher.pgptr == NULL)
-		  {
-		    found = false;
-		    continue;
-		  }
-
-		*vpid = m_tl_vpid;
-		m_tl_pgoffset++;
-		m_tl_vpid.pageid++;
-		return S_SUCCESS;
-	      }
-	  }
-
-	if (m_tl_pgoffset >= DISK_SECTOR_NPAGES)
-	  {
-	    m_tl_vpid.pageid = -1;
-	  }
+	pgbuf_replace_watcher (thread_p, &m_tl_scan_cache->page_watcher, &m_tl_old_page_watcher);
       }
+
+    while (!is_valid_page)
+      {
+	io_vpid_size = m_tl_io_vpid_set->size();
+	non_io_vpid_size = m_tl_non_io_vpid_queue->size();
+	/* get next vpid */
+	if (non_io_vpid_size > 0)
+	  {
+	    curr_vpid = m_tl_non_io_vpid_queue->front();
+	    m_tl_non_io_vpid_queue->pop();
+	  }
+	else if (io_vpid_size > 0)
+	  {
+	    error_code = pgbuf_get_prefetched_vpid (thread_p, &curr_vpid, tl_io_uring_manager);
+	    if (error_code != NO_ERROR)
+	      {
+		er_set (ER_FATAL_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		return S_ERROR;
+	      }
+	    m_tl_io_vpid_set->erase (curr_vpid);
+	  }
+	else if (m_tl_prefetch_ended)
+	  {
+	    pgbuf_ordered_unfix (thread_p, &m_tl_old_page_watcher);
+	    return S_END;
+	  }
+	else
+	  {
+	    assert_release_error (false);
+	    return S_ERROR;
+	  }
+
+	/* read-ahead */
+	if (!m_tl_prefetch_ended && io_vpid_size < iouring::IO_URING_DEFAULT_QUEUE_SIZE/2)
+	  {
+	    prefetch_sectors (thread_p);
+	  }
+
+#if defined(NDEBUG)
+	error_code = pgbuf_ordered_fix_release (thread_p, &curr_vpid, OLD_PAGE_PREVENT_DEALLOC, PGBUF_LATCH_READ,
+						&m_tl_scan_cache->page_watcher, true);
+#else
+	error_code = pgbuf_ordered_fix_debug (thread_p, &curr_vpid, OLD_PAGE_PREVENT_DEALLOC, PGBUF_LATCH_READ,
+					      &m_tl_scan_cache->page_watcher, true, ARG_FILE_LINE_FUNC);
+#endif
+	if (m_tl_old_page_watcher.pgptr != NULL)
+	  {
+	    pgbuf_ordered_unfix (thread_p, &m_tl_old_page_watcher);
+	  }
+
+	if (error_code != NO_ERROR)
+	  {
+	    return S_ERROR;
+	  }
+
+	is_valid_page = (m_tl_scan_cache->page_watcher.pgptr != NULL);
+	*vpid = curr_vpid;
+      }
+
     return ret;
   }
 
   int input_handler_ftabs::finalize (THREAD_ENTRY *thread_p)
   {
+    while (!m_tl_io_vpid_set->empty())
+      {
+	VPID curr_vpid;
+	pgbuf_get_prefetched_vpid (thread_p, &curr_vpid, tl_io_uring_manager);
+	m_tl_io_vpid_set->erase (curr_vpid);
+      }
+
     if (m_tl_old_page_watcher.pgptr != NULL)
       {
 	pgbuf_ordered_unfix (thread_p, &m_tl_old_page_watcher);
@@ -183,6 +256,12 @@ namespace parallel_heap_scan
       }
     m_tl_scan_cache = NULL;
     m_tl_old_page_watcher.pgptr = NULL;
+    delete tl_io_uring_manager;
+    tl_io_uring_manager = NULL;
+    delete m_tl_non_io_vpid_queue;
+    m_tl_non_io_vpid_queue = NULL;
+    delete m_tl_io_vpid_set;
+    m_tl_io_vpid_set = NULL;
     return NO_ERROR;
   }
 }

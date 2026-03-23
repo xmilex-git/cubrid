@@ -503,12 +503,14 @@ set(STORAGE_SOURCES
   ${STORAGE_DIR}/storage_common.c
   ${STORAGE_DIR}/system_catalog.c
   ${STORAGE_DIR}/tde.c
+  ${STORAGE_DIR}/io_uring.cpp
   )
 set(STORAGE_HEADERS
   ${STORAGE_DIR}/btree_unique.hpp
   ${STORAGE_DIR}/double_write_buffer.hpp
   ${STORAGE_DIR}/record_descriptor.hpp
   ${STORAGE_DIR}/vpid.hpp
+  ${STORAGE_DIR}/io_uring.hpp
 )
 
 set(SESSION_SOURCES
@@ -689,6 +691,9 @@ if(UNIX)
   target_link_libraries(cubrid LINK_PUBLIC ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
   target_link_libraries(cubrid PUBLIC stdc++fs)
   target_link_libraries(cubrid PUBLIC rt)
+  if(LIBURING_LIBRARY)
+    target_link_libraries(cubrid PRIVATE ${LIBURING_LIBRARY})
+  endif()
 
   # Add TBB
   target_include_directories(cubrid PUBLIC ${TBB_INCLUDES})

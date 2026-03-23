@@ -33,11 +33,13 @@ namespace parallel_heap_scan
     private:
       std::vector<FILE_PARTIAL_SECTOR> m_ftab_set;
       size_t iterator;
+      size_t prefetch_iterator;
 
     public:
       ftab_set()
 	:m_ftab_set(),
-	 iterator (0)
+	 iterator (0),
+	 prefetch_iterator (0)
       {}
 
       void convert (FILE_FTAB_COLLECTOR *ftab_collector)
@@ -88,10 +90,22 @@ namespace parallel_heap_scan
 	return ftab;
       }
 
+      FILE_PARTIAL_SECTOR get_prefetch_next()
+      {
+	if (prefetch_iterator >= m_ftab_set.size())
+	  {
+	    return FILE_PARTIAL_SECTOR_INITIALIZER;
+	  }
+	FILE_PARTIAL_SECTOR ftab = m_ftab_set[prefetch_iterator];
+	prefetch_iterator++;
+	return ftab;
+      }
+
       void clear()
       {
 	m_ftab_set.clear();
 	iterator = 0;
+	prefetch_iterator = 0;
       }
   };
 }

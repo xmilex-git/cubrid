@@ -37,6 +37,10 @@
 #include "storage_common.h"
 #include "tde.h"
 
+#if SERVER_MODE
+#include "io_uring.hpp"
+#endif
+
 #define FREE			true	/* Free page buffer */
 #define DONT_FREE		false	/* Don't free the page buffer */
 
@@ -497,5 +501,13 @@ extern void pgbuf_daemons_destroy ();
 #endif /* SERVER_MODE */
 
 extern int pgbuf_start_scan (THREAD_ENTRY * thread_p, int type, DB_VALUE ** arg_values, int arg_cnt, void **ptr);
+
+#if SERVER_MODE
+
+extern int pgbuf_prefetch_sector (THREAD_ENTRY * thread_p, UINTPTR sector_p, UINTPTR out_sector_p,
+				  iouring::manager * iouring_manager_p);
+extern int pgbuf_get_prefetched_vpid (THREAD_ENTRY * thread_p, VPID * vpid, iouring::manager * iouring_manager_p);
+
+#endif
 
 #endif /* _PAGE_BUFFER_H_ */
