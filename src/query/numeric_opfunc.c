@@ -1905,6 +1905,56 @@ numeric_db_value_mul (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
       return NO_ERROR;
     }
 
+  /* C5b: __int128 fast-path for NUMERIC*NUMERIC. Engages only where bit-identical to legacy by construction.
+   * numeric_mul builds the 256-bit unsigned magnitude product (low 128 = temp[16..31]); numeric_get_msb_for_dec
+   * either copies the low 128 (no-truncation prec<=38, OR Case-1 upper-128-zero && low top-bit-clear) or returns
+   * ER_IT_DATA_OVERFLOW. We replicate the eligible "copy low 128" path: full 256-bit product, eligible IFF
+   * hi128==0 && (lo128>>127)==0 (== numeric_is_zero(temp[0..15]) && temp[16]<=0x7F); else fall through to legacy.
+   * prec = (p1+p2+1>38)?38:(p1+p2+1), scale = s1+s2 (matches both no-trunc and Case-1 dest stamps).
+   * Sign applied after via signed negate, matching the post-msb numeric_negate. The 256-bit carry math and the
+   * Case-1 byte equivalence are proven by the C5b standalone harness over random a1/b1!=0 pairs.
+   * Gated on PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL (PRM_FOR_SERVER), default OFF. */
+  if (prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL))
+    {
+      int p1 = DB_VALUE_PRECISION (dbv1);
+      int p2 = DB_VALUE_PRECISION (dbv2);
+
+      if (p1 <= DB_MAX_NUMERIC_PRECISION && p2 <= DB_MAX_NUMERIC_PRECISION)
+	{
+	  __int128 a = numeric_be16_to_int128 (db_locate_numeric (dbv1));
+	  __int128 b = numeric_be16_to_int128 (db_locate_numeric (dbv2));
+	  bool positive = ((a < 0) == (b < 0));	/* sign as numeric_mul: applied to |operands| product */
+	  unsigned __int128 ua = numeric_abs128 (a);
+	  unsigned __int128 ub = numeric_abs128 (b);
+
+	  /* full 256-bit unsigned product (hi128 : lo128) via 64-bit partial products */
+	  UINT64 a0 = (UINT64) ua, a1 = (UINT64) (ua >> 64);
+	  UINT64 b0 = (UINT64) ub, b1 = (UINT64) (ub >> 64);
+	  unsigned __int128 p00 = (unsigned __int128) a0 * b0;
+	  unsigned __int128 p01 = (unsigned __int128) a0 * b1;
+	  unsigned __int128 p10 = (unsigned __int128) a1 * b0;
+	  unsigned __int128 p11 = (unsigned __int128) a1 * b1;
+	  unsigned __int128 mid = p01 + p10;
+	  unsigned __int128 mid_carry = (mid < p01) ? ((unsigned __int128) 1 << 64) : 0;	/* 128-bit add overflow -> hi bit64 */
+	  unsigned __int128 lo128 = p00 + (mid << 64);
+	  unsigned __int128 lo_carry = (lo128 < p00) ? 1 : 0;
+	  unsigned __int128 hi128 = p11 + (mid >> 64) + mid_carry + lo_carry;
+
+	  /* numeric_get_msb_for_dec Case-1 / no-truncation "copy low 128" eligibility */
+	  if (hi128 == 0 && (lo128 >> 127) == 0)
+	    {
+	      __int128 signed_result = positive ? (__int128) lo128 : -(__int128) lo128;
+	      int fprec = (p1 + p2 + 1 > DB_MAX_NUMERIC_PRECISION) ? DB_MAX_NUMERIC_PRECISION : (p1 + p2 + 1);
+	      int fscale = DB_VALUE_SCALE (dbv1) + DB_VALUE_SCALE (dbv2);
+
+	      numeric_int128_to_be16 (signed_result, result);
+	      db_make_numeric (answer, result, fprec, fscale);
+	      return NO_ERROR;
+	    }
+	  /* hi128!=0 OR low top-bit set -> fall through to legacy so result / ER_IT_DATA_OVERFLOW is byte-identical */
+	}
+    }
+
   /* Perform the multiplication */
   numeric_mul (db_locate_numeric (dbv1), db_locate_numeric (dbv2), &positive_ans, temp);
   /* Check for overflow.  Reset precision & scale if necessary */
