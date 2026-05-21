@@ -583,6 +583,16 @@ qdata_aggregate_multiple_values_to_accumulator (cubthread::entry *thread_p, cubx
   return NO_ERROR;
 }
 
+/* True only when SUM consumes the operand value into acc before the call returns (no retained pointer past the tuple). */
+static bool
+agg_is_synchronous_consume (const cubxasl::aggregate_list_node *agg_p)
+{
+  return agg_p->function == PT_SUM
+	 && agg_p->option != Q_DISTINCT
+	 && agg_p->sort_list == NULL
+	 && !agg_p->flag.min_max_optimized;
+}
+
 /*
  * qdata_evaluate_aggregate_list () -
  *   return: NO_ERROR, or ER_code
@@ -662,6 +672,26 @@ qdata_evaluate_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
 	    {
 	      pr_clear_value_vector (db_values);
 	      return ER_FAILED;
+	    }
+
+	  /* C2b: synchronous-consume SUM consumes prog_res into acc here, skipping the per-tuple deep copy.
+	   * Replicates legacy exactly: NULL operand is skipped without touching curr_cnt; non-NULL is added
+	   * then curr_cnt++. Safe because acc consumes before the next tuple resets the producing slot (C2a). */
+	  if (agg_is_synchronous_consume (agg_p))
+	    {
+	      if (DB_IS_NULL (prog_res))
+		{
+		  continue;
+		}
+
+	      error = qdata_aggregate_value_to_accumulator (thread_p, accumulator, &agg_p->accumulator_domain,
+		      agg_p->function, agg_p->domain, prog_res, false);
+	      accumulator->curr_cnt++;
+	      if (error != NO_ERROR)
+		{
+		  return error;
+		}
+	      continue;
 	    }
 
 	  db_values.emplace_back ();
