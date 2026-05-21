@@ -144,4 +144,11 @@ extern int expr_eval_add (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 // predicate path; defined in query_evaluator.c.
 extern db_value *expr_program_eval_value (void *thread_p, EXPR_PROGRAM * prog, void *vd, void *obj_oid, char *tpl);
 
+// flat multi-leaf fetch core (C3): runs EVERY step over one tuple, leaving each step's resval at the
+// peeked (no-copy) value - legacy ownership kept. Unlike expr_program_eval_value it does not single out
+// the last step; the caller pr_share_value's each step->resval into its destination slot (fetch_val_list
+// model). This is the single choke-point C2 later rewrites for slot->tuple direct. Returns NO_ERROR or
+// ER_FAILED. void* mode-agnostic params (THREAD_ENTRY*, VAL_DESCR*, OID*, QFILE_TUPLE).
+extern int expr_program_eval_fetch_share (void *thread_p, EXPR_PROGRAM * prog, void *vd, void *obj_oid, char *tpl);
+
 #endif /* _EXPR_PROGRAM_HPP_ */

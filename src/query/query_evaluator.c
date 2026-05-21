@@ -2289,6 +2289,56 @@ expr_program_eval_value (void *thread_p, EXPR_PROGRAM * prog, void *vd, void *ob
 }
 
 /*
+ * expr_program_eval_fetch_share () - flat multi-leaf fetch core (C3). Runs ALL steps over one tuple,
+ *                                    leaving each step's resval at the peeked value (no copy, legacy
+ *                                    ownership). Caller pr_share_value's each step->resval into its dest.
+ *   return: NO_ERROR, or ER_FAILED on a missing evaluator or step error
+ *   thread_p(in): THREAD_ENTRY*
+ *   prog(in): compiled fetch program (steps + per-clone step_values, ready-bound)
+ *   vd(in): VAL_DESCR*
+ *   obj_oid(in): OID* for leaf fetch
+ *   tpl(in): QFILE_TUPLE for list-file leaf fetch (NULL for heap)
+ *
+ * This is the single seam C2 later rewrites to read slot->tuple directly; today it reuses the legacy
+ * fetch_peek_dbval kernel per leaf so the peeked values are byte-identical to fetch_val_list.
+ */
+int
+expr_program_eval_fetch_share (void *thread_p, EXPR_PROGRAM * prog, void *vd, void *obj_oid, char *tpl)
+{
+  EXPR_EVAL_CTX ctx;
+  int i;
+
+  if (prog == NULL || prog->steps == NULL || prog->steps_len <= 0)
+    {
+      return ER_FAILED;
+    }
+
+  ctx.thread_p = thread_p;
+  ctx.vd = vd;
+  ctx.obj_oid = obj_oid;
+  ctx.tpl = tpl;
+  ctx.program = prog;
+  ctx.et_comp = NULL;
+
+  for (i = 0; i < prog->steps_len; i++)
+    {
+      EXPR_STEP *step = &prog->steps[i];
+
+      if (step->evaluator == NULL)
+	{
+	  return ER_FAILED;
+	}
+
+      if ((*step->evaluator) (step, &ctx) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
+
+  return NO_ERROR;
+}
+
+/*
  * expr_program_eval_pred () - flat predicate execute core (Phase 6a). Runs a compiled EXPR_PROGRAM
  *                             over one tuple and returns the predicate truth value, bit-identical to
  *                             eval_pred_comp0 for the supported q1 shape.

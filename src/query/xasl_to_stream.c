@@ -3567,6 +3567,14 @@ xts_process_buildlist_proc (char *ptr, const BUILDLIST_PROC_NODE * build_list_pr
     }
   ptr = or_pack_int (ptr, offset);
 
+  /* g_scan_hidden_fetch_program: optional flat compiled hidden-column scan fetch; offset 0 (NULL) -> legacy */
+  offset = xts_save_expr_program (build_list_proc->g_scan_hidden_fetch_program);
+  if (offset == ER_FAILED)
+    {
+      return NULL;
+    }
+  ptr = or_pack_int (ptr, offset);
+
   return ptr;
 }
 
@@ -4335,6 +4343,14 @@ xts_process_outptr_list (char *ptr, const OUTPTR_LIST * outptr_list)
   ptr = or_pack_int (ptr, outptr_list->valptr_cnt);
 
   offset = xts_save_regu_variable_list (outptr_list->valptrp);
+  if (offset == ER_FAILED)
+    {
+      return NULL;
+    }
+  ptr = or_pack_int (ptr, offset);
+
+  /* fetch_program: optional flat compiled non-hidden output fetch; offset 0 (NULL) -> legacy on unpack */
+  offset = xts_save_expr_program (outptr_list->fetch_program);
   if (offset == ER_FAILED)
     {
       return NULL;
@@ -6390,7 +6406,8 @@ xts_sizeof_buildlist_proc (const BUILDLIST_PROC_NODE * build_list)
 	   + PTR_SIZE		/* a_outptr_list */
 	   + PTR_SIZE		/* a_outptr_list_ex */
 	   + PTR_SIZE		/* a_outptr_list_interm */
-	   + PTR_SIZE);		/* a_val_list */
+	   + PTR_SIZE		/* a_val_list */
+	   + PTR_SIZE);		/* g_scan_hidden_fetch_program */
   return size;
 }
 
@@ -6678,7 +6695,8 @@ xts_sizeof_outptr_list (const OUTPTR_LIST * outptr_list)
   int size = 0;
 
   size += (OR_INT_SIZE		/* valptr_cnt */
-	   + PTR_SIZE);		/* valptrp */
+	   + PTR_SIZE		/* valptrp */
+	   + PTR_SIZE);		/* fetch_program */
 
   return size;
 }

@@ -857,6 +857,26 @@ stx_ready_bind_xasl_programs (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 	    }
 	}
 
+      /* output fetch program (C3): on the node's outptr_list */
+      if (x->outptr_list != NULL && x->outptr_list->fetch_program != NULL)
+	{
+	  error = stx_ready_bind_expr_program (thread_p, x->outptr_list->fetch_program);
+	  if (error != NO_ERROR)
+	    {
+	      return error;
+	    }
+	}
+
+      /* hidden-column scan fetch program (C3): on the buildlist proc */
+      if (x->type == BUILDLIST_PROC && x->proc.buildlist.g_scan_hidden_fetch_program != NULL)
+	{
+	  error = stx_ready_bind_expr_program (thread_p, x->proc.buildlist.g_scan_hidden_fetch_program);
+	  if (error != NO_ERROR)
+	    {
+	      return error;
+	    }
+	}
+
       /* aggregate operand programs (Phase 6b): buildlist g_agg_list / buildvalue agg_list */
       if (x->type == BUILDLIST_PROC)
 	{
@@ -3212,6 +3232,16 @@ stx_build_buildlist_proc (THREAD_ENTRY * thread_p, char *ptr, BUILDLIST_PROC_NOD
 	}
     }
 
+  /* g_scan_hidden_fetch_program (C3): NULL-init ALWAYS (unpack arena not zeroed - load-bearing); offset 0
+     -> none, version mismatch -> NULL -> legacy (not an error) */
+  stx_build_list_proc->g_scan_hidden_fetch_program = NULL;
+  ptr = or_unpack_int (ptr, &offset);
+  if (offset != 0)
+    {
+      stx_build_list_proc->g_scan_hidden_fetch_program =
+	stx_restore_expr_program (thread_p, &xasl_unpack_info->packed_xasl[offset]);
+    }
+
   return ptr;
 
 error:
@@ -4319,6 +4349,15 @@ stx_build_outptr_list (THREAD_ENTRY * thread_p, char *ptr, OUTPTR_LIST * outptr_
 	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
 	  return NULL;
 	}
+    }
+
+  /* fetch_program (C3): NULL-init ALWAYS (unpack arena not zeroed - load-bearing); offset 0 -> none,
+     version mismatch -> NULL -> legacy (not an error) */
+  outptr_list->fetch_program = NULL;
+  ptr = or_unpack_int (ptr, &offset);
+  if (offset != 0)
+    {
+      outptr_list->fetch_program = stx_restore_expr_program (thread_p, &xasl_unpack_info->packed_xasl[offset]);
     }
 
   return ptr;

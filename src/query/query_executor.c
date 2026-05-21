@@ -4761,28 +4761,65 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
       context->tuple_count++;
 
       /* fetch values */
-      for (regu_var_p = proc->g_scan_regu_list; regu_var_p != NULL; regu_var_p = regu_var_p->next)
+      if (proc->g_scan_hidden_fetch_program != NULL)
 	{
-	  if (REGU_VARIABLE_IS_FLAGED (&regu_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
+	  /* C3.2 flat path: run every hidden-leaf step once (peek, no copy), then share each step's resval
+	   * into the matching hidden regu's vfetch_to in the SAME order the legacy loop iterates. */
+	  EXPR_PROGRAM *prog = proc->g_scan_hidden_fetch_program;
+	  int step_idx = 0;
+
+	  rc = expr_program_eval_fetch_share (thread_p, prog, &xasl_state->vd, NULL, tplrec->tpl);
+	  if (rc != NO_ERROR)
 	    {
-	      if (regu_var_p->value.vfetch_to && pr_is_set_type (DB_VALUE_DOMAIN_TYPE (regu_var_p->value.vfetch_to)))
-		{
-		  pr_clear_value (regu_var_p->value.vfetch_to);
-		}
+	      return ER_FAILED;
+	    }
 
-	      if (regu_var_p->value.vfetch_to && DB_NEED_CLEAR (regu_var_p->value.vfetch_to))
+	  for (regu_var_p = proc->g_scan_regu_list; regu_var_p != NULL; regu_var_p = regu_var_p->next)
+	    {
+	      if (REGU_VARIABLE_IS_FLAGED (&regu_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
 		{
-		  pr_clear_value (regu_var_p->value.vfetch_to);
-		}
+		  if (regu_var_p->value.vfetch_to
+		      && pr_is_set_type (DB_VALUE_DOMAIN_TYPE (regu_var_p->value.vfetch_to)))
+		    {
+		      pr_clear_value (regu_var_p->value.vfetch_to);
+		    }
 
-	      rc = fetch_peek_dbval (thread_p, &regu_var_p->value, &xasl_state->vd, NULL, NULL, tplrec->tpl, &tmp);
-	      if (rc != NO_ERROR)
+		  if (regu_var_p->value.vfetch_to && DB_NEED_CLEAR (regu_var_p->value.vfetch_to))
+		    {
+		      pr_clear_value (regu_var_p->value.vfetch_to);
+		    }
+
+		  pr_share_value (prog->steps[step_idx].resval, regu_var_p->value.vfetch_to);
+		  step_idx++;
+		}
+	    }
+	}
+      else
+	{
+	  for (regu_var_p = proc->g_scan_regu_list; regu_var_p != NULL; regu_var_p = regu_var_p->next)
+	    {
+	      if (REGU_VARIABLE_IS_FLAGED (&regu_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
 		{
-		  pr_clear_value (regu_var_p->value.vfetch_to);
-		  return ER_FAILED;
-		}
+		  if (regu_var_p->value.vfetch_to
+		      && pr_is_set_type (DB_VALUE_DOMAIN_TYPE (regu_var_p->value.vfetch_to)))
+		    {
+		      pr_clear_value (regu_var_p->value.vfetch_to);
+		    }
 
-	      pr_share_value (tmp, regu_var_p->value.vfetch_to);
+		  if (regu_var_p->value.vfetch_to && DB_NEED_CLEAR (regu_var_p->value.vfetch_to))
+		    {
+		      pr_clear_value (regu_var_p->value.vfetch_to);
+		    }
+
+		  rc = fetch_peek_dbval (thread_p, &regu_var_p->value, &xasl_state->vd, NULL, NULL, tplrec->tpl, &tmp);
+		  if (rc != NO_ERROR)
+		    {
+		      pr_clear_value (regu_var_p->value.vfetch_to);
+		      return ER_FAILED;
+		    }
+
+		  pr_share_value (tmp, regu_var_p->value.vfetch_to);
+		}
 	    }
 	}
 

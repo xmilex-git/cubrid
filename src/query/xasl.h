@@ -332,6 +332,7 @@ struct buildlist_proc_node
   REGU_VARIABLE_LIST g_hk_scan_regu_list;	/* group_by key regu list during scan */
   REGU_VARIABLE_LIST g_hk_sort_regu_list;	/* group_by key regu list during sort */
   REGU_VARIABLE_LIST g_scan_regu_list;	/* group_by regulist during scan */
+  EXPR_PROGRAM *g_scan_hidden_fetch_program;	/* flat compiled hidden-column scan fetch (NULL = legacy); C3 */
   ANALYTIC_EVAL_TYPE *a_eval_list;	/* analytic functions evaluation groups */
   REGU_VARIABLE_LIST a_regu_list;	/* analytic regu list */
   REGU_VARIABLE_LIST a_scan_regu_list;	/* analytic regulist during scan */

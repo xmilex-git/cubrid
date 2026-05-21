@@ -586,6 +586,8 @@ static int pt_emit_regu_leaf (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU
 static EXPR_PROGRAM *pt_compile_pred_to_expr_program (PARSER_CONTEXT * parser, PRED_EXPR * pred);
 static int pt_compile_arith_subtree (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu);
 static EXPR_PROGRAM *pt_compile_arith_to_expr_program (PARSER_CONTEXT * parser, REGU_VARIABLE * root);
+static EXPR_PROGRAM *pt_compile_outlist_to_fetch_program (PARSER_CONTEXT * parser, OUTPTR_LIST * outptr_list);
+static EXPR_PROGRAM *pt_compile_hidden_fetch_program (PARSER_CONTEXT * parser, REGU_VARIABLE_LIST g_scan_regu_list);
 
 static VAL_LIST *pt_make_val_list (PARSER_CONTEXT * parser, PT_NODE * attribute_list);
 
@@ -6261,6 +6263,103 @@ pt_compile_arith_to_expr_program (PARSER_CONTEXT * parser, REGU_VARIABLE * root)
     }
 
   /* value program (no IS_QUAL flag): the final step's resval is the operand value */
+  prog->format_version = EXPR_PROGRAM_FORMAT_VERSION;
+  return prog;
+}
+
+/*
+ * pt_compile_outlist_to_fetch_program () - compile an outptr_list to a flat fetch program (C3.1 plumbing)
+ *   return: new EXPR_PROGRAM (one VAR/CONST leaf per NON-HIDDEN regu, in valptr order), or NULL -> legacy
+ *   parser(in):
+ *   outptr_list(in): the output value pointer list
+ *
+ * The PRM gate must be checked before calling. D2 all-or-nothing: any non-leaf regu -> NULL (legacy).
+ * HIDDEN columns are skipped exactly as qdata_generate_tuple_desc_for_valptr_list (query_opfunc.c:643).
+ * C3 only builds/serializes/ready-binds this; it is NOT consumed in execution (reserved for C2).
+ */
+static EXPR_PROGRAM *
+pt_compile_outlist_to_fetch_program (PARSER_CONTEXT * parser, OUTPTR_LIST * outptr_list)
+{
+  EXPR_PROGRAM *prog;
+  REGU_VARIABLE_LIST regu_list;
+
+  if (outptr_list == NULL || outptr_list->valptrp == NULL)
+    {
+      return NULL;
+    }
+
+  regu_alloc (prog);
+  if (prog == NULL)
+    {
+      return NULL;
+    }
+
+  for (regu_list = outptr_list->valptrp; regu_list != NULL; regu_list = regu_list->next)
+    {
+      if (REGU_VARIABLE_IS_FLAGED (&regu_list->value, REGU_VARIABLE_HIDDEN_COLUMN))
+	{
+	  continue;
+	}
+      if (pt_emit_regu_leaf (parser, prog, &regu_list->value) < 0)
+	{
+	  return NULL;
+	}
+    }
+
+  if (prog->steps_len <= 0)
+    {
+      return NULL;
+    }
+
+  /* value/fetch program (no IS_QUAL flag): caller pr_share_value's each step's resval into its dest */
+  prog->format_version = EXPR_PROGRAM_FORMAT_VERSION;
+  return prog;
+}
+
+/*
+ * pt_compile_hidden_fetch_program () - compile the hidden-column scan regus to a flat fetch program (C3.2)
+ *   return: new EXPR_PROGRAM (one VAR/CONST leaf per HIDDEN regu, in list order), or NULL -> legacy
+ *   parser(in):
+ *   g_scan_regu_list(in): buildlist g_scan_regu_list (the scan-time group-by regulist)
+ *
+ * The PRM gate must be checked before calling. Emits in the SAME order the legacy execute loop iterates
+ * (hidden regus only); reuses the exact regu pointers so peeked values are byte-identical. D2
+ * all-or-nothing: any unsupported hidden regu -> NULL (legacy).
+ */
+static EXPR_PROGRAM *
+pt_compile_hidden_fetch_program (PARSER_CONTEXT * parser, REGU_VARIABLE_LIST g_scan_regu_list)
+{
+  EXPR_PROGRAM *prog;
+  REGU_VARIABLE_LIST regu_list;
+
+  if (g_scan_regu_list == NULL)
+    {
+      return NULL;
+    }
+
+  regu_alloc (prog);
+  if (prog == NULL)
+    {
+      return NULL;
+    }
+
+  for (regu_list = g_scan_regu_list; regu_list != NULL; regu_list = regu_list->next)
+    {
+      if (!REGU_VARIABLE_IS_FLAGED (&regu_list->value, REGU_VARIABLE_HIDDEN_COLUMN))
+	{
+	  continue;
+	}
+      if (pt_emit_regu_leaf (parser, prog, &regu_list->value) < 0)
+	{
+	  return NULL;
+	}
+    }
+
+  if (prog->steps_len <= 0)
+    {
+      return NULL;
+    }
+
   prog->format_version = EXPR_PROGRAM_FORMAT_VERSION;
   return prog;
 }
@@ -16811,6 +16910,14 @@ pt_to_buildlist_proc (PARSER_CONTEXT * parser, PT_NODE * select_node, QO_PLAN * 
 	  agg_list = agg_list->next;
 	}
 
+      /* C3.2: flatten the hidden-column scan fetch into a program (NULL = legacy). g_scan_regu_list is now
+       * final (pt_to_aggregate may have appended); compile after the count loop. */
+      if (prm_get_bool_value (PRM_ID_ENABLE_FLAT_EXPR_PROGRAM))
+	{
+	  buildlist->g_scan_hidden_fetch_program =
+	    pt_compile_hidden_fetch_program (parser, buildlist->g_scan_regu_list);
+	}
+
       /* compute hash key size */
       buildlist->g_hkey_size = 0;
       if (buildlist->g_hash_eligible)
@@ -17339,6 +17446,13 @@ pt_to_buildlist_proc (PARSER_CONTEXT * parser, PT_NODE * select_node, QO_PLAN * 
       if (xasl->outptr_list == NULL)
 	{
 	  goto exit_on_error;
+	}
+
+      /* C3.1 (plumbing-only): flatten the non-hidden output fetch into a program (NULL = legacy). Built and
+       * serialized/ready-bound but NOT consumed in execution; reserved for C2 to consume. */
+      if (prm_get_bool_value (PRM_ID_ENABLE_FLAT_EXPR_PROGRAM))
+	{
+	  xasl->outptr_list->fetch_program = pt_compile_outlist_to_fetch_program (parser, xasl->outptr_list);
 	}
     }
 
