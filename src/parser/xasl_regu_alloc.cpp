@@ -148,6 +148,7 @@ regu_init (access_spec_node &spec)
   spec.indexptr = NULL;
   spec.where_key = NULL;
   spec.where_pred = NULL;
+  spec.where_pred_program = NULL;
   spec.where_range = NULL;
   spec.single_fetch = (QPROC_SINGLE_FETCH) false;
   spec.s_dbval = NULL;

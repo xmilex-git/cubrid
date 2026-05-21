@@ -74,6 +74,7 @@
 #include "wintcp.h"
 #endif /* WINDOWS */
 
+#include "expr_program.hpp"
 #include "dbtype.h"
 
 extern void qo_plan_lite_print (QO_PLAN * plan, FILE * f, int howfar);
@@ -577,6 +578,12 @@ static int pt_is_subquery (PT_NODE * node);
 static int *pt_make_identity_offsets (PT_NODE * attr_list);
 
 static void pt_to_pred_terms (PARSER_CONTEXT * parser, PT_NODE * terms, UINTPTR id, PRED_EXPR ** pred);
+
+/* flat EXPR_PROGRAM compile (Phase 3a, predicate slice) */
+static bool pt_regu_subtree_is_const (const REGU_VARIABLE * regu);
+static bool pt_expr_step_reserve (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog);
+static int pt_emit_regu_leaf (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu);
+static EXPR_PROGRAM *pt_compile_pred_to_expr_program (PARSER_CONTEXT * parser, PRED_EXPR * pred);
 
 static VAL_LIST *pt_make_val_list (PARSER_CONTEXT * parser, PT_NODE * attribute_list);
 
@@ -5845,6 +5852,284 @@ pt_to_after_groupby (PARSER_CONTEXT * parser, PT_NODE * group_list, PT_NODE * ro
   return pt_to_sort_list (parser, group_list, pt_get_select_list (parser, root), SORT_LIST_AFTER_GROUPBY);
 }
 
+
+/*
+ * pt_regu_subtree_is_const () - post-order const classification of a regu subtree
+ *   return: true iff the subtree evaluates to a compile-time constant
+ *   regu(in): regu variable to classify
+ *
+ * Mirrors the server-side classification shape in fetch.c (fetch_peek_arith): a leaf is const
+ * only when it is a baked-in literal (TYPE_DBVAL); host-vars (TYPE_CONSTANT) and columns
+ * (TYPE_ATTR_ID family / TYPE_POSITION) are not const. An ARITH node is const iff all of its
+ * non-NULL children are const AND its opcode is not in the non-const set. Anything unrecognized
+ * returns false (conservative).
+ */
+static bool
+pt_regu_subtree_is_const (const REGU_VARIABLE * regu)
+{
+  const ARITH_TYPE *arithptr;
+
+  if (regu == NULL)
+    {
+      return false;
+    }
+
+  switch (regu->type)
+    {
+    case TYPE_DBVAL:
+      /* baked-in literal (already const-folded upstream) */
+      return true;
+
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      arithptr = regu->value.arithptr;
+      if (arithptr == NULL)
+	{
+	  return false;
+	}
+
+      /* a predicate-bearing arith (T_CASE/T_DECODE/T_IF/T_PREDICATE) is never const */
+      if (arithptr->pred != NULL)
+	{
+	  return false;
+	}
+
+      switch (arithptr->opcode)
+	{
+	  /* not-const opcode set (mirrors fetch.c non-const enumeration) */
+	case T_INCR:
+	case T_DECR:
+	case T_RAND:
+	case T_RANDOM:
+	case T_DRAND:
+	case T_DRANDOM:
+	case T_SYS_GUID:
+	case T_CURRENT_VALUE:
+	case T_NEXT_VALUE:
+	case T_SLEEP:
+	case T_ROW_COUNT:
+	case T_LAST_INSERT_ID:
+	case T_EVALUATE_VARIABLE:
+	case T_DEFINE_VARIABLE:
+	case T_EXEC_STATS:
+	case T_TRACE_STATS:
+	case T_CASE:
+	case T_DECODE:
+	case T_IF:
+	case T_PREDICATE:
+	  return false;
+	default:
+	  break;
+	}
+
+      /* const iff every non-NULL operand is const */
+      if (arithptr->leftptr != NULL && !pt_regu_subtree_is_const (arithptr->leftptr))
+	{
+	  return false;
+	}
+      if (arithptr->rightptr != NULL && !pt_regu_subtree_is_const (arithptr->rightptr))
+	{
+	  return false;
+	}
+      if (arithptr->thirdptr != NULL && !pt_regu_subtree_is_const (arithptr->thirdptr))
+	{
+	  return false;
+	}
+      return true;
+
+    default:
+      /* TYPE_CONSTANT (host-var), TYPE_ATTR_ID*, TYPE_POSITION, funcs, etc. -> not const */
+      return false;
+    }
+}
+
+/*
+ * pt_expr_step_reserve () - ensure room for one more step, growing the step array x2
+ *   return: true on success, false on allocation failure
+ *   parser(in):
+ *   prog(in/out): program whose steps array may grow
+ *
+ * Operands are stored as indices (not pointers), so reallocating the array is safe.
+ * Uses the XASL packing-buffer arena (regu_array_alloc) so the program lives as long as the
+ * XASL and is reachable by Phase 4 serialization.
+ */
+static bool
+pt_expr_step_reserve (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog)
+{
+  EXPR_STEP *new_steps = NULL;
+  int new_alloc;
+
+  if (prog->steps_len < prog->steps_alloc)
+    {
+      return true;
+    }
+
+  new_alloc = (prog->steps_alloc == 0) ? 8 : prog->steps_alloc * 2;
+  regu_array_alloc (&new_steps, (size_t) new_alloc);
+  if (new_steps == NULL)
+    {
+      return false;
+    }
+
+  if (prog->steps != NULL && prog->steps_len > 0)
+    {
+      memcpy (new_steps, prog->steps, sizeof (EXPR_STEP) * prog->steps_len);
+    }
+  prog->steps = new_steps;
+  prog->steps_alloc = new_alloc;
+  return true;
+}
+
+/*
+ * pt_emit_regu_leaf () - emit a CONST or VAR leaf step for a regu operand
+ *   return: emitted step index, or -1 on unsupported/failure
+ *   parser(in):
+ *   prog(in/out):
+ *   regu(in): leaf regu (column or const literal); a foldable const subtree is treated as CONST
+ *
+ * Const literals arrive pre-folded as TYPE_DBVAL (q1 RHS DATE_ADD is folded upstream in
+ * pt_fold_const_expr), so no arith/cast step is emitted for them. For a CONST step, resval
+ * carries the compile-time source DB_VALUE pointer until Phase 4 serializes it and Phase 5
+ * rebinds resval to the per-clone slot.
+ */
+static int
+pt_emit_regu_leaf (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu)
+{
+  EXPR_STEP *step;
+  int idx;
+
+  if (regu == NULL)
+    {
+      return -1;
+    }
+
+  if (!pt_expr_step_reserve (parser, prog))
+    {
+      return -1;
+    }
+
+  idx = prog->steps_len;
+  step = &prog->steps[idx];
+  step->arg1_idx = -1;
+  step->arg2_idx = -1;
+
+  switch (regu->type)
+    {
+    case TYPE_ATTR_ID:
+    case TYPE_CLASS_ATTR_ID:
+    case TYPE_SHARED_ATTR_ID:
+    case TYPE_POSITION:
+      /* leaf column; executed by reusing fetch_peek_dbval on the source regu (axis A keeps leaf fetch) */
+      step->opcode = EXPR_OP_VAR;
+      step->d.src = regu;
+      break;
+
+    case TYPE_DBVAL:
+      /* pre-folded literal; same leaf-fetch path (fetch_peek_dbval on a TYPE_DBVAL regu returns the baked value) */
+      step->opcode = EXPR_OP_CONST;
+      step->d.src = regu;
+      break;
+
+    default:
+      /* host-var (TYPE_CONSTANT), live arith, func, etc. are unsupported in this slice */
+      return -1;
+    }
+
+  prog->steps_len = idx + 1;
+  return idx;
+}
+
+/*
+ * pt_compile_pred_to_expr_program () - compile a supported predicate to a flat EXPR_PROGRAM
+ *   return: a new EXPR_PROGRAM on success, or NULL to fall back to legacy (D2 all-or-nothing)
+ *   parser(in):
+ *   pred(in): predicate expression to compile
+ *
+ * Phase 3a slice: SUPPORTED = a single T_EVAL_TERM / T_COMP_EVAL_TERM with rel_op R_LE over
+ * {column VAR, const literal DBVAL}. Any other shape -> NULL (legacy). The PRM gate must be
+ * checked before calling. Does NOT set step->evaluator / program_eval / step_values (Phase 5).
+ */
+static EXPR_PROGRAM *
+pt_compile_pred_to_expr_program (PARSER_CONTEXT * parser, PRED_EXPR * pred)
+{
+  EXPR_PROGRAM *prog;
+  const COMP_EVAL_TERM *et_comp;
+  REGU_VARIABLE *lhs, *rhs;
+  int lhs_idx, rhs_idx, le_idx;
+  EXPR_STEP *step;
+
+  if (pred == NULL)
+    {
+      return NULL;
+    }
+
+  /* only a single comparison eval term is supported in this slice */
+  if (pred->type != T_EVAL_TERM)
+    {
+      return NULL;
+    }
+  if (pred->pe.m_eval_term.et_type != T_COMP_EVAL_TERM)
+    {
+      return NULL;
+    }
+
+  et_comp = &pred->pe.m_eval_term.et.et_comp;
+  if (et_comp->rel_op != R_LE)
+    {
+      return NULL;
+    }
+
+  lhs = et_comp->lhs;
+  rhs = et_comp->rhs;
+  if (lhs == NULL || rhs == NULL)
+    {
+      return NULL;
+    }
+
+  /* supported operands only: column VAR on lhs, const literal on rhs (q1 shape) */
+  if (lhs->type != TYPE_ATTR_ID && lhs->type != TYPE_CLASS_ATTR_ID && lhs->type != TYPE_SHARED_ATTR_ID
+      && lhs->type != TYPE_POSITION)
+    {
+      return NULL;
+    }
+  if (rhs->type != TYPE_DBVAL || !pt_regu_subtree_is_const (rhs))
+    {
+      return NULL;
+    }
+
+  regu_alloc (prog);
+  if (prog == NULL)
+    {
+      return NULL;
+    }
+
+  /* post-order: lhs leaf, rhs leaf, then the comparison referencing both by index */
+  lhs_idx = pt_emit_regu_leaf (parser, prog, lhs);
+  if (lhs_idx < 0)
+    {
+      return NULL;
+    }
+  rhs_idx = pt_emit_regu_leaf (parser, prog, rhs);
+  if (rhs_idx < 0)
+    {
+      return NULL;
+    }
+
+  if (!pt_expr_step_reserve (parser, prog))
+    {
+      return NULL;
+    }
+  le_idx = prog->steps_len;
+  step = &prog->steps[le_idx];
+  step->opcode = EXPR_OP_LE;
+  step->arg1_idx = lhs_idx;
+  step->arg2_idx = rhs_idx;
+  prog->steps_len = le_idx + 1;
+
+  prog->flags |= EXPR_PROGRAM_IS_QUAL;
+  prog->format_version = EXPR_PROGRAM_FORMAT_VERSION;
+  return prog;
+}
 
 /*
  * pt_to_pred_terms () -
@@ -12698,6 +12983,12 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
 	      if (spec->info.spec.flag & PT_SPEC_FLAG_FOR_UPDATE_CLAUSE)
 		{
 		  ACCESS_SPEC_SET_FLAG (access, ACCESS_SPEC_FLAG_FOR_UPDATE);
+		}
+
+	      /* Phase 3a: compile the single-table data filter to a flat program (NULL = legacy) */
+	      if (prm_get_bool_value (PRM_ID_ENABLE_FLAT_EXPR_PROGRAM) && access->where_pred != NULL)
+		{
+		  access->where_pred_program = pt_compile_pred_to_expr_program (parser, access->where_pred);
 		}
 
 	      access->next = access_list;

@@ -63,6 +63,10 @@ typedef struct xasl_node XASL_NODE;
 struct xasl_unpack_info;
 typedef struct xasl_unpack_info XASL_UNPACK_INFO;
 
+// flat compiled expression program (expr_program.hpp); only a pointer is stored here (low coupling)
+struct expr_program;
+typedef struct expr_program EXPR_PROGRAM;
+
 /* XASL HEADER */
 /*
  * XASL_NODE_HEADER has useful information that needs to be passed to client
@@ -1046,6 +1050,7 @@ struct access_spec_node
   BTID btid;
   PRED_EXPR *where_key;		/* key filter expression */
   PRED_EXPR *where_pred;	/* predicate expression */
+  EXPR_PROGRAM *where_pred_program;	/* flat compiled where_pred (NULL = legacy); in-memory only until Phase 4 */
   PRED_EXPR *where_range;	/* used in mvcc UPDATE/DELETE reevaluation */
   HYBRID_NODE s;		/* class/list access specification */
   QPROC_SINGLE_FETCH single_fetch;	/* open scan in single fetch mode */
@@ -1105,6 +1110,7 @@ struct xasl_node
   PRED_EXPR *during_join_pred;	/* during-join predicate */
   PRED_EXPR *after_join_pred;	/* after-join predicate */
   PRED_EXPR *if_pred;		/* if predicate */
+  EXPR_PROGRAM *if_pred_program;	/* flat compiled if_pred (NULL = legacy); in-memory only until Phase 4 */
   PRED_EXPR *instnum_pred;	/* inst_num() predicate */
   DB_VALUE *instnum_val;	/* inst_num() value result */
   DB_VALUE *save_instnum_val;	/* inst_num() value kept after being substi- tuted for ordbynum_val; */
