@@ -799,6 +799,8 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_ENABLE_FLAT_EXPR_PROGRAM "enable_flat_expr_program"
 
+#define PRM_NAME_ENABLE_WIDE_NUMERIC_KERNEL "enable_wide_numeric_kernel"
+
 // #endregion 
 
 /*
@@ -5346,6 +5348,17 @@ SYSPRM_PARAM prm_Def[] = {
   {PRM_ID_ENABLE_FLAT_EXPR_PROGRAM,
    PRM_NAME_ENABLE_FLAT_EXPR_PROGRAM,
    (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_SESSION | PRM_FOR_QRY_STRING),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE, NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL,
+   PRM_NAME_ENABLE_WIDE_NUMERIC_KERNEL,
+   (PRM_FOR_CLIENT | PRM_FOR_SERVER | PRM_USER_CHANGE | PRM_FOR_SESSION | PRM_FOR_QRY_STRING),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},

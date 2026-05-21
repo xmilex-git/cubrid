@@ -157,6 +157,47 @@ static bool numeric_is_longnum_value (DB_C_NUMERIC arg);
 static int numeric_longnum_to_shortnum (DB_C_NUMERIC answer, DB_C_NUMERIC long_arg);
 static void numeric_shortnum_to_longnum (DB_C_NUMERIC long_answer, DB_C_NUMERIC arg);
 static int get_significant_digit (DB_BIGINT i);
+
+/* C5a: __int128 fast-path helpers for prec<=38 equal-scale NUMERIC add.
+ * NUMERIC is a 16-byte big-endian (buf[0]=MSB) two's-complement integer, i.e. a byteswapped __int128.
+ * Target is little-endian x86_64 (OR_LITTLE_ENDIAN), so MSB-first load/store is an explicit byteswap.
+ * Bit-identity vs legacy numeric_add / numeric_overflow proven by construction; see C5a report. */
+static inline __int128
+numeric_be16_to_int128 (const unsigned char *b)
+{
+  /* big-endian 16B -> __int128 via two bswap64 (the naive byte loop cost ~20s/callsite = the C5a regression) */
+  UINT64 hi, lo;
+  memcpy (&hi, b, 8);
+  memcpy (&lo, b + 8, 8);
+  hi = __builtin_bswap64 (hi);
+  lo = __builtin_bswap64 (lo);
+  return (__int128) (((unsigned __int128) hi << 64) | (unsigned __int128) lo);
+}
+
+static inline void
+numeric_int128_to_be16 (__int128 v, unsigned char *out)
+{
+  unsigned __int128 u = (unsigned __int128) v;
+  UINT64 hi = __builtin_bswap64 ((UINT64) (u >> 64));
+  UINT64 lo = __builtin_bswap64 ((UINT64) u);
+  memcpy (out, &hi, 8);
+  memcpy (out + 8, &lo, 8);
+}
+
+/* magnitude exactly as numeric_overflow: negate negatives via 2's-comp wrap (matches numeric_negate) */
+static inline unsigned __int128
+numeric_abs128 (__int128 v)
+{
+  return (v < 0) ? (unsigned __int128) (-(unsigned __int128) v) : (unsigned __int128) v;
+}
+
+/* 10^exp as __int128, derived from the legacy big-endian table so it is byte-identical to numeric_get_pow_of_10 */
+static inline unsigned __int128
+numeric_pow10_int128 (int exp)
+{
+  return (unsigned __int128) numeric_be16_to_int128 (numeric_get_pow_of_10 (exp));
+}
+
 /*
  * numeric_is_negative () -
  *   return: true, false
@@ -1622,6 +1663,44 @@ numeric_db_value_add (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
     {
       db_value_domain_init (answer, DB_TYPE_NUMERIC, DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE);
       return NO_ERROR;
+    }
+
+  /* C5a: __int128 fast-path. Engages only where bit-identical to legacy by construction:
+   * equal scale (numeric_common_prec_scale equal-scale branch does no scaling) and cprec<=38 (fits 128-bit).
+   * Replicates exactly numeric_add (16-byte 2's-comp add == int128 add mod 2^128),
+   * numeric_overflow (abs-magnitude vs 10^cprec), the carry prec-bump, and db_make_numeric stamping.
+   * The cprec==38 overflow case (the only one that errors) falls through to legacy verbatim.
+   * Gated on PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL (PRM_FOR_SERVER) so it engages on server workers. */
+  if (prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL))
+    {
+      int scale1 = DB_VALUE_SCALE (dbv1);
+      int scale2 = DB_VALUE_SCALE (dbv2);
+      int prec1 = DB_VALUE_PRECISION (dbv1);
+      int prec2 = DB_VALUE_PRECISION (dbv2);
+
+      if (scale1 == scale2 && prec1 <= DB_MAX_NUMERIC_PRECISION && prec2 <= DB_MAX_NUMERIC_PRECISION)
+	{
+	  int cprec = MAX (prec1, prec2);
+	  __int128 a = numeric_be16_to_int128 (db_locate_numeric (dbv1));
+	  __int128 b = numeric_be16_to_int128 (db_locate_numeric (dbv2));
+	  __int128 s = a + b;		/* wraps mod 2^128, exactly like numeric_add */
+	  bool overflow = (numeric_abs128 (s) >= numeric_pow10_int128 (cprec));
+
+	  if (!overflow)
+	    {
+	      numeric_int128_to_be16 (s, temp);
+	      db_make_numeric (answer, temp, cprec, scale1);
+	      return NO_ERROR;
+	    }
+	  else if (cprec < DB_MAX_NUMERIC_PRECISION)
+	    {
+	      /* legacy carry path: keep value, bump prec by one (NO error) */
+	      numeric_int128_to_be16 (s, temp);
+	      db_make_numeric (answer, temp, cprec + 1, scale1);
+	      return NO_ERROR;
+	    }
+	  /* cprec == 38 && overflow -> fall through to legacy so ER_IT_DATA_OVERFLOW is byte-identical */
+	}
     }
 
   /* Coerce, if necessary, to make prec & scale match */

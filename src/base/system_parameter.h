@@ -532,8 +532,10 @@ enum param_id
 
   PRM_ID_ENABLE_FLAT_EXPR_PROGRAM,
 
+  PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL,
+
   /* change PRM_LAST_ID when adding new system parameters */
-  PRM_LAST_ID = PRM_ID_ENABLE_FLAT_EXPR_PROGRAM
+  PRM_LAST_ID = PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL
 };
 typedef enum param_id PARAM_ID;
 
