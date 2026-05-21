@@ -4687,6 +4687,10 @@ stx_build_expr_program (THREAD_ENTRY * thread_p, char *ptr, EXPR_PROGRAM * prog)
 	  stx_set_xasl_errcode (thread_p, ER_QPROC_INVALID_XASLNODE);
 	  return NULL;
 	}
+
+      /* is_producing trailing per-step (C2a): lock-step with xts_process_expr_program */
+      ptr = or_unpack_int (ptr, &tmp);
+      step->is_producing = (tmp != 0);
     }
 
 done:

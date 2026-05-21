@@ -85,6 +85,7 @@ struct expr_step
   EXPR_OPCODE opcode;		/* dense opcode - NOT overwritten with a label (PoC1 uses fn-ptr dispatch) */
   int arg1_idx;			/* first operand: index of a prior step in step_values, or -1 */
   int arg2_idx;			/* second operand: index of a prior step in step_values, or -1 */
+  bool is_producing;		/* arith result owns its resval slot (reset/clear per tuple); leaf resval is a peeked alias - never reset (C2a) */
   db_value *resval;		/* where this step writes its result (parent's input slot) */
   EXPR_EVAL_FN evaluator;	/* bound at ready-time; NEVER serialized (P4) */
 

@@ -1862,15 +1862,18 @@ qexec_clear_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog)
 {
   int i;
 
-  if (prog == NULL || prog->step_values == NULL || prog->steps_len <= 0)
+  if (prog == NULL || prog->step_values == NULL || prog->steps == NULL || prog->steps_len <= 0)
     {
       return;
     }
 
   for (i = 0; i < prog->steps_len; i++)
     {
-      /* owned result slot; pr_clear_value on a DB_TYPE_NULL slot is a no-op (no peeked alias here) */
-      pr_clear_value (&prog->step_values[i]);
+      /* clear only OWNED producing slots; leaf step_values stay DB_TYPE_NULL (resval is a peeked alias) (C2a) */
+      if (prog->steps[i].is_producing)
+	{
+	  pr_clear_value (&prog->step_values[i]);
+	}
     }
 }
 

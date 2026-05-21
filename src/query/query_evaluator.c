@@ -2279,6 +2279,12 @@ expr_program_eval_value (void *thread_p, EXPR_PROGRAM * prog, void *vd, void *ob
 	  return NULL;
 	}
 
+      /* clear owned producing slot before dispatch (NULL operand leaves kernel resval stale) - mirrors fetch.c:674 (C2a) */
+      if (step->is_producing)
+	{
+	  pr_clear_value (step->resval);
+	}
+
       if ((*step->evaluator) (step, &ctx) != NO_ERROR)
 	{
 	  return NULL;
@@ -2327,6 +2333,12 @@ expr_program_eval_fetch_share (void *thread_p, EXPR_PROGRAM * prog, void *vd, vo
       if (step->evaluator == NULL)
 	{
 	  return ER_FAILED;
+	}
+
+      /* clear owned producing slot before dispatch (NULL operand leaves kernel resval stale) - mirrors fetch.c:674 (C2a) */
+      if (step->is_producing)
+	{
+	  pr_clear_value (step->resval);
 	}
 
       if ((*step->evaluator) (step, &ctx) != NO_ERROR)

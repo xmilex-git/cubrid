@@ -4477,6 +4477,9 @@ xts_process_expr_program (char *ptr, const EXPR_PROGRAM * prog)
 	  xts_Xasl_errcode = ER_QPROC_INVALID_XASLNODE;
 	  return NULL;
 	}
+
+      /* is_producing trailing per-step (C2a): appended after op-specific fields, lock-step with unpack */
+      ptr = or_pack_int (ptr, step->is_producing ? 1 : 0);
     }
 
   return ptr;
@@ -6794,6 +6797,8 @@ xts_sizeof_expr_program (const EXPR_PROGRAM * prog)
 	  xts_Xasl_errcode = ER_QPROC_INVALID_XASLNODE;
 	  return ER_FAILED;
 	}
+
+      size += OR_INT_SIZE;	/* is_producing (C2a) */
     }
 
   return size;

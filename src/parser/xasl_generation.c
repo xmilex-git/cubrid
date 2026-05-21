@@ -6027,6 +6027,7 @@ pt_emit_regu_leaf (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE *
   step = &prog->steps[idx];
   step->arg1_idx = -1;
   step->arg2_idx = -1;
+  step->is_producing = false;	/* leaf resval is a peeked alias - never owned/reset (C2a) */
 
   switch (regu->type)
     {
@@ -6210,9 +6211,16 @@ pt_compile_arith_subtree (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VAR
   step = &prog->steps[op_idx];
   step->arg1_idx = left_idx;
   step->arg2_idx = right_idx;
+  step->is_producing = true;	/* arith result owns its slot; reset/cleared per tuple (C2a) */
   step->d.arith.operator_type = arithptr->opcode;
   /* result domain == legacy ARITH regu->domain (the kernel domain) for bit-identity (axis A only) */
   step->d.arith.domain = regu->domain;
+
+  /* legacy resolves DB_TYPE_VARIABLE per-tuple (fetch.c:675); an owned pre-typed slot cannot replicate that -> legacy (C2a) */
+  if (step->d.arith.domain == NULL || TP_DOMAIN_TYPE (step->d.arith.domain) == DB_TYPE_VARIABLE)
+    {
+      return -1;
+    }
 
   switch (arithptr->opcode)
     {
