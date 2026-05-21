@@ -2725,6 +2725,16 @@ qdata_add_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, 
       return error;
     }
 
+  /* US-COERCE: skip same-domain coerce no-op for NUMERIC (kernel already produced target prec/scale).
+   * Guard mirrors tp_value_cast_internal's NUMERIC short-circuit (same type+prec+scale); domain_p->next==NULL
+   * so no domain selection can pick a different target. Off by default -> falls through to legacy coerce. */
+  if (numeric_wide_kernel_enabled () && domain_p != NULL && domain_p->next == NULL
+      && TP_DOMAIN_TYPE (domain_p) == DB_TYPE_NUMERIC && DB_VALUE_DOMAIN_TYPE (result_p) == DB_TYPE_NUMERIC
+      && DB_VALUE_PRECISION (result_p) == domain_p->precision && DB_VALUE_SCALE (result_p) == domain_p->scale)
+    {
+      return NO_ERROR;
+    }
+
   return qdata_coerce_result_to_domain (result_p, domain_p);
 }
 
@@ -4790,6 +4800,16 @@ qdata_subtract_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * resul
       return error;
     }
 
+  /* US-COERCE: skip same-domain coerce no-op for NUMERIC (kernel already produced target prec/scale).
+   * Guard mirrors tp_value_cast_internal's NUMERIC short-circuit (same type+prec+scale); domain_p->next==NULL
+   * so no domain selection can pick a different target. Off by default -> falls through to legacy coerce. */
+  if (numeric_wide_kernel_enabled () && domain_p != NULL && domain_p->next == NULL
+      && TP_DOMAIN_TYPE (domain_p) == DB_TYPE_NUMERIC && DB_VALUE_DOMAIN_TYPE (result_p) == DB_TYPE_NUMERIC
+      && DB_VALUE_PRECISION (result_p) == domain_p->precision && DB_VALUE_SCALE (result_p) == domain_p->scale)
+    {
+      return NO_ERROR;
+    }
+
   return qdata_coerce_result_to_domain (result_p, domain_p);
 }
 
@@ -5368,6 +5388,16 @@ qdata_multiply_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * resul
   if (error != NO_ERROR)
     {
       return error;
+    }
+
+  /* US-COERCE: skip same-domain coerce no-op for NUMERIC (kernel already produced target prec/scale).
+   * Guard mirrors tp_value_cast_internal's NUMERIC short-circuit (same type+prec+scale); domain_p->next==NULL
+   * so no domain selection can pick a different target. Off by default -> falls through to legacy coerce. */
+  if (numeric_wide_kernel_enabled () && domain_p != NULL && domain_p->next == NULL
+      && TP_DOMAIN_TYPE (domain_p) == DB_TYPE_NUMERIC && DB_VALUE_DOMAIN_TYPE (result_p) == DB_TYPE_NUMERIC
+      && DB_VALUE_PRECISION (result_p) == domain_p->precision && DB_VALUE_SCALE (result_p) == domain_p->scale)
+    {
+      return NO_ERROR;
     }
 
   return qdata_coerce_result_to_domain (result_p, domain_p);

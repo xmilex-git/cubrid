@@ -46,6 +46,11 @@
 #include <cmath>
 #endif
 
+#if defined (SERVER_MODE)
+#include "thread_manager.hpp"	// for thread_get_thread_entry_info
+#include "query_manager.h"	// for qmgr_get_current_query_id
+#endif // SERVER_MODE
+
 #include "dbtype.h"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -87,6 +92,35 @@ static bool initialized_10 = false;
 static const double numeric_Pow_of_10[10] = {
   1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9
 };
+
+/* US-HOIST: resolve PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL once per query (per worker), self-invalidating by query id.
+ * Server workers carry the parent tran_index, so qmgr_get_current_query_id returns the current query's id and the
+ * cache re-resolves on each new query -- the wide=0/wide=1 toggle still works. Avoids per-call session_get_session_state. */
+/* US-COERCE: non-static so query_opfunc.c shares the same cached gate (declared extern in numeric_opfunc.h). */
+bool
+numeric_wide_kernel_enabled (void)
+{
+#if defined (SERVER_MODE)
+  THREAD_ENTRY *thread_p = thread_get_thread_entry_info ();
+  QUERY_ID qid = (thread_p != NULL) ? qmgr_get_current_query_id (thread_p) : NULL_QUERY_ID;
+
+  /* NULL_QUERY_ID (no active query entry) is never cached -> always re-resolves, never goes stale */
+  if (thread_p != NULL && qid != NULL_QUERY_ID && thread_p->m_wide_numeric_kernel_qid == qid)
+    {
+      return thread_p->m_wide_numeric_kernel;
+    }
+
+  bool enabled = prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL);
+  if (thread_p != NULL && qid != NULL_QUERY_ID)
+    {
+      thread_p->m_wide_numeric_kernel = enabled;
+      thread_p->m_wide_numeric_kernel_qid = qid;
+    }
+  return enabled;
+#else /* SERVER_MODE */
+  return prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL);
+#endif /* SERVER_MODE */
+}
 
 typedef enum fp_value_type
 {
@@ -1671,7 +1705,7 @@ numeric_db_value_add (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
    * numeric_overflow (abs-magnitude vs 10^cprec), the carry prec-bump, and db_make_numeric stamping.
    * The cprec==38 overflow case (the only one that errors) falls through to legacy verbatim.
    * Gated on PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL (PRM_FOR_SERVER) so it engages on server workers. */
-  if (prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL))
+  if (numeric_wide_kernel_enabled ())
     {
       int scale1 = DB_VALUE_SCALE (dbv1);
       int scale2 = DB_VALUE_SCALE (dbv2);
@@ -1914,7 +1948,7 @@ numeric_db_value_mul (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
    * Sign applied after via signed negate, matching the post-msb numeric_negate. The 256-bit carry math and the
    * Case-1 byte equivalence are proven by the C5b standalone harness over random a1/b1!=0 pairs.
    * Gated on PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL (PRM_FOR_SERVER), default OFF. */
-  if (prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL))
+  if (numeric_wide_kernel_enabled ())
     {
       int p1 = DB_VALUE_PRECISION (dbv1);
       int p2 = DB_VALUE_PRECISION (dbv2);

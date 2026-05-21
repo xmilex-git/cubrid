@@ -51,6 +51,9 @@ typedef enum
 extern void numeric_init_power_value_string (void);
 #endif
 
+/* US-COERCE: shared per-query cached gate (defined in numeric_opfunc.c, also used by query_opfunc.c). */
+extern bool numeric_wide_kernel_enabled (void);
+
 /* Arithmetic routines */
 extern int numeric_db_value_add (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * answer);
 extern int numeric_db_value_sub (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * answer);

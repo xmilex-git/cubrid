@@ -141,6 +141,8 @@ namespace cubthread
     , m_uses_px_stats (false)
     , m_is_private_lru_enabled (false)
     , m_holder_anchor (NULL)
+    , m_wide_numeric_kernel (false)
+    , m_wide_numeric_kernel_qid (NULL_QUERY_ID)	/* US-HOIST: start invalid so first numeric call resolves the PRM */
       // private:
     , m_id ()
     , m_error ()
