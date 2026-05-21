@@ -530,8 +530,10 @@ enum param_id
 
   PRM_ID_ENABLE_HEAP_FIXED_SCAN,
 
+  PRM_ID_ENABLE_FLAT_EXPR_PROGRAM,
+
   /* change PRM_LAST_ID when adding new system parameters */
-  PRM_LAST_ID = PRM_ID_ENABLE_HEAP_FIXED_SCAN
+  PRM_LAST_ID = PRM_ID_ENABLE_FLAT_EXPR_PROGRAM
 };
 typedef enum param_id PARAM_ID;
 
