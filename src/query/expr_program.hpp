@@ -51,11 +51,29 @@ typedef enum
 } EXPR_OPCODE;
 
 typedef struct expr_step EXPR_STEP;
+typedef struct expr_program EXPR_PROGRAM;
+
+// EXPR_EVAL_CTX - per-tuple execution context threaded by the flat loop to every step (Phase 6).
+// Carries the legacy fetch/compare inputs so the step evaluators can reuse fetch_peek_dbval and
+// eval_value_rel_cmp verbatim. thread_p/vd/obj_oid/et_comp are void* so this header stays mode- and
+// namespace-agnostic (THREAD_ENTRY is cubthread::entry in server, void in CS); the evaluators cast
+// them back to their real types (THREAD_ENTRY*, VAL_DESCR*, OID*, const COMP_EVAL_TERM*).
+typedef struct expr_eval_ctx EXPR_EVAL_CTX;
+struct expr_eval_ctx
+{
+  void *thread_p;		/* THREAD_ENTRY* */
+  void *vd;			/* VAL_DESCR* */
+  void *obj_oid;		/* OID* of the current object (leaf fetch) */
+  char *tpl;			/* QFILE_TUPLE (list-file leaf fetch); NULL for heap scan */
+  EXPR_PROGRAM *program;	/* operand resolution: read steps[arg_idx].resval */
+  const void *et_comp;		/* const COMP_EVAL_TERM* - comparison/coercion context for LE */
+};
 
 // EXPR_EVAL_FN - per-step evaluator bound at server ready-time.
 // NEVER serialized (P4): the pointer is process-local and is rebound from the opcode registry
-// after the program is unpacked server-side.
-typedef int (*EXPR_EVAL_FN) (EXPR_STEP * step, void *vd, void *tpl);
+// after the program is unpacked server-side. Returns a DB_LOGICAL (int) for predicate steps and
+// NO_ERROR/ER_FAILED for leaf/arith steps; the flat loop interprets per opcode.
+typedef int (*EXPR_EVAL_FN) (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 
 // EXPR_STEP ~= PG ExprEvalStep. Target sizeof <= 64B (1 cacheline).
 // Operand wiring (PG §3 invariant): a child step writes its result directly into the DB_VALUE
@@ -99,7 +117,6 @@ static_assert (sizeof (EXPR_STEP) <= 64, "EXPR_STEP must fit in one cacheline (P
 #define EXPR_PROGRAM_IS_QUAL 0x01	/* program evaluates a predicate (eval_pred path) */
 
 // EXPR_PROGRAM ~= PG ExprState. Contiguous flat program.
-typedef struct expr_program EXPR_PROGRAM;
 struct expr_program
 {
   EXPR_STEP *steps;		/* contiguous flat array */
@@ -110,5 +127,12 @@ struct expr_program
   unsigned short format_version;	/* set during serialization (D8) = EXPR_PROGRAM_FORMAT_VERSION */
   unsigned short flags;		/* EXPR_PROGRAM_* */
 };
+
+// Phase 6 per-opcode evaluators bound into the server registry (stx_Expr_eval_registry). Declared
+// here (mode-agnostic) so the registry TU sees them without pulling the server-only query_evaluator.h.
+// Defined in query_evaluator.c (reuses fetch_peek_dbval / eval_value_rel_cmp). All including TUs are
+// compiled as C++ (CMake LANGUAGE CXX), so default linkage stays consistent with the definitions.
+extern int expr_eval_leaf (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
+extern int expr_eval_le (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 
 #endif /* _EXPR_PROGRAM_HPP_ */

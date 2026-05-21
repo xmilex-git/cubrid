@@ -43,6 +43,7 @@
 #include "dbtype.h"
 #include "thread_entry.hpp"
 #include "xasl_predicate.hpp"
+#include "expr_program.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -2137,6 +2138,146 @@ exit:
   return result;
 }
 
+#if !defined (NDEBUG)
+/* AC4 observability (debug builds only): confirms the flat path actually ran with PRM on; q1's
+   compiled predicate must keep the per-tuple cast counter (in fetch.c) at 0. Thread-local. */
+__thread int expr_flat_pred_eval_count = 0;
+extern __thread int expr_per_tuple_cast_count;	/* defined in fetch.c */
+#endif /* !NDEBUG */
+
+/*
+ * expr_eval_leaf () - flat VAR/CONST leaf: reuse the legacy fetch_peek_dbval kernel and override
+ *                     this step's result slot with the peeked (no-copy) pointer.
+ *   return: NO_ERROR, or ER_FAILED on fetch error
+ *   step(in/out): leaf step (d.src = underlying regu); resval is repointed at the peeked value
+ *   ctx(in): per-tuple execution context
+ */
+int
+expr_eval_leaf (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  DB_VALUE *peeked = NULL;
+
+  if (fetch_peek_dbval ((THREAD_ENTRY *) ctx->thread_p, step->d.src, (val_descr *) ctx->vd, NULL,
+			(OID *) ctx->obj_oid, ctx->tpl, &peeked) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+
+  /* peek pointer (no copy); operand resolution reads steps[arg_idx].resval */
+  step->resval = peeked;
+  return NO_ERROR;
+}
+
+/*
+ * expr_eval_le () - flat R_LE comparison. Replicates eval_pred_comp0 EXACTLY: comp0's NULL rule
+ *                   (null operand && rel_op != R_NULLSAFE_EQ => V_UNKNOWN) then eval_value_rel_cmp
+ *                   with the original et_comp context, for bit-identity (AC3).
+ *   return: DB_LOGICAL (V_TRUE/V_FALSE/V_UNKNOWN/V_ERROR) encoded as int
+ *   step(in): LE step (arg1_idx/arg2_idx index prior steps)
+ *   ctx(in): per-tuple execution context (program for operand resolution, et_comp for compare ctx)
+ */
+int
+expr_eval_le (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  const COMP_EVAL_TERM *et_comp = (const COMP_EVAL_TERM *) ctx->et_comp;
+  DB_VALUE *lhs = ctx->program->steps[step->arg1_idx].resval;
+  DB_VALUE *rhs = ctx->program->steps[step->arg2_idx].resval;
+  REL_OP rel_op = et_comp->rel_op;
+
+  /* comp0 NULL rule (query_evaluator.c:2168/2177) - NOT the general eval_pred rule */
+  if (db_value_is_null (lhs) && rel_op != R_NULLSAFE_EQ)
+    {
+      return V_UNKNOWN;
+    }
+  if (db_value_is_null (rhs) && rel_op != R_NULLSAFE_EQ)
+    {
+      return V_UNKNOWN;
+    }
+
+  /* rel_op is R_LE for any compiled program (compiler gates rel_op != R_LE); use et_comp->rel_op
+     verbatim to match eval_pred_comp0's call exactly (AC3 bit-identity) */
+  return eval_value_rel_cmp ((THREAD_ENTRY *) ctx->thread_p, lhs, rhs, rel_op, et_comp);
+}
+
+/*
+ * expr_program_eval_pred () - flat predicate execute core (Phase 6a). Runs a compiled EXPR_PROGRAM
+ *                             over one tuple and returns the predicate truth value, bit-identical to
+ *                             eval_pred_comp0 for the supported q1 shape.
+ *   return: DB_LOGICAL (V_TRUE/V_FALSE/V_UNKNOWN/V_ERROR)
+ *   thread_p(in):
+ *   prog(in): compiled program (steps + per-clone step_values, ready-bound)
+ *   pred_expr(in): original PRED_EXPR; carries et_comp for the comparison context
+ *   vd(in): value descriptor
+ *   obj_oid(in): object OID for leaf fetch
+ *
+ * Note: caller must guarantee prog != NULL. The final step (IS_QUAL: the LE) is the result. On any
+ * unexpected shape (no et_comp, non-LE final, missing evaluator) returns V_ERROR so the seam can be
+ * audited; the seam itself only enters this path when prog != NULL (PRM on).
+ */
+DB_LOGICAL
+expr_program_eval_pred (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog, const PRED_EXPR * pred_expr, val_descr * vd,
+			OID * obj_oid)
+{
+  EXPR_EVAL_CTX ctx;
+  int i;
+  DB_LOGICAL result = V_TRUE;
+
+  if (prog == NULL || prog->steps == NULL || prog->steps_len <= 0 || pred_expr == NULL
+      || pred_expr->type != T_EVAL_TERM || pred_expr->pe.m_eval_term.et_type != T_COMP_EVAL_TERM)
+    {
+      return V_ERROR;
+    }
+
+#if !defined (NDEBUG)
+  if (expr_flat_pred_eval_count++ == 0)
+    {
+      /* one-shot per thread: proves the flat path was taken with PRM on; cast count must be 0 for q1 */
+      er_log_debug (ARG_FILE_LINE, "expr_program_eval_pred: flat predicate path active (per_tuple_cast=%d)\n",
+		    expr_per_tuple_cast_count);
+    }
+#endif /* !NDEBUG */
+
+  ctx.thread_p = (void *) thread_p;
+  ctx.vd = (void *) vd;
+  ctx.obj_oid = (void *) obj_oid;
+  ctx.tpl = NULL;
+  ctx.program = prog;
+  ctx.et_comp = &pred_expr->pe.m_eval_term.et.et_comp;
+
+  for (i = 0; i < prog->steps_len; i++)
+    {
+      EXPR_STEP *step = &prog->steps[i];
+
+      if (step->evaluator == NULL)
+	{
+	  return V_ERROR;
+	}
+
+      switch (step->opcode)
+	{
+	case EXPR_OP_VAR:
+	case EXPR_OP_CONST:
+	  /* leaf: NO_ERROR/ER_FAILED; resval is repointed at the peeked value in the evaluator */
+	  if ((*step->evaluator) (step, &ctx) != NO_ERROR)
+	    {
+	      return V_ERROR;
+	    }
+	  break;
+
+	case EXPR_OP_LE:
+	  /* comparison: the evaluator returns a DB_LOGICAL directly */
+	  result = (DB_LOGICAL) (*step->evaluator) (step, &ctx);
+	  break;
+
+	default:
+	  /* unsupported opcode in this slice - audit via V_ERROR */
+	  return V_ERROR;
+	}
+    }
+
+  return result;
+}
+
 /*
  * eval_pred_comp0 () -
  *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
@@ -2783,7 +2924,13 @@ eval_data_filter (THREAD_ENTRY * thread_p, OID * oid, RECDES * recdesp, HEAP_SCA
 
   /* evaluate the predicates of the data filter */
   ev_res = V_TRUE;
-  if (scan_predp->pr_eval_fnc && scan_predp->pred_expr)
+  if (scan_predp->pr_program != NULL && scan_predp->pred_expr)
+    {
+      /* flat compiled path (PRM on): bit-identical to pr_eval_fnc for the supported shape (Phase 6) */
+      ev_res =
+	expr_program_eval_pred (thread_p, scan_predp->pr_program, scan_predp->pred_expr, filterp->val_descr, oid);
+    }
+  else if (scan_predp->pr_eval_fnc && scan_predp->pred_expr)
     {
       ev_res = (*scan_predp->pr_eval_fnc) (thread_p, scan_predp->pred_expr, filterp->val_descr, oid);
     }

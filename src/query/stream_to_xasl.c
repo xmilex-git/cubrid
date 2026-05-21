@@ -782,13 +782,13 @@ static const EXPR_EVAL_FN stx_Expr_eval_registry[EXPR_OP_LAST] = {
   /* [EXPR_OP_DONE]  */ NULL,
   /* [EXPR_OP_QUAL]  */ NULL,
   /* [EXPR_OP_JUMP]  */ NULL,
-  /* [EXPR_OP_CONST] */ NULL,	/* Phase 6: fetch_peek_dbval(d.src) -> resval */
-  /* [EXPR_OP_VAR]   */ NULL,	/* Phase 6: fetch_peek_dbval(d.src) -> resval */
-  /* [EXPR_OP_MUL]   */ NULL,	/* Phase 6: qdata_multiply_dbval */
-  /* [EXPR_OP_SUB]   */ NULL,	/* Phase 6: qdata_subtract_dbval */
-  /* [EXPR_OP_ADD]   */ NULL,	/* Phase 6: qdata_add_dbval */
-  /* [EXPR_OP_LE]    */ NULL,	/* Phase 6: eval_value_rel_cmp wrapper (R_LE, comp0 NULL rule) */
-  /* [EXPR_OP_CAST]  */ NULL,	/* Phase 6: tp_value_cast_force wrapper */
+  /* [EXPR_OP_CONST] */ expr_eval_leaf,	/* fetch_peek_dbval(d.src) -> resval (Phase 6a) */
+  /* [EXPR_OP_VAR]   */ expr_eval_leaf,	/* fetch_peek_dbval(d.src) -> resval (Phase 6a) */
+  /* [EXPR_OP_MUL]   */ NULL,	/* Phase 6b: qdata_multiply_dbval */
+  /* [EXPR_OP_SUB]   */ NULL,	/* Phase 6b: qdata_subtract_dbval */
+  /* [EXPR_OP_ADD]   */ NULL,	/* Phase 6b: qdata_add_dbval */
+  /* [EXPR_OP_LE]    */ expr_eval_le,	/* eval_value_rel_cmp (R_LE, comp0 NULL rule) (Phase 6a) */
+  /* [EXPR_OP_CAST]  */ NULL,	/* Phase 6b: tp_value_cast_force wrapper */
   /* [EXPR_OP_FUNC]  */ NULL
 };
 
