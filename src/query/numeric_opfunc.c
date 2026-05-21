@@ -232,6 +232,15 @@ numeric_pow10_int128 (int exp)
   return (unsigned __int128) numeric_be16_to_int128 (numeric_get_pow_of_10 (exp));
 }
 
+/* US-DOMINIT-lite: byte-identical to db_make_numeric when answer's NUMERIC domain already matches (caller-verified); memcpy overwrites codeset via buf[1] union overlap */
+static inline void
+numeric_store_same_domain (DB_VALUE * answer, const unsigned char *bytes)
+{
+  memcpy (answer->data.num.d.buf, bytes, DB_NUMERIC_BUF_SIZE);
+  answer->need_clear = false;
+  answer->domain.general_info.is_null = 0;
+}
+
 /*
  * numeric_is_negative () -
  *   return: true, false
@@ -1723,14 +1732,32 @@ numeric_db_value_add (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
 	  if (!overflow)
 	    {
 	      numeric_int128_to_be16 (s, temp);
-	      db_make_numeric (answer, temp, cprec, scale1);
+	      /* US-DOMINIT-lite: skip redundant db_value_domain_init when answer (e.g. persistent SUM acc) already matches */
+	      if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == cprec
+		  && DB_VALUE_SCALE (answer) == scale1)
+		{
+		  numeric_store_same_domain (answer, temp);
+		}
+	      else
+		{
+		  db_make_numeric (answer, temp, cprec, scale1);
+		}
 	      return NO_ERROR;
 	    }
 	  else if (cprec < DB_MAX_NUMERIC_PRECISION)
 	    {
 	      /* legacy carry path: keep value, bump prec by one (NO error) */
 	      numeric_int128_to_be16 (s, temp);
-	      db_make_numeric (answer, temp, cprec + 1, scale1);
+	      /* US-DOMINIT-lite: skip redundant db_value_domain_init when answer already matches the bumped domain */
+	      if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == cprec + 1
+		  && DB_VALUE_SCALE (answer) == scale1)
+		{
+		  numeric_store_same_domain (answer, temp);
+		}
+	      else
+		{
+		  db_make_numeric (answer, temp, cprec + 1, scale1);
+		}
 	      return NO_ERROR;
 	    }
 	  /* cprec == 38 && overflow -> fall through to legacy so ER_IT_DATA_OVERFLOW is byte-identical */
@@ -1982,7 +2009,16 @@ numeric_db_value_mul (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
 	      int fscale = DB_VALUE_SCALE (dbv1) + DB_VALUE_SCALE (dbv2);
 
 	      numeric_int128_to_be16 (signed_result, result);
-	      db_make_numeric (answer, result, fprec, fscale);
+	      /* US-DOMINIT-lite: skip redundant db_value_domain_init when answer already matches the target domain */
+	      if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == fprec
+		  && DB_VALUE_SCALE (answer) == fscale)
+		{
+		  numeric_store_same_domain (answer, result);
+		}
+	      else
+		{
+		  db_make_numeric (answer, result, fprec, fscale);
+		}
 	      return NO_ERROR;
 	    }
 	  /* hi128!=0 OR low top-bit set -> fall through to legacy so result / ER_IT_DATA_OVERFLOW is byte-identical */
