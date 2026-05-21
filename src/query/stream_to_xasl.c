@@ -43,6 +43,7 @@
 #include "xasl_stream.hpp"
 #include "xasl_unpack_info.hpp"
 #include "pl_signature.hpp"
+#include "expr_program.hpp"
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -63,6 +64,7 @@ static UPDDEL_CLASS_INFO *stx_restore_update_class_info_array (THREAD_ENTRY * th
 static UPDATE_ASSIGNMENT *stx_restore_update_assignment_array (THREAD_ENTRY * thread_p, char *ptr, int num_assigns);
 static ODKU_INFO *stx_restore_odku_info (THREAD_ENTRY * thread_p, char *ptr);
 static PRED_EXPR *stx_restore_pred_expr (THREAD_ENTRY * thread_p, char *ptr);
+static EXPR_PROGRAM *stx_restore_expr_program (THREAD_ENTRY * thread_p, char *ptr);
 static REGU_VARIABLE *stx_restore_regu_variable (THREAD_ENTRY * thread_p, char *ptr);
 static REGU_VARIABLE_LIST stx_restore_regu_variable_list (THREAD_ENTRY * thread_p, char *ptr);
 static REGU_VARLIST_LIST stx_restore_regu_varlist_list (THREAD_ENTRY * thread_p, char *ptr);
@@ -113,6 +115,9 @@ static char *stx_build_cte_proc (THREAD_ENTRY * thread_p, char *tmp, CTE_PROC_NO
 static char *stx_build_outptr_list (THREAD_ENTRY * thread_p, char *tmp, OUTPTR_LIST * ptr);
 static char *stx_build_selupd_list (THREAD_ENTRY * thread_p, char *tmp, SELUPD_LIST * ptr);
 static char *stx_build_pred_expr (THREAD_ENTRY * thread_p, char *tmp, PRED_EXPR * ptr);
+static char *stx_build_expr_program (THREAD_ENTRY * thread_p, char *tmp, EXPR_PROGRAM * ptr);
+static int stx_ready_bind_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog);
+static int stx_ready_bind_xasl_programs (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static char *stx_build_pred (THREAD_ENTRY * thread_p, char *tmp, PRED * ptr);
 static char *stx_build_eval_term (THREAD_ENTRY * thread_p, char *tmp, EVAL_TERM * ptr);
 static char *stx_build_comp_eval_term (THREAD_ENTRY * thread_p, char *tmp, COMP_EVAL_TERM * ptr);
@@ -262,6 +267,16 @@ stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool us
   /* initialize the query in progress flag to FALSE.  Note that this flag is not packed/unpacked.  It is strictly a
    * server side flag. */
   xasl->query_in_progress = false;
+
+  /* ready-bind every EXPR_PROGRAM PER CLONE: step_values are allocated from THIS clone's unpack arena
+   * (active here, before the SERVER_MODE restore below), giving each parallel clone its own slots (P5). */
+  if (stx_ready_bind_xasl_programs (thread_p, xasl) != NO_ERROR)
+    {
+      free_xasl_unpack_info (thread_p, unpack_info_p);
+      *xasl_tree = NULL;
+      *xasl_unpack_info_ptr = NULL;
+      goto end;
+    }
 end:
   stx_free_visited_ptrs (thread_p);
 #if defined(SERVER_MODE)
@@ -757,6 +772,156 @@ stx_restore_pred_expr (THREAD_ENTRY * thread_p, char *ptr)
     }
 
   return pred_expr;
+}
+
+/* Opcode -> evaluator registry (AC5-INV): adding an opcode = 1 entry here + 1 supported-set entry
+   in the compiler. Phase 6 plugs the REAL evaluators (LE -> eval_value_rel_cmp wrapper; arith ->
+   qdata_*_dbval wrappers; VAR/CONST -> fetch_peek_dbval wrapper). For Phase 4/5 every entry is a
+   NULL stub: ready-bind binds NULL evaluators and execute is not wired yet (Phase 6). */
+static const EXPR_EVAL_FN stx_Expr_eval_registry[EXPR_OP_LAST] = {
+  /* [EXPR_OP_DONE]  */ NULL,
+  /* [EXPR_OP_QUAL]  */ NULL,
+  /* [EXPR_OP_JUMP]  */ NULL,
+  /* [EXPR_OP_CONST] */ NULL,	/* Phase 6: fetch_peek_dbval(d.src) -> resval */
+  /* [EXPR_OP_VAR]   */ NULL,	/* Phase 6: fetch_peek_dbval(d.src) -> resval */
+  /* [EXPR_OP_MUL]   */ NULL,	/* Phase 6: qdata_multiply_dbval */
+  /* [EXPR_OP_SUB]   */ NULL,	/* Phase 6: qdata_subtract_dbval */
+  /* [EXPR_OP_ADD]   */ NULL,	/* Phase 6: qdata_add_dbval */
+  /* [EXPR_OP_LE]    */ NULL,	/* Phase 6: eval_value_rel_cmp wrapper (R_LE, comp0 NULL rule) */
+  /* [EXPR_OP_CAST]  */ NULL,	/* Phase 6: tp_value_cast_force wrapper */
+  /* [EXPR_OP_FUNC]  */ NULL
+};
+
+/* per-clone ready-bind for one EXPR_PROGRAM (P5): allocate step_values from the clone unpack arena,
+   db_value_domain_init each slot, bind evaluators from the static registry, point each step's resval
+   at its own slot. Runs once per clone via stx_ready_bind_xasl_programs. */
+static int
+stx_ready_bind_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog)
+{
+  int i;
+
+  if (prog == NULL || prog->steps == NULL || prog->steps_len <= 0)
+    {
+      return NO_ERROR;
+    }
+
+  /* step_values: one DB_VALUE result slot per step, from the per-clone arena (parallel-safe) */
+  prog->step_values = (DB_VALUE *) stx_alloc_struct (thread_p, (int) (sizeof (DB_VALUE) * prog->steps_len));
+  if (prog->step_values == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+
+  for (i = 0; i < prog->steps_len; i++)
+    {
+      EXPR_STEP *step = &prog->steps[i];
+
+      db_value_domain_init (&prog->step_values[i], DB_TYPE_NULL, DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE);
+
+      /* every step writes into its own slot; Phase 6 leaves set resval per-tuple to the peeked value */
+      step->resval = &prog->step_values[i];
+
+      if ((int) step->opcode >= 0 && (int) step->opcode < (int) EXPR_OP_LAST)
+	{
+	  step->evaluator = stx_Expr_eval_registry[step->opcode];
+	}
+      else
+	{
+	  step->evaluator = NULL;
+	}
+    }
+
+  return NO_ERROR;
+}
+
+/* walk one clone's XASL and ready-bind every EXPR_PROGRAM it carries (currently access-spec
+   where_pred_program; if_pred_program reserved). Called once per clone from stx_map_stream_to_xasl. */
+static int
+stx_ready_bind_xasl_programs (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
+{
+  XASL_NODE *x;
+  ACCESS_SPEC_TYPE *spec;
+  int error;
+
+  for (x = xasl; x != NULL; x = x->next)
+    {
+      if (x->if_pred_program != NULL)
+	{
+	  error = stx_ready_bind_expr_program (thread_p, x->if_pred_program);
+	  if (error != NO_ERROR)
+	    {
+	      return error;
+	    }
+	}
+
+      for (spec = x->spec_list; spec != NULL; spec = spec->next)
+	{
+	  if (spec->where_pred_program != NULL)
+	    {
+	      error = stx_ready_bind_expr_program (thread_p, spec->where_pred_program);
+	      if (error != NO_ERROR)
+		{
+		  return error;
+		}
+	    }
+	}
+      for (spec = x->merge_spec; spec != NULL; spec = spec->next)
+	{
+	  if (spec->where_pred_program != NULL)
+	    {
+	      error = stx_ready_bind_expr_program (thread_p, spec->where_pred_program);
+	      if (error != NO_ERROR)
+		{
+		  return error;
+		}
+	    }
+	}
+    }
+
+  return NO_ERROR;
+}
+
+/* restore an EXPR_PROGRAM (P5). format_version mismatch -> NULL (caller falls back to legacy,
+   NOT an error). evaluator/resval/step_values are bound later per-clone (stx_ready_bind_*). */
+static EXPR_PROGRAM *
+stx_restore_expr_program (THREAD_ENTRY * thread_p, char *ptr)
+{
+  EXPR_PROGRAM *prog;
+  int version;
+
+  if (ptr == NULL)
+    {
+      return NULL;
+    }
+
+  /* peek format_version FIRST (D8 strict): mismatch -> legacy, do not allocate/visit */
+  (void) or_unpack_int (ptr, &version);
+  if (version != EXPR_PROGRAM_FORMAT_VERSION)
+    {
+      return NULL;
+    }
+
+  prog = (EXPR_PROGRAM *) stx_get_struct_visited_ptr (thread_p, ptr);
+  if (prog != NULL)
+    {
+      return prog;
+    }
+
+  prog = (EXPR_PROGRAM *) stx_alloc_struct (thread_p, sizeof (*prog));
+  if (prog == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return NULL;
+    }
+
+  if (stx_mark_struct_visited (thread_p, ptr, prog) == ER_FAILED
+      || stx_build_expr_program (thread_p, ptr, prog) == NULL)
+    {
+      return NULL;
+    }
+
+  return prog;
 }
 
 static REGU_VARIABLE *
@@ -4374,6 +4539,105 @@ stx_build_comp_eval_term (THREAD_ENTRY * thread_p, char *ptr, COMP_EVAL_TERM * c
   return ptr;
 }
 
+/* unpack an EXPR_PROGRAM body; SAME order as xts_process_expr_program (positional wire, P5).
+   Leaf d.src reuses stx_restore_regu_variable -> shared (deduped) with the pred copy per clone.
+   evaluator/resval/step_values are left NULL here; bound later by stx_ready_bind_expr_program. */
+static char *
+stx_build_expr_program (THREAD_ENTRY * thread_p, char *ptr, EXPR_PROGRAM * prog)
+{
+  int i, version, offset, tmp;
+  XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
+
+  /* format_version first (already gated in stx_restore_expr_program; re-read to advance ptr) */
+  ptr = or_unpack_int (ptr, &version);
+
+  ptr = or_unpack_int (ptr, &prog->steps_len);
+  prog->steps_alloc = prog->steps_len;
+  prog->step_values = NULL;
+  prog->program_eval = NULL;
+  prog->format_version = (unsigned short) version;
+  prog->flags = 0;
+
+  if (prog->steps_len <= 0)
+    {
+      prog->steps = NULL;
+      goto done;
+    }
+
+  prog->steps = (EXPR_STEP *) stx_alloc_struct (thread_p, (int) (sizeof (EXPR_STEP) * prog->steps_len));
+  if (prog->steps == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return NULL;
+    }
+
+  for (i = 0; i < prog->steps_len; i++)
+    {
+      EXPR_STEP *step = &prog->steps[i];
+
+      memset (step, 0, sizeof (*step));
+
+      ptr = or_unpack_int (ptr, &tmp);
+      step->opcode = (EXPR_OPCODE) tmp;
+      ptr = or_unpack_int (ptr, &step->arg1_idx);
+      ptr = or_unpack_int (ptr, &step->arg2_idx);
+      step->resval = NULL;
+      step->evaluator = NULL;
+
+      switch (step->opcode)
+	{
+	case EXPR_OP_VAR:
+	case EXPR_OP_CONST:
+	  ptr = or_unpack_int (ptr, &offset);
+	  if (offset == 0)
+	    {
+	      step->d.src = NULL;
+	    }
+	  else
+	    {
+	      step->d.src = stx_restore_regu_variable (thread_p, &xasl_unpack_info->packed_xasl[offset]);
+	      if (step->d.src == NULL)
+		{
+		  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+		  return NULL;
+		}
+	    }
+	  break;
+
+	case EXPR_OP_CAST:
+	  ptr = or_unpack_domain (ptr, &step->d.cast.domain, NULL);
+	  break;
+
+	case EXPR_OP_MUL:
+	case EXPR_OP_SUB:
+	case EXPR_OP_ADD:
+	  ptr = or_unpack_int (ptr, &step->d.arith.operator_type);
+	  break;
+
+	case EXPR_OP_LE:
+	  break;		/* no op-specific payload */
+
+	default:
+	  stx_set_xasl_errcode (thread_p, ER_QPROC_INVALID_XASLNODE);
+	  return NULL;
+	}
+    }
+
+done:
+#if !defined (NDEBUG)
+  /* roundtrip validation: confirms serialize->deserialize intact without execute (P4/P5). REMOVE w/ Phase 6. */
+  er_log_debug (ARG_FILE_LINE, "stx_restore_expr_program: format_version=%d steps_len=%d\n", version,
+		prog->steps_len);
+  for (i = 0; i < prog->steps_len; i++)
+    {
+      er_log_debug (ARG_FILE_LINE, "  step[%d] opcode=%d arg1=%d arg2=%d\n", i, (int) prog->steps[i].opcode,
+		    prog->steps[i].arg1_idx, prog->steps[i].arg2_idx);
+    }
+#endif /* !NDEBUG */
+
+  return ptr;
+}
+
 static char *
 stx_build_alsm_eval_term (THREAD_ENTRY * thread_p, char *ptr, ALSM_EVAL_TERM * alsm_eval_term)
 {
@@ -4593,6 +4857,17 @@ stx_build_access_spec_type (THREAD_ENTRY * thread_p, char *ptr, ACCESS_SPEC_TYPE
 	{
 	  goto error;
 	}
+    }
+
+  /* where_pred_program (P5): offset 0 -> none; NULL restore (version mismatch) -> legacy, not an error */
+  ptr = or_unpack_int (ptr, &offset);
+  if (offset == 0)
+    {
+      access_spec->where_pred_program = NULL;
+    }
+  else
+    {
+      access_spec->where_pred_program = stx_restore_expr_program (thread_p, &xasl_unpack_info->packed_xasl[offset]);
     }
 
   ptr = or_unpack_int (ptr, &offset);

@@ -83,6 +83,7 @@
 #include "subquery_cache.h"
 #include "query_hash_join.h"
 #include "memoize.hpp"
+#include "expr_program.hpp"
 
 #if SERVER_MODE && !WINDOWS
 #include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
@@ -429,6 +430,7 @@ static void qexec_clear_sort_list (XASL_NODE * xasl_p, SORT_LIST * list, bool is
 static void qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final);
 static int qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, bool is_final,
 			     bool for_parallel_aptr);
+static void qexec_clear_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog);
 static int qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCESS_SPEC_TYPE * list,
 					 bool is_final, bool except_trace, bool for_parallel_aptr);
 static int qexec_clear_analytic_function_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ANALYTIC_EVAL_TYPE * list,
@@ -1848,6 +1850,31 @@ qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, b
 }
 
 /*
+ * qexec_clear_expr_program () - clear per-clone EXPR_PROGRAM result slots (P5)
+ *   prog(in): flat compiled program, or NULL
+ *
+ * Clears only the OWNED step_values slots (allocated in the clone unpack arena, freed with it).
+ * Leaf regus (d.src) are shared with the PRED_EXPR copy and cleared by qexec_clear_pred; a leaf
+ * step's resval is a per-tuple alias of a peeked value we do NOT own, so it is never cleared here.
+ */
+static void
+qexec_clear_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog)
+{
+  int i;
+
+  if (prog == NULL || prog->step_values == NULL || prog->steps_len <= 0)
+    {
+      return;
+    }
+
+  for (i = 0; i < prog->steps_len; i++)
+    {
+      /* owned result slot; pr_clear_value on a DB_TYPE_NULL slot is a no-op (no peeked alias here) */
+      pr_clear_value (&prog->step_values[i]);
+    }
+}
+
+/*
  * qexec_clear_access_spec_list () - clear the db_values in the access spec list
  *   return:
  *   xasl_p(in) :
@@ -1917,6 +1944,7 @@ qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCES
 	}
 
       pg_cnt += qexec_clear_pred (thread_p, xasl_p, p->where_pred, is_final, for_parallel_aptr);
+      qexec_clear_expr_program (thread_p, p->where_pred_program);
       pg_cnt += qexec_clear_pred (thread_p, xasl_p, p->where_key, is_final, for_parallel_aptr);
       pg_cnt += qexec_clear_pred (thread_p, xasl_p, p->where_range, is_final, for_parallel_aptr);
       pr_clear_value (p->s_id.join_dbval);
@@ -2752,6 +2780,7 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->during_join_pred, is_final, false);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->after_join_pred, is_final, false);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->if_pred, is_final, false);
+      qexec_clear_expr_program (thread_p, xasl->if_pred_program);	/* defensive; NULL for q1 */
       if (xasl->instnum_val)
 	{
 	  pr_clear_value (xasl->instnum_val);
@@ -2977,6 +3006,7 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->during_join_pred, is_final, true);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->after_join_pred, is_final, true);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->if_pred, is_final, true);
+      qexec_clear_expr_program (thread_p, xasl->if_pred_program);	/* defensive; NULL for q1 */
       if (xasl->instnum_val)
 	{
 	  pr_clear_value (xasl->instnum_val);
