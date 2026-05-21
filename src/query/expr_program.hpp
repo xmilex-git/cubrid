@@ -53,6 +53,15 @@ typedef enum
 typedef struct expr_step EXPR_STEP;
 typedef struct expr_program EXPR_PROGRAM;
 
+// ARITH kernel selection (C4a): compile-resolved so the per-tuple evaluator skips cast-detect +
+// DB_VALUE_DOMAIN_TYPE re-dispatch + coerce. APPEND-ONLY: values frozen for stream compatibility.
+typedef enum
+{
+  ARITH_KERNEL_GENERIC = 0,	/* legacy qdata_*_dbval (cast-detect, re-dispatch, coerce) */
+  ARITH_KERNEL_NUMERIC_TYPED = 1	/* direct numeric_db_value_* (NUMERIC,NUMERIC -> NUMERIC) */
+  /* 2 reserved for C4b int128 */
+} ARITH_KERNEL_TAG;
+
 // EXPR_EVAL_CTX - per-tuple execution context threaded by the flat loop to every step (Phase 6).
 // Carries the legacy fetch/compare inputs so the step evaluators can reuse fetch_peek_dbval and
 // eval_value_rel_cmp verbatim. thread_p/vd/obj_oid/et_comp are void* so this header stays mode- and
@@ -102,6 +111,7 @@ struct expr_step
     struct
     {
       int operator_type;	/* CUBRID T_* operator for a generic arith evaluator */
+      int kernel_tag;		/* ARITH_KERNEL_TAG: compile-resolved evaluator selection (C4a); fits existing pad, no sizeof growth */
       tp_domain *domain;	/* result domain (== legacy ARITH regu->domain); re-resolved server-side, domain-id serialized (P4) */
     } arith;
   } d;				/* op-specific inline data, kept minimal (<= ~40B) */
@@ -113,7 +123,8 @@ static_assert (sizeof (EXPR_STEP) <= 64, "EXPR_STEP must fit in one cacheline (P
 #endif /* __cplusplus */
 
 // strict version (D8): bumped whenever the stream encoding of EXPR_PROGRAM changes; mismatch -> legacy.
-#define EXPR_PROGRAM_FORMAT_VERSION 1
+// v2 (C4a): per-arith-step kernel_tag added inside the MUL/ADD/SUB wire (append-only); v1<->v2 skew -> legacy.
+#define EXPR_PROGRAM_FORMAT_VERSION 2
 
 /* EXPR_PROGRAM flags - #define (not const int) to keep C linkage clean if a C TU ever includes this */
 #define EXPR_PROGRAM_IS_QUAL 0x01	/* program evaluates a predicate (eval_pred path) */
@@ -139,6 +150,10 @@ extern int expr_eval_le (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 extern int expr_eval_mul (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 extern int expr_eval_sub (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 extern int expr_eval_add (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
+
+// C4a typed arith: compile-resolved NUMERIC,NUMERIC -> numeric_db_value_* direct (no cast-detect/coerce);
+// bound only when kernel_tag == ARITH_KERNEL_NUMERIC_TYPED. Dispatches mul/add/sub on operator_type.
+extern int expr_eval_arith_numeric (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 
 // flat value-program execute core (Phase 6b). Runs every step and returns the final step's resval, or
 // NULL on error. void* mode-agnostic params (THREAD_ENTRY*, VAL_DESCR*, OID*, QFILE_TUPLE) like the

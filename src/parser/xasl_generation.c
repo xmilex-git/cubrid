@@ -583,6 +583,7 @@ static void pt_to_pred_terms (PARSER_CONTEXT * parser, PT_NODE * terms, UINTPTR 
 static bool pt_regu_subtree_is_const (const REGU_VARIABLE * regu);
 static bool pt_expr_step_reserve (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog);
 static int pt_emit_regu_leaf (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu);
+static TP_DOMAIN *pt_expr_step_result_domain (const EXPR_PROGRAM * prog, int idx);
 static EXPR_PROGRAM *pt_compile_pred_to_expr_program (PARSER_CONTEXT * parser, PRED_EXPR * pred);
 static int pt_compile_arith_subtree (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu);
 static EXPR_PROGRAM *pt_compile_arith_to_expr_program (PARSER_CONTEXT * parser, REGU_VARIABLE * root);
@@ -6056,6 +6057,41 @@ pt_emit_regu_leaf (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE *
 }
 
 /*
+ * pt_expr_step_result_domain () - result domain of an already-emitted step (C4a kernel-tag resolve)
+ *   return: the step's result TP_DOMAIN, or NULL if unresolvable
+ *   prog(in): program under construction
+ *   idx(in): index of a prior step
+ *
+ * arith step -> d.arith.domain (the kernel result domain); leaf VAR/CONST -> d.src->domain.
+ */
+static TP_DOMAIN *
+pt_expr_step_result_domain (const EXPR_PROGRAM * prog, int idx)
+{
+  const EXPR_STEP *step;
+
+  if (prog == NULL || idx < 0 || idx >= prog->steps_len)
+    {
+      return NULL;
+    }
+
+  step = &prog->steps[idx];
+  switch (step->opcode)
+    {
+    case EXPR_OP_MUL:
+    case EXPR_OP_SUB:
+    case EXPR_OP_ADD:
+      return step->d.arith.domain;
+
+    case EXPR_OP_VAR:
+    case EXPR_OP_CONST:
+      return (step->d.src != NULL) ? step->d.src->domain : NULL;
+
+    default:
+      return NULL;
+    }
+}
+
+/*
  * pt_compile_pred_to_expr_program () - compile a supported predicate to a flat EXPR_PROGRAM
  *   return: a new EXPR_PROGRAM on success, or NULL to fall back to legacy (D2 all-or-nothing)
  *   parser(in):
@@ -6140,6 +6176,7 @@ pt_compile_pred_to_expr_program (PARSER_CONTEXT * parser, PRED_EXPR * pred)
   step->opcode = EXPR_OP_LE;
   step->arg1_idx = lhs_idx;
   step->arg2_idx = rhs_idx;
+  step->d.arith.kernel_tag = ARITH_KERNEL_GENERIC;	/* LE union unused; keep tag never-garbage (C4a) */
   prog->steps_len = le_idx + 1;
 
   prog->flags |= EXPR_PROGRAM_IS_QUAL;
@@ -6215,11 +6252,32 @@ pt_compile_arith_subtree (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VAR
   step->d.arith.operator_type = arithptr->opcode;
   /* result domain == legacy ARITH regu->domain (the kernel domain) for bit-identity (axis A only) */
   step->d.arith.domain = regu->domain;
+  step->d.arith.kernel_tag = ARITH_KERNEL_GENERIC;	/* default; upgraded below only for proven-safe NUMERIC,NUMERIC */
 
   /* legacy resolves DB_TYPE_VARIABLE per-tuple (fetch.c:675); an owned pre-typed slot cannot replicate that -> legacy (C2a) */
   if (step->d.arith.domain == NULL || TP_DOMAIN_TYPE (step->d.arith.domain) == DB_TYPE_VARIABLE)
     {
       return -1;
+    }
+
+  /* C4a typed kernel (PROVEN-SAFE SUBSET ONLY): MUL with both operands NUMERIC and no precision overflow.
+     Bit-identity requires the kernel result (prec,scale) == regu->domain so qdata_coerce is a no-op:
+       - MUL no-overflow: kernel = (p1+p2+1, s1+s2), type_checking PT_TIMES = (p1+p2+1, s1+s2) -> MATCH.
+       - MUL overflow (p1+p2+1 > 38): kernel numeric_get_msb_for_dec clamp != type_checking clamp -> EXCLUDE.
+       - ADD/SUB: kernel = numeric_common_prec_scale (common prec), type_checking = MAX(scale)+MAX(int)+1
+                  (extra carry digit) -> coerce re-stamps prec, NOT a no-op -> EXCLUDE (stay GENERIC).
+     Any excluded shape keeps ARITH_KERNEL_GENERIC (qdata_*_dbval + coerce), legacy bit-identical. */
+  if (arithptr->opcode == T_MUL && TP_DOMAIN_TYPE (step->d.arith.domain) == DB_TYPE_NUMERIC)
+    {
+      TP_DOMAIN *left_dom = pt_expr_step_result_domain (prog, left_idx);
+      TP_DOMAIN *right_dom = pt_expr_step_result_domain (prog, right_idx);
+
+      if (left_dom != NULL && right_dom != NULL
+	  && TP_DOMAIN_TYPE (left_dom) == DB_TYPE_NUMERIC && TP_DOMAIN_TYPE (right_dom) == DB_TYPE_NUMERIC
+	  && (left_dom->precision + right_dom->precision + 1) <= DB_MAX_NUMERIC_PRECISION)
+	{
+	  step->d.arith.kernel_tag = ARITH_KERNEL_NUMERIC_TYPED;
+	}
     }
 
   switch (arithptr->opcode)

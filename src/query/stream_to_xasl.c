@@ -822,7 +822,13 @@ stx_ready_bind_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog)
       /* every step writes into its own slot; Phase 6 leaves set resval per-tuple to the peeked value */
       step->resval = &prog->step_values[i];
 
-      if ((int) step->opcode >= 0 && (int) step->opcode < (int) EXPR_OP_LAST)
+      if ((step->opcode == EXPR_OP_MUL || step->opcode == EXPR_OP_SUB || step->opcode == EXPR_OP_ADD)
+	  && step->d.arith.kernel_tag == ARITH_KERNEL_NUMERIC_TYPED)
+	{
+	  /* C4a: compile-resolved typed NUMERIC kernel (numeric_db_value_* direct, no coerce) */
+	  step->evaluator = expr_eval_arith_numeric;
+	}
+      else if ((int) step->opcode >= 0 && (int) step->opcode < (int) EXPR_OP_LAST)
 	{
 	  step->evaluator = stx_Expr_eval_registry[step->opcode];
 	}
@@ -4678,6 +4684,8 @@ stx_build_expr_program (THREAD_ENTRY * thread_p, char *ptr, EXPR_PROGRAM * prog)
 	case EXPR_OP_ADD:
 	  ptr = or_unpack_int (ptr, &step->d.arith.operator_type);
 	  ptr = or_unpack_domain (ptr, &step->d.arith.domain, NULL);
+	  /* kernel_tag inside the arith case (C4a v2), after domain; lock-step with pack/sizeof */
+	  ptr = or_unpack_int (ptr, &step->d.arith.kernel_tag);
 	  break;
 
 	case EXPR_OP_LE:

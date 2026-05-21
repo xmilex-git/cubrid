@@ -4467,6 +4467,8 @@ xts_process_expr_program (char *ptr, const EXPR_PROGRAM * prog)
 	  /* arith operator_type + result domain (re-resolved server-side, like the cast branch) */
 	  ptr = or_pack_int (ptr, step->d.arith.operator_type);
 	  ptr = OR_PACK_DOMAIN_OBJECT_TO_OID (ptr, step->d.arith.domain, 0, 0);
+	  /* kernel_tag inside the arith case (C4a v2), after domain; lock-step with unpack/sizeof */
+	  ptr = or_pack_int (ptr, step->d.arith.kernel_tag);
 	  break;
 
 	case EXPR_OP_LE:
@@ -6788,6 +6790,7 @@ xts_sizeof_expr_program (const EXPR_PROGRAM * prog)
 	case EXPR_OP_ADD:
 	  size += OR_INT_SIZE;	/* d.arith.operator_type */
 	  size += or_packed_domain_size (step->d.arith.domain, 0);	/* d.arith.domain */
+	  size += OR_INT_SIZE;	/* d.arith.kernel_tag (C4a v2) */
 	  break;
 
 	case EXPR_OP_LE:

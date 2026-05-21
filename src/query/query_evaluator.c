@@ -40,6 +40,7 @@
 #include "dbtype.h"
 #include "query_executor.h"
 #include "query_opfunc.h"
+#include "numeric_opfunc.h"
 #include "dbtype.h"
 #include "thread_entry.hpp"
 #include "xasl_predicate.hpp"
@@ -2237,6 +2238,46 @@ expr_eval_add (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
   DB_VALUE *r = ctx->program->steps[step->arg2_idx].resval;
 
   return qdata_add_dbval (l, r, step->resval, step->d.arith.domain);
+}
+
+/*
+ * expr_eval_arith_numeric () - C4a typed NUMERIC,NUMERIC arith: numeric_db_value_*(l, r, resval) direct,
+ *                              skipping the per-tuple cast-detect + DB_VALUE_DOMAIN_TYPE re-dispatch +
+ *                              qdata_coerce_result_to_domain (proven same-domain no-op for q1).
+ *   return: NO_ERROR, or an error code from the kernel
+ *   step(in/out): arith step (operator_type picks the kernel; resval = result slot)
+ *   ctx(in): per-tuple execution context (program for operand resolution)
+ *
+ * Bound only when kernel_tag == ARITH_KERNEL_NUMERIC_TYPED. The compiler currently tags ONLY T_MUL with
+ * both operands NUMERIC and p1+p2+1 <= 38 (the proven coerce-no-op subset; ADD/SUB stay GENERIC because
+ * their kernel result prec != type_checking's +1-carry domain). ADD/SUB arms kept for forward use (C4b).
+ * NULL operand: MATCH legacy qdata_*_dbval EXACTLY (return NO_ERROR, resval left untouched = C2a
+ * pre-cleared NULL). NOT the kernel's NULL branch (which db_value_domain_init's NUMERIC into resval).
+ */
+int
+expr_eval_arith_numeric (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  DB_VALUE *l = ctx->program->steps[step->arg1_idx].resval;
+  DB_VALUE *r = ctx->program->steps[step->arg2_idx].resval;
+
+  /* legacy returns NO_ERROR without touching resval on NULL operand; leave the C2a pre-cleared NULL */
+  if (DB_IS_NULL (l) || DB_IS_NULL (r))
+    {
+      return NO_ERROR;
+    }
+
+  /* operand order preserved (dbv1=left, dbv2=right) to match qdata_*_numeric_to_dbval result prec/scale */
+  switch (step->d.arith.operator_type)
+    {
+    case T_MUL:
+      return numeric_db_value_mul (l, r, step->resval);
+    case T_ADD:
+      return numeric_db_value_add (l, r, step->resval);
+    case T_SUB:
+      return numeric_db_value_sub (l, r, step->resval);
+    default:
+      return ER_FAILED;
+    }
 }
 
 /*
