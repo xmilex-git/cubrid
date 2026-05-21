@@ -101,6 +101,7 @@ struct expr_step
     struct
     {
       int operator_type;	/* CUBRID T_* operator for a generic arith evaluator */
+      tp_domain *domain;	/* result domain (== legacy ARITH regu->domain); re-resolved server-side, domain-id serialized (P4) */
     } arith;
   } d;				/* op-specific inline data, kept minimal (<= ~40B) */
 };
@@ -134,5 +135,13 @@ struct expr_program
 // compiled as C++ (CMake LANGUAGE CXX), so default linkage stays consistent with the definitions.
 extern int expr_eval_leaf (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
 extern int expr_eval_le (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
+extern int expr_eval_mul (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
+extern int expr_eval_sub (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
+extern int expr_eval_add (EXPR_STEP * step, EXPR_EVAL_CTX * ctx);
+
+// flat value-program execute core (Phase 6b). Runs every step and returns the final step's resval, or
+// NULL on error. void* mode-agnostic params (THREAD_ENTRY*, VAL_DESCR*, OID*, QFILE_TUPLE) like the
+// predicate path; defined in query_evaluator.c.
+extern db_value *expr_program_eval_value (void *thread_p, EXPR_PROGRAM * prog, void *vd, void *obj_oid, char *tpl);
 
 #endif /* _EXPR_PROGRAM_HPP_ */

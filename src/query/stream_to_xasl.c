@@ -784,9 +784,9 @@ static const EXPR_EVAL_FN stx_Expr_eval_registry[EXPR_OP_LAST] = {
   /* [EXPR_OP_JUMP]  */ NULL,
   /* [EXPR_OP_CONST] */ expr_eval_leaf,	/* fetch_peek_dbval(d.src) -> resval (Phase 6a) */
   /* [EXPR_OP_VAR]   */ expr_eval_leaf,	/* fetch_peek_dbval(d.src) -> resval (Phase 6a) */
-  /* [EXPR_OP_MUL]   */ NULL,	/* Phase 6b: qdata_multiply_dbval */
-  /* [EXPR_OP_SUB]   */ NULL,	/* Phase 6b: qdata_subtract_dbval */
-  /* [EXPR_OP_ADD]   */ NULL,	/* Phase 6b: qdata_add_dbval */
+  /* [EXPR_OP_MUL]   */ expr_eval_mul,	/* qdata_multiply_dbval(l, r, resval, domain) (Phase 6b) */
+  /* [EXPR_OP_SUB]   */ expr_eval_sub,	/* qdata_subtract_dbval(l, r, resval, domain) (Phase 6b) */
+  /* [EXPR_OP_ADD]   */ expr_eval_add,	/* qdata_add_dbval(l, r, resval, domain) (Phase 6b) */
   /* [EXPR_OP_LE]    */ expr_eval_le,	/* eval_value_rel_cmp (R_LE, comp0 NULL rule) (Phase 6a) */
   /* [EXPR_OP_CAST]  */ NULL,	/* Phase 6b: tp_value_cast_force wrapper */
   /* [EXPR_OP_FUNC]  */ NULL
@@ -846,12 +846,35 @@ stx_ready_bind_xasl_programs (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 
   for (x = xasl; x != NULL; x = x->next)
     {
+      AGGREGATE_TYPE *agg = NULL;
+
       if (x->if_pred_program != NULL)
 	{
 	  error = stx_ready_bind_expr_program (thread_p, x->if_pred_program);
 	  if (error != NO_ERROR)
 	    {
 	      return error;
+	    }
+	}
+
+      /* aggregate operand programs (Phase 6b): buildlist g_agg_list / buildvalue agg_list */
+      if (x->type == BUILDLIST_PROC)
+	{
+	  agg = x->proc.buildlist.g_agg_list;
+	}
+      else if (x->type == BUILDVALUE_PROC)
+	{
+	  agg = x->proc.buildvalue.agg_list;
+	}
+      for (; agg != NULL; agg = agg->next)
+	{
+	  if (agg->operand_program != NULL)
+	    {
+	      error = stx_ready_bind_expr_program (thread_p, agg->operand_program);
+	      if (error != NO_ERROR)
+		{
+		  return error;
+		}
 	    }
 	}
 
@@ -4615,6 +4638,7 @@ stx_build_expr_program (THREAD_ENTRY * thread_p, char *ptr, EXPR_PROGRAM * prog)
 	case EXPR_OP_SUB:
 	case EXPR_OP_ADD:
 	  ptr = or_unpack_int (ptr, &step->d.arith.operator_type);
+	  ptr = or_unpack_domain (ptr, &step->d.arith.domain, NULL);
 	  break;
 
 	case EXPR_OP_LE:
@@ -6318,6 +6342,16 @@ stx_build_aggregate_type (THREAD_ENTRY * thread_p, char *ptr, AGGREGATE_TYPE * a
   aggregate->flag.min_max_optimized = (flagint & (1 << 1)) != 0;
   aggregate->flag.part_key_descending = (flagint & (1 << 2)) != 0;
   aggregate->flag.dummy = (flagint & (1 << 3)) != 0;
+
+  /* operand_program (P5): NULL-init ALWAYS (unpack arena not zeroed - load-bearing); offset 0 -> none,
+     version mismatch -> NULL -> legacy (not an error) */
+  aggregate->operand_program = NULL;
+  ptr = or_unpack_int (ptr, &offset);
+  if (offset != 0)
+    {
+      aggregate->operand_program = stx_restore_expr_program (thread_p, &xasl_unpack_info_p->packed_xasl[offset]);
+    }
+
   /* is_ended */
   ptr = or_unpack_int (ptr, &offset);
   aggregate->is_ended = false;

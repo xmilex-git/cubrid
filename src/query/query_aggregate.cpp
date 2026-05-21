@@ -26,6 +26,7 @@
 #include "btree.h"                          // btree_find_min_or_max_key, btree_get_unique_statistics_for_count
 #include "db_json.hpp"
 #include "dbtype.h"
+#include "expr_program.hpp"
 #include "fetch.h"
 #include "list_file.h"
 #include "memory_alloc.h"
@@ -652,18 +653,39 @@ qdata_evaluate_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
 	}
 
       /* fetch operands value. aggregate regulator variable should only contain constants */
-      REGU_VARIABLE_LIST operand = NULL;
-      for (operand = agg_p->operands; operand != NULL; operand = operand->next)
+      if (agg_p->operand_program != NULL)
 	{
-	  // create an empty value
-	  db_values.emplace_back ();
-
-	  // fetch it
-	  if (fetch_copy_dbval (thread_p, &operand->value, val_desc_p, NULL, NULL, NULL,
-				&db_values.back ()) != NO_ERROR)
+	  /* Phase 6b: flat single arith operand. Run once, COPY the result into db_values to match the
+	   * legacy fetch_copy_dbval ownership/lifetime exactly (qdata_copy_db_value = same deep copy). */
+	  DB_VALUE *prog_res = expr_program_eval_value (thread_p, agg_p->operand_program, val_desc_p, NULL, NULL);
+	  if (prog_res == NULL)
 	    {
 	      pr_clear_value_vector (db_values);
 	      return ER_FAILED;
+	    }
+
+	  db_values.emplace_back ();
+	  if (!qdata_copy_db_value (&db_values.back (), prog_res))
+	    {
+	      pr_clear_value_vector (db_values);
+	      return ER_FAILED;
+	    }
+	}
+      else
+	{
+	  REGU_VARIABLE_LIST operand = NULL;
+	  for (operand = agg_p->operands; operand != NULL; operand = operand->next)
+	    {
+	      // create an empty value
+	      db_values.emplace_back ();
+
+	      // fetch it
+	      if (fetch_copy_dbval (thread_p, &operand->value, val_desc_p, NULL, NULL, NULL,
+				    &db_values.back ()) != NO_ERROR)
+		{
+		  pr_clear_value_vector (db_values);
+		  return ER_FAILED;
+		}
 	    }
 	}
 

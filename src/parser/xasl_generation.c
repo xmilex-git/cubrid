@@ -584,6 +584,8 @@ static bool pt_regu_subtree_is_const (const REGU_VARIABLE * regu);
 static bool pt_expr_step_reserve (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog);
 static int pt_emit_regu_leaf (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu);
 static EXPR_PROGRAM *pt_compile_pred_to_expr_program (PARSER_CONTEXT * parser, PRED_EXPR * pred);
+static int pt_compile_arith_subtree (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu);
+static EXPR_PROGRAM *pt_compile_arith_to_expr_program (PARSER_CONTEXT * parser, REGU_VARIABLE * root);
 
 static VAL_LIST *pt_make_val_list (PARSER_CONTEXT * parser, PT_NODE * attribute_list);
 
@@ -4218,6 +4220,17 @@ pt_to_aggregate_node (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg, int *c
 	  aggregate_list->operands->value.domain = &tp_Integer_domain;
 	}
 
+      /* Phase 3b: flatten a single arith operand into a value program (NULL = legacy fetch). Only the
+       * sum/avg-style single-operand arith case (q1 lever); >1 operand or non-arith operand stays legacy. */
+      if (prm_get_bool_value (PRM_ID_ENABLE_FLAT_EXPR_PROGRAM) && aggregate_list->operands != NULL
+	  && aggregate_list->operands->next == NULL
+	  && (aggregate_list->operands->value.type == TYPE_INARITH
+	      || aggregate_list->operands->value.type == TYPE_OUTARITH))
+	{
+	  aggregate_list->operand_program =
+	    pt_compile_arith_to_expr_program (parser, &aggregate_list->operands->value);
+	}
+
       /* record the value for pt_to_regu_variable to use in "out arith" */
       tree->etc = (void *) aggregate_list->accumulator.value;
 
@@ -6127,6 +6140,127 @@ pt_compile_pred_to_expr_program (PARSER_CONTEXT * parser, PRED_EXPR * pred)
   prog->steps_len = le_idx + 1;
 
   prog->flags |= EXPR_PROGRAM_IS_QUAL;
+  prog->format_version = EXPR_PROGRAM_FORMAT_VERSION;
+  return prog;
+}
+
+/*
+ * pt_compile_arith_subtree () - post-order emit of an arith regu subtree into a value program
+ *   return: emitted step index, or -1 to fall back to legacy (D2 all-or-nothing)
+ *   parser(in):
+ *   prog(in/out): program being built
+ *   regu(in): regu node (leaf or supported ARITH)
+ *
+ * Supported: leaves (column/const via pt_emit_regu_leaf) and binary T_MUL/T_SUB/T_ADD ARITH nodes
+ * (thirdptr must be NULL, no predicate). Any other shape -> -1 (whole tree stays legacy).
+ */
+static int
+pt_compile_arith_subtree (PARSER_CONTEXT * parser, EXPR_PROGRAM * prog, REGU_VARIABLE * regu)
+{
+  const ARITH_TYPE *arithptr;
+  int left_idx, right_idx, op_idx;
+  EXPR_STEP *step;
+
+  if (regu == NULL)
+    {
+      return -1;
+    }
+
+  if (regu->type != TYPE_INARITH && regu->type != TYPE_OUTARITH)
+    {
+      /* leaf: column or pre-folded literal */
+      return pt_emit_regu_leaf (parser, prog, regu);
+    }
+
+  arithptr = regu->value.arithptr;
+  if (arithptr == NULL || arithptr->pred != NULL || arithptr->thirdptr != NULL)
+    {
+      return -1;
+    }
+
+  switch (arithptr->opcode)
+    {
+    case T_MUL:
+    case T_SUB:
+    case T_ADD:
+      break;
+    default:
+      return -1;
+    }
+
+  /* post-order: children first so their step indices precede the operator step */
+  left_idx = pt_compile_arith_subtree (parser, prog, arithptr->leftptr);
+  if (left_idx < 0)
+    {
+      return -1;
+    }
+  right_idx = pt_compile_arith_subtree (parser, prog, arithptr->rightptr);
+  if (right_idx < 0)
+    {
+      return -1;
+    }
+
+  if (!pt_expr_step_reserve (parser, prog))
+    {
+      return -1;
+    }
+  op_idx = prog->steps_len;
+  step = &prog->steps[op_idx];
+  step->arg1_idx = left_idx;
+  step->arg2_idx = right_idx;
+  step->d.arith.operator_type = arithptr->opcode;
+  /* result domain == legacy ARITH regu->domain (the kernel domain) for bit-identity (axis A only) */
+  step->d.arith.domain = regu->domain;
+
+  switch (arithptr->opcode)
+    {
+    case T_MUL:
+      step->opcode = EXPR_OP_MUL;
+      break;
+    case T_SUB:
+      step->opcode = EXPR_OP_SUB;
+      break;
+    case T_ADD:
+      step->opcode = EXPR_OP_ADD;
+      break;
+    default:
+      return -1;
+    }
+
+  prog->steps_len = op_idx + 1;
+  return op_idx;
+}
+
+/*
+ * pt_compile_arith_to_expr_program () - compile an arithmetic operand regu tree to a flat value program
+ *   return: new EXPR_PROGRAM (value program, NOT IS_QUAL), or NULL to fall back to legacy
+ *   parser(in):
+ *   root(in): aggregate operand regu (must be a supported TYPE_INARITH/OUTARITH tree)
+ *
+ * The PRM gate must be checked before calling. The last emitted step is the program result.
+ */
+static EXPR_PROGRAM *
+pt_compile_arith_to_expr_program (PARSER_CONTEXT * parser, REGU_VARIABLE * root)
+{
+  EXPR_PROGRAM *prog;
+
+  if (root == NULL || (root->type != TYPE_INARITH && root->type != TYPE_OUTARITH))
+    {
+      return NULL;
+    }
+
+  regu_alloc (prog);
+  if (prog == NULL)
+    {
+      return NULL;
+    }
+
+  if (pt_compile_arith_subtree (parser, prog, root) < 0)
+    {
+      return NULL;
+    }
+
+  /* value program (no IS_QUAL flag): the final step's resval is the operand value */
   prog->format_version = EXPR_PROGRAM_FORMAT_VERSION;
   return prog;
 }

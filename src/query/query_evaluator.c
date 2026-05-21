@@ -2200,6 +2200,95 @@ expr_eval_le (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
 }
 
 /*
+ * expr_eval_mul () - flat T_MUL: qdata_multiply_dbval(l, r, resval, domain) (same kernel/domain as legacy).
+ *   return: NO_ERROR, or an error code
+ *   step(in/out): arith step (arg1/arg2 index prior steps; d.arith.domain = result domain)
+ *   ctx(in): per-tuple execution context (program for operand resolution)
+ */
+int
+expr_eval_mul (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  DB_VALUE *l = ctx->program->steps[step->arg1_idx].resval;
+  DB_VALUE *r = ctx->program->steps[step->arg2_idx].resval;
+
+  /* kernel handles NULL propagation (early-return leaves resval untouched/NULL) */
+  return qdata_multiply_dbval (l, r, step->resval, step->d.arith.domain);
+}
+
+/*
+ * expr_eval_sub () - flat T_SUB: qdata_subtract_dbval(l, r, resval, domain).
+ */
+int
+expr_eval_sub (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  DB_VALUE *l = ctx->program->steps[step->arg1_idx].resval;
+  DB_VALUE *r = ctx->program->steps[step->arg2_idx].resval;
+
+  return qdata_subtract_dbval (l, r, step->resval, step->d.arith.domain);
+}
+
+/*
+ * expr_eval_add () - flat T_ADD: qdata_add_dbval(l, r, resval, domain).
+ */
+int
+expr_eval_add (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  DB_VALUE *l = ctx->program->steps[step->arg1_idx].resval;
+  DB_VALUE *r = ctx->program->steps[step->arg2_idx].resval;
+
+  return qdata_add_dbval (l, r, step->resval, step->d.arith.domain);
+}
+
+/*
+ * expr_program_eval_value () - flat value-program execute core (Phase 6b). Runs every step over one
+ *                              tuple and returns the final step's result (an owned step_values slot).
+ *   return: DB_VALUE* of the final step (NUMERIC results allocate in the owned slot), or NULL on error
+ *   thread_p(in): THREAD_ENTRY*
+ *   prog(in): compiled value program (steps + per-clone step_values, ready-bound)
+ *   vd(in): VAL_DESCR*
+ *   obj_oid(in): OID* for leaf fetch
+ *   tpl(in): QFILE_TUPLE for list-file leaf fetch (NULL for heap)
+ *
+ * No et_comp (value program, not a predicate). On a missing evaluator or step error, returns NULL so
+ * the seam falls back / aborts. The result lives until qexec_clear_agg_list clears step_values.
+ */
+DB_VALUE *
+expr_program_eval_value (void *thread_p, EXPR_PROGRAM * prog, void *vd, void *obj_oid, char *tpl)
+{
+  EXPR_EVAL_CTX ctx;
+  int i;
+
+  if (prog == NULL || prog->steps == NULL || prog->steps_len <= 0)
+    {
+      return NULL;
+    }
+
+  ctx.thread_p = thread_p;
+  ctx.vd = vd;
+  ctx.obj_oid = obj_oid;
+  ctx.tpl = tpl;
+  ctx.program = prog;
+  ctx.et_comp = NULL;
+
+  for (i = 0; i < prog->steps_len; i++)
+    {
+      EXPR_STEP *step = &prog->steps[i];
+
+      if (step->evaluator == NULL)
+	{
+	  return NULL;
+	}
+
+      if ((*step->evaluator) (step, &ctx) != NO_ERROR)
+	{
+	  return NULL;
+	}
+    }
+
+  return prog->steps[prog->steps_len - 1].resval;
+}
+
+/*
  * expr_program_eval_pred () - flat predicate execute core (Phase 6a). Runs a compiled EXPR_PROGRAM
  *                             over one tuple and returns the predicate truth value, bit-identical to
  *                             eval_pred_comp0 for the supported q1 shape.

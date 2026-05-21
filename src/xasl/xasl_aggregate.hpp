@@ -33,6 +33,8 @@ class regu_variable_node;
 struct sort_list;
 typedef struct sort_list SORT_LIST;   // todo - rename sort_list member.
 struct tp_domain;
+struct expr_program;
+typedef struct expr_program EXPR_PROGRAM;
 
 namespace cubxasl
 {
@@ -104,6 +106,7 @@ namespace cubxasl
       bool dummy; /* for alignment, free space for future use */
     } flag;
     int is_ended;		/* true, if the aggregate is ended */
+    EXPR_PROGRAM *operand_program;	/* flat compiled single arith operand (NULL = legacy fetch); must be NULL-init on server unpack */
   };
 };
 

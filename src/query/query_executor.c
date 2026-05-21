@@ -2315,6 +2315,8 @@ qexec_clear_agg_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, AGGREGATE_TYP
 	}
 
       pg_cnt += qexec_clear_regu_variable_list (thread_p, xasl_p, p->operands, is_final, false);
+      /* clear owned step_values (NUMERIC arith results allocate); mirrors qexec_clear_expr_program */
+      qexec_clear_expr_program (thread_p, p->operand_program);
       p->domain = p->original_domain;
       p->opr_dbtype = p->original_opr_dbtype;
     }

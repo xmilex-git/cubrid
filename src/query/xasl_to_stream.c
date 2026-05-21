@@ -4448,8 +4448,9 @@ xts_process_expr_program (char *ptr, const EXPR_PROGRAM * prog)
 	case EXPR_OP_MUL:
 	case EXPR_OP_SUB:
 	case EXPR_OP_ADD:
-	  /* arith operator_type consumed by the Phase 6 generic arith evaluator */
+	  /* arith operator_type + result domain (re-resolved server-side, like the cast branch) */
 	  ptr = or_pack_int (ptr, step->d.arith.operator_type);
+	  ptr = OR_PACK_DOMAIN_OBJECT_TO_OID (ptr, step->d.arith.domain, 0, 0);
 	  break;
 
 	case EXPR_OP_LE:
@@ -5710,7 +5711,16 @@ xts_process_aggregate_type (char *ptr, const AGGREGATE_TYPE * aggregate)
   flagint |= (aggregate->flag.dummy ? 1 : 0) << 3;
 
   ptr = or_pack_int (ptr, flagint);
+
+  /* operand_program: flat compiled single arith operand; offset 0 (NULL) -> legacy on unpack */
+  offset = xts_save_expr_program (aggregate->operand_program);
+  if (offset == ER_FAILED)
+    {
+      return NULL;
+    }
   ptr = or_pack_int (ptr, offset);
+
+  ptr = or_pack_int (ptr, offset);	/* stale is_ended slot absorbed by stx_build_aggregate_type */
 
   return ptr;
 }
@@ -6756,6 +6766,7 @@ xts_sizeof_expr_program (const EXPR_PROGRAM * prog)
 	case EXPR_OP_SUB:
 	case EXPR_OP_ADD:
 	  size += OR_INT_SIZE;	/* d.arith.operator_type */
+	  size += or_packed_domain_size (step->d.arith.domain, 0);	/* d.arith.domain */
 	  break;
 
 	case EXPR_OP_LE:
@@ -7602,6 +7613,7 @@ xts_sizeof_aggregate_type (const AGGREGATE_TYPE * aggregate)
     }
 
   size += OR_INT_SIZE;		/* flag */
+  size += PTR_SIZE;		/* operand_program */
   return size;
 }
 
