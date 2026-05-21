@@ -16599,6 +16599,8 @@ qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, c
    * tree out from under us in the event the transaction is unilaterally aborted during query execution. */
 
   xasl->query_in_progress = true;
+  /* US-HOIST: invalidate per-query wide-numeric-kernel cache so the first numeric op re-resolves this query's PRM (avoids stale flag from a reused thread_entry of a prior query/session) */
+  thread_p->m_wide_numeric_kernel_qid = NULL_QUERY_ID;
   stat = qexec_execute_mainblock (thread_p, xasl, &xasl_state, NULL);
   xasl->query_in_progress = false;
 

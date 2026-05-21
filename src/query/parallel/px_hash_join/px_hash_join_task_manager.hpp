@@ -111,6 +111,8 @@ namespace parallel_query
 	  m_thread_ref.conn_entry = main_thread_ref.conn_entry;
 	  m_thread_ref.tran_index = main_thread_ref.tran_index;
 	  m_thread_ref.on_trace = main_thread_ref.on_trace;
+	  /* US-HOIST: reset wide-numeric-kernel cache after adopting main tran_index, so any numeric op re-resolves this query's PRM (worker thread_entry is reused across sessions) */
+	  m_thread_ref.m_wide_numeric_kernel_qid = NULL_QUERY_ID;
 
 	  assert (m_thread_ref.conn_entry != nullptr);
 	  assert (m_thread_ref.tran_index != NULL_TRAN_INDEX);

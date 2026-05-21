@@ -84,6 +84,8 @@ namespace parallel_heap_scan
     thread_ref.conn_entry = m_parent_thread_p->conn_entry;
     thread_ref.tran_index = m_parent_thread_p->tran_index;
     thread_ref.on_trace = m_parent_thread_p->on_trace;
+    /* US-HOIST: reset wide-numeric-kernel cache after adopting parent tran_index, so the first numeric op re-resolves this query's PRM (worker thread_entry is reused across sessions) */
+    thread_ref.m_wide_numeric_kernel_qid = NULL_QUERY_ID;
 
     if (thread_ref.on_trace)
       {
