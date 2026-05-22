@@ -433,7 +433,7 @@ extern int scan_open_heap_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 				val_descr * vd,
 				/* fields of HEAP_SCAN_ID */
 				OID * cls_oid, HFID * hfid, regu_variable_list_node * regu_list_pred, PRED_EXPR * pr,
-				EXPR_PROGRAM * pr_program, regu_variable_list_node * regu_list_rest,
+				regu_variable_list_node * regu_list_rest,
 				int num_attrs_pred, ATTR_ID * attrids_pred, HEAP_CACHE_ATTRINFO * cache_pred,
 				int num_attrs_rest, ATTR_ID * attrids_rest, HEAP_CACHE_ATTRINFO * cache_rest,
 				SCAN_TYPE scan_type, DB_VALUE ** cache_recordinfo,

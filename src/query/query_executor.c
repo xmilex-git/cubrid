@@ -83,7 +83,6 @@
 #include "subquery_cache.h"
 #include "query_hash_join.h"
 #include "memoize.hpp"
-#include "expr_program.hpp"
 
 #if SERVER_MODE && !WINDOWS
 #include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
@@ -430,7 +429,6 @@ static void qexec_clear_sort_list (XASL_NODE * xasl_p, SORT_LIST * list, bool is
 static void qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final);
 static int qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, bool is_final,
 			     bool for_parallel_aptr);
-static void qexec_clear_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog);
 static int qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCESS_SPEC_TYPE * list,
 					 bool is_final, bool except_trace, bool for_parallel_aptr);
 static int qexec_clear_analytic_function_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ANALYTIC_EVAL_TYPE * list,
@@ -1850,34 +1848,6 @@ qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, b
 }
 
 /*
- * qexec_clear_expr_program () - clear per-clone EXPR_PROGRAM result slots (P5)
- *   prog(in): flat compiled program, or NULL
- *
- * Clears only the OWNED step_values slots (allocated in the clone unpack arena, freed with it).
- * Leaf regus (d.src) are shared with the PRED_EXPR copy and cleared by qexec_clear_pred; a leaf
- * step's resval is a per-tuple alias of a peeked value we do NOT own, so it is never cleared here.
- */
-static void
-qexec_clear_expr_program (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog)
-{
-  int i;
-
-  if (prog == NULL || prog->step_values == NULL || prog->steps == NULL || prog->steps_len <= 0)
-    {
-      return;
-    }
-
-  for (i = 0; i < prog->steps_len; i++)
-    {
-      /* clear only OWNED producing slots; leaf step_values stay DB_TYPE_NULL (resval is a peeked alias) (C2a) */
-      if (prog->steps[i].is_producing)
-	{
-	  pr_clear_value (&prog->step_values[i]);
-	}
-    }
-}
-
-/*
  * qexec_clear_access_spec_list () - clear the db_values in the access spec list
  *   return:
  *   xasl_p(in) :
@@ -1947,7 +1917,6 @@ qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCES
 	}
 
       pg_cnt += qexec_clear_pred (thread_p, xasl_p, p->where_pred, is_final, for_parallel_aptr);
-      qexec_clear_expr_program (thread_p, p->where_pred_program);
       pg_cnt += qexec_clear_pred (thread_p, xasl_p, p->where_key, is_final, for_parallel_aptr);
       pg_cnt += qexec_clear_pred (thread_p, xasl_p, p->where_range, is_final, for_parallel_aptr);
       pr_clear_value (p->s_id.join_dbval);
@@ -2318,8 +2287,6 @@ qexec_clear_agg_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, AGGREGATE_TYP
 	}
 
       pg_cnt += qexec_clear_regu_variable_list (thread_p, xasl_p, p->operands, is_final, false);
-      /* clear owned step_values (NUMERIC arith results allocate); mirrors qexec_clear_expr_program */
-      qexec_clear_expr_program (thread_p, p->operand_program);
       p->domain = p->original_domain;
       p->opr_dbtype = p->original_opr_dbtype;
     }
@@ -2785,7 +2752,6 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->during_join_pred, is_final, false);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->after_join_pred, is_final, false);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->if_pred, is_final, false);
-      qexec_clear_expr_program (thread_p, xasl->if_pred_program);	/* defensive; NULL for q1 */
       if (xasl->instnum_val)
 	{
 	  pr_clear_value (xasl->instnum_val);
@@ -3011,7 +2977,6 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->during_join_pred, is_final, true);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->after_join_pred, is_final, true);
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->if_pred, is_final, true);
-      qexec_clear_expr_program (thread_p, xasl->if_pred_program);	/* defensive; NULL for q1 */
       if (xasl->instnum_val)
 	{
 	  pr_clear_value (xasl->instnum_val);
@@ -4764,65 +4729,28 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
       context->tuple_count++;
 
       /* fetch values */
-      if (proc->g_scan_hidden_fetch_program != NULL)
+      for (regu_var_p = proc->g_scan_regu_list; regu_var_p != NULL; regu_var_p = regu_var_p->next)
 	{
-	  /* C3.2 flat path: run every hidden-leaf step once (peek, no copy), then share each step's resval
-	   * into the matching hidden regu's vfetch_to in the SAME order the legacy loop iterates. */
-	  EXPR_PROGRAM *prog = proc->g_scan_hidden_fetch_program;
-	  int step_idx = 0;
-
-	  rc = expr_program_eval_fetch_share (thread_p, prog, &xasl_state->vd, NULL, tplrec->tpl);
-	  if (rc != NO_ERROR)
+	  if (REGU_VARIABLE_IS_FLAGED (&regu_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
 	    {
-	      return ER_FAILED;
-	    }
-
-	  for (regu_var_p = proc->g_scan_regu_list; regu_var_p != NULL; regu_var_p = regu_var_p->next)
-	    {
-	      if (REGU_VARIABLE_IS_FLAGED (&regu_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
+	      if (regu_var_p->value.vfetch_to && pr_is_set_type (DB_VALUE_DOMAIN_TYPE (regu_var_p->value.vfetch_to)))
 		{
-		  if (regu_var_p->value.vfetch_to
-		      && pr_is_set_type (DB_VALUE_DOMAIN_TYPE (regu_var_p->value.vfetch_to)))
-		    {
-		      pr_clear_value (regu_var_p->value.vfetch_to);
-		    }
-
-		  if (regu_var_p->value.vfetch_to && DB_NEED_CLEAR (regu_var_p->value.vfetch_to))
-		    {
-		      pr_clear_value (regu_var_p->value.vfetch_to);
-		    }
-
-		  pr_share_value (prog->steps[step_idx].resval, regu_var_p->value.vfetch_to);
-		  step_idx++;
+		  pr_clear_value (regu_var_p->value.vfetch_to);
 		}
-	    }
-	}
-      else
-	{
-	  for (regu_var_p = proc->g_scan_regu_list; regu_var_p != NULL; regu_var_p = regu_var_p->next)
-	    {
-	      if (REGU_VARIABLE_IS_FLAGED (&regu_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
+
+	      if (regu_var_p->value.vfetch_to && DB_NEED_CLEAR (regu_var_p->value.vfetch_to))
 		{
-		  if (regu_var_p->value.vfetch_to
-		      && pr_is_set_type (DB_VALUE_DOMAIN_TYPE (regu_var_p->value.vfetch_to)))
-		    {
-		      pr_clear_value (regu_var_p->value.vfetch_to);
-		    }
-
-		  if (regu_var_p->value.vfetch_to && DB_NEED_CLEAR (regu_var_p->value.vfetch_to))
-		    {
-		      pr_clear_value (regu_var_p->value.vfetch_to);
-		    }
-
-		  rc = fetch_peek_dbval (thread_p, &regu_var_p->value, &xasl_state->vd, NULL, NULL, tplrec->tpl, &tmp);
-		  if (rc != NO_ERROR)
-		    {
-		      pr_clear_value (regu_var_p->value.vfetch_to);
-		      return ER_FAILED;
-		    }
-
-		  pr_share_value (tmp, regu_var_p->value.vfetch_to);
+		  pr_clear_value (regu_var_p->value.vfetch_to);
 		}
+
+	      rc = fetch_peek_dbval (thread_p, &regu_var_p->value, &xasl_state->vd, NULL, NULL, tplrec->tpl, &tmp);
+	      if (rc != NO_ERROR)
+		{
+		  pr_clear_value (regu_var_p->value.vfetch_to);
+		  return ER_FAILED;
+		}
+
+	      pr_share_value (tmp, regu_var_p->value.vfetch_to);
 	    }
 	}
 
@@ -7525,7 +7453,6 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 					 curr_spec->single_fetch, curr_spec->s_dbval, val_list, vd,
 					 &ACCESS_SPEC_CLS_OID (curr_spec), &ACCESS_SPEC_HFID (curr_spec),
 					 curr_spec->s.cls_node.cls_regu_list_pred, curr_spec->where_pred,
-					 curr_spec->where_pred_program,
 					 curr_spec->s.cls_node.cls_regu_list_rest, curr_spec->s.cls_node.num_attrs_pred,
 					 curr_spec->s.cls_node.attrids_pred, curr_spec->s.cls_node.cache_pred,
 					 curr_spec->s.cls_node.num_attrs_rest, curr_spec->s.cls_node.attrids_rest,
@@ -7554,7 +7481,6 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 						curr_spec->single_fetch, curr_spec->s_dbval, val_list, vd,
 						&ACCESS_SPEC_CLS_OID (curr_spec), &ACCESS_SPEC_HFID (curr_spec),
 						curr_spec->s.cls_node.cls_regu_list_pred, curr_spec->where_pred,
-						curr_spec->where_pred_program,
 						curr_spec->s.cls_node.cls_regu_list_rest,
 						curr_spec->s.cls_node.num_attrs_pred,
 						curr_spec->s.cls_node.attrids_pred, curr_spec->s.cls_node.cache_pred,
@@ -9034,7 +8960,6 @@ qexec_init_next_partition (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, XAS
 					 spec->s_id.scan_op_type, spec->s_id.fixed, spec->s_id.grouped,
 					 spec->s_id.single_fetch, spec->s_dbval, spec->s_id.val_list, spec->s_id.vd,
 					 &class_oid, &class_hfid, spec->s.cls_node.cls_regu_list_pred, spec->where_pred,
-					 spec->where_pred_program,
 					 spec->s.cls_node.cls_regu_list_rest, spec->s.cls_node.num_attrs_pred,
 					 spec->s.cls_node.attrids_pred, spec->s.cls_node.cache_pred,
 					 spec->s.cls_node.num_attrs_rest, spec->s.cls_node.attrids_rest,
@@ -9080,7 +9005,6 @@ qexec_init_next_partition (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, XAS
 				     spec->s_id.fixed, spec->s_id.grouped, spec->s_id.single_fetch, spec->s_dbval,
 				     spec->s_id.val_list, spec->s_id.vd, &class_oid, &class_hfid,
 				     spec->s.cls_node.cls_regu_list_pred, spec->where_pred,
-				     spec->where_pred_program,
 				     spec->s.cls_node.cls_regu_list_rest, spec->s.cls_node.num_attrs_pred,
 				     spec->s.cls_node.attrids_pred, spec->s.cls_node.cache_pred,
 				     spec->s.cls_node.num_attrs_rest, spec->s.cls_node.attrids_rest,

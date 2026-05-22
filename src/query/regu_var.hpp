@@ -35,9 +35,6 @@
 
 // forward definitions
 struct xasl_node;
-// flat compiled expression program (expr_program.hpp); only a pointer is stored here (low coupling)
-struct expr_program;
-typedef struct expr_program EXPR_PROGRAM;
 namespace cubxasl
 {
   struct aggregate_list_node;
@@ -121,7 +118,6 @@ struct valptr_list_node
 {
   REGU_VARIABLE_LIST valptrp;	/* value pointer list */
   int valptr_cnt;		/* value count */
-  EXPR_PROGRAM *fetch_program;	/* flat compiled non-hidden output fetch (NULL = legacy); C3 plumbing, C2 consumes */
 
   valptr_list_node () = default;
 };

@@ -44,7 +44,6 @@
 #include "xasl_predicate.hpp"
 #include "xasl_stream.hpp"
 #include "xasl_unpack_info.hpp"
-#include "expr_program.hpp"
 
 #define    BYTE_SIZE        OR_INT_SIZE
 #define    LONG_SIZE        OR_INT_SIZE
@@ -88,7 +87,6 @@ static int xts_save_indx_info (const INDX_INFO * indx_info);
 static int xts_save_outptr_list (const OUTPTR_LIST * outptr_list);
 static int xts_save_selupd_list (const SELUPD_LIST * selupd_list);
 static int xts_save_pred_expr (const PRED_EXPR * ptr);
-static int xts_save_expr_program (const EXPR_PROGRAM * ptr);
 static int xts_save_regu_variable (const REGU_VARIABLE * ptr);
 static int xts_save_regu_variable_list (const REGU_VARIABLE_LIST ptr);
 static int xts_save_regu_varlist_list (const REGU_VARLIST_LIST ptr);
@@ -157,7 +155,6 @@ static char *xts_process_cte_proc (char *ptr, const CTE_PROC_NODE * cte_proc);
 static char *xts_process_outptr_list (char *ptr, const OUTPTR_LIST * outptr_list);
 static char *xts_process_selupd_list (char *ptr, const SELUPD_LIST * selupd_list);
 static char *xts_process_pred_expr (char *ptr, const PRED_EXPR * pred_expr);
-static char *xts_process_expr_program (char *ptr, const EXPR_PROGRAM * prog);
 static char *xts_process_pred (char *ptr, const PRED * pred);
 static char *xts_process_eval_term (char *ptr, const EVAL_TERM * eval_term);
 static char *xts_process_comp_eval_term (char *ptr, const COMP_EVAL_TERM * comp_eval_term);
@@ -218,7 +215,6 @@ static int xts_sizeof_merge_proc (const MERGE_PROC_NODE * ptr);
 static int xts_sizeof_outptr_list (const OUTPTR_LIST * ptr);
 static int xts_sizeof_selupd_list (const SELUPD_LIST * ptr);
 static int xts_sizeof_pred_expr (const PRED_EXPR * ptr);
-static int xts_sizeof_expr_program (const EXPR_PROGRAM * ptr);
 static int xts_sizeof_pred (const PRED * ptr);
 static int xts_sizeof_eval_term (const EVAL_TERM * ptr);
 static int xts_sizeof_comp_eval_term (const COMP_EVAL_TERM * ptr);
@@ -1292,66 +1288,6 @@ xts_save_pred_expr (const PRED_EXPR * pred_expr)
     }
 
   buf = xts_process_pred_expr (buf_p, pred_expr);
-  if (buf == NULL)
-    {
-      offset = ER_FAILED;
-      goto end;
-    }
-  assert (buf <= buf_p + size);
-
-  memcpy (&xts_Stream_buffer[offset], buf_p, size);
-
-end:
-  if (is_buf_alloced)
-    {
-      free_and_init (buf_p);
-    }
-
-  return offset;
-}
-
-/* serialize an EXPR_PROGRAM body block; mirrors xts_save_pred_expr boilerplate (P4) */
-static int
-xts_save_expr_program (const EXPR_PROGRAM * prog)
-{
-  int offset;
-  int size;
-  char *buf = NULL;
-  char *buf_p = NULL;
-  bool is_buf_alloced = false;
-
-  if (prog == NULL)
-    {
-      return NO_ERROR;
-    }
-
-  offset = xts_get_offset_visited_ptr (prog);
-  if (offset != ER_FAILED)
-    {
-      return offset;
-    }
-
-  size = xts_sizeof_expr_program (prog);
-  if (size == ER_FAILED)
-    {
-      return ER_FAILED;
-    }
-
-  offset = xts_reserve_location_in_stream (size);
-  if (offset == ER_FAILED || xts_mark_ptr_visited (prog, offset) == ER_FAILED)
-    {
-      return ER_FAILED;
-    }
-
-  buf_p = (char *) malloc (size);
-  if (buf_p == NULL)
-    {
-      xts_Xasl_errcode = ER_OUT_OF_VIRTUAL_MEMORY;
-      return ER_FAILED;
-    }
-  is_buf_alloced = true;
-
-  buf = xts_process_expr_program (buf_p, prog);
   if (buf == NULL)
     {
       offset = ER_FAILED;
@@ -3567,14 +3503,6 @@ xts_process_buildlist_proc (char *ptr, const BUILDLIST_PROC_NODE * build_list_pr
     }
   ptr = or_pack_int (ptr, offset);
 
-  /* g_scan_hidden_fetch_program: optional flat compiled hidden-column scan fetch; offset 0 (NULL) -> legacy */
-  offset = xts_save_expr_program (build_list_proc->g_scan_hidden_fetch_program);
-  if (offset == ER_FAILED)
-    {
-      return NULL;
-    }
-  ptr = or_pack_int (ptr, offset);
-
   return ptr;
 }
 
@@ -4349,14 +4277,6 @@ xts_process_outptr_list (char *ptr, const OUTPTR_LIST * outptr_list)
     }
   ptr = or_pack_int (ptr, offset);
 
-  /* fetch_program: optional flat compiled non-hidden output fetch; offset 0 (NULL) -> legacy on unpack */
-  offset = xts_save_expr_program (outptr_list->fetch_program);
-  if (offset == ER_FAILED)
-    {
-      return NULL;
-    }
-  ptr = or_pack_int (ptr, offset);
-
   return ptr;
 }
 
@@ -4418,70 +4338,6 @@ xts_process_pred_expr (char *ptr, const PRED_EXPR * pred_expr)
     default:
       xts_Xasl_errcode = ER_QPROC_INVALID_XASLNODE;
       return NULL;
-    }
-
-  return ptr;
-}
-
-/* pack an EXPR_PROGRAM body; format_version FIRST (D8), then steps_len, then per-step payload.
-   POSITIONAL: keep in lock-step with stx_build_expr_program / xts_sizeof_expr_program (P4). */
-static char *
-xts_process_expr_program (char *ptr, const EXPR_PROGRAM * prog)
-{
-  int i, offset;
-
-  /* format_version first (D8): strict mismatch -> legacy on unpack */
-  ptr = or_pack_int (ptr, (int) EXPR_PROGRAM_FORMAT_VERSION);
-
-  ptr = or_pack_int (ptr, prog->steps_len);
-
-  for (i = 0; i < prog->steps_len; i++)
-    {
-      const EXPR_STEP *step = &prog->steps[i];
-
-      ptr = or_pack_int (ptr, (int) step->opcode);
-      ptr = or_pack_int (ptr, step->arg1_idx);
-      ptr = or_pack_int (ptr, step->arg2_idx);
-
-      switch (step->opcode)
-	{
-	case EXPR_OP_VAR:
-	case EXPR_OP_CONST:
-	  /* leaf regu, deduped vs the pred copy via pointer-visited table */
-	  offset = xts_save_regu_variable (step->d.src);
-	  if (offset == ER_FAILED)
-	    {
-	      return NULL;
-	    }
-	  ptr = or_pack_int (ptr, offset);
-	  break;
-
-	case EXPR_OP_CAST:
-	  /* defensive: q1 predicate emits no cast step; pack domain via OID mechanism (P4) */
-	  ptr = OR_PACK_DOMAIN_OBJECT_TO_OID (ptr, step->d.cast.domain, 0, 0);
-	  break;
-
-	case EXPR_OP_MUL:
-	case EXPR_OP_SUB:
-	case EXPR_OP_ADD:
-	  /* arith operator_type + result domain (re-resolved server-side, like the cast branch) */
-	  ptr = or_pack_int (ptr, step->d.arith.operator_type);
-	  ptr = OR_PACK_DOMAIN_OBJECT_TO_OID (ptr, step->d.arith.domain, 0, 0);
-	  /* kernel_tag inside the arith case (C4a v2), after domain; lock-step with unpack/sizeof */
-	  ptr = or_pack_int (ptr, step->d.arith.kernel_tag);
-	  break;
-
-	case EXPR_OP_LE:
-	  /* comparison: arg indices carry all payload; no extra op-specific data */
-	  break;
-
-	default:
-	  xts_Xasl_errcode = ER_QPROC_INVALID_XASLNODE;
-	  return NULL;
-	}
-
-      /* is_producing trailing per-step (C2a): appended after op-specific fields, lock-step with unpack */
-      ptr = or_pack_int (ptr, step->is_producing ? 1 : 0);
     }
 
   return ptr;
@@ -4715,14 +4571,6 @@ xts_process_access_spec_type (char *ptr, const ACCESS_SPEC_TYPE * access_spec)
   ptr = or_pack_int (ptr, offset);
 
   offset = xts_save_pred_expr (access_spec->where_pred);
-  if (offset == ER_FAILED)
-    {
-      return NULL;
-    }
-  ptr = or_pack_int (ptr, offset);
-
-  /* where_pred_program: optional flat compiled predicate; offset 0 (NULL) -> legacy on unpack */
-  offset = xts_save_expr_program (access_spec->where_pred_program);
   if (offset == ER_FAILED)
     {
       return NULL;
@@ -5732,16 +5580,7 @@ xts_process_aggregate_type (char *ptr, const AGGREGATE_TYPE * aggregate)
   flagint |= (aggregate->flag.dummy ? 1 : 0) << 3;
 
   ptr = or_pack_int (ptr, flagint);
-
-  /* operand_program: flat compiled single arith operand; offset 0 (NULL) -> legacy on unpack */
-  offset = xts_save_expr_program (aggregate->operand_program);
-  if (offset == ER_FAILED)
-    {
-      return NULL;
-    }
   ptr = or_pack_int (ptr, offset);
-
-  ptr = or_pack_int (ptr, offset);	/* stale is_ended slot absorbed by stx_build_aggregate_type */
 
   return ptr;
 }
@@ -6411,8 +6250,7 @@ xts_sizeof_buildlist_proc (const BUILDLIST_PROC_NODE * build_list)
 	   + PTR_SIZE		/* a_outptr_list */
 	   + PTR_SIZE		/* a_outptr_list_ex */
 	   + PTR_SIZE		/* a_outptr_list_interm */
-	   + PTR_SIZE		/* a_val_list */
-	   + PTR_SIZE);		/* g_scan_hidden_fetch_program */
+	   + PTR_SIZE);		/* a_val_list */
   return size;
 }
 
@@ -6700,8 +6538,7 @@ xts_sizeof_outptr_list (const OUTPTR_LIST * outptr_list)
   int size = 0;
 
   size += (OR_INT_SIZE		/* valptr_cnt */
-	   + PTR_SIZE		/* valptrp */
-	   + PTR_SIZE);		/* fetch_program */
+	   + PTR_SIZE);		/* valptrp */
 
   return size;
 }
@@ -6745,63 +6582,6 @@ xts_sizeof_pred_expr (const PRED_EXPR * pred_expr)
     default:
       xts_Xasl_errcode = ER_QPROC_INVALID_XASLNODE;
       return ER_FAILED;
-    }
-
-  return size;
-}
-
-/*
- * xts_sizeof_expr_program () - byte size of a packed EXPR_PROGRAM body
- *   return: size, or ER_FAILED
- *   prog(in):
- *
- * MUST equal the bytes written by xts_process_expr_program (positional wire, P4).
- */
-static int
-xts_sizeof_expr_program (const EXPR_PROGRAM * prog)
-{
-  int size = 0;
-  int i;
-
-  size += OR_INT_SIZE;		/* format_version */
-  size += OR_INT_SIZE;		/* steps_len */
-
-  for (i = 0; i < prog->steps_len; i++)
-    {
-      const EXPR_STEP *step = &prog->steps[i];
-
-      size += (OR_INT_SIZE	/* opcode */
-	       + OR_INT_SIZE	/* arg1_idx */
-	       + OR_INT_SIZE);	/* arg2_idx */
-
-      switch (step->opcode)
-	{
-	case EXPR_OP_VAR:
-	case EXPR_OP_CONST:
-	  size += PTR_SIZE;	/* d.src offset */
-	  break;
-
-	case EXPR_OP_CAST:
-	  size += or_packed_domain_size (step->d.cast.domain, 0);	/* d.cast.domain */
-	  break;
-
-	case EXPR_OP_MUL:
-	case EXPR_OP_SUB:
-	case EXPR_OP_ADD:
-	  size += OR_INT_SIZE;	/* d.arith.operator_type */
-	  size += or_packed_domain_size (step->d.arith.domain, 0);	/* d.arith.domain */
-	  size += OR_INT_SIZE;	/* d.arith.kernel_tag (C4a v2) */
-	  break;
-
-	case EXPR_OP_LE:
-	  break;		/* no op-specific payload */
-
-	default:
-	  xts_Xasl_errcode = ER_QPROC_INVALID_XASLNODE;
-	  return ER_FAILED;
-	}
-
-      size += OR_INT_SIZE;	/* is_producing (C2a) */
     }
 
   return size;
@@ -7008,7 +6788,6 @@ xts_sizeof_access_spec_type (const ACCESS_SPEC_TYPE * access_spec)
 	   + PTR_SIZE		/* index_ptr */
 	   + PTR_SIZE		/* where_key */
 	   + PTR_SIZE		/* where_pred */
-	   + PTR_SIZE		/* where_pred_program */
 	   + PTR_SIZE);		/* where_range */
 
   switch (access_spec->type)
@@ -7639,7 +7418,6 @@ xts_sizeof_aggregate_type (const AGGREGATE_TYPE * aggregate)
     }
 
   size += OR_INT_SIZE;		/* flag */
-  size += PTR_SIZE;		/* operand_program */
   return size;
 }
 

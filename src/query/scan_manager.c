@@ -644,7 +644,6 @@ scan_init_scan_pred (SCAN_PRED * scan_pred_p, regu_variable_list_node * regu_lis
   scan_pred_p->regu_list = regu_list;
   scan_pred_p->pred_expr = pred_expr;
   scan_pred_p->pr_eval_fnc = pr_eval_fnc;
-  scan_pred_p->pr_program = NULL;	/* default legacy; heap scan sets it from the access spec (Phase 6) */
 }
 
 /*
@@ -2850,8 +2849,8 @@ scan_open_heap_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 		     QPROC_SINGLE_FETCH single_fetch, DB_VALUE * join_dbval, val_list_node * val_list, VAL_DESCR * vd,
 		     /* fields of HEAP_SCAN_ID */
 		     OID * cls_oid, HFID * hfid, regu_variable_list_node * regu_list_pred, PRED_EXPR * pr,
-		     EXPR_PROGRAM * pr_program, regu_variable_list_node * regu_list_rest, int num_attrs_pred,
-		     ATTR_ID * attrids_pred, HEAP_CACHE_ATTRINFO * cache_pred, int num_attrs_rest, ATTR_ID * attrids_rest,
+		     regu_variable_list_node * regu_list_rest, int num_attrs_pred, ATTR_ID * attrids_pred,
+		     HEAP_CACHE_ATTRINFO * cache_pred, int num_attrs_rest, ATTR_ID * attrids_rest,
 		     HEAP_CACHE_ATTRINFO * cache_rest, SCAN_TYPE scan_type, DB_VALUE ** cache_recordinfo,
 		     regu_variable_list_node * regu_list_recordinfo, bool is_partition_table)
 {
@@ -2881,8 +2880,6 @@ scan_open_heap_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
   /* scan predicates */
   scan_init_scan_pred (&hsidp->scan_pred, regu_list_pred, pr,
 		       ((pr) ? eval_fnc (thread_p, pr, &single_node_type) : NULL));
-  /* flat compiled where_pred (NULL = legacy); per-clone, parallel-safe (Phase 6) */
-  hsidp->scan_pred.pr_program = pr_program;
   /* attribute information from predicates */
   scan_init_scan_attrs (&hsidp->pred_attrs, num_attrs_pred, attrids_pred, cache_pred);
 

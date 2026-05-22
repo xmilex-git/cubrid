@@ -112,7 +112,7 @@ namespace parallel_heap_scan
 	    scan_open_heap_scan (&thread_ref, m_scan_id, false, S_SELECT,
 				 m_is_fixed, m_is_grouped, spec->single_fetch, spec->s_dbval,
 				 m_xasl->val_list, m_vd, &m_cls_oid, &m_hfid,
-				 cls->cls_regu_list_pred, spec->where_pred, spec->where_pred_program, cls->cls_regu_list_rest,
+				 cls->cls_regu_list_pred, spec->where_pred, cls->cls_regu_list_rest,
 				 cls->num_attrs_pred, cls->attrids_pred, cls->cache_pred,
 				 cls->num_attrs_rest, cls->attrids_rest, cls->cache_rest,
 				 S_HEAP_SCAN, cls->cache_reserved, cls->cls_regu_list_reserved, false);
@@ -182,7 +182,6 @@ namespace parallel_heap_scan
 							S_SELECT, fixed_scan, specp->s_id.grouped,
 							specp->single_fetch, specp->s_dbval, xptr->val_list, m_vd,
 							&scan_info.oid, &scan_info.hfid, specp->s.cls_node.cls_regu_list_pred, specp->where_pred,
-							specp->where_pred_program,
 							specp->s.cls_node.cls_regu_list_rest, specp->s.cls_node.num_attrs_pred,
 							specp->s.cls_node.attrids_pred, specp->s.cls_node.cache_pred,
 							specp->s.cls_node.num_attrs_rest, specp->s.cls_node.attrids_rest,

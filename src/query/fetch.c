@@ -60,12 +60,6 @@
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
-#if !defined (NDEBUG)
-/* AC4-CAST observability (debug builds only): per-tuple cast counter. For the q1 compiled predicate
-   no cast step runs, so this must stay 0 across the flat predicate path. Thread-local. */
-__thread int expr_per_tuple_cast_count = 0;
-#endif /* !NDEBUG */
-
 static int fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr * vd, OID * obj_oid,
 			     QFILE_TUPLE tpl, DB_VALUE ** peek_dbval);
 static int fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE tpl);
@@ -2511,9 +2505,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    }
 	  else
 	    {
-#if !defined (NDEBUG)
-	      expr_per_tuple_cast_count++;	/* AC4-CAST: q1 flat predicate must keep this at 0 */
-#endif /* !NDEBUG */
 	      dom_status = tp_value_cast_force (peek_right, arithptr->value, arithptr->domain, false);
 	    }
 

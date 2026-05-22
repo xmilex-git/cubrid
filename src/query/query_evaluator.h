@@ -47,8 +47,6 @@ class regu_variable_node;
 struct val_descr;
 typedef struct val_descr VAL_DESCR;
 struct val_list_node;
-struct expr_program;
-typedef struct expr_program EXPR_PROGRAM;
 
 // *INDENT-OFF*
 namespace cubxasl
@@ -98,7 +96,6 @@ struct scan_pred
   regu_variable_list_node *regu_list;	/* regu list for predicates (or filters) */
   PRED_EXPR *pred_expr;		/* predicate expressions */
   PR_EVAL_FNC pr_eval_fnc;	/* predicate evaluation function */
-  EXPR_PROGRAM *pr_program;	/* flat compiled predicate (NULL = legacy pr_eval_fnc path), Phase 6 */
 };
 
 /* attributes information of scan */
@@ -150,12 +147,5 @@ extern DB_LOGICAL eval_data_filter (THREAD_ENTRY * thread_p, OID * oid, RECDES *
 extern DB_LOGICAL eval_key_filter (THREAD_ENTRY * thread_p, DB_VALUE * value, int prefix_size, DB_VALUE * prefix_value,
 				   FILTER_INFO * filter);
 extern DB_LOGICAL update_logical_result (THREAD_ENTRY * thread_p, DB_LOGICAL ev_res, int *qualification);
-
-/* Phase 6 flat predicate execute core. expr_program_eval_pred runs a compiled EXPR_PROGRAM; the
-   per-opcode evaluators it dispatches (expr_eval_leaf/expr_eval_le) are declared in expr_program.hpp
-   since they are also bound into stx_Expr_eval_registry (stream_to_xasl.c). pred_expr is the original
-   PRED_EXPR (carries et_comp for the LE comparison/coercion context). */
-extern DB_LOGICAL expr_program_eval_pred (THREAD_ENTRY * thread_p, EXPR_PROGRAM * prog, const PRED_EXPR * pred_expr,
-					  val_descr * vd, OID * obj_oid);
 
 #endif /* _QUERY_EVALUATOR_H_ */
