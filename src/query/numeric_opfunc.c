@@ -46,11 +46,6 @@
 #include <cmath>
 #endif
 
-#if defined (SERVER_MODE)
-#include "thread_manager.hpp"	// for thread_get_thread_entry_info
-#include "query_manager.h"	// for qmgr_get_current_query_id
-#endif // SERVER_MODE
-
 #include "dbtype.h"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -92,35 +87,6 @@ static bool initialized_10 = false;
 static const double numeric_Pow_of_10[10] = {
   1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9
 };
-
-/* US-HOIST: resolve PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL once per query (per worker), self-invalidating by query id.
- * Server workers carry the parent tran_index, so qmgr_get_current_query_id returns the current query's id and the
- * cache re-resolves on each new query -- the wide=0/wide=1 toggle still works. Avoids per-call session_get_session_state. */
-/* US-COERCE: non-static so query_opfunc.c shares the same cached gate (declared extern in numeric_opfunc.h). */
-bool
-numeric_wide_kernel_enabled (void)
-{
-#if defined (SERVER_MODE)
-  THREAD_ENTRY *thread_p = thread_get_thread_entry_info ();
-  QUERY_ID qid = (thread_p != NULL) ? qmgr_get_current_query_id (thread_p) : NULL_QUERY_ID;
-
-  /* NULL_QUERY_ID (no active query entry) is never cached -> always re-resolves, never goes stale */
-  if (thread_p != NULL && qid != NULL_QUERY_ID && thread_p->m_wide_numeric_kernel_qid == qid)
-    {
-      return thread_p->m_wide_numeric_kernel;
-    }
-
-  bool enabled = prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL);
-  if (thread_p != NULL && qid != NULL_QUERY_ID)
-    {
-      thread_p->m_wide_numeric_kernel = enabled;
-      thread_p->m_wide_numeric_kernel_qid = qid;
-    }
-  return enabled;
-#else /* SERVER_MODE */
-  return prm_get_bool_value (PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL);
-#endif /* SERVER_MODE */
-}
 
 typedef enum fp_value_type
 {
@@ -192,14 +158,11 @@ static int numeric_longnum_to_shortnum (DB_C_NUMERIC answer, DB_C_NUMERIC long_a
 static void numeric_shortnum_to_longnum (DB_C_NUMERIC long_answer, DB_C_NUMERIC arg);
 static int get_significant_digit (DB_BIGINT i);
 
-/* C5a: __int128 fast-path helpers for prec<=38 equal-scale NUMERIC add.
- * NUMERIC is a 16-byte big-endian (buf[0]=MSB) two's-complement integer, i.e. a byteswapped __int128.
- * Target is little-endian x86_64 (OR_LITTLE_ENDIAN), so MSB-first load/store is an explicit byteswap.
- * Bit-identity vs legacy numeric_add / numeric_overflow proven by construction; see C5a report. */
+/* int128 fast-path helpers: NUMERIC is 16B big-endian two's-complement = byteswapped int128 on little-endian; bit-identical to legacy by construction. */
 static inline __int128
 numeric_be16_to_int128 (const unsigned char *b)
 {
-  /* big-endian 16B -> __int128 via two bswap64 (the naive byte loop cost ~20s/callsite = the C5a regression) */
+  /* two bswap64, not a byte loop -- byte loop failed to vectorize */
   UINT64 hi, lo;
   memcpy (&hi, b, 8);
   memcpy (&lo, b + 8, 8);
@@ -218,21 +181,21 @@ numeric_int128_to_be16 (__int128 v, unsigned char *out)
   memcpy (out + 8, &lo, 8);
 }
 
-/* magnitude exactly as numeric_overflow: negate negatives via 2's-comp wrap (matches numeric_negate) */
+/* abs via 2's-comp wrap, matching numeric_negate */
 static inline unsigned __int128
 numeric_abs128 (__int128 v)
 {
   return (v < 0) ? (unsigned __int128) (-(unsigned __int128) v) : (unsigned __int128) v;
 }
 
-/* 10^exp as __int128, derived from the legacy big-endian table so it is byte-identical to numeric_get_pow_of_10 */
+/* 10^exp from legacy big-endian table -> byte-identical to numeric_get_pow_of_10 */
 static inline unsigned __int128
 numeric_pow10_int128 (int exp)
 {
   return (unsigned __int128) numeric_be16_to_int128 (numeric_get_pow_of_10 (exp));
 }
 
-/* US-DOMINIT-lite: byte-identical to db_make_numeric when answer's NUMERIC domain already matches (caller-verified); memcpy overwrites codeset via buf[1] union overlap */
+/* in-place store; valid only when answer's NUMERIC domain already matches (caller-verified). buf[1] union overlap rewrites codeset. */
 static inline void
 numeric_store_same_domain (DB_VALUE * answer, const unsigned char *bytes)
 {
@@ -1708,61 +1671,55 @@ numeric_db_value_add (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
       return NO_ERROR;
     }
 
-  /* C5a: __int128 fast-path. Engages only where bit-identical to legacy by construction:
-   * equal scale (numeric_common_prec_scale equal-scale branch does no scaling) and cprec<=38 (fits 128-bit).
-   * Replicates exactly numeric_add (16-byte 2's-comp add == int128 add mod 2^128),
-   * numeric_overflow (abs-magnitude vs 10^cprec), the carry prec-bump, and db_make_numeric stamping.
-   * The cprec==38 overflow case (the only one that errors) falls through to legacy verbatim.
-   * Gated on PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL (PRM_FOR_SERVER) so it engages on server workers. */
-  if (numeric_wide_kernel_enabled ())
-    {
-      int scale1 = DB_VALUE_SCALE (dbv1);
-      int scale2 = DB_VALUE_SCALE (dbv2);
-      int prec1 = DB_VALUE_PRECISION (dbv1);
-      int prec2 = DB_VALUE_PRECISION (dbv2);
+  /* int128 add fast-path: equal-scale & cprec<=38 only; cprec==38 overflow falls through to legacy. Bit-identical by construction. */
+  {
+    int scale1 = DB_VALUE_SCALE (dbv1);
+    int scale2 = DB_VALUE_SCALE (dbv2);
+    int prec1 = DB_VALUE_PRECISION (dbv1);
+    int prec2 = DB_VALUE_PRECISION (dbv2);
 
-      if (scale1 == scale2 && prec1 <= DB_MAX_NUMERIC_PRECISION && prec2 <= DB_MAX_NUMERIC_PRECISION)
-	{
-	  int cprec = MAX (prec1, prec2);
-	  __int128 a = numeric_be16_to_int128 (db_locate_numeric (dbv1));
-	  __int128 b = numeric_be16_to_int128 (db_locate_numeric (dbv2));
-	  __int128 s = a + b;		/* wraps mod 2^128, exactly like numeric_add */
-	  bool overflow = (numeric_abs128 (s) >= numeric_pow10_int128 (cprec));
+    if (scale1 == scale2 && prec1 <= DB_MAX_NUMERIC_PRECISION && prec2 <= DB_MAX_NUMERIC_PRECISION)
+      {
+	int cprec = MAX (prec1, prec2);
+	__int128 a = numeric_be16_to_int128 (db_locate_numeric (dbv1));
+	__int128 b = numeric_be16_to_int128 (db_locate_numeric (dbv2));
+	__int128 s = a + b;	/* wraps mod 2^128, like numeric_add */
+	bool overflow = (numeric_abs128 (s) >= numeric_pow10_int128 (cprec));
 
-	  if (!overflow)
-	    {
-	      numeric_int128_to_be16 (s, temp);
-	      /* US-DOMINIT-lite: skip redundant db_value_domain_init when answer (e.g. persistent SUM acc) already matches */
-	      if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == cprec
-		  && DB_VALUE_SCALE (answer) == scale1)
-		{
-		  numeric_store_same_domain (answer, temp);
-		}
-	      else
-		{
-		  db_make_numeric (answer, temp, cprec, scale1);
-		}
-	      return NO_ERROR;
-	    }
-	  else if (cprec < DB_MAX_NUMERIC_PRECISION)
-	    {
-	      /* legacy carry path: keep value, bump prec by one (NO error) */
-	      numeric_int128_to_be16 (s, temp);
-	      /* US-DOMINIT-lite: skip redundant db_value_domain_init when answer already matches the bumped domain */
-	      if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == cprec + 1
-		  && DB_VALUE_SCALE (answer) == scale1)
-		{
-		  numeric_store_same_domain (answer, temp);
-		}
-	      else
-		{
-		  db_make_numeric (answer, temp, cprec + 1, scale1);
-		}
-	      return NO_ERROR;
-	    }
-	  /* cprec == 38 && overflow -> fall through to legacy so ER_IT_DATA_OVERFLOW is byte-identical */
-	}
-    }
+	if (!overflow)
+	  {
+	    numeric_int128_to_be16 (s, temp);
+	    /* skip redundant db_value_domain_init when answer domain already matches (persistent SUM acc) */
+	    if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == cprec
+		&& DB_VALUE_SCALE (answer) == scale1)
+	      {
+		numeric_store_same_domain (answer, temp);
+	      }
+	    else
+	      {
+		db_make_numeric (answer, temp, cprec, scale1);
+	      }
+	    return NO_ERROR;
+	  }
+	else if (cprec < DB_MAX_NUMERIC_PRECISION)
+	  {
+	    /* carry path: keep value, bump prec by one, no error */
+	    numeric_int128_to_be16 (s, temp);
+	    /* skip redundant db_value_domain_init when answer already matches the bumped domain */
+	    if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == cprec + 1
+		&& DB_VALUE_SCALE (answer) == scale1)
+	      {
+		numeric_store_same_domain (answer, temp);
+	      }
+	    else
+	      {
+		db_make_numeric (answer, temp, cprec + 1, scale1);
+	      }
+	    return NO_ERROR;
+	  }
+	/* cprec==38 overflow -> legacy fall-through for byte-identical ER_IT_DATA_OVERFLOW */
+      }
+  }
 
   /* Coerce, if necessary, to make prec & scale match */
   ret = numeric_common_prec_scale (dbv1, dbv2, &dbv1_common, &dbv2_common);
@@ -1966,64 +1923,55 @@ numeric_db_value_mul (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * a
       return NO_ERROR;
     }
 
-  /* C5b: __int128 fast-path for NUMERIC*NUMERIC. Engages only where bit-identical to legacy by construction.
-   * numeric_mul builds the 256-bit unsigned magnitude product (low 128 = temp[16..31]); numeric_get_msb_for_dec
-   * either copies the low 128 (no-truncation prec<=38, OR Case-1 upper-128-zero && low top-bit-clear) or returns
-   * ER_IT_DATA_OVERFLOW. We replicate the eligible "copy low 128" path: full 256-bit product, eligible IFF
-   * hi128==0 && (lo128>>127)==0 (== numeric_is_zero(temp[0..15]) && temp[16]<=0x7F); else fall through to legacy.
-   * prec = (p1+p2+1>38)?38:(p1+p2+1), scale = s1+s2 (matches both no-trunc and Case-1 dest stamps).
-   * Sign applied after via signed negate, matching the post-msb numeric_negate. The 256-bit carry math and the
-   * Case-1 byte equivalence are proven by the C5b standalone harness over random a1/b1!=0 pairs.
-   * Gated on PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL (PRM_FOR_SERVER), default OFF. */
-  if (numeric_wide_kernel_enabled ())
-    {
-      int p1 = DB_VALUE_PRECISION (dbv1);
-      int p2 = DB_VALUE_PRECISION (dbv2);
+  /* int128 mul fast-path: eligible IFF 256-bit product fits low 128 (hi128==0 && lo128 top-bit clear); prec=min(p1+p2+1,38), scale=s1+s2; else legacy. Bit-identical by construction. */
+  {
+    int p1 = DB_VALUE_PRECISION (dbv1);
+    int p2 = DB_VALUE_PRECISION (dbv2);
 
-      if (p1 <= DB_MAX_NUMERIC_PRECISION && p2 <= DB_MAX_NUMERIC_PRECISION)
-	{
-	  __int128 a = numeric_be16_to_int128 (db_locate_numeric (dbv1));
-	  __int128 b = numeric_be16_to_int128 (db_locate_numeric (dbv2));
-	  bool positive = ((a < 0) == (b < 0));	/* sign as numeric_mul: applied to |operands| product */
-	  unsigned __int128 ua = numeric_abs128 (a);
-	  unsigned __int128 ub = numeric_abs128 (b);
+    if (p1 <= DB_MAX_NUMERIC_PRECISION && p2 <= DB_MAX_NUMERIC_PRECISION)
+      {
+	__int128 a = numeric_be16_to_int128 (db_locate_numeric (dbv1));
+	__int128 b = numeric_be16_to_int128 (db_locate_numeric (dbv2));
+	bool positive = ((a < 0) == (b < 0));	/* sign of |operands| product, like numeric_mul */
+	unsigned __int128 ua = numeric_abs128 (a);
+	unsigned __int128 ub = numeric_abs128 (b);
 
-	  /* full 256-bit unsigned product (hi128 : lo128) via 64-bit partial products */
-	  UINT64 a0 = (UINT64) ua, a1 = (UINT64) (ua >> 64);
-	  UINT64 b0 = (UINT64) ub, b1 = (UINT64) (ub >> 64);
-	  unsigned __int128 p00 = (unsigned __int128) a0 * b0;
-	  unsigned __int128 p01 = (unsigned __int128) a0 * b1;
-	  unsigned __int128 p10 = (unsigned __int128) a1 * b0;
-	  unsigned __int128 p11 = (unsigned __int128) a1 * b1;
-	  unsigned __int128 mid = p01 + p10;
-	  unsigned __int128 mid_carry = (mid < p01) ? ((unsigned __int128) 1 << 64) : 0;	/* 128-bit add overflow -> hi bit64 */
-	  unsigned __int128 lo128 = p00 + (mid << 64);
-	  unsigned __int128 lo_carry = (lo128 < p00) ? 1 : 0;
-	  unsigned __int128 hi128 = p11 + (mid >> 64) + mid_carry + lo_carry;
+	/* 256-bit product hi128:lo128 via 64-bit partial products */
+	UINT64 a0 = (UINT64) ua, a1 = (UINT64) (ua >> 64);
+	UINT64 b0 = (UINT64) ub, b1 = (UINT64) (ub >> 64);
+	unsigned __int128 p00 = (unsigned __int128) a0 * b0;
+	unsigned __int128 p01 = (unsigned __int128) a0 * b1;
+	unsigned __int128 p10 = (unsigned __int128) a1 * b0;
+	unsigned __int128 p11 = (unsigned __int128) a1 * b1;
+	unsigned __int128 mid = p01 + p10;
+	unsigned __int128 mid_carry = (mid < p01) ? ((unsigned __int128) 1 << 64) : 0;	/* add overflow -> carry into bit 64 */
+	unsigned __int128 lo128 = p00 + (mid << 64);
+	unsigned __int128 lo_carry = (lo128 < p00) ? 1 : 0;
+	unsigned __int128 hi128 = p11 + (mid >> 64) + mid_carry + lo_carry;
 
-	  /* numeric_get_msb_for_dec Case-1 / no-truncation "copy low 128" eligibility */
-	  if (hi128 == 0 && (lo128 >> 127) == 0)
-	    {
-	      __int128 signed_result = positive ? (__int128) lo128 : -(__int128) lo128;
-	      int fprec = (p1 + p2 + 1 > DB_MAX_NUMERIC_PRECISION) ? DB_MAX_NUMERIC_PRECISION : (p1 + p2 + 1);
-	      int fscale = DB_VALUE_SCALE (dbv1) + DB_VALUE_SCALE (dbv2);
+	/* numeric_get_msb_for_dec "copy low 128" eligibility */
+	if (hi128 == 0 && (lo128 >> 127) == 0)
+	  {
+	    __int128 signed_result = positive ? (__int128) lo128 : -(__int128) lo128;
+	    int fprec = (p1 + p2 + 1 > DB_MAX_NUMERIC_PRECISION) ? DB_MAX_NUMERIC_PRECISION : (p1 + p2 + 1);
+	    int fscale = DB_VALUE_SCALE (dbv1) + DB_VALUE_SCALE (dbv2);
 
-	      numeric_int128_to_be16 (signed_result, result);
-	      /* US-DOMINIT-lite: skip redundant db_value_domain_init when answer already matches the target domain */
-	      if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == fprec
-		  && DB_VALUE_SCALE (answer) == fscale)
-		{
-		  numeric_store_same_domain (answer, result);
-		}
-	      else
-		{
-		  db_make_numeric (answer, result, fprec, fscale);
-		}
-	      return NO_ERROR;
-	    }
-	  /* hi128!=0 OR low top-bit set -> fall through to legacy so result / ER_IT_DATA_OVERFLOW is byte-identical */
-	}
-    }
+	    numeric_int128_to_be16 (signed_result, result);
+	    /* skip redundant db_value_domain_init when answer already matches target domain */
+	    if (DB_VALUE_DOMAIN_TYPE (answer) == DB_TYPE_NUMERIC && DB_VALUE_PRECISION (answer) == fprec
+		&& DB_VALUE_SCALE (answer) == fscale)
+	      {
+		numeric_store_same_domain (answer, result);
+	      }
+	    else
+	      {
+		db_make_numeric (answer, result, fprec, fscale);
+	      }
+	    return NO_ERROR;
+	  }
+	/* not eligible -> legacy fall-through for byte-identical result/overflow */
+      }
+  }
 
   /* Perform the multiplication */
   numeric_mul (db_locate_numeric (dbv1), db_locate_numeric (dbv2), &positive_ans, temp);

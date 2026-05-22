@@ -311,10 +311,6 @@ namespace cubthread
       bool m_is_private_lru_enabled;
       struct pgbuf_holder_anchor *m_holder_anchor;
 
-      /* US-HOIST: per-query cached resolution of PRM_ID_ENABLE_WIDE_NUMERIC_KERNEL; self-invalidates when qid changes */
-      bool m_wide_numeric_kernel;
-      QUERY_ID m_wide_numeric_kernel_qid;
-
       thread_id_t get_id ();
       pthread_t get_posix_id ();
       void register_id ();

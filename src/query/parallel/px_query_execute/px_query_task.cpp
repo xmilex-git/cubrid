@@ -119,8 +119,6 @@ namespace parallel_query_execute
     cur_thread_p->tran_index = parent_thread_p->tran_index;
     cur_thread_p->on_trace = parent_thread_p->on_trace;
     cur_thread_p->m_px_orig_thread_entry = parent_thread_p;
-    /* US-HOIST: reset wide-numeric-kernel cache after adopting parent tran_index, so the first numeric op re-resolves this query's PRM (worker thread_entry is reused across sessions) */
-    cur_thread_p->m_wide_numeric_kernel_qid = NULL_QUERY_ID;
     is_on_root_thread = cur_thread_p == parent_thread_p;
     new_xasl_state = qexec_deep_copy_xasl_state (cur_thread_p, xasl_state);
     assert (new_xasl_state != nullptr);
