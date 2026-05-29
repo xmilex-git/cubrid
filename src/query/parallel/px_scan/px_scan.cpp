@@ -375,10 +375,36 @@ extern "C"
 
     scan_id->type = S_HEAP_SCAN;
 
-    if (spec->curent == nullptr)
+    /* anchor model: when the inner anchor table is opened at its own join level, keep it serial here;
+       the driver/head's parallel manager is what partitions it. */
+    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR))
+      {
+	return NO_ERROR;
+      }
+
+    /* anchor: partition a flagged deeper inner-join spec instead of the head; head stays result/join driver. */
+    ACCESS_SPEC_TYPE *part_spec = spec;
+    for (XASL_NODE *anchor_xptr = (xasl != nullptr) ? xasl->scan_ptr : nullptr; anchor_xptr != nullptr;
+	 anchor_xptr = anchor_xptr->scan_ptr)
+      {
+	ACCESS_SPEC_TYPE *cand = anchor_xptr->spec_list;
+	if (cand != nullptr && ACCESS_SPEC_IS_FLAGED (cand, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR)
+	    && cand->type == TARGET_CLASS && cand->access == ACCESS_METHOD_SEQUENTIAL)
+	  {
+	    part_spec = cand;
+	    /* checker marks inner specs NO_PARALLEL (old level-0-only model); the anchor is explicitly
+	       chosen for partitioning, so clear it — real ineligibility is re-checked just below. */
+	    ACCESS_SPEC_UNSET_FLAG (cand, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN);
+	    class_oid = &ACCESS_SPEC_CLS_OID (cand);
+	    class_hfid = &ACCESS_SPEC_HFID (cand);
+	    break;
+	  }
+      }
+
+    if (part_spec->curent == nullptr)
       {
 	/* DB_PARTITION_CLASS will be parallel-heap-scanned, not DB_PARTITIONED_CLASS */
-	if (spec->pruning_type == DB_PARTITIONED_CLASS)
+	if (part_spec->pruning_type == DB_PARTITIONED_CLASS)
 	  {
 	    /* try single-thread heap scan */
 	    return NO_ERROR;
@@ -390,11 +416,11 @@ extern "C"
 	    || thread_p->private_heap_id == 0)
 	  {
 	    /* parallel-thread heap scan not supported */
-	    ACCESS_SPEC_SET_FLAG (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN);
+	    ACCESS_SPEC_SET_FLAG (part_spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN);
 	  }
       }
 
-    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN) || HFID_IS_NULL (class_hfid))
+    if (ACCESS_SPEC_IS_FLAGED (part_spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN) || HFID_IS_NULL (class_hfid))
       {
 	/* try single-thread heap scan */
 	return NO_ERROR;
