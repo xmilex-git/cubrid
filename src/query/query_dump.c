@@ -3572,6 +3572,11 @@ qdump_print_access_spec_stats_text (FILE * fp, ACCESS_SPEC_TYPE * spec_list_p, i
 		}
 	    }
 #endif
+	  if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR))
+	    {
+	      fprintf (fp, "\n%*c(parallel anchor: %s partitioned across workers)", multi_spec_indent, ' ',
+		       (class_name != NULL) ? class_name : "?");
+	    }
 	  if (class_name != NULL)
 	    {
 	      free_and_init (class_name);
@@ -3705,6 +3710,67 @@ qdump_print_access_spec_stats_text (FILE * fp, ACCESS_SPEC_TYPE * spec_list_p, i
  *   xasl_p(in):
  *   indent(in):
  */
+/* one-line role summary for an anchor-decoupled parallel scan: which table is the
+   split partition source and which leading tables are replicated per worker. */
+static void
+qdump_print_parallel_anchor_summary (FILE * fp, xasl_node * head, int indent)
+{
+  ACCESS_SPEC_TYPE *anchor_spec = NULL;
+  xasl_node *xp;
+  THREAD_ENTRY *thread_p = thread_get_thread_entry_info ();
+  bool first;
+
+  for (xp = head; xp != NULL && anchor_spec == NULL; xp = xp->scan_ptr)
+    {
+      for (ACCESS_SPEC_TYPE * sp = xp->spec_list; sp != NULL; sp = sp->next)
+	{
+	  if (ACCESS_SPEC_IS_FLAGED (sp, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR))
+	    {
+	      anchor_spec = sp;
+	      break;
+	    }
+	}
+    }
+  if (anchor_spec == NULL)
+    {
+      return;
+    }
+
+  {
+    char *aname = NULL;
+    (void) heap_get_class_name (thread_p, &ACCESS_SPEC_CLS_OID (anchor_spec), &aname);
+    fprintf (fp, "%*cparallel: anchor=%s (split across workers); prefix replicated:", indent, ' ',
+	     (aname != NULL) ? aname : "?");
+    if (aname != NULL)
+      {
+	free_and_init (aname);
+      }
+  }
+
+  first = true;
+  for (xp = head; xp != NULL; xp = xp->scan_ptr)
+    {
+      ACCESS_SPEC_TYPE *sp = xp->spec_list;
+      char *pname = NULL;
+
+      if (sp == anchor_spec)
+	{
+	  break;
+	}
+      if (sp != NULL && sp->type == TARGET_CLASS)
+	{
+	  (void) heap_get_class_name (thread_p, &ACCESS_SPEC_CLS_OID (sp), &pname);
+	}
+      fprintf (fp, "%s %s", first ? "" : ",", (pname != NULL) ? pname : "?");
+      first = false;
+      if (pname != NULL)
+	{
+	  free_and_init (pname);
+	}
+    }
+  fprintf (fp, "\n");
+}
+
 void
 qdump_print_stats_text (FILE * fp, xasl_node * xasl_p, int indent)
 {
@@ -3741,6 +3807,11 @@ qdump_print_stats_text (FILE * fp, xasl_node * xasl_p, int indent)
 	       qdump_xasl_type_string (xasl_p), TO_MSEC (xasl_p->xasl_stats.elapsed_time),
 	       (long long int) xasl_p->xasl_stats.fetches, (long long int) xasl_p->xasl_stats.fetch_time,
 	       (long long int) xasl_p->xasl_stats.ioreads);
+
+      if (xasl_p->type == BUILDLIST_PROC || xasl_p->type == BUILDVALUE_PROC)
+	{
+	  qdump_print_parallel_anchor_summary (fp, xasl_p, indent + 2);
+	}
 
       indent += 2;
       if (xasl_p->func_stats.calls > 0)

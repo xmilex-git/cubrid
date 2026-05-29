@@ -60,6 +60,7 @@ namespace parallel_scan
       m_hfid (hfid),
       m_cls_oid (cls_oid),
       m_xasl (nullptr),
+      m_anchor_xptr (nullptr),
       m_scan_id (nullptr),
       m_slot_iterator (),
       m_result_handler (result_handler),
@@ -94,6 +95,7 @@ namespace parallel_scan
       HFID m_hfid;
       OID m_cls_oid;
       XASL_NODE *m_xasl;
+      XASL_NODE *m_anchor_xptr;		/* partition-source level; == m_xasl (head) when no anchor flag */
       SCAN_ID *m_scan_id;
       slot_iterator_t m_slot_iterator;
       result_handler<result_type> *m_result_handler;

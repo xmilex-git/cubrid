@@ -98,19 +98,32 @@ namespace parallel_scan
       {
 	return err_code;
       }
+    /* anchor: partition-source level (flagged spec) or head (level 0) by default. */
+    m_anchor_xptr = m_xasl;
+    for (xasl_node *xp = m_xasl; xp != NULL; xp = xp->scan_ptr)
+      {
+	if (xp->spec_list != NULL && ACCESS_SPEC_IS_FLAGED (xp->spec_list, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR))
+	  {
+	    m_anchor_xptr = xp;
+	    break;
+	  }
+      }
+    m_scan_id = &m_anchor_xptr->spec_list->s_id;
+
     if constexpr (ST != SCAN_TYPE::LIST)
       {
 	hsidp = &m_scan_id->s.hsid;
       }
     m_scan_id->vd = m_vd;
-    spec = m_xasl->spec_list;
+    spec = m_anchor_xptr->spec_list;
     cls = &spec->s.cls_node;
     m_xasl->curr_spec = m_xasl->spec_list;
+    m_anchor_xptr->curr_spec = m_anchor_xptr->spec_list;
 
     for (xptr = m_xasl, level = 0; xptr != NULL; xptr = xptr->scan_ptr, level++)
       {
 	spec_ptr = xptr->spec_list;
-	if (level == 0)
+	if (xptr == m_anchor_xptr)
 	  {
 	    if constexpr (ST == SCAN_TYPE::LIST)
 	      {
@@ -626,13 +639,13 @@ namespace parallel_scan
 	  }
 	if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST || result_type == RESULT_TYPE::BUILDVALUE_OPT)
 	  {
-	    if (m_xasl->scan_ptr)
+	    if (m_anchor_xptr->scan_ptr)
 	      {
-		m_xasl->curr_spec->s_id.qualified_block = true;
+		m_anchor_xptr->curr_spec->s_id.qualified_block = true;
 
 		/* handle the scan procedure */
-		m_xasl->scan_ptr->next_scan_on = false;
-		if (scan_reset_scan_block (&thread_ref, &m_xasl->scan_ptr->curr_spec->s_id) == S_ERROR)
+		m_anchor_xptr->scan_ptr->next_scan_on = false;
+		if (scan_reset_scan_block (&thread_ref, &m_anchor_xptr->scan_ptr->curr_spec->s_id) == S_ERROR)
 		  {
 		    m_err_messages->move_top_error_message_to_this();
 		    m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
@@ -640,12 +653,12 @@ namespace parallel_scan
 		    return S_ERROR;
 		  }
 
-		m_xasl->next_scan_on = true;
-		if (m_xasl->scan_ptr->memoize_storage)
+		m_anchor_xptr->next_scan_on = true;
+		if (m_anchor_xptr->scan_ptr->memoize_storage)
 		  {
-		    m_xasl->scan_ptr->memoize_storage->set_key_changed ();
+		    m_anchor_xptr->scan_ptr->memoize_storage->set_key_changed ();
 		  }
-		while ((xs_scan = qexec_execute_scan_ptr (&thread_ref, m_xasl->scan_ptr, m_xasl_state, m_scan_func_ptr)) == S_SUCCESS)
+		while ((xs_scan = qexec_execute_scan_ptr (&thread_ref, m_anchor_xptr->scan_ptr, m_xasl_state, m_scan_func_ptr)) == S_SUCCESS)
 		  {
 		    if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
 		      {
@@ -663,7 +676,7 @@ namespace parallel_scan
 		    stop = true;
 		    return S_ERROR;
 		  }
-		m_xasl->next_scan_on = false;
+		m_anchor_xptr->next_scan_on = false;
 	      }
 	    else
 	      {
@@ -728,6 +741,23 @@ namespace parallel_scan
       {
 	m_input_handler->enter_worker ();
 	worker_guard.handler = m_input_handler;
+      }
+
+    /* anchor mode (k=1): position the single-table prefix (head) once; binds m_vd for the
+       anchor predicate / suffix join / output. Empty prefix -> no rows for this worker. */
+    if (m_anchor_xptr != m_xasl)
+      {
+	SCAN_CODE prefix_code = scan_next_scan (&thread_ref, &m_xasl->spec_list->s_id);
+	if (prefix_code != S_SUCCESS)
+	  {
+	    if (prefix_code == S_ERROR
+		&& m_interrupt->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+	      {
+		m_err_messages->move_top_error_message_to_this ();
+		m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+	      }
+	    return;
+	  }
       }
 
     while (!stop)

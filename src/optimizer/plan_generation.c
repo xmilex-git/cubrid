@@ -3115,17 +3115,22 @@ qo_select_parallel_anchor (QO_PLAN * plan)
       return NULL;
     }
 
-  outer = plan->plan_un.join.outer;
+  outer = qo_skip_sort_plan (plan->plan_un.join.outer);
   inner = plan->plan_un.join.inner;
   if (outer == NULL || inner == NULL || outer->info == NULL)
     {
       return NULL;
     }
 
-  if (outer->info->cardinality >= 1.5)
+  if (outer->plan_type == QO_PLANTYPE_JOIN)
     {
-      /* prefix exceeds ~1 row inside outer; anchor is deeper. */
+      /* prefix lies deeper in the left subtree; recurse to a lower single-table prefix. */
       return qo_select_parallel_anchor (outer);
+    }
+  if (outer->plan_type != QO_PLANTYPE_SCAN || outer->info->cardinality >= 1.5)
+    {
+      /* v1: prefix must be a single ~1-row base table (k=1); big leading table is handled by the level-0 path. */
+      return NULL;
     }
 
   anchor = qo_skip_sort_plan (inner);
