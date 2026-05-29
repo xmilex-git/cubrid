@@ -24,6 +24,7 @@
 #define _PX_SCAN_INPUT_HANDLER_LIST_HPP_
 
 #include "px_interrupt.hpp"
+#include "px_scan_list_page_steal_pool.hpp"
 #include "query_list.h"
 #include "query_manager.h"
 #include "scan_manager.h"
@@ -62,16 +63,50 @@ namespace parallel_scan
 	return m_list_id;
       }
 
+      void enter_worker ()
+      {
+	if (m_steal_pool.is_initialized ())
+	  {
+	    m_steal_pool.enter_worker ();
+	  }
+      }
+
+      void leave_worker ()
+      {
+	if (m_steal_pool.is_initialized ())
+	  {
+	    m_steal_pool.leave_worker ();
+	  }
+      }
+
+      void signal_no_more_sectors ()
+      {
+	if (m_steal_pool.is_initialized ())
+	  {
+	    m_steal_pool.signal_no_more_sectors ();
+	  }
+      }
+
+      SCAN_CODE wait_or_help_steal (THREAD_ENTRY *thread_p, PAGE_PTR &out_page, QMGR_TEMP_FILE *&out_tfile)
+      {
+	if (m_steal_pool.is_initialized ())
+	  {
+	    return m_steal_pool.wait_or_help (thread_p, out_page, out_tfile);
+	  }
+	return S_END;
+      }
+
     private:
       QFILE_LIST_SECTOR_SCAN_INFO m_sector_scan;
+      list_page_steal_pool m_steal_pool;
 
       QFILE_LIST_ID *m_list_id;
       interrupt *m_interrupt_p;
       err_messages_with_lock *m_err_messages_p;
 
-      thread_local static UINT64 m_tl_bitmap;
       thread_local static VSID m_tl_vsid;
       thread_local static QMGR_TEMP_FILE *m_tl_current_tfile;
+      thread_local static int m_tl_sector_idx;
       thread_local static bool m_tl_is_membuf_worker;
       thread_local static int m_tl_membuf_pageid;
   };

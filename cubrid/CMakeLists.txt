@@ -363,6 +363,7 @@ set(PARALLEL_HASH_JOIN_HEADERS
 set(PARALLEL_SCAN_SOURCES
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_heap.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_list.cpp
+  ${PARALLEL_SCAN_DIR}/px_scan_list_page_steal_pool.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_index.cpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_key_range_list.cpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_leaf_page_dispatcher.cpp

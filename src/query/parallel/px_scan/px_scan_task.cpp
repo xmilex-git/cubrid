@@ -720,11 +720,24 @@ namespace parallel_scan
 		handler->leave_worker ();
 	      }
 	  }
+	else if constexpr (ST == SCAN_TYPE::LIST)
+	  {
+	    if (handler != nullptr)
+	      {
+		handler->signal_no_more_sectors ();
+		handler->leave_worker ();
+	      }
+	  }
       }
     };
     worker_scope_guard worker_guard;
     worker_guard.handler = nullptr;
     if constexpr (ST == SCAN_TYPE::INDEX)
+      {
+	m_input_handler->enter_worker ();
+	worker_guard.handler = m_input_handler;
+      }
+    else if constexpr (ST == SCAN_TYPE::LIST)
       {
 	m_input_handler->enter_worker ();
 	worker_guard.handler = m_input_handler;
@@ -775,6 +788,11 @@ namespace parallel_scan
 		/* drain_late_joiner_chains calls leave_worker itself; disarm the RAII guard first. */
 		worker_guard.handler = nullptr;
 		drain_late_joiner_chains (thread_ref, stop);
+	      }
+	    else if constexpr (ST == SCAN_TYPE::LIST)
+	      {
+		worker_guard.handler = nullptr;
+		drain_stolen_pages (thread_ref, stop);
 	      }
 	    m_xasl->curr_spec->s_id.position = S_AFTER;
 	    break;
@@ -881,6 +899,53 @@ namespace parallel_scan
 		break;
 	      }
 	    /* drain_slot_oids returns S_END at completion or S_ERROR with stop=true on terminal failure. */
+	    (void) drain_slot_oids (thread_ref, stop);
+	  }
+      }
+  }
+
+  /* LIST-only: after sectors exhausted, signal completion, then steal unprocessed pages from any sector's shared bitmap. */
+  template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  void task<result_type, ST>::drain_stolen_pages (cubthread::entry &thread_ref, bool &stop)
+  {
+    if constexpr (ST == SCAN_TYPE::LIST)
+      {
+	m_input_handler->signal_no_more_sectors ();
+	m_input_handler->leave_worker ();
+	while (!stop)
+	  {
+	    if (m_interrupt->get_code () != parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+	      {
+		break;
+	      }
+	    PAGE_PTR steal_page = nullptr;
+	    QMGR_TEMP_FILE *steal_tfile = nullptr;
+	    SCAN_CODE help = m_input_handler->wait_or_help_steal (&thread_ref, steal_page, steal_tfile);
+	    if (help == S_END)
+	      {
+		break;
+	      }
+	    if (help == S_ERROR)
+	      {
+		if (m_interrupt->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+		  {
+		    m_err_messages->move_top_error_message_to_this ();
+		    m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		  }
+		stop = true;
+		break;
+	      }
+	    int sp_err = m_slot_iterator.set_page (&thread_ref, steal_page, steal_tfile);
+	    if (sp_err != NO_ERROR)
+	      {
+		if (m_interrupt->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+		  {
+		    m_err_messages->move_top_error_message_to_this ();
+		    m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		  }
+		stop = true;
+		break;
+	      }
 	    (void) drain_slot_oids (thread_ref, stop);
 	  }
       }

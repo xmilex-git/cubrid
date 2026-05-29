@@ -33,9 +33,9 @@
 
 namespace parallel_scan
 {
-  thread_local UINT64 input_handler_list::m_tl_bitmap = 0;
   thread_local VSID input_handler_list::m_tl_vsid = {NULL_SECTID, NULL_VOLID};
   thread_local QMGR_TEMP_FILE *input_handler_list::m_tl_current_tfile = nullptr;
+  thread_local int input_handler_list::m_tl_sector_idx = -1;
   thread_local bool input_handler_list::m_tl_is_membuf_worker = false;
   thread_local int input_handler_list::m_tl_membuf_pageid = 0;
 
@@ -59,6 +59,14 @@ namespace parallel_scan
 	return error_code;
       }
     m_list_id = list_id;
+
+    if (m_sector_scan.sector_info.sector_cnt > 0 && m_sector_scan.sector_info.sectors != nullptr)
+      {
+	m_steal_pool.init (m_sector_scan.sector_info.sector_cnt,
+			   m_sector_scan.sector_info.sectors,
+			   m_sector_scan.sector_info.tfiles);
+      }
+
     (void) parallelism;
     return NO_ERROR;
   }
@@ -66,7 +74,7 @@ namespace parallel_scan
   int
   input_handler_list::initialize (THREAD_ENTRY *thread_p, HFID *hfid, SCAN_ID *scan_id)
   {
-    m_tl_bitmap = 0;
+    m_tl_sector_idx = -1;
     VSID_SET_NULL (&m_tl_vsid);
     m_tl_current_tfile = nullptr;
 
@@ -110,26 +118,30 @@ namespace parallel_scan
 	  }
 	else
 	  {
-	    /* Phase 2: refill bitmap from next sector via dynamic atomic claim. */
-	    if (m_tl_bitmap == 0)
+	    /* Phase 2: pop page from shared atomic bitmap via steal pool or claim next sector. */
+	    if (m_tl_sector_idx >= 0
+		&& m_steal_pool.is_initialized ()
+		&& m_steal_pool.pop_page (m_tl_sector_idx, vpid, m_tl_current_tfile))
 	      {
+		/* popped from current sector's shared bitmap */
+	      }
+	    else
+	      {
+		/* current sector exhausted or no sector assigned; claim next sector */
 		int sidx = m_sector_scan.next_sector_index.fetch_add (1, std::memory_order_relaxed);
 		if (sidx >= m_sector_scan.sector_info.sector_cnt)
 		  {
 		    return S_END;
 		  }
+		m_tl_sector_idx = sidx;
 		m_tl_vsid = m_sector_scan.sector_info.sectors[sidx].vsid;
-		m_tl_bitmap = m_sector_scan.sector_info.sectors[sidx].page_bitmap;
 		m_tl_current_tfile = (QMGR_TEMP_FILE *) m_sector_scan.sector_info.tfiles[sidx];
-		if (m_tl_bitmap == 0)
+
+		if (!m_steal_pool.is_initialized ()
+		    || !m_steal_pool.pop_page (sidx, vpid, m_tl_current_tfile))
 		  {
 		    continue;	/* defensive: empty sector */
 		  }
-	      }
-
-	    if (!qfile_sector_bitmap_next_vpid (&m_tl_vsid, &m_tl_bitmap, &vpid))
-	      {
-		continue;	/* defensive: helper false despite non-zero check above */
 	      }
 	  }
 
@@ -157,7 +169,7 @@ namespace parallel_scan
   int
   input_handler_list::finalize (THREAD_ENTRY *thread_p)
   {
-    m_tl_bitmap = 0;
+    m_tl_sector_idx = -1;
     VSID_SET_NULL (&m_tl_vsid);
     m_tl_current_tfile = nullptr;
     m_tl_is_membuf_worker = false;

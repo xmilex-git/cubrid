@@ -120,6 +120,8 @@ namespace parallel_scan
       SCAN_CODE drain_slot_oids (cubthread::entry &thread_ref, bool &stop);
       /* INDEX-only: after leaf supply exhausted, help drain remaining shared overflow chains. No-op otherwise. */
       void drain_late_joiner_chains (cubthread::entry &thread_ref, bool &stop);
+      /* LIST-only: after sectors exhausted, steal unprocessed pages from busy workers' sectors. */
+      void drain_stolen_pages (cubthread::entry &thread_ref, bool &stop);
   };
 }
 
