@@ -772,7 +772,8 @@ typedef enum
   ACCESS_SPEC_FLAG_MERGEABLE_LIST = 0x1 << 3,	/* used with parallel heap scan. */
   ACCESS_SPEC_FLAG_BUILDVALUE_OPT = 0x1 << 4,	/* used with parallel heap scan buildvalue aggregate optimization. */
   ACCESS_SPEC_FLAG_ONLY_MIN_MAX_SCAN = 0x1 << 5,	/* used with min/max aggregate. */
-  ACCESS_SPEC_FLAG_FORCE_FIXED_SCAN = 0x1 << 6	/* used with keep page hint. */
+  ACCESS_SPEC_FLAG_FORCE_FIXED_SCAN = 0x1 << 6,	/* used with keep page hint. */
+  ACCESS_SPEC_FLAG_PARALLEL_ANCHOR = 0x1 << 7	/* parallel partition anchor; absent => anchor is chain head (level 0). */
 } ACCESS_SPEC_FLAG;
 
 #define ACCESS_SPEC_IS_FLAGED(spec, f)		((ACCESS_SPEC_FLAGS(spec) & (int) (f)) != 0)
