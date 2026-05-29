@@ -3074,6 +3074,107 @@ qo_apply_parallel_index_scan_threshold (QO_PLAN * plan)
 }
 
 /*
+ * qo_skip_sort_plan () - descend non-LIMIT SORT wrappers to the underlying plan
+ *   return: underlying scan/join plan, or the plan itself
+ *   plan(in): plan
+ */
+static QO_PLAN *
+qo_skip_sort_plan (QO_PLAN * plan)
+{
+  while (plan != NULL && plan->plan_type == QO_PLANTYPE_SORT && plan->plan_un.sort.sort_type != SORT_LIMIT)
+    {
+      plan = plan->plan_un.sort.subplan;
+    }
+  return plan;
+}
+
+/*
+ * qo_select_parallel_anchor () - pick the parallel partition anchor for a join
+ *                                whose leading prefix is ~1 row
+ *   return: inner SCAN plan of the lowest inner-join whose outer (prefix)
+ *           cardinality is <= 1 and whose inner is a partitionable SEQ/INDEX
+ *           scan; NULL otherwise (big leading table, outer join, etc.)
+ *   plan(in): root (or sub) plan
+ *
+ * Note: decouples partition source from join-order position 0.  prefix card <= 1
+ *       keeps a single concrete key range / filter binding (no per-page combo
+ *       tagging).  Detailed access-method gating is left to the server checker.
+ */
+static QO_PLAN *
+qo_select_parallel_anchor (QO_PLAN * plan)
+{
+  QO_PLAN *outer, *inner, *anchor;
+
+  plan = qo_skip_sort_plan (plan);
+  if (plan == NULL || plan->plan_type != QO_PLANTYPE_JOIN)
+    {
+      return NULL;
+    }
+  if (plan->plan_un.join.join_type != JOIN_INNER)
+    {
+      return NULL;
+    }
+
+  outer = plan->plan_un.join.outer;
+  inner = plan->plan_un.join.inner;
+  if (outer == NULL || inner == NULL || outer->info == NULL)
+    {
+      return NULL;
+    }
+
+  if (outer->info->cardinality >= 1.5)
+    {
+      /* prefix exceeds ~1 row inside outer; anchor is deeper. */
+      return qo_select_parallel_anchor (outer);
+    }
+
+  anchor = qo_skip_sort_plan (inner);
+  if (anchor != NULL && anchor->plan_type == QO_PLANTYPE_SCAN
+      && (anchor->plan_un.scan.scan_method == QO_SCANMETHOD_SEQ_SCAN
+	  || anchor->plan_un.scan.scan_method == QO_SCANMETHOD_INDEX_SCAN))
+    {
+      return anchor;
+    }
+  return NULL;
+}
+
+/*
+ * qo_apply_parallel_anchor () - flag the chosen anchor spec for parallel
+ *                               partitioning
+ *   return: void
+ *   plan(in): root plan
+ *
+ * Note: marks only PT_SPEC_FLAG_PARALLEL_ANCHOR; degree and the runtime
+ *       partition-source repoint are decided server-side so a partial build
+ *       stays serial.
+ */
+static void
+qo_apply_parallel_anchor (QO_PLAN * plan)
+{
+  QO_PLAN *anchor;
+  PT_NODE *spec;
+
+  if (prm_get_integer_value (PRM_ID_PARALLELISM) <= 0)
+    {
+      return;
+    }
+
+  anchor = qo_select_parallel_anchor (plan);
+  if (anchor == NULL)
+    {
+      return;
+    }
+
+  spec = QO_NODE_ENTITY_SPEC (anchor->plan_un.scan.node);
+  if (spec == NULL)
+    {
+      return;
+    }
+
+  spec->info.spec.flag = (PT_SPEC_FLAG) (spec->info.spec.flag | PT_SPEC_FLAG_PARALLEL_ANCHOR);
+}
+
+/*
  * qo_to_xasl () -
  *   return: XASL_NODE *
  *   plan(in): The (already optimized) select statement to generate code for
@@ -3098,6 +3199,7 @@ qo_to_xasl (QO_PLAN * plan, xasl_node * xasl)
   if (plan && xasl && (env = (plan->info)->env))
     {
       qo_apply_parallel_index_scan_threshold (plan);
+      qo_apply_parallel_anchor (plan);
 
       xasl = gen_outer (env, plan, &EMPTY_SET, NULL, NULL, xasl);
 
