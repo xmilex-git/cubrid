@@ -3124,6 +3124,17 @@ qo_select_parallel_anchor (QO_PLAN * plan)
 
   if (outer->plan_type == QO_PLANTYPE_JOIN)
     {
+      /* multi-table prefix: outer join with small cardinality qualifies as prefix */
+      if (outer->info != NULL && outer->info->cardinality < 1.5)
+	{
+	  anchor = qo_skip_sort_plan (inner);
+	  if (anchor != NULL && anchor->plan_type == QO_PLANTYPE_SCAN
+	      && (anchor->plan_un.scan.scan_method == QO_SCANMETHOD_SEQ_SCAN
+		  || anchor->plan_un.scan.scan_method == QO_SCANMETHOD_INDEX_SCAN))
+	    {
+	      return anchor;
+	    }
+	}
       /* prefix lies deeper in the left subtree; recurse to a lower single-table prefix. */
       return qo_select_parallel_anchor (outer);
     }
