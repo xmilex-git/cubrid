@@ -1584,7 +1584,9 @@ typedef enum
   PT_SPEC_FLAG_REFERENCED_AT_ODKU = 0x4000,	/* spec for odku assignment */
   PT_SPEC_FLAG_NO_PARALLEL_SCAN = 0x8000,	/* spec for not for parallel scan */
   PT_SPEC_FLAG_PARALLEL_THREAD = 0x10000,	/* spec for setted number of parallel query execution threads */
-  PT_SPEC_FLAG_DUMMY_REMOVED = 0x20000	/* this spec was originally a subquery but was resolved to a table during dummy SELECT removal; invisible columns should be excluded from this spec */
+  PT_SPEC_FLAG_DUMMY_REMOVED = 0x20000,	/* this spec was originally a subquery but was resolved to a table during dummy SELECT removal; invisible columns should be excluded from this spec */
+  PT_SPEC_FLAG_SEMI_JOIN = 0x40000,	/* pulled-up correlated IN/EXISTS subquery base table: NL semi-join inner */
+  PT_SPEC_FLAG_ANTI_JOIN = 0x80000	/* pulled-up correlated NOT IN/NOT EXISTS subquery base table: NL anti-join inner */
 } PT_SPEC_FLAG;
 
 typedef enum
@@ -3901,6 +3903,9 @@ struct parser_context
     unsigned is_skip_auto_parameterize:1;	/* set to 1 when skip auto parameterize, now only used for merge xasl generation */
     unsigned dblink_skip_implicit_serial_qualifier:1;	/* DBLink: do not merge current schema into unqualified SERIAL names */
   } flag;
+
+  PT_NODE *unnest_fallback_orig;	/* pristine dependent SELECT kept by correlated-unnest for plan-on-copy fallback */
+  PT_NODE *unnest_fallback_for;	/* the rewritten (marked) SELECT that unnest_fallback_orig pairs with */
 };
 
 /* used in assignments enumeration */

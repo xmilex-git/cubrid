@@ -17742,6 +17742,73 @@ pt_plan_schema (PARSER_CONTEXT * parser, PT_NODE * select_node)
 }
 
 
+/* correlated semi/anti unnest is applied here (plan-on-copy); function lives in the optimizer rewriter */
+extern PT_NODE *qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
+						  int *continue_walk);
+
+/*
+ * pt_unnest_count_marked_specs () - number of FROM specs marked as pulled-up semi/anti inners
+ */
+static int
+pt_unnest_count_marked_specs (PT_NODE * select_node)
+{
+  PT_NODE *spec;
+  int n = 0;
+
+  if (select_node == NULL || select_node->node_type != PT_SELECT)
+    {
+      return 0;
+    }
+  for (spec = select_node->info.query.q.select.from; spec != NULL; spec = spec->next)
+    {
+      if (PT_IS_SPEC_FLAG_SET (spec, (PT_SPEC_FLAG) (PT_SPEC_FLAG_SEMI_JOIN | PT_SPEC_FLAG_ANTI_JOIN)))
+	{
+	  n++;
+	}
+    }
+  return n;
+}
+
+/*
+ * pt_unnest_count_xasl_inners () - number of scans in the xasl scan_ptr chain that became single-fetch
+ *	NL semi/anti inners (flag set by gen_inner only when the marked node is an NL QO_PLANTYPE_SCAN inner)
+ */
+static int
+pt_unnest_count_xasl_inners (XASL_NODE * xasl)
+{
+  XASL_NODE *x;
+  int n = 0;
+
+  if (xasl == NULL)
+    {
+      return 0;
+    }
+  for (x = xasl->scan_ptr; x != NULL; x = x->scan_ptr)
+    {
+      if (XASL_IS_NL_SEMI_OR_ANTI (x) && x->spec_list != NULL && x->spec_list->single_fetch == QPROC_SINGLE_INNER)
+	{
+	  n++;
+	}
+    }
+  return n;
+}
+
+/*
+ * pt_unnest_swap_for_fallback () - swap node contents (preserving a's list linkage) so the pristine
+ *	original replaces the rewritten candidate; the candidate content ends up in b and is freed by caller
+ */
+static void
+pt_unnest_swap_for_fallback (PT_NODE * a, PT_NODE * b)
+{
+  PT_NODE tmp;
+  PT_NODE *a_next = a->next;
+
+  tmp = *a;
+  *a = *b;
+  *b = tmp;
+  a->next = a_next;
+}
+
 /*
  * pt_plan_query () -
  *   return: XASL_NODE, NULL indicates error
@@ -17757,10 +17824,20 @@ pt_plan_query (PARSER_CONTEXT * parser, PT_NODE * select_node)
   int level, trace_format;
   bool hint_ignored = false;
   bool dump_plan;
+  PT_NODE *unnest_orig = NULL;	/* pristine dependent tree kept for plan-on-copy fallback */
 
   if (select_node->node_type != PT_SELECT)
     {
       return NULL;
+    }
+
+  /* Correlated unnest was applied in mq_optimize(); if it marked any spec it stashed the pristine
+   * dependent tree in the parser for the plan-on-copy fallback below. Detach it for this select. */
+  if (pt_unnest_count_marked_specs (select_node) > 0 && parser->unnest_fallback_for == select_node)
+    {
+      unnest_orig = parser->unnest_fallback_orig;
+      parser->unnest_fallback_orig = NULL;
+      parser->unnest_fallback_for = NULL;
     }
 
   /* Check for join, path expr, and index optimizations */
@@ -17830,6 +17907,42 @@ pt_plan_query (PARSER_CONTEXT * parser, PT_NODE * select_node)
   else
     {
       xasl = pt_to_buildlist_proc (parser, select_node, plan);
+    }
+
+  /* Phase-4 plan-on-copy confirmation: every marked spec must have become a single-fetch NL semi/anti
+   * inner; otherwise discard this plan and re-plan the pristine dependent original (always correct).
+   * CUBRID_UNNEST_FORCE_FALLBACK is a test-only knob to exercise the fallback path (the Phase-3 edge
+   * pin makes this deterministic in production, so the fallback is otherwise belt-and-suspenders). */
+  if (unnest_orig != NULL)
+    {
+      int marked = pt_unnest_count_marked_specs (select_node);
+
+      if (xasl != NULL && pt_unnest_count_xasl_inners (xasl) >= marked && marked > 0
+	  && getenv ("CUBRID_UNNEST_FORCE_FALLBACK") == NULL)
+	{
+	  /* commit the unnested plan */
+	  parser_free_tree (parser, unnest_orig);
+	  unnest_orig = NULL;
+	}
+      else
+	{
+	  /* fall back: restore the original (dependent) tree into select_node and re-plan.
+	   * Do not parser_free_tree the swapped-out candidate: it may share sub-objects with the copy and
+	   * the parser arena reclaims it on destroy anyway. */
+	  pt_unnest_swap_for_fallback (select_node, unnest_orig);
+	  unnest_orig = NULL;
+	  select_node->alias_print = NULL;	/* drop stale plan-cache key from the discarded candidate */
+
+	  plan = qo_optimize_query (parser, select_node);
+	  if (pt_is_single_tuple (parser, select_node))
+	    {
+	      xasl = pt_to_buildvalue_proc (parser, select_node, plan);
+	    }
+	  else
+	    {
+	      xasl = pt_to_buildlist_proc (parser, select_node, plan);
+	    }
+	}
     }
 
   qo_get_optimization_param (&level, QO_PARAM_LEVEL);

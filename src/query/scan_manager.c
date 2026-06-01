@@ -7359,7 +7359,7 @@ scan_handle_single_scan (THREAD_ENTRY * thread_p, SCAN_ID * s_id, QP_SCAN_FUNC n
 	}
       break;
 
-    case QPROC_SINGLE_INNER:	/* currently, not used */
+    case QPROC_SINGLE_INNER:	/* NL semi/anti inner: 0 or 1 qualified row, stop at first match */
       /* already returned a row? */
       /* if scan works in a single_fetch mode and first qualified scan item has already been fetched, return
        * end_of_scan. */
@@ -7368,6 +7368,9 @@ scan_handle_single_scan (THREAD_ENTRY * thread_p, SCAN_ID * s_id, QP_SCAN_FUNC n
 	  result = S_END;
 	}
       /* if it is known that scan has no qualified items, return the NULL row, without searching. */
+      /* Invariant-N: NULL join key -> S_END == "no match"; for ANTI that means "emit outer". Safe only
+       * because the NOT IN NULL gate (qo_is_nonnull_for_notin, query_rewrite_subquery.c) never routes a
+       * nullable key to the anti path. Gate (rewrite side) and this branch are one paired invariant. */
       else if (s_id->join_dbval && DB_IS_NULL (s_id->join_dbval))
 	{
 	  result = S_END;

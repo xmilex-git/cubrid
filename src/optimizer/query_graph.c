@@ -485,6 +485,58 @@ qo_optimize_helper (QO_ENV * env)
 		qo_add_dep_term (node, &antecedents, &dependencies, env);
 	      }
 	  }
+	else if (PT_IS_SPEC_FLAG_SET (spec, (PT_SPEC_FLAG) (PT_SPEC_FLAG_SEMI_JOIN | PT_SPEC_FLAG_ANTI_JOIN)))
+	  {
+	    /*
+	     * Pin a pulled-up correlated semi/anti inner under its outer antecedents using the SAME
+	     * machinery as a dependent derived table. qo_add_dep_term builds QO_TC_DEP_LINK +
+	     * QO_TC_DEP_JOIN edge terms (both carry the 0x10 edge bit) so the marked node stays in
+	     * the outer block's partition and is forced to the NL inner side. A bare
+	     * bitset_add(&QO_NODE_DEP_SET(...)) would skip those edge terms AND demote the
+	     * outer_key=proj_col equi term to QO_TC_OTHER (see ~2569), fragmenting the marked node
+	     * into its own partition (cartesian product) -> no NL scan_ptr inner is built and the
+	     * XASL_NL_SEMI/ANTI flag never takes effect. The equi term being demoted afterwards is
+	     * intended and fine: connectivity/order come from the DEP edges, and the equi predicate
+	     * is applied as a during-join/sarg term at run time (merge_applies=false also keeps this
+	     * NL-only, which is what we want).
+	     */
+	    BITSET pred_segs;
+	    BITSET conj_segs;
+
+	    bitset_init (&pred_segs, env);
+	    bitset_init (&conj_segs, env);
+	    BITSET_CLEAR (dependencies);
+	    BITSET_CLEAR (antecedents);
+
+	    for (conj = tree->info.query.q.select.where; conj != NULL; conj = conj->next)
+	      {
+		BITSET_CLEAR (conj_segs);
+		next = conj->next;
+		conj->next = NULL;
+		qo_expr_segs (env, conj, &conj_segs);
+		conj->next = next;
+		/* a predicate that touches the marked node's segments is one of its join/sarg terms */
+		if (bitset_intersects (&conj_segs, &(QO_NODE_SEGS (node))))
+		  {
+		    bitset_union (&pred_segs, &conj_segs);
+		  }
+	      }
+
+	    /* antecedents = nodes referenced by those predicates, excluding the marked node itself */
+	    qo_seg_nodes (env, &pred_segs, &antecedents);
+	    bitset_remove (&antecedents, QO_NODE_IDX (node));
+	    /* dependency segs = the antecedent (outer) side segments */
+	    bitset_assign (&dependencies, &pred_segs);
+	    bitset_difference (&dependencies, &(QO_NODE_SEGS (node)));
+
+	    if (!bitset_is_empty (&antecedents))
+	      {
+		qo_add_dep_term (node, &antecedents, &dependencies, env);
+	      }
+
+	    bitset_delset (&pred_segs);
+	    bitset_delset (&conj_segs);
+	  }
       }				/* for (n = 0 ...) */
 
     bitset_delset (&dependencies);
@@ -891,7 +943,10 @@ graph_size_for_entity (QO_ENV * env, PT_NODE * entity)
 	}
     }
 
-  if (is_dependent_table (entity))
+  /* dependent tables and pulled-up semi/anti inners both get pinned via qo_add_dep_term, which
+   * appends up to nnodes DEP_LINK/DEP_JOIN terms; reserve the slots so Nterms does not overflow. */
+  if (is_dependent_table (entity)
+      || PT_IS_SPEC_FLAG_SET (entity, (PT_SPEC_FLAG) (PT_SPEC_FLAG_SEMI_JOIN | PT_SPEC_FLAG_ANTI_JOIN)))
     {
       env->nterms += env->nnodes;
     }

@@ -2113,6 +2113,7 @@ gen_outer (QO_ENV * env, QO_PLAN * plan, BITSET * subqueries, XASL_NODE * inner_
       outer = plan->plan_un.join.outer;
       inner = plan->plan_un.join.inner;
 
+
       switch (plan->plan_un.join.join_method)
 	{
 	case QO_JOINMETHOD_NL_JOIN:
@@ -2777,6 +2778,7 @@ gen_inner (QO_ENV * env, QO_PLAN * plan, BITSET * predset, BITSET * subqueries, 
   bitset_assign (&new_subqueries, subqueries);
   bitset_union (&new_subqueries, &(plan->subqueries));
 
+
   switch (plan->plan_type)
     {
     case QO_PLANTYPE_SCAN:
@@ -2787,6 +2789,31 @@ gen_inner (QO_ENV * env, QO_PLAN * plan, BITSET * predset, BITSET * subqueries, 
       bitset_union (&(plan->sarged_terms), predset);
 
       scan = init_class_scan_proc (env, scan, plan);
+
+      /* carrier: a node marked as a pulled-up correlated semi/anti inner becomes a single-fetch NL
+       * inner here. gen_inner is only called for the NL inner side (see NL call site ~2203). If the
+       * optimizer routed this node through the SORT/list-file branch instead, the flag is never set
+       * and Phase 4 (plan-on-copy verify) falls back to the dependent path. */
+      {
+	PT_NODE *sa_spec = QO_NODE_ENTITY_SPEC (plan->plan_un.scan.node);
+	if (scan != NULL && sa_spec != NULL
+	    && PT_IS_SPEC_FLAG_SET (sa_spec, (PT_SPEC_FLAG) (PT_SPEC_FLAG_SEMI_JOIN | PT_SPEC_FLAG_ANTI_JOIN)))
+	  {
+	    if (PT_IS_SPEC_FLAG_SET (sa_spec, PT_SPEC_FLAG_ANTI_JOIN))
+	      {
+		XASL_SET_FLAG (scan, XASL_NL_ANTIJOIN);
+	      }
+	    else
+	      {
+		XASL_SET_FLAG (scan, XASL_NL_SEMIJOIN);
+	      }
+	    if (scan->spec_list != NULL)
+	      {
+		scan->spec_list->single_fetch = QPROC_SINGLE_INNER;
+	      }
+	  }
+      }
+
       scan = add_scan_proc (env, scan, inner_scans);
       scan = add_fetch_proc (env, scan, fetches);
       scan = add_subqueries (env, scan, &new_subqueries);

@@ -379,57 +379,118 @@ qo_corr_analyze_refs (PARSER_CONTEXT * parser, PT_NODE * subtree, PT_NODE * root
 }
 
 /*
- * qo_rewrite_correlated_subqueries () - Unnest correlated IN subquery to inner-join + DISTINCT
+ * qo_is_nonnull_for_notin () - NOT IN can be lowered to anti-join only when
+ *	neither the outer IN key nor the inner projected column can ever be NULL.
+ *	NOT IN uses 3-valued logic: a NULL on either side makes the predicate
+ *	UNKNOWN, which differs from a plain anti (NOT EXISTS). This gate is paired
+ *	with Invariant-N at scan_manager.c:7371-7374: there a NULL join key yields
+ *	S_END, which on the anti path means "emit outer" -- correct ONLY because a
+ *	nullable key never reaches the anti path. Conservative: unproven -> false.
+ */
+static bool
+qo_is_nonnull_for_notin (PARSER_CONTEXT * parser, PT_NODE * outer_from, PT_NODE * in_key, PT_NODE * inner_from,
+			 PT_NODE * proj_col)
+{
+  return pt_check_not_null_constraint (parser, outer_from, in_key)
+    && pt_check_not_null_constraint (parser, inner_from, proj_col);
+}
+
+/*
+ * qo_rewrite_correlated_subqueries () - Unnest a correlated subquery to an NL semi/anti join
  *   return: PT_NODE *
  *   parser(in):
  *   node(in): SELECT node
- *   arg(in): derived-spec name index
+ *   arg(in): unused (kept for walk signature compatibility)
  *   continue_walk(in):
  *
- * Note: v1 scope only - x IN (SELECT y FROM t WHERE y = x AND <inner-only>), level 1,
- *	 the single correlated predicate redundant with the IN key. Anything outside this
- *	 narrow shape is left untouched for the dependent-subquery path (always correct).
+ * Note: v1 scope - x IN/NOT IN (SELECT y FROM t WHERE <corr> [AND <inner-only>]) and
+ *	 [NOT] EXISTS (SELECT 1 FROM t WHERE <corr> ...). Single flat base table, level 1,
+ *	 non-OR, no aggregate/analytic/group/having/connect-by/order/limit, no nested query.
+ *	 The single flat base spec is pulled up into the outer FROM and marked SEMI/ANTI;
+ *	 the subquery's predicates become outer join/sarg predicates. IN/NOT IN additionally
+ *	 synthesizes in_key = projected-column. NOT IN is lowered to anti only when NULL-safe.
+ *	 Anything outside this shape is left for the dependent-subquery path (always correct).
+ *	 Phase-4 (caller) plans on a copy and falls back to the original if the marked spec
+ *	 does not become a single-fetch NL semi/anti inner.
  */
 PT_NODE *
 qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
 {
-  PT_NODE *cnf_node, *in_key, *subq, *sel, *from_spec;
-  PT_NODE *prev_w, *w, *corr_pred, *prev_corr;
-  PT_NODE *new_spec, *new_attr, *a, *b, *inner_side, *outer_side;
-  int *idx = (int *) arg;
+  PT_NODE *cnf_node, *prev_cnf, *next_cnf;
+  PT_NODE *in_key, *subq, *sel, *from_spec;
+  PT_NODE *w, *moved_where, *eq_pred;
+  PT_NODE *orig_for_fallback;
+  PT_OP_TYPE op;
   UINTPTR inner_spec_id;
-  int total_outer, pred_outer, found_preds;
-  bool has_nested;
+  int total_outer, corr_here, found_corr;
+  bool has_nested, is_anti, is_in_form, bad, inner_only_found;
+  bool changed = false;
 
   if (node->node_type != PT_SELECT)
     {
       return node;
     }
 
-  for (cnf_node = node->info.query.q.select.where; cnf_node; cnf_node = cnf_node->next)
+  /* keep a pristine copy before any destructive pull-up, for the plan-on-copy fallback in pt_plan_query */
+  orig_for_fallback = parser_copy_tree (parser, node);
+
+  prev_cnf = NULL;
+  for (cnf_node = node->info.query.q.select.where; cnf_node; cnf_node = next_cnf)
     {
-      if (cnf_node->or_next != NULL || cnf_node->node_type != PT_EXPR)
+      next_cnf = cnf_node->next;
+
+      /* only plain (non-OR) WHERE-level expression conjuncts; skip outer-join ON terms (location > 0) */
+      if (cnf_node->or_next != NULL || cnf_node->node_type != PT_EXPR || cnf_node->info.expr.location != 0)
 	{
-	  continue;
-	}
-      if (cnf_node->info.expr.op != PT_IS_IN)
-	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
 
-      in_key = cnf_node->info.expr.arg1;
-      subq = cnf_node->info.expr.arg2;
+      /* classify the four supported forms: IN/EXISTS -> semi, NOT IN/NOT EXISTS -> anti */
+      op = cnf_node->info.expr.op;
+      in_key = NULL;
+      subq = NULL;
+      is_anti = false;
+      is_in_form = false;
 
-      /* in_key: single scalar indexable attribute */
-      if (in_key == NULL || in_key->next != NULL || !pt_is_attr (in_key) || PT_IS_COLLECTION_TYPE (in_key->type_enum)
-	  || !tp_valid_indextype (pt_type_enum_to_db (in_key->type_enum)))
+      if (op == PT_IS_IN)
 	{
+	  is_in_form = true;
+	  is_anti = false;
+	  in_key = cnf_node->info.expr.arg1;
+	  subq = cnf_node->info.expr.arg2;
+	}
+      else if (op == PT_IS_NOT_IN)
+	{
+	  is_in_form = true;
+	  is_anti = true;
+	  in_key = cnf_node->info.expr.arg1;
+	  subq = cnf_node->info.expr.arg2;
+	}
+      else if (op == PT_EXISTS)
+	{
+	  is_in_form = false;
+	  is_anti = false;
+	  subq = cnf_node->info.expr.arg1;
+	}
+      else if (op == PT_NOT && cnf_node->info.expr.arg1 != NULL && cnf_node->info.expr.arg1->node_type == PT_EXPR
+	       && cnf_node->info.expr.arg1->info.expr.op == PT_EXISTS)
+	{
+	  /* NOT EXISTS is parsed as PT_NOT (PT_EXISTS (subq)) */
+	  is_in_form = false;
+	  is_anti = true;
+	  subq = cnf_node->info.expr.arg1->info.expr.arg1;
+	}
+      else
+	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
 
       /* subq: plain correlated (level 1) SELECT */
-      if (!PT_IS_SELECT (subq) || subq->info.query.correlation_level != 1)
+      if (subq == NULL || !PT_IS_SELECT (subq) || subq->info.query.correlation_level != 1)
 	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
 
@@ -438,6 +499,7 @@ qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void 
       if (from_spec == NULL || from_spec->next != NULL || from_spec->info.spec.derived_table != NULL
 	  || from_spec->info.spec.entity_name == NULL)
 	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
       inner_spec_id = from_spec->info.spec.id;
@@ -448,110 +510,169 @@ qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void 
 	  || subq->info.query.q.select.connect_by != NULL || subq->info.query.orderby_for != NULL
 	  || subq->info.query.order_by != NULL || subq->info.query.limit != NULL)
 	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
 
-      /* single indexable attribute projected from the inner table */
-      sel = pt_get_select_list (parser, subq);
-      if (sel == NULL || sel->next != NULL || !pt_is_attr (sel)
-	  || pt_length_of_select_list (sel, EXCLUDE_HIDDEN_COLUMNS) != 1
-	  || !tp_valid_indextype (pt_type_enum_to_db (sel->type_enum)) || sel->info.name.spec_id != inner_spec_id)
-	{
-	  continue;
-	}
-
-      /* exactly one outer reference in the whole subquery, no nested query */
+      /* genuinely correlated and no nested query anywhere inside the subquery */
       qo_corr_analyze_refs (parser, subq, subq, inner_spec_id, &total_outer, &has_nested);
-      if (has_nested || total_outer != 1)
+      if (has_nested || total_outer < 1)
 	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
 
-      /* locate the single WHERE conjunct carrying the outer reference */
-      corr_pred = NULL;
-      prev_corr = NULL;
-      found_preds = 0;
-      for (prev_w = NULL, w = subq->info.query.q.select.where; w; prev_w = w, w = w->next)
+      /* IN/NOT IN only: single scalar indexable IN key + single indexable projected inner column */
+      sel = NULL;
+      if (is_in_form)
 	{
-	  qo_corr_analyze_refs (parser, w, subq, inner_spec_id, &pred_outer, &has_nested);
-	  if (pred_outer > 0)
+	  if (in_key == NULL || in_key->next != NULL || !pt_is_attr (in_key)
+	      || PT_IS_COLLECTION_TYPE (in_key->type_enum) || !tp_valid_indextype (pt_type_enum_to_db (in_key->type_enum)))
 	    {
-	      corr_pred = w;
-	      prev_corr = prev_w;
-	      found_preds++;
+	      prev_cnf = cnf_node;
+	      continue;
+	    }
+	  sel = pt_get_select_list (parser, subq);
+	  if (sel == NULL || sel->next != NULL || !pt_is_attr (sel)
+	      || pt_length_of_select_list (sel, EXCLUDE_HIDDEN_COLUMNS) != 1
+	      || !tp_valid_indextype (pt_type_enum_to_db (sel->type_enum)) || sel->info.name.spec_id != inner_spec_id)
+	    {
+	      prev_cnf = cnf_node;
+	      continue;
 	    }
 	}
-      if (found_preds != 1 || corr_pred == NULL)
+
+      /* every subquery WHERE conjunct must be a plain (non-OR, non-nested) predicate we can pull up;
+       * correlated ones become join predicates, inner-only ones become sargs on the pulled table */
+      bad = false;
+      found_corr = 0;
+      inner_only_found = false;
+      for (w = subq->info.query.q.select.where; w; w = w->next)
 	{
+	  if (w->or_next != NULL)
+	    {
+	      bad = true;
+	      break;
+	    }
+	  qo_corr_analyze_refs (parser, w, subq, inner_spec_id, &corr_here, &has_nested);
+	  if (has_nested)
+	    {
+	      bad = true;
+	      break;
+	    }
+	  if (corr_here > 0)
+	    {
+	      found_corr++;
+	    }
+	  else
+	    {
+	      inner_only_found = true;
+	    }
+	}
+      if (bad || found_corr < 1)
+	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
 
-      /* redundant form: <inner sel> = <in_key>, either order, plain equality */
-      if (corr_pred->or_next != NULL || corr_pred->node_type != PT_EXPR || corr_pred->info.expr.op != PT_EQ)
+      /* ANTI safety: an inner-only equality filter sharing the correlated key column lets the optimizer
+       * derive a transitive sarg on the OUTER (e.g. i.v=o.k AND i.v=C  =>  o.k=C). That sarg is sound for
+       * semi (a match needs it) but UNSOUND for anti (it would drop outers that should be emitted). Be
+       * conservative: for anti, only unnest when every conjunct is correlated. SEMI keeps inner filters. */
+      if (is_anti && inner_only_found)
 	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
-      a = corr_pred->info.expr.arg1;
-      b = corr_pred->info.expr.arg2;
-      if (a == NULL || b == NULL || !pt_is_attr (a) || !pt_is_attr (b))
+
+      /* NOT IN -> anti only when NULL-safe (Invariant-N, see qo_is_nonnull_for_notin) */
+      if (op == PT_IS_NOT_IN
+	  && !qo_is_nonnull_for_notin (parser, node->info.query.q.select.from, in_key, from_spec, sel))
 	{
+	  prev_cnf = cnf_node;
 	  continue;
 	}
-      if (a->info.name.spec_id == inner_spec_id && b->info.name.spec_id != inner_spec_id)
+
+      /* ---- all guards passed: flat base-table pull-up ---- */
+
+      /* 1. detach the inner base spec, mark it semi/anti, append it to the outer FROM */
+      subq->info.query.q.select.from = NULL;
+      from_spec->next = NULL;
+      from_spec->info.spec.flag =
+	(PT_SPEC_FLAG) (from_spec->info.spec.flag | (is_anti ? PT_SPEC_FLAG_ANTI_JOIN : PT_SPEC_FLAG_SEMI_JOIN));
+      node->info.query.q.select.from = parser_append_node (from_spec, node->info.query.q.select.from);
+
+      /* 2. move all subquery WHERE conjuncts (correlated joins + inner sargs) up to the outer WHERE */
+      moved_where = subq->info.query.q.select.where;
+      subq->info.query.q.select.where = NULL;
+      for (w = moved_where; w != NULL; w = w->next)
 	{
-	  inner_side = a;
-	  outer_side = b;
+	  if (w->node_type == PT_EXPR)
+	    {
+	      w->info.expr.location = 0;
+	    }
 	}
-      else if (b->info.name.spec_id == inner_spec_id && a->info.name.spec_id != inner_spec_id)
+      node->info.query.q.select.where = parser_append_node (moved_where, node->info.query.q.select.where);
+
+      /* 3. IN/NOT IN: synthesize in_key = inner_projected_column equi predicate */
+      if (is_in_form)
 	{
-	  inner_side = b;
-	  outer_side = a;
+	  eq_pred = parser_new_node (parser, PT_EXPR);
+	  if (eq_pred == NULL)
+	    {
+	      PT_INTERNAL_ERROR (parser, "allocate new node");
+	      return NULL;
+	    }
+	  eq_pred->info.expr.op = PT_EQ;
+	  eq_pred->info.expr.arg1 = parser_copy_tree (parser, in_key);
+	  eq_pred->info.expr.arg2 = parser_copy_tree (parser, sel);
+	  eq_pred->info.expr.location = 0;
+	  eq_pred->type_enum = PT_TYPE_LOGICAL;
+	  eq_pred->next = NULL;
+	  if (eq_pred->info.expr.arg1 == NULL || eq_pred->info.expr.arg2 == NULL)
+	    {
+	      PT_INTERNAL_ERROR (parser, "parser_copy_tree");
+	      return NULL;
+	    }
+	  node->info.query.q.select.where = parser_append_node (eq_pred, node->info.query.q.select.where);
+	}
+
+      /* 4. unlink the original conjunct (tail-appends in 2/3 never move the head) and free its husk */
+      if (prev_cnf == NULL)
+	{
+	  node->info.query.q.select.where = cnf_node->next;
 	}
       else
 	{
-	  continue;
+	  prev_cnf->next = cnf_node->next;
 	}
-      /* inner side must be the projected column; outer side must be the IN key */
-      if (!pt_name_equal (parser, inner_side, sel) || !pt_name_equal (parser, outer_side, in_key))
-	{
-	  continue;
-	}
+      cnf_node->next = NULL;
+      parser_free_tree (parser, cnf_node);
 
-      /* transform: drop the redundant correlated predicate */
-      if (prev_corr == NULL)
-	{
-	  subq->info.query.q.select.where = corr_pred->next;
-	}
-      else
-	{
-	  prev_corr->next = corr_pred->next;
-	}
-      corr_pred->next = NULL;
-      parser_free_tree (parser, corr_pred);
+      changed = true;
+      /* prev_cnf is unchanged: it still precedes next_cnf after cnf_node removal */
+    }
 
-      /* derived subquery becomes self-contained: DISTINCT + uncorrelated */
-      subq->info.query.all_distinct = PT_DISTINCT;
-      subq->info.query.correlation_level = 0;
-      subq->info.query.is_subquery = PT_IS_SUBQUERY;
+  if (changed)
+    {
+      /* refresh spec ids and referenced_attrs for the restructured statement */
+      (void) mq_reset_ids_in_statement (parser, node);
 
-      /* append derived spec (inner join via default PT_JOIN_NONE) */
-      if (mq_make_derived_spec (parser, node, subq, idx, &new_spec, &new_attr) == NULL)
+      /* stash the pristine original so pt_plan_query() can fall back if the unnest does not become a
+       * single-fetch NL semi/anti inner (one slot; the deterministic edge-pin makes this dead code in
+       * production -- it is belt-and-suspenders against optimizer routing changes) */
+      if (parser->unnest_fallback_orig != NULL)
 	{
-	  return NULL;
+	  parser_free_tree (parser, parser->unnest_fallback_orig);
 	}
+      parser->unnest_fallback_orig = orig_for_fallback;
+      parser->unnest_fallback_for = node;
+      orig_for_fallback = NULL;
+    }
 
-      /* IN-membership becomes an equi-join: in_key = av.col */
-      cnf_node->info.expr.arg1 = in_key;
-      cnf_node->info.expr.arg2 = new_attr;
-      cnf_node->info.expr.op = PT_EQ;
-      if (new_attr != NULL)
-	{
-	  new_attr->next = NULL;
-	}
-
-      /* recurse into derived table to unnest any nested correlated IN */
-      (void) parser_walk_tree (parser, new_spec->info.spec.derived_table, qo_rewrite_correlated_subqueries, idx, NULL,
-			       NULL);
+  if (orig_for_fallback != NULL)
+    {
+      parser_free_tree (parser, orig_for_fallback);
     }
 
   *continue_walk = PT_LIST_WALK;

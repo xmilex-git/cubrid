@@ -291,7 +291,9 @@ qo_rewrite_queries (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *con
 	  /* rewrite uncorrelated subquery to join query (TODO : correlated) */
 	  qo_rewrite_subqueries (parser, node, &idx, &continue_walk);
 
-	  /* opt-in: unnest correlated IN subquery whose correlated predicate is redundant with the IN key */
+	  /* opt-in: unnest correlated IN / NOT IN / EXISTS / NOT EXISTS subqueries to NL semi/anti joins
+	   * (flat base-table pull-up). Off by default; v1 shape only, otherwise left on the dependent path.
+	   * Phase-4 plan-on-copy verification/fallback is applied in pt_plan_query(). */
 	  if (prm_get_bool_value (PRM_ID_OPTIMIZER_UNNEST_SUBQUERY))
 	    {
 	      qo_rewrite_correlated_subqueries (parser, node, &idx, &continue_walk);
