@@ -291,6 +291,11 @@ qo_rewrite_queries (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *con
 	  /* rewrite uncorrelated subquery to join query (TODO : correlated) */
 	  qo_rewrite_subqueries (parser, node, &idx, &continue_walk);
 
+	  /* opt-in: unnest correlated IN subquery whose correlated predicate is redundant with the IN key */
+	  if (prm_get_bool_value (PRM_ID_OPTIMIZER_UNNEST_SUBQUERY))
+	    {
+	      qo_rewrite_correlated_subqueries (parser, node, &idx, &continue_walk);
+	    }
 	}
 
       /* rewrite optimization on WHERE, HAVING clause */

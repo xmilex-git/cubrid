@@ -317,6 +317,248 @@ qo_rewrite_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *
   return node;
 }
 
+/* context for counting correlated (outer) attribute references inside a subquery */
+typedef struct qo_corr_ref_info QO_CORR_REF_INFO;
+struct qo_corr_ref_info
+{
+  PT_NODE *root;		/* subquery node being analyzed; skipped in the query-node check */
+  UINTPTR inner_spec_id;	/* spec id of the subquery's single base table */
+  int outer_count;		/* attribute refs bound to a spec other than inner */
+  bool has_nested_query;	/* nested query node present -> not foldable */
+};
+
+/*
+ * qo_corr_count_refs () - parser_walk_tree pre function: tally outer attribute
+ *			   references and flag any nested query node
+ */
+static PT_NODE *
+qo_corr_count_refs (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  QO_CORR_REF_INFO *info = (QO_CORR_REF_INFO *) arg;
+
+  if (node != info->root && PT_IS_QUERY (node))
+    {
+      info->has_nested_query = true;
+      *continue_walk = PT_STOP_WALK;
+      return node;
+    }
+
+  if (node->node_type == PT_NAME && pt_is_attr (node) && node->info.name.spec_id != 0
+      && node->info.name.spec_id != info->inner_spec_id)
+    {
+      info->outer_count++;
+    }
+
+  return node;
+}
+
+/*
+ * qo_corr_analyze_refs () - walk subtree (with its 'next' link severed so AND
+ *			     siblings are excluded; 'or_next' kept) collecting
+ *			     outer-ref count and nested-query flag
+ */
+static void
+qo_corr_analyze_refs (PARSER_CONTEXT * parser, PT_NODE * subtree, PT_NODE * root, UINTPTR inner_spec_id,
+		      int *outer_count, bool *has_nested_query)
+{
+  QO_CORR_REF_INFO info;
+  PT_NODE *save_next;
+
+  info.root = root;
+  info.inner_spec_id = inner_spec_id;
+  info.outer_count = 0;
+  info.has_nested_query = false;
+
+  save_next = subtree->next;
+  subtree->next = NULL;
+  (void) parser_walk_tree (parser, subtree, qo_corr_count_refs, &info, NULL, NULL);
+  subtree->next = save_next;
+
+  *outer_count = info.outer_count;
+  *has_nested_query = info.has_nested_query;
+}
+
+/*
+ * qo_rewrite_correlated_subqueries () - Unnest correlated IN subquery to inner-join + DISTINCT
+ *   return: PT_NODE *
+ *   parser(in):
+ *   node(in): SELECT node
+ *   arg(in): derived-spec name index
+ *   continue_walk(in):
+ *
+ * Note: v1 scope only - x IN (SELECT y FROM t WHERE y = x AND <inner-only>), level 1,
+ *	 the single correlated predicate redundant with the IN key. Anything outside this
+ *	 narrow shape is left untouched for the dependent-subquery path (always correct).
+ */
+PT_NODE *
+qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  PT_NODE *cnf_node, *in_key, *subq, *sel, *from_spec;
+  PT_NODE *prev_w, *w, *corr_pred, *prev_corr;
+  PT_NODE *new_spec, *new_attr, *a, *b, *inner_side, *outer_side;
+  int *idx = (int *) arg;
+  UINTPTR inner_spec_id;
+  int total_outer, pred_outer, found_preds;
+  bool has_nested;
+
+  if (node->node_type != PT_SELECT)
+    {
+      return node;
+    }
+
+  for (cnf_node = node->info.query.q.select.where; cnf_node; cnf_node = cnf_node->next)
+    {
+      if (cnf_node->or_next != NULL || cnf_node->node_type != PT_EXPR)
+	{
+	  continue;
+	}
+      if (cnf_node->info.expr.op != PT_IS_IN)
+	{
+	  continue;
+	}
+
+      in_key = cnf_node->info.expr.arg1;
+      subq = cnf_node->info.expr.arg2;
+
+      /* in_key: single scalar indexable attribute */
+      if (in_key == NULL || in_key->next != NULL || !pt_is_attr (in_key) || PT_IS_COLLECTION_TYPE (in_key->type_enum)
+	  || !tp_valid_indextype (pt_type_enum_to_db (in_key->type_enum)))
+	{
+	  continue;
+	}
+
+      /* subq: plain correlated (level 1) SELECT */
+      if (!PT_IS_SELECT (subq) || subq->info.query.correlation_level != 1)
+	{
+	  continue;
+	}
+
+      /* single flat base table in FROM */
+      from_spec = subq->info.query.q.select.from;
+      if (from_spec == NULL || from_spec->next != NULL || from_spec->info.spec.derived_table != NULL
+	  || from_spec->info.spec.entity_name == NULL)
+	{
+	  continue;
+	}
+      inner_spec_id = from_spec->info.spec.id;
+
+      /* no aggregate / analytic / grouping / ordering / limit / hierarchical */
+      if (pt_has_aggregate (parser, subq) || pt_has_analytic (parser, subq)
+	  || subq->info.query.q.select.group_by != NULL || subq->info.query.q.select.having != NULL
+	  || subq->info.query.q.select.connect_by != NULL || subq->info.query.orderby_for != NULL
+	  || subq->info.query.order_by != NULL || subq->info.query.limit != NULL)
+	{
+	  continue;
+	}
+
+      /* single indexable attribute projected from the inner table */
+      sel = pt_get_select_list (parser, subq);
+      if (sel == NULL || sel->next != NULL || !pt_is_attr (sel)
+	  || pt_length_of_select_list (sel, EXCLUDE_HIDDEN_COLUMNS) != 1
+	  || !tp_valid_indextype (pt_type_enum_to_db (sel->type_enum)) || sel->info.name.spec_id != inner_spec_id)
+	{
+	  continue;
+	}
+
+      /* exactly one outer reference in the whole subquery, no nested query */
+      qo_corr_analyze_refs (parser, subq, subq, inner_spec_id, &total_outer, &has_nested);
+      if (has_nested || total_outer != 1)
+	{
+	  continue;
+	}
+
+      /* locate the single WHERE conjunct carrying the outer reference */
+      corr_pred = NULL;
+      prev_corr = NULL;
+      found_preds = 0;
+      for (prev_w = NULL, w = subq->info.query.q.select.where; w; prev_w = w, w = w->next)
+	{
+	  qo_corr_analyze_refs (parser, w, subq, inner_spec_id, &pred_outer, &has_nested);
+	  if (pred_outer > 0)
+	    {
+	      corr_pred = w;
+	      prev_corr = prev_w;
+	      found_preds++;
+	    }
+	}
+      if (found_preds != 1 || corr_pred == NULL)
+	{
+	  continue;
+	}
+
+      /* redundant form: <inner sel> = <in_key>, either order, plain equality */
+      if (corr_pred->or_next != NULL || corr_pred->node_type != PT_EXPR || corr_pred->info.expr.op != PT_EQ)
+	{
+	  continue;
+	}
+      a = corr_pred->info.expr.arg1;
+      b = corr_pred->info.expr.arg2;
+      if (a == NULL || b == NULL || !pt_is_attr (a) || !pt_is_attr (b))
+	{
+	  continue;
+	}
+      if (a->info.name.spec_id == inner_spec_id && b->info.name.spec_id != inner_spec_id)
+	{
+	  inner_side = a;
+	  outer_side = b;
+	}
+      else if (b->info.name.spec_id == inner_spec_id && a->info.name.spec_id != inner_spec_id)
+	{
+	  inner_side = b;
+	  outer_side = a;
+	}
+      else
+	{
+	  continue;
+	}
+      /* inner side must be the projected column; outer side must be the IN key */
+      if (!pt_name_equal (parser, inner_side, sel) || !pt_name_equal (parser, outer_side, in_key))
+	{
+	  continue;
+	}
+
+      /* transform: drop the redundant correlated predicate */
+      if (prev_corr == NULL)
+	{
+	  subq->info.query.q.select.where = corr_pred->next;
+	}
+      else
+	{
+	  prev_corr->next = corr_pred->next;
+	}
+      corr_pred->next = NULL;
+      parser_free_tree (parser, corr_pred);
+
+      /* derived subquery becomes self-contained: DISTINCT + uncorrelated */
+      subq->info.query.all_distinct = PT_DISTINCT;
+      subq->info.query.correlation_level = 0;
+      subq->info.query.is_subquery = PT_IS_SUBQUERY;
+
+      /* append derived spec (inner join via default PT_JOIN_NONE) */
+      if (mq_make_derived_spec (parser, node, subq, idx, &new_spec, &new_attr) == NULL)
+	{
+	  return NULL;
+	}
+
+      /* IN-membership becomes an equi-join: in_key = av.col */
+      cnf_node->info.expr.arg1 = in_key;
+      cnf_node->info.expr.arg2 = new_attr;
+      cnf_node->info.expr.op = PT_EQ;
+      if (new_attr != NULL)
+	{
+	  new_attr->next = NULL;
+	}
+
+      /* recurse into derived table to unnest any nested correlated IN */
+      (void) parser_walk_tree (parser, new_spec->info.spec.derived_table, qo_rewrite_correlated_subqueries, idx, NULL,
+			       NULL);
+    }
+
+  *continue_walk = PT_LIST_WALK;
+
+  return node;
+}
+
 /*
  * qo_rewrite_hidden_col_as_derived () - Rewrite subquery with ORDER BY
  *				      hidden column as derived one

@@ -587,7 +587,7 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_OPTIMIZER_ENABLE_MERGE_JOIN "optimizer_enable_merge_join"
 #define PRM_NAME_MAX_HASH_LIST_SCAN_SIZE "max_hash_list_scan_size"
-#define PRM_NAME_OPTIMIZER_RESERVE_02 "optimizer_reserve_02"
+#define PRM_NAME_OPTIMIZER_UNNEST_SUBQUERY "optimizer_unnest_subquery"
 #define PRM_NAME_OPTIMIZER_RESERVE_03 "optimizer_reserve_03"
 #define PRM_NAME_OPTIMIZER_RESERVE_04 "optimizer_reserve_04"
 #define PRM_NAME_OPTIMIZER_RESERVE_05 "optimizer_reserve_05"
@@ -3525,9 +3525,9 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
-  {PRM_ID_OPTIMIZER_RESERVE_02,
-   PRM_NAME_OPTIMIZER_RESERVE_02,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+  {PRM_ID_OPTIMIZER_UNNEST_SUBQUERY,
+   PRM_NAME_OPTIMIZER_UNNEST_SUBQUERY,
+   (PRM_FOR_CLIENT | PRM_FOR_SESSION | PRM_FOR_QRY_STRING | PRM_USER_CHANGE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
