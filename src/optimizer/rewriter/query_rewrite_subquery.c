@@ -431,6 +431,21 @@ qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void 
       return node;
     }
 
+  /* MERGE internally generates NOT EXISTS correlated subqueries (pt_to_merge_insert_query); unnesting
+   * those breaks MERGE INSERT-path duplicate-detection semantics. */
+  if (PT_SELECT_INFO_IS_FLAGED (node, PT_SELECT_INFO_IS_MERGE_QUERY))
+    {
+      return node;
+    }
+
+  /* When this SELECT is itself a correlated subquery (e.g. an intermediate NOT EXISTS inside a nested
+   * NOT EXISTS chain), pulling an inner spec into it changes the shape the outer query relies on.
+   * Leave it on the always-correct dependent path. */
+  if (node->info.query.correlation_level > 0)
+    {
+      return node;
+    }
+
   /* keep a pristine copy before any destructive pull-up, for the plan-on-copy fallback in pt_plan_query */
   orig_for_fallback = parser_copy_tree (parser, node);
 
@@ -502,6 +517,16 @@ qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void 
 	  prev_cnf = cnf_node;
 	  continue;
 	}
+
+      /* partitioned inner: the scan-block iteration stop for semi/anti prevents multi-partition
+       * traversal; leave partitioned inner on the dependent path (v1 scope). */
+      if (from_spec->info.spec.entity_name->info.name.db_object != NULL
+	  && sm_is_partitioned_class (from_spec->info.spec.entity_name->info.name.db_object) > 0)
+	{
+	  prev_cnf = cnf_node;
+	  continue;
+	}
+
       inner_spec_id = from_spec->info.spec.id;
 
       /* no aggregate / analytic / grouping / ordering / limit / hierarchical */

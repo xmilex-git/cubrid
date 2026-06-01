@@ -8213,6 +8213,13 @@ qexec_next_scan_block_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 	{
 	  break;
 	}
+      /* NL semi/anti inner's scan lifecycle is managed by the join handler (qexec_execute_scan);
+       * do not let scan-block iteration advance past it — that would reset the outer chain and
+       * re-emit rows already counted by the semi/anti emit path. */
+      if (XASL_IS_NL_SEMI_OR_ANTI (last_xptr->scan_ptr))
+	{
+	  break;
+	}
     }
 
   /* move the last scan block and reset further scans */
@@ -8681,7 +8688,9 @@ qexec_execute_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl
 	    }
 	  if (!xasl->scan_ptr)
 	    {
-	      /* no scan procedure block */
+	      /* no scan procedure block; mark qualified_block so qexec_next_scan_block_iterations
+	       * does not re-advance this leaf (semi/anti inner shares this scan-block walk). */
+	      xasl->curr_spec->s_id.qualified_block = true;
 	      return S_SUCCESS;
 	    }
 	  else
