@@ -3739,8 +3739,13 @@ qdump_print_parallel_anchor_summary (FILE * fp, xasl_node * head, int indent)
   {
     char *aname = NULL;
     (void) heap_get_class_name (thread_p, &ACCESS_SPEC_CLS_OID (anchor_spec), &aname);
-    fprintf (fp, "%*cparallel: anchor=%s (split across workers); prefix replicated:", indent, ' ',
-	     (aname != NULL) ? aname : "?");
+    const char *method_tag = "SEQ";
+    if (anchor_spec->access == ACCESS_METHOD_INDEX)
+      {
+	method_tag = "INDEX";
+      }
+    fprintf (fp, "%*cparallel: anchor=%s (%s, split across workers); prefix replicated:", indent, ' ',
+	     (aname != NULL) ? aname : "?", method_tag);
     if (aname != NULL)
       {
 	free_and_init (aname);

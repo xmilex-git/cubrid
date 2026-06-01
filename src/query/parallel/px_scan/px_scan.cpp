@@ -1336,7 +1336,14 @@ extern "C"
 
     if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN))
       {
-	return NO_ERROR;
+	if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR))
+	  {
+	    ACCESS_SPEC_UNSET_FLAG (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN);
+	  }
+	else
+	  {
+	    return NO_ERROR;
+	  }
       }
 
     /* parent partitioned class only (curent==NULL); per-partition reopens flow through */
@@ -1348,6 +1355,16 @@ extern "C"
     if (xasl->topn_items || XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED))
       {
 	return NO_ERROR;
+      }
+
+    /* anchor: inner-level specs lack MERGEABLE_LIST/BUILDVALUE_OPT; INDEX requires one */
+    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR))
+      {
+	if (!ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST)
+	    && !ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT))
+	  {
+	    ACCESS_SPEC_SET_FLAG (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST);
+	  }
       }
 
     assert (spec->num_parallel_threads == -1
@@ -1401,8 +1418,29 @@ extern "C"
     num_parallel_threads = spec->num_parallel_threads;
     if (num_parallel_threads < 2)
       {
-	assert (scan_id->type == S_INDX_SCAN);
-	return NO_ERROR;
+	if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_PARALLEL_ANCHOR))
+	  {
+	    /* anchor: optimizer defers degree to runtime. Compute from heap file pages. */
+	    int num_pages = -1;
+	    int err = file_get_num_user_pages (thread_p, &class_hfid.vfid, &num_pages);
+	    if (err != NO_ERROR || num_pages <= 0)
+	      {
+		assert (scan_id->type == S_INDX_SCAN);
+		return NO_ERROR;
+	      }
+	    num_parallel_threads = parallel_query::compute_parallel_degree (
+	      parallel_query::parallel_type::SCAN, num_pages, -1 /* auto */);
+	    if (num_parallel_threads < 2)
+	      {
+		assert (scan_id->type == S_INDX_SCAN);
+		return NO_ERROR;
+	      }
+	  }
+	else
+	  {
+	    assert (scan_id->type == S_INDX_SCAN);
+	    return NO_ERROR;
+	  }
       }
 
     worker_manager_p = parallel_query::worker_manager::try_reserve_workers (num_parallel_threads);
