@@ -80,7 +80,7 @@ static bool qdump_print_delete_proc_node (DELETE_PROC_NODE * ptr);
 static bool qdump_print_insert_proc_node (INSERT_PROC_NODE * ptr);
 static const char *qdump_target_type_string (TARGET_TYPE type);
 static const char *qdump_access_method_string (ACCESS_METHOD access);
-static bool qdump_print_access_spec (ACCESS_SPEC_TYPE * spec_list);
+static bool qdump_print_access_spec (ACCESS_SPEC_TYPE * spec_list, int unnest_flag);
 static const char *qdump_key_range_string (RANGE range);
 static bool qdump_print_key_info (KEY_INFO * key_info);
 static const char *qdump_range_type_string (RANGE_TYPE range_type);
@@ -280,7 +280,7 @@ qdump_print_merge_list_proc_node (MERGELIST_PROC_NODE * node_p)
   if (node_p->outer_spec_list)
     {
       fprintf (foutput, "-->outer access spec:");
-      qdump_print_access_spec (node_p->outer_spec_list);
+      qdump_print_access_spec (node_p->outer_spec_list, 0);
       fprintf (foutput, "\n");
     }
 
@@ -296,7 +296,7 @@ qdump_print_merge_list_proc_node (MERGELIST_PROC_NODE * node_p)
   if (node_p->inner_spec_list)
     {
       fprintf (foutput, "-->inner access spec:");
-      qdump_print_access_spec (node_p->inner_spec_list);
+      qdump_print_access_spec (node_p->inner_spec_list, 0);
       fprintf (foutput, "\n");
     }
 
@@ -497,7 +497,7 @@ qdump_access_method_string (ACCESS_METHOD access)
  *   spec_list(in):
  */
 static bool
-qdump_print_access_spec (ACCESS_SPEC_TYPE * spec_list_p)
+qdump_print_access_spec (ACCESS_SPEC_TYPE * spec_list_p, int unnest_flag)
 {
   TARGET_TYPE type;
 
@@ -567,6 +567,10 @@ qdump_print_access_spec (ACCESS_SPEC_TYPE * spec_list_p)
   fprintf (foutput, ",fixed scan=%d", spec_list_p->fixed_scan);
 #endif /* defined (SERVER_MODE) || defined (SA_MODE) */
   fprintf (foutput, ",single fetch=%d", spec_list_p->single_fetch);
+  if (spec_list_p->single_fetch == QPROC_SINGLE_INNER && unnest_flag)
+    {
+      fprintf (foutput, " (%s)", (unnest_flag & XASL_NL_SEMIJOIN) ? "semi-join inner" : "anti-join inner");
+    }
 
   if (spec_list_p->s_dbval)
     {
@@ -575,7 +579,7 @@ qdump_print_access_spec (ACCESS_SPEC_TYPE * spec_list_p)
     }
 
   fprintf (foutput, "\n-->next access spec:");
-  qdump_print_access_spec (spec_list_p->next);
+  qdump_print_access_spec (spec_list_p->next, unnest_flag);
   fprintf (foutput, "\n");
 
   return true;
@@ -2428,6 +2432,20 @@ qdump_print_xasl (xasl_node * xasl_p)
 	  nflag++;
 	}
 
+      if (XASL_IS_FLAGED (xasl_p, XASL_NL_SEMIJOIN))
+	{
+	  XASL_CLEAR_FLAG (xasl_p, XASL_NL_SEMIJOIN);
+	  fprintf (foutput, "%sXASL_NL_SEMIJOIN", (nflag ? "|" : ""));
+	  nflag++;
+	}
+
+      if (XASL_IS_FLAGED (xasl_p, XASL_NL_ANTIJOIN))
+	{
+	  XASL_CLEAR_FLAG (xasl_p, XASL_NL_ANTIJOIN);
+	  fprintf (foutput, "%sXASL_NL_ANTIJOIN", (nflag ? "|" : ""));
+	  nflag++;
+	}
+
       if (xasl_p->flag)
 	{
 	  fprintf (foutput, "%d%s", xasl_p->flag, (nflag ? "|" : ""));
@@ -2517,14 +2535,14 @@ qdump_print_xasl (xasl_node * xasl_p)
   if (xasl_p->spec_list)
     {
       fprintf (foutput, "-->access spec:");
-      qdump_print_access_spec (xasl_p->spec_list);
+      qdump_print_access_spec (xasl_p->spec_list, xasl_p->flag & (XASL_NL_SEMIJOIN | XASL_NL_ANTIJOIN));
       fprintf (foutput, "\n");
     }
 
   if (xasl_p->merge_spec)
     {
       fprintf (foutput, "-->merge spec:");
-      qdump_print_access_spec (xasl_p->merge_spec);
+      qdump_print_access_spec (xasl_p->merge_spec, 0);
       fprintf (foutput, "\n");
     }
 
@@ -2669,7 +2687,7 @@ qdump_print_xasl (xasl_node * xasl_p)
     }
 
   fprintf (foutput, "-->current spec:");
-  qdump_print_access_spec (xasl_p->curr_spec);
+  qdump_print_access_spec (xasl_p->curr_spec, xasl_p->flag & (XASL_NL_SEMIJOIN | XASL_NL_ANTIJOIN));
   fprintf (foutput, "\n");
 
 #if defined (SERVER_MODE) || defined (SA_MODE)
@@ -2858,7 +2876,7 @@ qdump_xasl_type_string (XASL_NODE * xasl_p)
  *   proc(in):
  */
 static json_t *
-qdump_print_access_spec_stats_json (ACCESS_SPEC_TYPE * spec_list_p)
+qdump_print_access_spec_stats_json (ACCESS_SPEC_TYPE * spec_list_p, int unnest_flag)
 {
   TARGET_TYPE type;
   char *class_name = NULL, *index_name = NULL;
@@ -3064,6 +3082,12 @@ qdump_print_access_spec_stats_json (ACCESS_SPEC_TYPE * spec_list_p)
 	}
 
       scan_print_stats_json (&spec->s_id, scan);
+
+      if (spec->single_fetch == QPROC_SINGLE_INNER && unnest_flag)
+	{
+	  json_object_set_new (scan, "unnest_join",
+	    json_string ((unnest_flag & XASL_NL_SEMIJOIN) ? "semi" : "anti"));
+	}
 
       if (part_scan_array != NULL)
 	{
@@ -3284,11 +3308,11 @@ qdump_print_stats_json (xasl_node * xasl_p, json_t * parent)
 
   if (xasl_p->spec_list != NULL)
     {
-      scan = qdump_print_access_spec_stats_json (xasl_p->spec_list);
+      scan = qdump_print_access_spec_stats_json (xasl_p->spec_list, xasl_p->flag & (XASL_NL_SEMIJOIN | XASL_NL_ANTIJOIN));
     }
   else if (xasl_p->merge_spec != NULL)
     {
-      scan = qdump_print_access_spec_stats_json (xasl_p->merge_spec);
+      scan = qdump_print_access_spec_stats_json (xasl_p->merge_spec, 0);
     }
 
   if (xasl_p->memoize_storage && xasl_p->memoize_storage->hit > 0)
@@ -3479,7 +3503,7 @@ qdump_print_stats_json (xasl_node * xasl_p, json_t * parent)
  *   spec_list_p(in):
  */
 static void
-qdump_print_access_spec_stats_text (FILE * fp, ACCESS_SPEC_TYPE * spec_list_p, int indent)
+qdump_print_access_spec_stats_text (FILE * fp, ACCESS_SPEC_TYPE * spec_list_p, int indent, int unnest_flag)
 {
   TARGET_TYPE type;
   char *class_name = NULL, *index_name = NULL;
@@ -3544,6 +3568,10 @@ qdump_print_access_spec_stats_text (FILE * fp, ACCESS_SPEC_TYPE * spec_list_p, i
 		}
 	    }
 	  scan_print_stats_text (fp, &spec->s_id);
+	  if (spec->single_fetch == QPROC_SINGLE_INNER && unnest_flag)
+	    {
+	      fprintf (fp, " (%s)", (unnest_flag & XASL_NL_SEMIJOIN) ? "semi-join inner" : "anti-join inner");
+	    }
 #if !WINDOWS
 	  if (spec->s_id.type == S_PARALLEL_HEAP_SCAN || spec->s_id.type == S_HEAP_SCAN)
 	    {
@@ -3838,8 +3866,8 @@ qdump_print_stats_text (FILE * fp, xasl_node * xasl_p, int indent)
     }
   else
     {
-      qdump_print_access_spec_stats_text (fp, xasl_p->spec_list, indent);
-      qdump_print_access_spec_stats_text (fp, xasl_p->merge_spec, indent);
+      qdump_print_access_spec_stats_text (fp, xasl_p->spec_list, indent, xasl_p->flag & (XASL_NL_SEMIJOIN | XASL_NL_ANTIJOIN));
+      qdump_print_access_spec_stats_text (fp, xasl_p->merge_spec, indent, 0);
     }
 
   if (xasl_p->memoize_storage && xasl_p->memoize_storage->hit > 0)

@@ -9032,7 +9032,22 @@ qo_term_fprint (QO_TERM * term, FILE * f)
 
 	case QO_TC_DEP_JOIN:
 	  qo_node_fprint (QO_TERM_HEAD (term), f);
-	  fprintf (f, " <dj> ");
+	  {
+	    QO_NODE *tail = QO_TERM_TAIL (term);
+	    PT_NODE *spec = QO_NODE_ENTITY_SPEC (tail);
+	    if (spec && PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_SEMI_JOIN))
+	      {
+		fprintf (f, " <dj:semi> ");
+	      }
+	    else if (spec && PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_ANTI_JOIN))
+	      {
+		fprintf (f, " <dj:anti> ");
+	      }
+	    else
+	      {
+		fprintf (f, " <dj> ");
+	      }
+	  }
 	  qo_node_fprint (QO_TERM_TAIL (term), f);
 	  break;
 

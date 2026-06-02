@@ -295,6 +295,8 @@ static void qo_plan_join_print_text (FILE * fp, QO_PLAN * plan, int indent);
 static void qo_plan_follow_print_text (FILE * fp, QO_PLAN * plan, int indent);
 static void qo_plan_print_text (FILE * fp, QO_PLAN * plan, int indent);
 
+static char qo_plan_get_unnest_type (QO_PLAN * plan);
+
 static bool qo_index_has_bit_attr (QO_INDEX_ENTRY * index_entryp);
 
 static QO_PLAN_VTBL qo_seq_scan_plan_vtbl = {
@@ -3099,6 +3101,74 @@ qo_join_walk (QO_PLAN * plan, void (*child_fn) (QO_PLAN *, void *), void *child_
     }
 }
 
+static char
+qo_plan_get_unnest_type (QO_PLAN * plan)
+{
+  QO_PLAN *inner;
+  QO_NODE *node;
+  PT_NODE *spec;
+
+  if (plan->plan_type != QO_PLANTYPE_JOIN)
+    {
+      return '\0';
+    }
+
+  if (plan->plan_un.join.join_type != JOIN_INNER)
+    {
+      return '\0';
+    }
+
+  if (plan->plan_un.join.join_method != QO_JOINMETHOD_NL_JOIN
+      && plan->plan_un.join.join_method != QO_JOINMETHOD_IDX_JOIN)
+    {
+      return '\0';
+    }
+
+  inner = plan->plan_un.join.inner;
+  while (inner != NULL && inner->plan_type != QO_PLANTYPE_SCAN)
+    {
+      if (inner->plan_type == QO_PLANTYPE_SORT)
+        {
+          inner = inner->plan_un.sort.subplan;
+        }
+      else if (inner->plan_type == QO_PLANTYPE_JOIN)
+        {
+          inner = inner->plan_un.join.inner;
+        }
+      else
+        {
+          return '\0';
+        }
+    }
+
+  if (inner == NULL)
+    {
+      return '\0';
+    }
+
+  node = inner->plan_un.scan.node;
+  spec = QO_NODE_ENTITY_SPEC (node);
+
+  if (spec == NULL)
+    {
+      return '\0';
+    }
+
+  assert_release (!(PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_SEMI_JOIN)
+                    && PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_ANTI_JOIN)));
+
+  if (PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_SEMI_JOIN))
+    {
+      return 's';
+    }
+  else if (PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_ANTI_JOIN))
+    {
+      return 'a';
+    }
+
+  return '\0';
+}
+
 /*
  * qo_join_fprint () -
  *   return:
@@ -3127,6 +3197,19 @@ qo_join_fprint (QO_PLAN * plan, FILE * f, int howfar)
 	      fputs (" (cross join)", f);
 	    }
 	}
+      {
+        char unnest = qo_plan_get_unnest_type (plan);
+        if (unnest == 's')
+          {
+            fprintf (f, "\n" INDENTED_TITLE_FMT "semi-join: emit outer once per first inner match  (unnested correlated IN/EXISTS)",
+                     (int) howfar, ' ', " ");
+          }
+        else if (unnest == 'a')
+          {
+            fprintf (f, "\n" INDENTED_TITLE_FMT "anti-join: emit outer only when zero inner matches  (unnested NOT EXISTS / null-safe NOT IN)",
+                     (int) howfar, ' ', " ");
+          }
+      }
       break;
     case JOIN_LEFT:
       fputs (" (left outer join)", f);
@@ -3196,6 +3279,18 @@ qo_join_info (QO_PLAN * plan, FILE * f, int howfar)
   else if (plan->plan_un.join.join_type == JOIN_RIGHT)
     {
       fprintf (f, ": right outer");
+    }
+  else if (plan->plan_un.join.join_type == JOIN_INNER)
+    {
+      char unnest = qo_plan_get_unnest_type (plan);
+      if (unnest == 's')
+        {
+          fprintf (f, ": semi-join");
+        }
+      else if (unnest == 'a')
+        {
+          fprintf (f, ": anti-join");
+        }
     }
 
   qo_plan_lite_print (plan->plan_un.join.outer, f, howfar + INDENT_INCR);
@@ -12788,6 +12883,18 @@ qo_plan_join_print_json (QO_PLAN * plan)
 
   join = json_pack ("{s:[o,o]}", buf, outer, inner);
 
+  {
+    char unnest = qo_plan_get_unnest_type (plan);
+    if (unnest == 's')
+      {
+        json_object_set_new (join, "unnest_join", json_string ("semi"));
+      }
+    else if (unnest == 'a')
+      {
+        json_object_set_new (join, "unnest_join", json_string ("anti"));
+      }
+  }
+
   return join;
 }
 
@@ -12986,6 +13093,18 @@ qo_plan_scan_print_text (FILE * fp, QO_PLAN * plan, int indent)
       break;
     }
 
+  {
+    PT_NODE *spec = QO_NODE_ENTITY_SPEC (plan->plan_un.scan.node);
+    if (spec != NULL)
+      {
+        if (PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_SEMI_JOIN)
+            || PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_ANTI_JOIN))
+          {
+            fprintf (fp, " [single-fetch]");
+          }
+      }
+  }
+
   fprintf (fp, "\n");
 }
 
@@ -13111,6 +13230,17 @@ qo_plan_join_print_text (FILE * fp, QO_PLAN * plan, int indent)
     }
 
   fprintf (fp, "%*c%s (%s)\n", indent, ' ', method, type);
+  {
+    char unnest = qo_plan_get_unnest_type (plan);
+    if (unnest == 's')
+      {
+        fprintf (fp, "%*c  semi-join: emit outer once per first inner match  (unnested correlated IN/EXISTS)\n", indent, ' ');
+      }
+    else if (unnest == 'a')
+      {
+        fprintf (fp, "%*c  anti-join: emit outer only when zero inner matches  (unnested NOT EXISTS / null-safe NOT IN)\n", indent, ' ');
+      }
+  }
   qo_plan_print_text (fp, plan->plan_un.join.outer, indent);
   qo_plan_print_text (fp, plan->plan_un.join.inner, indent);
 }
@@ -13226,6 +13356,23 @@ qo_top_plan_print_text (PARSER_CONTEXT * parser, xasl_node * xasl, PT_NODE * sel
     {
       fprintf (fp, "\n%*crewritten query: %s\n", indent, ' ', sql);
     }
+
+  {
+    PT_NODE *from;
+    for (from = select->info.query.q.select.from; from != NULL; from = from->next)
+      {
+        if (PT_IS_SPEC_FLAG_SET (from, PT_SPEC_FLAG_SEMI_JOIN))
+          {
+            const char *alias = from->info.spec.range_var ? from->info.spec.range_var->info.name.original : "?";
+            fprintf (fp, "%*c  unnest: %s = SEMI inner (correlated EXISTS/IN)\n", indent, ' ', alias);
+          }
+        else if (PT_IS_SPEC_FLAG_SET (from, PT_SPEC_FLAG_ANTI_JOIN))
+          {
+            const char *alias = from->info.spec.range_var ? from->info.spec.range_var->info.name.original : "?";
+            fprintf (fp, "%*c  unnest: %s = ANTI inner (NOT EXISTS / null-safe NOT IN)\n", indent, ' ', alias);
+          }
+      }
+  }
 
   port_close_memstream (fp, &ptr, &sizeloc);
 
