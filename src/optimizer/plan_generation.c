@@ -34,6 +34,7 @@
 #include "query_planner.h"
 #include "parser.h"
 #include "parser_support.h"
+#include "storage_common.h"
 #include "system_parameter.h"
 #include "xasl.h"
 #include "xasl_generation.h"
@@ -120,6 +121,7 @@ static int qo_get_multi_col_range_segs (QO_ENV * env, QO_PLAN * plan, QO_INDEX_E
 
 static QO_PLAN *qo_find_driving_scan_plan (QO_PLAN * plan);
 static void qo_apply_parallel_index_scan_threshold (QO_PLAN * plan);
+static QO_PLAN *qo_find_parallel_prefix_boundary (QO_PLAN * plan, QO_PLAN ** prefix_plan_out);
 
 static int qo_init_projection_info (QO_ENV * env, QO_PLAN * plan, BITSET * pred_set, PROJECTION_INFO * info);
 static void qo_clear_projection_info (QO_ENV * env, PROJECTION_INFO * info);
@@ -3074,6 +3076,116 @@ qo_apply_parallel_index_scan_threshold (QO_PLAN * plan)
 }
 
 /*
+ * qo_find_parallel_prefix_boundary () - find where a small join prefix ends
+ *   and the first parallel-worthy table begins
+ *   return: boundary JOIN node, or NULL if no viable split
+ *   plan(in): root plan (SORT wrappers skipped internally)
+ *   prefix_plan_out(out): set to the outer subtree at the boundary
+ */
+static QO_PLAN *
+qo_find_parallel_prefix_boundary (QO_PLAN * plan, QO_PLAN ** prefix_plan_out)
+{
+#define PREFIX_MAX_JOIN_DEPTH 64
+  QO_PLAN *p;
+  QO_PLAN *driving;
+  QO_PLAN *chain[PREFIX_MAX_JOIN_DEPTH];
+  int depth = 0;
+  int parallelism;
+  int threshold;
+  double pages;
+  int i;
+
+  *prefix_plan_out = NULL;
+
+  parallelism = prm_get_integer_value (PRM_ID_PARALLELISM);
+  if (parallelism <= 0)
+    {
+      return NULL;
+    }
+
+  /* PRM_ID_PARALLEL_INDEX_SCAN_PAGE_THRESHOLD is PRM_FOR_CLIENT; optimizer is client-side */
+  threshold = prm_get_integer_value (PRM_ID_PARALLEL_INDEX_SCAN_PAGE_THRESHOLD);
+  if (threshold <= 0)
+    {
+      return NULL;
+    }
+
+  /* v1: root must be a bare JOIN (no SORT/LIMIT wrapper) */
+  if (plan == NULL || plan->plan_type != QO_PLANTYPE_JOIN)
+    {
+      return NULL;
+    }
+
+  if (plan->plan_un.join.join_type != JOIN_INNER)
+    {
+      return NULL;
+    }
+
+  driving = qo_find_driving_scan_plan (plan);
+  if (driving == NULL || driving->info == NULL)
+    {
+      return NULL;
+    }
+
+  pages = MAX (1.0, (driving->info->cardinality * driving->info->projected_size) / (double) IO_PAGESIZE);
+  if (pages >= (double) threshold)
+    {
+      return NULL;
+    }
+
+  /* collect join chain root → deepest */
+  p = plan;
+  while (p != NULL && p->plan_type == QO_PLANTYPE_JOIN && depth < PREFIX_MAX_JOIN_DEPTH)
+    {
+      if (p->plan_un.join.join_type != JOIN_INNER)
+	{
+	  return NULL;
+	}
+      chain[depth++] = p;
+      p = p->plan_un.join.outer;
+    }
+
+  /* walk bottom-up; only accept boundary at root (i == 0) for v1 */
+  for (i = depth - 1; i >= 0; i--)
+    {
+      QO_PLAN *jn = chain[i];
+      QO_PLAN *outer = jn->plan_un.join.outer;
+      QO_PLAN *inner = jn->plan_un.join.inner;
+      double outer_pages, join_pages;
+
+      if (inner->plan_type != QO_PLANTYPE_SCAN)
+	{
+	  continue;
+	}
+
+      if (outer->info == NULL || jn->info == NULL)
+	{
+	  continue;
+	}
+
+      outer_pages = MAX (1.0, (outer->info->cardinality * outer->info->projected_size) / (double) IO_PAGESIZE);
+      if (outer_pages >= (double) threshold)
+	{
+	  return NULL;
+	}
+
+      join_pages = MAX (1.0, (jn->info->cardinality * jn->info->projected_size) / (double) IO_PAGESIZE);
+      if (join_pages >= (double) threshold)
+	{
+	  if (i != 0)
+	    {
+	      return NULL;
+	    }
+	  *prefix_plan_out = outer;
+	  return jn;
+	}
+    }
+
+  return NULL;
+#undef PREFIX_MAX_JOIN_DEPTH
+}
+
+/*
  * qo_to_xasl () -
  *   return: XASL_NODE *
  *   plan(in): The (already optimized) select statement to generate code for
@@ -3097,9 +3209,75 @@ qo_to_xasl (QO_PLAN * plan, xasl_node * xasl)
 
   if (plan && xasl && (env = (plan->info)->env))
     {
+      QO_PLAN *prefix_plan = NULL;
+      QO_PLAN *boundary_join = NULL;
+
       qo_apply_parallel_index_scan_threshold (plan);
 
-      xasl = gen_outer (env, plan, &EMPTY_SET, NULL, NULL, xasl);
+      boundary_join = qo_find_parallel_prefix_boundary (plan, &prefix_plan);
+      if (boundary_join != NULL && prefix_plan != NULL)
+	{
+	  QO_PLAN *anchor = boundary_join->plan_un.join.inner;
+	  PARSER_CONTEXT *parser = QO_ENV_PARSER (env);
+	  PT_NODE *namelist;
+	  XASL_NODE *listfile;
+	  XASL_NODE *prefix_scan;
+	  BITSET boundary_preds;
+
+	  bitset_init (&boundary_preds, env);
+	  bitset_assign (&boundary_preds, &boundary_join->sarged_terms);
+	  bitset_union (&boundary_preds, &boundary_join->plan_un.join.join_terms);
+
+	  namelist = make_namelist_from_projected_segs (env, prefix_plan);
+	  listfile = make_buildlist_proc (env, namelist);
+	  listfile = gen_outer (env, prefix_plan, &EMPTY_SET, NULL, NULL, listfile);
+
+	  /* tear down old JOIN bitsets before rewriting the union */
+	  bitset_delset (&boundary_join->plan_un.join.join_terms);
+	  bitset_delset (&boundary_join->plan_un.join.during_join_terms);
+	  bitset_delset (&boundary_join->plan_un.join.other_outer_join_terms);
+	  bitset_delset (&boundary_join->plan_un.join.after_join_terms);
+	  bitset_delset (&boundary_join->plan_un.join.hash_terms);
+
+	  /* rewrite boundary as seq-scan of the anchor table */
+	  boundary_join->plan_type = QO_PLANTYPE_SCAN;
+	  boundary_join->plan_un.scan.scan_method = QO_SCANMETHOD_SEQ_SCAN;
+	  boundary_join->plan_un.scan.node = anchor->plan_un.scan.node;
+	  boundary_join->plan_un.scan.index = NULL;
+	  boundary_join->plan_un.scan.index_equi = false;
+	  boundary_join->plan_un.scan.index_cover = false;
+	  boundary_join->plan_un.scan.index_iss = false;
+	  boundary_join->plan_un.scan.index_loose = false;
+	  bitset_init (&boundary_join->plan_un.scan.terms, env);
+	  bitset_init (&boundary_join->plan_un.scan.kf_terms, env);
+	  bitset_init (&boundary_join->plan_un.scan.multi_col_range_segs, env);
+	  bitset_init (&boundary_join->plan_un.scan.hash_terms, env);
+	  boundary_join->info = anchor->info;
+	  bitset_assign (&boundary_join->sarged_terms, &anchor->sarged_terms);
+	  bitset_assign (&boundary_join->subqueries, &anchor->subqueries);
+	  boundary_join->order = anchor->order;
+
+	  xasl = gen_outer (env, plan, &EMPTY_SET, NULL, NULL, xasl);
+	  xasl = add_uncorrelated (env, xasl, listfile);
+
+	  prefix_scan = make_scan_proc (env);
+	  prefix_scan = init_list_scan_proc (env, prefix_scan, listfile, namelist, &boundary_preds, NULL);
+	  if (prefix_scan != NULL)
+	    {
+	      prefix_scan->scan_ptr = xasl->scan_ptr;
+	      xasl->scan_ptr = prefix_scan;
+	    }
+
+	  if (namelist)
+	    {
+	      parser_free_tree (parser, namelist);
+	    }
+	  bitset_delset (&boundary_preds);
+	}
+      else
+	{
+	  xasl = gen_outer (env, plan, &EMPTY_SET, NULL, NULL, xasl);
+	}
 
       lastxasl = xasl;
       while (lastxasl)
