@@ -553,6 +553,7 @@ static QO_CORR_REF_KIND qo_corr_classify (PARSER_CONTEXT * parser, PT_NODE * tre
 					  PT_NODE * outer_from);
 static bool qo_corr_col_is_nonnull (PARSER_CONTEXT * parser, PT_NODE * from, PT_NODE * name);
 static bool qo_corr_value_is_nonnull (PT_NODE * node);
+static bool qo_corr_unique_covered (MOP cls, const char **s_names, int s_count);
 static PT_NODE *qo_corr_nth (PT_NODE * list, int n);
 static void qo_corr_stamp_location (PARSER_CONTEXT * parser, PT_NODE * on_cond, short location);
 static bool qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int *idx);
@@ -686,6 +687,60 @@ qo_corr_value_is_nonnull (PT_NODE * node)
 }
 
 /*
+ * qo_corr_unique_covered () - true iff the inner base class has a UNIQUE/PK constraint whose every member
+ *      column name is present in s_names (the set of inner base columns equi-pinned to an outer/const value
+ *      in the ON). When all columns of a UNIQUE/PK are pinned, at most one base row matches per outer row
+ *      (a NULL pin makes "=" UNKNOWN -> 0 matches), so a SEMI join over it is equivalent to INNER.
+ */
+static bool
+qo_corr_unique_covered (MOP cls, const char **s_names, int s_count)
+{
+  SM_CLASS_CONSTRAINT *consp, *iter;
+  int i, j;
+
+  if (cls == NULL)
+    {
+      return false;
+    }
+
+  consp = sm_class_constraints (cls);
+  for (iter = consp; iter != NULL; iter = iter->next)
+    {
+      if (!SM_IS_CONSTRAINT_UNIQUE_FAMILY (iter->type) || iter->attributes[0] == NULL)
+	{
+	  continue;
+	}
+      {
+	bool all_in = true;
+	for (i = 0; iter->attributes[i] != NULL; i++)
+	  {
+	    bool found = false;
+	    for (j = 0; j < s_count; j++)
+	      {
+		if (s_names[j] != NULL
+		    && intl_identifier_casecmp (s_names[j], iter->attributes[i]->header.name) == 0)
+		  {
+		    found = true;
+		    break;
+		  }
+	      }
+	    if (!found)
+	      {
+		all_in = false;
+		break;
+	      }
+	  }
+	if (all_in)
+	  {
+	    return true;
+	  }
+      }
+    }
+
+  return false;
+}
+
+/*
  * qo_corr_nth () - n-th (0-based) element of a ->next-linked list.
  */
 static PT_NODE *
@@ -816,6 +871,7 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
   PT_NODE *outer_key = NULL;	/* IN/NOT IN left-hand side (NULL for EXISTS/NOT EXISTS) */
   PT_NODE *inner_from, *sub_where, *sub_list, *w, *col;
   UINTPTR inner_id;
+  MOP inner_cls = NULL;		/* inner base class MOP (captured pre-mutation; used by unique/PK demotion) */
   QO_CORR_TERM terms[QO_CORR_MAX_TERMS];
   int nterms = 0;
   int i;
@@ -823,7 +879,10 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
   PT_NODE *on_cond = NULL, *on_tail = NULL;
   PT_NODE *corr_head = NULL, *corr_tail = NULL;	/* detached correlated conjuncts (kept alive for copying) */
   PT_NODE *proj_name[QO_CORR_MAX_PROJ];
+  PT_NODE *pending_proj[QO_CORR_MAX_PROJ];	/* projection copies pre-allocated before any mutation */
+  int npending = 0;
   int nproj = 0;
+  const char *in_key_col = NULL;	/* IN/=ANY match column name iff it is a bare inner base column */
   bool all_on_equi = true;
   bool bound[QO_CORR_MAX_PROJ];
   short location;
@@ -906,25 +965,31 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
     {
       return false;
     }
-  {
-    MOP inner_cls = NULL;
-    PT_SPEC_GET_DB_OBJECT (inner_from, inner_cls);
-    if (inner_cls == NULL || sm_is_partitioned_class (inner_cls) > 0)
-      {
-	return false;
-      }
-  }
+  PT_SPEC_GET_DB_OBJECT (inner_from, inner_cls);
+  if (inner_cls == NULL || sm_is_partitioned_class (inner_cls) > 0)
+    {
+      return false;
+    }
 
   /* IN/NOT IN: scalar (single-column) match only */
   if (outer_key != NULL)
     {
+      PT_NODE *match;
+
       if (PT_IS_COLLECTION_TYPE (outer_key->type_enum) || PT_IS_FUNCTION (outer_key))
 	{
 	  return false;
 	}
-      if (pt_length_of_select_list (pt_get_select_list (parser, subq), EXCLUDE_HIDDEN_COLUMNS) != 1)
+      match = pt_get_select_list (parser, subq);
+      if (pt_length_of_select_list (match, EXCLUDE_HIDDEN_COLUMNS) != 1)
 	{
 	  return false;
+	}
+      /* remember the match column name iff it is a bare inner base column (for unique/PK demotion) */
+      if (match != NULL && match->node_type == PT_NAME && pt_is_attr (match)
+	  && match->info.name.spec_id == inner_id)
+	{
+	  in_key_col = match->info.name.original;
 	}
     }
 
@@ -1068,8 +1133,63 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
 	}
     }
 
+  /* ---- projection planning (read-only; precedes all mutation) ----
+   * Register the current select-list columns and map each correlated inner column to a projection
+   * index, pre-allocating any NEW projection copy now. The capacity check and the only fallible
+   * allocations happen here, BEFORE the tree is touched, so the mutation phase below has no
+   * allocation-failure or capacity early-return (Task 1 invariant: never return false after mutating). */
+  sub_list = pt_get_select_list (parser, subq);
+  for (col = sub_list; col != NULL; col = col->next)
+    {
+      if (nproj >= QO_CORR_MAX_PROJ)
+	{
+	  return false;		/* wide select-list (e.g. SELECT * over a >=33-col table): keep dependent */
+	}
+      proj_name[nproj++] = col;
+    }
+  for (i = 0; i < nterms; i++)
+    {
+      int found = -1;
+      int j;
+      for (j = 0; j < nproj; j++)
+	{
+	  if (proj_name[j]->node_type == PT_NAME
+	      && proj_name[j]->info.name.spec_id == terms[i].inner_name->info.name.spec_id
+	      && intl_identifier_casecmp (proj_name[j]->info.name.original,
+					  terms[i].inner_name->info.name.original) == 0)
+	    {
+	      found = j;
+	      break;
+	    }
+	}
+      if (found >= 0)
+	{
+	  terms[i].proj_idx = found;
+	}
+      else
+	{
+	  PT_NODE *proj;
+	  if (nproj >= QO_CORR_MAX_PROJ)
+	    {
+	      return false;	/* no projection room: keep dependent (no mutation yet) */
+	    }
+	  proj = parser_copy_tree (parser, terms[i].inner_name);
+	  if (proj == NULL)
+	    {
+	      return false;	/* allocation failure, still pre-mutation: safe to bail */
+	    }
+	  proj->next = NULL;
+	  terms[i].proj_idx = nproj;
+	  proj_name[nproj] = proj;	/* the pre-built copy; appended to the subquery in the mutation phase */
+	  pending_proj[npending++] = proj;
+	  nproj++;
+	}
+    }
+
   /* =========================================================================
-   * Point of no return: every gate passed. Begin mutation.
+   * Point of no return: every gate passed and all fallible allocations done. Begin mutation.
+   * Past this point the function never returns false; a residual allocation failure raises a
+   * parser error (statement aborts) rather than leaving a silently corrupted tree.
    * ========================================================================= */
 
   /* (6a) detach correlated conjuncts from the subquery WHERE, keep them alive to copy outer operands */
@@ -1111,45 +1231,10 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
 
   /* the detached subtrees are what terms[].inner_name / outer_expr point into; they remain valid */
 
-  /* (6b) register existing select-list bare columns, then ensure each correlated inner column is projected */
-  sub_list = pt_get_select_list (parser, subq);
-  for (col = sub_list; col != NULL && nproj < QO_CORR_MAX_PROJ; col = col->next)
+  /* (6b) append the pre-built projection copies for correlated inner columns (planned above) */
+  for (i = 0; i < npending; i++)
     {
-      proj_name[nproj] = col;
-      nproj++;
-    }
-  for (i = 0; i < nterms; i++)
-    {
-      int found = -1;
-      int j;
-      for (j = 0; j < nproj; j++)
-	{
-	  if (proj_name[j]->node_type == PT_NAME
-	      && proj_name[j]->info.name.spec_id == terms[i].inner_name->info.name.spec_id
-	      && intl_identifier_casecmp (proj_name[j]->info.name.original,
-					  terms[i].inner_name->info.name.original) == 0)
-	    {
-	      found = j;
-	      break;
-	    }
-	}
-      if (found >= 0)
-	{
-	  terms[i].proj_idx = found;
-	}
-      else
-	{
-	  PT_NODE *proj = parser_copy_tree (parser, terms[i].inner_name);
-	  if (proj == NULL || nproj >= QO_CORR_MAX_PROJ)
-	    {
-	      return false;		/* should not happen; bail without further mutation is unsafe here */
-	    }
-	  proj->next = NULL;
-	  subq->info.query.q.select.list = parser_append_node (proj, subq->info.query.q.select.list);
-	  terms[i].proj_idx = nproj;
-	  proj_name[nproj] = proj;
-	  nproj++;
-	}
+      subq->info.query.q.select.list = parser_append_node (pending_proj[i], subq->info.query.q.select.list);
     }
 
   /* decorrelated subquery body is now self-contained */
@@ -1158,7 +1243,9 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
   /* (7) wrap subquery as a derived spec appended to the outer FROM */
   if (mq_make_derived_spec (parser, node, subq, idx, &new_spec, &new_attr) == NULL)
     {
-      return false;
+      /* residual allocation failure mid-mutation: abort the statement instead of corrupting the tree */
+      PT_INTERNAL_ERROR (parser, "allocate new node");
+      return true;
     }
   new_spec->info.spec.join_type = (anti ? PT_JOIN_ANTI : PT_JOIN_SEMI);
 
@@ -1175,7 +1262,8 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
       PT_NODE *t = parser_new_node (parser, PT_EXPR);
       if (t == NULL || av0 == NULL)
 	{
-	  return false;
+	  PT_INTERNAL_ERROR (parser, "allocate new node");
+	  return true;
 	}
       t->info.expr.op = PT_EQ;
       t->type_enum = PT_TYPE_LOGICAL;
@@ -1205,7 +1293,8 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
       PT_NODE *t = parser_new_node (parser, PT_EXPR);
       if (t == NULL || avk == NULL)
 	{
-	  return false;
+	  PT_INTERNAL_ERROR (parser, "allocate new node");
+	  return true;
 	}
       t->info.expr.op = terms[i].op;
       t->type_enum = PT_TYPE_LOGICAL;
@@ -1255,20 +1344,53 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
   new_spec->info.spec.location = location;
   qo_corr_stamp_location (parser, on_cond, location);
 
-  /* (Phase 4) SEMI -> INNER when the derived inner is provably unique per outer row:
-   * DISTINCT over the full projection AND every projected column equi-bound in the ON. */
-  if (!anti && subq->info.query.all_distinct == PT_DISTINCT && all_on_equi && nproj <= QO_CORR_MAX_PROJ)
+  /* (Phase 4) SEMI -> INNER when the derived inner is provably <=1 row per outer row (ANTI never demoted).
+   * Two independent sufficient proofs (OR):
+   *   (a) DISTINCT proof: subquery is DISTINCT over the full projection AND every projected column is
+   *       equi-bound in the ON -> the bound tuple is unique -> <=1 match.
+   *   (b) UNIQUE/PK proof: the inner BASE class has a UNIQUE/PK constraint whose every column is equi-
+   *       pinned (PT_EQ) to an outer/const value in the ON. A fixed outer row pins each such column to a
+   *       value, so at most one base row carries that unique tuple (a NULL pin -> "=" UNKNOWN -> 0 rows);
+   *       inner-only filters and the projection only preserve/reduce rows. This recovers the unique/PK
+   *       demotion for EXISTS-form SEMI joins (which the DISTINCT proof cannot see). */
+  if (!anti)
     {
-      bool all_bound = true;
-      for (i = 0; i < nproj; i++)
+      bool demote = false;
+
+      if (subq->info.query.all_distinct == PT_DISTINCT && all_on_equi && nproj <= QO_CORR_MAX_PROJ)
 	{
-	  if (!bound[i])
+	  bool all_bound = true;
+	  for (i = 0; i < nproj; i++)
 	    {
-	      all_bound = false;
-	      break;
+	      if (!bound[i])
+		{
+		  all_bound = false;
+		  break;
+		}
 	    }
+	  demote = all_bound;
 	}
-      if (all_bound)
+
+      if (!demote)
+	{
+	  const char *s_names[QO_CORR_MAX_TERMS + 1];
+	  int s_count = 0;
+
+	  for (i = 0; i < nterms; i++)
+	    {
+	      if (terms[i].op == PT_EQ)
+		{
+		  s_names[s_count++] = terms[i].inner_name->info.name.original;
+		}
+	    }
+	  if (in_key_col != NULL)
+	    {
+	      s_names[s_count++] = in_key_col;
+	    }
+	  demote = qo_corr_unique_covered (inner_cls, s_names, s_count);
+	}
+
+      if (demote)
 	{
 	  new_spec->info.spec.join_type = PT_JOIN_INNER;
 	}
