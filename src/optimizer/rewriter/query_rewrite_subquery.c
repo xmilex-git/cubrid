@@ -1116,6 +1116,21 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
   if (op == PT_IS_NOT_IN)
     {
       PT_NODE *inner_match = pt_get_select_list (parser, subq);
+      PT_NODE *osp;
+
+      /* If any spec in the outer FROM participates in an outer join, the outer key may be NULL-supplied even
+       * when its base column carries a NOT NULL / PK constraint (e.g. `b RIGHT OUTER JOIN a`: the null-supplied
+       * spec b has join_type PT_JOIN_NONE on itself, the RIGHT_OUTER marker is on the sibling, so a per-column
+       * non-null proof is unsound). A NULL key must make NOT IN three-valued and drop the row, but ANTI would
+       * keep it -> wrong result. Conservatively keep the subquery dependent whenever the outer block has any
+       * non-(none/inner) join. */
+      for (osp = node->info.query.q.select.from; osp != NULL; osp = osp->next)
+	{
+	  if (osp->info.spec.join_type != PT_JOIN_NONE && osp->info.spec.join_type != PT_JOIN_INNER)
+	    {
+	      return false;
+	    }
+	}
 
       /* inner NOT-IN projection element must be a bare base column (else: cannot prove non-null) */
       if (inner_match == NULL || !(inner_match->node_type == PT_NAME && pt_is_attr (inner_match)
