@@ -822,6 +822,16 @@ qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void 
       return node;
     }
 
+  /* hazard: never transform inside a MERGE-generated internal query. MERGE builds its WHEN NOT MATCHED
+   * detection as a SELECT ... WHERE NOT EXISTS (correlated) and runs mq_translate on it (see
+   * pt_to_merge_insert_query, which sets PT_SELECT_INFO_IS_MERGE_QUERY before that call); rewriting that
+   * NOT EXISTS into an ANTI join breaks the merge's single-tuple contract (ER -459). The earlier gate only
+   * checked the inner subquery's flag, but the flag lives on this outer merge query node. */
+  if (PT_SELECT_INFO_IS_FLAGED (node, PT_SELECT_INFO_IS_MERGE_QUERY))
+    {
+      return node;
+    }
+
   /* opt-out (ii): NO_MERGE on the outer query block */
   if (node->info.query.q.select.hint & PT_HINT_NO_MERGE)
     {
