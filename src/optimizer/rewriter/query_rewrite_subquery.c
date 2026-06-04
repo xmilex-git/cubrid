@@ -515,6 +515,7 @@ qo_add_limit_clause (PARSER_CONTEXT * parser, PT_NODE * node)
 
 #define QO_CORR_MAX_TERMS 16	/* max correlated conjuncts handled per subquery (else: keep dependent) */
 #define QO_CORR_MAX_PROJ  32	/* max derived projection columns tracked for SEMI->INNER coverage */
+#define QO_CORR_MAX_INNER 8	/* max inner base tables in a multi-table inner (else: keep dependent) */
 
 /* classification of a subquery WHERE conjunct relative to inner base spec / outer from-list */
 typedef enum
@@ -557,6 +558,24 @@ static bool qo_corr_unique_covered (MOP cls, const char **s_names, int s_count);
 static PT_NODE *qo_corr_nth (PT_NODE * list, int n);
 static void qo_corr_stamp_location (PARSER_CONTEXT * parser, PT_NODE * on_cond, short location);
 static bool qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int *idx);
+
+/* multi-table inner classification: inner is a SET of base spec ids (the subquery's joined tables) */
+typedef struct qo_corr_ref_minfo QO_CORR_REF_MINFO;
+struct qo_corr_ref_minfo
+{
+  PARSER_CONTEXT *parser;
+  const UINTPTR *inner_ids;	/* set of inner base spec ids */
+  int n_inner;
+  PT_NODE *outer_from;		/* the outer SELECT's from-list */
+  bool found_inner;
+  bool found_outer;
+  bool found_foreign;
+};
+
+static PT_NODE *qo_corr_ref_multi_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
+static QO_CORR_REF_KIND qo_corr_classify_multi (PARSER_CONTEXT * parser, PT_NODE * tree, const UINTPTR * inner_ids,
+						int n_inner, PT_NODE * outer_from);
+static bool qo_corr_rewrite_one_multi (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int *idx);
 
 /*
  * qo_corr_ref_pre () - walk helper: classify each resolved PT_NAME as inner / outer(local from-list) / foreign.
@@ -605,6 +624,86 @@ qo_corr_classify (PARSER_CONTEXT * parser, PT_NODE * tree, UINTPTR inner_id, PT_
   info.found_foreign = false;
 
   (void) parser_walk_tree (parser, tree, qo_corr_ref_pre, &info, NULL, NULL);
+
+  if (info.found_foreign)
+    {
+      return QO_CORR_REF_FOREIGN;
+    }
+  if (info.found_inner && info.found_outer)
+    {
+      return QO_CORR_REF_CORRELATED;
+    }
+  if (info.found_inner)
+    {
+      return QO_CORR_REF_INNER;
+    }
+  if (info.found_outer)
+    {
+      return QO_CORR_REF_OUTER;
+    }
+  return QO_CORR_REF_CONST;
+}
+
+/*
+ * qo_corr_ref_multi_pre () - walk helper: classify each resolved PT_NAME against a SET of inner base spec ids.
+ */
+static PT_NODE *
+qo_corr_ref_multi_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  QO_CORR_REF_MINFO *info = (QO_CORR_REF_MINFO *) arg;
+
+  *continue_walk = PT_CONTINUE_WALK;
+
+  if (node->node_type == PT_NAME && node->info.name.spec_id != 0
+      && (node->info.name.meta_class == PT_NORMAL || node->info.name.meta_class == PT_SHARED
+	  || node->info.name.meta_class == PT_OID_ATTR || node->info.name.meta_class == PT_VID_ATTR))
+    {
+      int i;
+      bool is_inner = false;
+
+      for (i = 0; i < info->n_inner; i++)
+	{
+	  if (node->info.name.spec_id == info->inner_ids[i])
+	    {
+	      is_inner = true;
+	      break;
+	    }
+	}
+      if (is_inner)
+	{
+	  info->found_inner = true;
+	}
+      else if (pt_find_entity (parser, info->outer_from, node->info.name.spec_id) != NULL)
+	{
+	  info->found_outer = true;
+	}
+      else
+	{
+	  info->found_foreign = true;
+	}
+    }
+
+  return node;
+}
+
+/*
+ * qo_corr_classify_multi () - classify a subtree's column references against a SET of inner ids.
+ */
+static QO_CORR_REF_KIND
+qo_corr_classify_multi (PARSER_CONTEXT * parser, PT_NODE * tree, const UINTPTR * inner_ids, int n_inner,
+			PT_NODE * outer_from)
+{
+  QO_CORR_REF_MINFO info;
+
+  info.parser = parser;
+  info.inner_ids = inner_ids;
+  info.n_inner = n_inner;
+  info.outer_from = outer_from;
+  info.found_inner = false;
+  info.found_outer = false;
+  info.found_foreign = false;
+
+  (void) parser_walk_tree (parser, tree, qo_corr_ref_multi_pre, &info, NULL, NULL);
 
   if (info.found_foreign)
     {
@@ -843,7 +942,9 @@ qo_rewrite_correlated_subqueries (PARSER_CONTEXT * parser, PT_NODE * node, void 
     {
       save_next = cnf->next;
 
-      if (qo_corr_rewrite_one (parser, node, cnf, idx))
+      /* single-table path first (bit-for-bit unchanged); it returns false for a multi-table inner, then the
+       * multi-table branch is tried. The two are mutually exclusive on inner_from->next. */
+      if (qo_corr_rewrite_one (parser, node, cnf, idx) || qo_corr_rewrite_one_multi (parser, node, cnf, idx))
 	{
 	  /* the conjunct was consumed; unlink and free it (subquery already re-homed in the derived spec) */
 	  if (prev != NULL)
@@ -1467,6 +1568,622 @@ qo_corr_rewrite_one (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int
     }
 
   /* free the detached correlated conjuncts (their outer operands were copied into the ON) */
+  if (corr_head != NULL)
+    {
+      parser_free_tree (parser, corr_head);
+    }
+
+  return true;
+}
+
+/*
+ * qo_corr_rewrite_one_multi () - SPEC3: multi-table-inner variant of qo_corr_rewrite_one.
+ *
+ * Handles a correlated EXISTS/NOT EXISTS/IN/NOT IN whose subquery FROM is a join of >=2 flat base tables
+ * (INNER/CROSS only). The whole multi-table join body is wrapped as ONE derived spec via mq_make_derived_spec
+ * and tagged SEMI/ANTI (or demoted to INNER when provably <=1 row per outer row), riding the executor's
+ * single-inner-scan first-match (SEMI) / drain (ANTI) -- the same realization the single-table path uses, so
+ * no explicit outer dedup is needed (the SEMI first-match IS the outer-row dedup; spike-verified).
+ *
+ * The single-table path (qo_corr_rewrite_one) is left bit-for-bit unchanged; this function returns false for a
+ * single-table inner so the two are mutually exclusive. Conservative v1 bails (keep dependent): inner OUTER
+ * joins, partitioned/derived/view inner, parent FROM that is not a single base table, unprovable-non-null NOT IN,
+ * correlation in an inner JOIN ON, foreign references. Principle 3: all capacity/proof/allocations precede the
+ * point of no return; residual allocation failure raises PT_INTERNAL_ERROR (never return false after mutating).
+ */
+static bool
+qo_corr_rewrite_one_multi (PARSER_CONTEXT * parser, PT_NODE * node, PT_NODE * cnf, int *idx)
+{
+  PT_OP_TYPE op;
+  bool anti = false;
+  PT_NODE *subq = NULL;
+  PT_NODE *outer_key = NULL;
+  PT_NODE *inner_from, *outer_from, *sub_where, *sub_list, *w, *col, *isp;
+  UINTPTR inner_ids[QO_CORR_MAX_INNER];
+  int n_inner = 0;
+  QO_CORR_TERM terms[QO_CORR_MAX_TERMS];
+  int nterms = 0;
+  int i;
+  PT_NODE *new_spec = NULL, *new_attr = NULL;
+  PT_NODE *on_cond = NULL, *on_tail = NULL;
+  PT_NODE *corr_head = NULL, *corr_tail = NULL;
+  PT_NODE *proj_name[QO_CORR_MAX_PROJ];
+  PT_NODE *pending_proj[QO_CORR_MAX_PROJ];
+  int npending = 0;
+  int nproj = 0;
+  const char *in_key_col = NULL;
+  bool all_on_equi = true;
+  bool bound[QO_CORR_MAX_PROJ];
+  short location;
+  PT_NODE *sp;
+
+  if (cnf->or_next != NULL || cnf->node_type != PT_EXPR)
+    {
+      return false;
+    }
+
+  /* ---- form detection (same as single-table) ---- */
+  op = cnf->info.expr.op;
+  if (op == PT_EXISTS)
+    {
+      anti = false;
+      subq = cnf->info.expr.arg1;
+    }
+  else if (op == PT_NOT && cnf->info.expr.arg1 != NULL && cnf->info.expr.arg1->node_type == PT_EXPR
+	   && cnf->info.expr.arg1->info.expr.op == PT_EXISTS)
+    {
+      anti = true;
+      subq = cnf->info.expr.arg1->info.expr.arg1;
+    }
+  else if (op == PT_IS_IN || op == PT_EQ_SOME)
+    {
+      anti = false;
+      outer_key = cnf->info.expr.arg1;
+      subq = cnf->info.expr.arg2;
+    }
+  else if (op == PT_IS_NOT_IN)
+    {
+      anti = true;
+      outer_key = cnf->info.expr.arg1;
+      subq = cnf->info.expr.arg2;
+    }
+  else
+    {
+      return false;
+    }
+
+  if (!PT_IS_SELECT (subq))
+    {
+      return false;
+    }
+  if (!PT_IS_CORRELATED_SUBQUERY (subq) || subq->info.query.correlation_level != 1)
+    {
+      return false;
+    }
+
+  inner_from = subq->info.query.q.select.from;
+  /* MULTI-TABLE ONLY: a single-table inner is handled bit-for-bit by qo_corr_rewrite_one. */
+  if (inner_from == NULL || inner_from->next == NULL)
+    {
+      return false;
+    }
+
+  /* every inner spec must be a flat base table joined INNER/CROSS only (no OUTER/SEMI/ANTI), not partitioned */
+  for (isp = inner_from; isp != NULL; isp = isp->next)
+    {
+      MOP icls = NULL;
+
+      if (isp->info.spec.entity_name == NULL || isp->info.spec.derived_table != NULL)
+	{
+	  return false;
+	}
+      if (isp->info.spec.join_type != PT_JOIN_NONE && isp->info.spec.join_type != PT_JOIN_INNER
+	  && isp->info.spec.join_type != PT_JOIN_CROSS)
+	{
+	  return false;
+	}
+      PT_SPEC_GET_DB_OBJECT (isp, icls);
+      if (icls == NULL || sm_is_partitioned_class (icls) > 0)
+	{
+	  return false;
+	}
+      if (n_inner >= QO_CORR_MAX_INNER)
+	{
+	  return false;
+	}
+      inner_ids[n_inner++] = isp->info.spec.id;
+    }
+
+  /* an inner JOIN ON term that references the outer (correlation inside a join ON) is out of scope: bail */
+  for (isp = inner_from; isp != NULL; isp = isp->next)
+    {
+      if (isp->info.spec.on_cond != NULL)
+	{
+	  QO_CORR_REF_KIND k = qo_corr_classify_multi (parser, isp->info.spec.on_cond, inner_ids, n_inner,
+						       node->info.query.q.select.from);
+	  if (k != QO_CORR_REF_INNER && k != QO_CORR_REF_CONST)
+	    {
+	      return false;
+	    }
+	}
+    }
+
+  /* parent (outer) FROM must be a single flat base table: gives a stable outer-row identity and avoids the
+   * v2 multi-outer-table / derived-parent cases. (Conservative: demote-to-INNER could relax this, but v1 bails.) */
+  outer_from = node->info.query.q.select.from;
+  if (outer_from == NULL || outer_from->next != NULL || outer_from->info.spec.entity_name == NULL
+      || outer_from->info.spec.derived_table != NULL)
+    {
+      return false;
+    }
+
+  /* shared subquery gates (carried over from single-table) */
+  if (PT_SELECT_INFO_IS_FLAGED (subq, PT_SELECT_INFO_HAS_AGG)
+      || PT_SELECT_INFO_IS_FLAGED (subq, PT_SELECT_INFO_HAS_ANALYTIC)
+      || subq->info.query.q.select.group_by != NULL || subq->info.query.q.select.having != NULL
+      || subq->info.query.q.select.connect_by != NULL || subq->info.query.q.select.start_with != NULL
+      || subq->info.query.order_by != NULL || subq->info.query.orderby_for != NULL
+      || subq->info.query.limit != NULL)
+    {
+      return false;
+    }
+  if (pt_has_aggregate (parser, subq) || pt_has_analytic (parser, subq))
+    {
+      return false;
+    }
+  if (subq->info.query.q.select.hint & PT_HINT_NO_MERGE)
+    {
+      return false;
+    }
+  if (PT_SELECT_INFO_IS_FLAGED (subq, PT_SELECT_INFO_IS_MERGE_QUERY))
+    {
+      return false;
+    }
+
+  /* IN/NOT IN: scalar (single-column) match only */
+  if (outer_key != NULL)
+    {
+      PT_NODE *match;
+      int mi;
+
+      if (PT_IS_COLLECTION_TYPE (outer_key->type_enum) || PT_IS_FUNCTION (outer_key))
+	{
+	  return false;
+	}
+      match = pt_get_select_list (parser, subq);
+      if (pt_length_of_select_list (match, EXCLUDE_HIDDEN_COLUMNS) != 1)
+	{
+	  return false;
+	}
+      if (match != NULL && match->node_type == PT_NAME && pt_is_attr (match))
+	{
+	  for (mi = 0; mi < n_inner; mi++)
+	    {
+	      if (match->info.name.spec_id == inner_ids[mi])
+		{
+		  in_key_col = match->info.name.original;
+		  break;
+		}
+	    }
+	}
+    }
+
+  /* ---- collect & validate correlated conjuncts of the subquery WHERE ---- */
+  sub_where = subq->info.query.q.select.where;
+  for (w = sub_where; w != NULL; w = w->next)
+    {
+      QO_CORR_REF_KIND kind;
+      PT_NODE *inner_side, *outer_side;
+      bool inner_is_arg1;
+
+      if (w->or_next != NULL)
+	{
+	  return false;
+	}
+      if (w->node_type == PT_EXPR
+	  && ((w->info.expr.arg1 != NULL && PT_IS_QUERY (w->info.expr.arg1))
+	      || (w->info.expr.arg2 != NULL && PT_IS_QUERY (w->info.expr.arg2))
+	      || (w->info.expr.arg3 != NULL && PT_IS_QUERY (w->info.expr.arg3))))
+	{
+	  return false;
+	}
+
+      {
+	/* classify THIS conjunct only: parser_walk_tree follows ->next, so cut the tail first */
+	PT_NODE *wsave = w->next;
+	w->next = NULL;
+	kind = qo_corr_classify_multi (parser, w, inner_ids, n_inner, node->info.query.q.select.from);
+	w->next = wsave;
+      }
+      if (kind == QO_CORR_REF_FOREIGN || kind == QO_CORR_REF_OUTER)
+	{
+	  return false;
+	}
+      if (kind == QO_CORR_REF_INNER || kind == QO_CORR_REF_CONST)
+	{
+	  continue;			/* inner-only filter / inner-join term: stays inside the derived body */
+	}
+
+      /* CORRELATED conjunct: binary comparison, one side a bare inner base column, other side outer-only */
+      if (w->node_type != PT_EXPR
+	  || (w->info.expr.op != PT_EQ && w->info.expr.op != PT_NE && w->info.expr.op != PT_GT
+	      && w->info.expr.op != PT_GE && w->info.expr.op != PT_LT && w->info.expr.op != PT_LE))
+	{
+	  return false;
+	}
+      {
+	QO_CORR_REF_KIND k1 = qo_corr_classify_multi (parser, w->info.expr.arg1, inner_ids, n_inner,
+						      node->info.query.q.select.from);
+	QO_CORR_REF_KIND k2 = qo_corr_classify_multi (parser, w->info.expr.arg2, inner_ids, n_inner,
+						      node->info.query.q.select.from);
+
+	if (k1 == QO_CORR_REF_INNER && (k2 == QO_CORR_REF_OUTER || k2 == QO_CORR_REF_CONST))
+	  {
+	    inner_is_arg1 = true;
+	    inner_side = w->info.expr.arg1;
+	    outer_side = w->info.expr.arg2;
+	  }
+	else if ((k1 == QO_CORR_REF_OUTER || k1 == QO_CORR_REF_CONST) && k2 == QO_CORR_REF_INNER)
+	  {
+	    inner_is_arg1 = false;
+	    inner_side = w->info.expr.arg2;
+	    outer_side = w->info.expr.arg1;
+	  }
+	else
+	  {
+	    return false;
+	  }
+
+	/* inner side must be a bare base column belonging to one of the inner tables */
+	if (!(inner_side->node_type == PT_NAME && pt_is_attr (inner_side)))
+	  {
+	    return false;
+	  }
+	{
+	  bool in_set = false;
+	  for (i = 0; i < n_inner; i++)
+	    {
+	      if (inner_side->info.name.spec_id == inner_ids[i])
+		{
+		  in_set = true;
+		  break;
+		}
+	    }
+	  if (!in_set)
+	    {
+	      return false;
+	    }
+	}
+      }
+
+      if (nterms >= QO_CORR_MAX_TERMS)
+	{
+	  return false;
+	}
+      terms[nterms].op = w->info.expr.op;
+      terms[nterms].inner_is_arg1 = inner_is_arg1;
+      terms[nterms].inner_name = inner_side;
+      terms[nterms].outer_expr = outer_side;
+      terms[nterms].proj_idx = -1;
+      nterms++;
+    }
+
+  if (nterms == 0)
+    {
+      return false;
+    }
+
+  /* immediate-parent correlation: every outer-side reference resolves in this node's FROM (single outer base) */
+  for (i = 0; i < nterms; i++)
+    {
+      QO_CORR_REF_KIND ok = qo_corr_classify_multi (parser, terms[i].outer_expr, inner_ids, n_inner,
+						    node->info.query.q.select.from);
+      if (ok != QO_CORR_REF_OUTER && ok != QO_CORR_REF_CONST)
+	{
+	  return false;
+	}
+    }
+
+  /* ---- NOT IN NULL-safety gate (3VL), carried over incl. the outer-join null-supply guard ---- */
+  if (op == PT_IS_NOT_IN)
+    {
+      PT_NODE *inner_match = pt_get_select_list (parser, subq);
+      bool im_inner = false;
+      PT_NODE *osp2;
+
+      /* outer key may be NULL-supplied by an outer join in the parent FROM -> unsound non-null proof -> bail */
+      for (osp2 = node->info.query.q.select.from; osp2 != NULL; osp2 = osp2->next)
+	{
+	  if (osp2->info.spec.join_type != PT_JOIN_NONE && osp2->info.spec.join_type != PT_JOIN_INNER)
+	    {
+	      return false;
+	    }
+	}
+
+      /* inner NOT-IN match column must be a bare base column of an inner table, provably non-null */
+      if (inner_match == NULL || !(inner_match->node_type == PT_NAME && pt_is_attr (inner_match)))
+	{
+	  return false;
+	}
+      for (i = 0; i < n_inner; i++)
+	{
+	  if (inner_match->info.name.spec_id == inner_ids[i])
+	    {
+	      im_inner = true;
+	      break;
+	    }
+	}
+      if (!im_inner)
+	{
+	  return false;
+	}
+      if (!qo_corr_col_is_nonnull (parser, subq->info.query.q.select.from, inner_match))
+	{
+	  return false;
+	}
+      if (outer_key->node_type == PT_NAME && pt_is_attr (outer_key))
+	{
+	  if (!qo_corr_col_is_nonnull (parser, node->info.query.q.select.from, outer_key))
+	    {
+	      return false;
+	    }
+	}
+      else if (!qo_corr_value_is_nonnull (outer_key))
+	{
+	  return false;
+	}
+    }
+
+  /* ---- projection planning (read-only; precedes all mutation) ---- */
+  sub_list = pt_get_select_list (parser, subq);
+  for (col = sub_list; col != NULL; col = col->next)
+    {
+      if (nproj >= QO_CORR_MAX_PROJ)
+	{
+	  return false;
+	}
+      proj_name[nproj++] = col;
+    }
+  for (i = 0; i < nterms; i++)
+    {
+      int found = -1;
+      int j;
+      for (j = 0; j < nproj; j++)
+	{
+	  if (proj_name[j]->node_type == PT_NAME
+	      && proj_name[j]->info.name.spec_id == terms[i].inner_name->info.name.spec_id
+	      && intl_identifier_casecmp (proj_name[j]->info.name.original,
+					  terms[i].inner_name->info.name.original) == 0)
+	    {
+	      found = j;
+	      break;
+	    }
+	}
+      if (found >= 0)
+	{
+	  terms[i].proj_idx = found;
+	}
+      else
+	{
+	  PT_NODE *proj;
+	  if (nproj >= QO_CORR_MAX_PROJ)
+	    {
+	      return false;
+	    }
+	  proj = parser_copy_tree (parser, terms[i].inner_name);
+	  if (proj == NULL)
+	    {
+	      return false;
+	    }
+	  proj->next = NULL;
+	  terms[i].proj_idx = nproj;
+	  proj_name[nproj] = proj;
+	  pending_proj[npending++] = proj;
+	  nproj++;
+	}
+    }
+
+  /* =========================================================================
+   * Point of no return: every gate passed and all fallible allocations done. Begin mutation.
+   * ========================================================================= */
+
+  /* (6a) detach correlated conjuncts from the subquery WHERE (inner-only / join terms stay in the derived body) */
+  {
+    PT_NODE *p = subq->info.query.q.select.where, *pprev = NULL, *pnext;
+    for (; p != NULL; p = pnext)
+      {
+	QO_CORR_REF_KIND pk;
+	pnext = p->next;
+	p->next = NULL;
+	pk = qo_corr_classify_multi (parser, p, inner_ids, n_inner, node->info.query.q.select.from);
+	p->next = pnext;
+	if (pk == QO_CORR_REF_CORRELATED)
+	  {
+	    if (pprev != NULL)
+	      {
+		pprev->next = pnext;
+	      }
+	    else
+	      {
+		subq->info.query.q.select.where = pnext;
+	      }
+	    p->next = NULL;
+	    if (corr_head == NULL)
+	      {
+		corr_head = corr_tail = p;
+	      }
+	    else
+	      {
+		corr_tail->next = p;
+		corr_tail = p;
+	      }
+	  }
+	else
+	  {
+	    pprev = p;
+	  }
+      }
+  }
+
+  /* (6b) append the pre-built projection copies for the correlated inner columns */
+  for (i = 0; i < npending; i++)
+    {
+      subq->info.query.q.select.list = parser_append_node (pending_proj[i], subq->info.query.q.select.list);
+    }
+
+  subq->info.query.correlation_level = 0;
+
+  /* (7) wrap the multi-table join body as ONE derived spec appended to the outer FROM */
+  if (mq_make_derived_spec (parser, node, subq, idx, &new_spec, &new_attr) == NULL)
+    {
+      PT_INTERNAL_ERROR (parser, "allocate new node");
+      return true;
+    }
+  new_spec->info.spec.join_type = (anti ? PT_JOIN_ANTI : PT_JOIN_SEMI);
+
+  /* (8) build the ON predicate */
+  for (i = 0; i < QO_CORR_MAX_PROJ; i++)
+    {
+      bound[i] = false;
+    }
+  if (outer_key != NULL)
+    {
+      PT_NODE *av0 = qo_corr_nth (new_attr, 0);
+      PT_NODE *t = parser_new_node (parser, PT_EXPR);
+      if (t == NULL || av0 == NULL)
+	{
+	  PT_INTERNAL_ERROR (parser, "allocate new node");
+	  return true;
+	}
+      t->info.expr.op = PT_EQ;
+      t->type_enum = PT_TYPE_LOGICAL;
+      t->info.expr.arg1 = parser_copy_tree (parser, outer_key);
+      t->info.expr.arg2 = parser_copy_tree (parser, av0);
+      t->info.expr.arg1->next = NULL;
+      t->info.expr.arg2->next = NULL;
+      t->next = NULL;
+      on_cond = on_tail = t;
+      bound[0] = true;
+    }
+  for (i = 0; i < nterms; i++)
+    {
+      PT_NODE *avk = qo_corr_nth (new_attr, terms[i].proj_idx);
+      PT_NODE *t = parser_new_node (parser, PT_EXPR);
+      if (t == NULL || avk == NULL)
+	{
+	  PT_INTERNAL_ERROR (parser, "allocate new node");
+	  return true;
+	}
+      t->info.expr.op = terms[i].op;
+      t->type_enum = PT_TYPE_LOGICAL;
+      if (terms[i].inner_is_arg1)
+	{
+	  t->info.expr.arg1 = parser_copy_tree (parser, avk);
+	  t->info.expr.arg2 = parser_copy_tree (parser, terms[i].outer_expr);
+	}
+      else
+	{
+	  t->info.expr.arg1 = parser_copy_tree (parser, terms[i].outer_expr);
+	  t->info.expr.arg2 = parser_copy_tree (parser, avk);
+	}
+      t->info.expr.arg1->next = NULL;
+      t->info.expr.arg2->next = NULL;
+      t->next = NULL;
+      if (on_cond == NULL)
+	{
+	  on_cond = on_tail = t;
+	}
+      else
+	{
+	  on_tail->next = t;
+	  on_tail = t;
+	}
+      if (terms[i].op != PT_EQ)
+	{
+	  all_on_equi = false;
+	}
+      if (terms[i].proj_idx >= 0 && terms[i].proj_idx < QO_CORR_MAX_PROJ)
+	{
+	  bound[terms[i].proj_idx] = true;
+	}
+    }
+
+  new_spec->info.spec.on_cond = on_cond;
+
+  /* location stamp */
+  location = 0;
+  for (sp = node->info.query.q.select.from; sp != NULL; sp = sp->next)
+    {
+      if (sp != new_spec && sp->info.spec.location >= location)
+	{
+	  location = (short) (sp->info.spec.location + 1);
+	}
+    }
+  new_spec->info.spec.location = location;
+  qo_corr_stamp_location (parser, on_cond, location);
+
+  /* SEMI -> INNER demotion: multi-table uses the DISTINCT-over-fully-equi-bound proof ONLY (the unique/PK
+   * proof assumes a single inner base class and is unsound across a join). ANTI never demoted. */
+  if (!anti && subq->info.query.all_distinct == PT_DISTINCT && all_on_equi && nproj <= QO_CORR_MAX_PROJ)
+    {
+      bool all_bound = true;
+      for (i = 0; i < nproj; i++)
+	{
+	  if (!bound[i])
+	    {
+	      all_bound = false;
+	      break;
+	    }
+	}
+      if (all_bound)
+	{
+	  new_spec->info.spec.join_type = PT_JOIN_INNER;
+	}
+    }
+
+  /* self-guarantee debug asserts (no-op in release): derived spec is now a single id */
+#if !defined(NDEBUG)
+  {
+    QO_CORR_REF_INFO chk;
+    chk.parser = parser;
+    chk.inner_id = new_spec->info.spec.id;
+    chk.outer_from = node->info.query.q.select.from;
+    chk.found_inner = false;
+    chk.found_outer = false;
+    chk.found_foreign = false;
+    (void) parser_walk_tree (parser, new_spec->info.spec.on_cond, qo_corr_ref_pre, &chk, NULL, NULL);
+    assert (chk.found_outer);
+
+    if (new_spec->info.spec.join_type == PT_JOIN_ANTI)
+      {
+	QO_CORR_REF_INFO leak;
+	leak.parser = parser;
+	leak.inner_id = new_spec->info.spec.id;
+	leak.outer_from = node->info.query.q.select.from;
+	leak.found_inner = false;
+	leak.found_outer = false;
+	leak.found_foreign = false;
+	(void) parser_walk_tree (parser, node->info.query.q.select.list, qo_corr_ref_pre, &leak, NULL, NULL);
+	(void) parser_walk_tree (parser, node->info.query.q.select.where, qo_corr_ref_pre, &leak, NULL, NULL);
+	assert (!leak.found_inner);
+      }
+  }
+#endif
+
+  /* (11) detach the subquery pointer from the original conjunct, then free the conjunct */
+  if (op == PT_EXISTS)
+    {
+      cnf->info.expr.arg1 = NULL;
+    }
+  else if (op == PT_NOT)
+    {
+      cnf->info.expr.arg1->info.expr.arg1 = NULL;
+    }
+  else
+    {
+      cnf->info.expr.arg2 = NULL;
+    }
+
   if (corr_head != NULL)
     {
       parser_free_tree (parser, corr_head);
