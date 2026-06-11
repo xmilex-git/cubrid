@@ -75,6 +75,38 @@ namespace parallel_query
     return manager;
   }
 
+  worker_manager *worker_manager::try_reserve_workers_exact (int num_workers)
+  {
+    assert (num_workers > 0);
+
+    /* all-or-nothing (C7/OWN-5): either exactly num_workers were subtracted from the
+     * global pool in one CAS, or nothing was */
+    int reserved = worker_manager_global::get_manager().try_reserve_workers_exact (num_workers);
+    if (reserved == 0)
+      {
+	return nullptr;
+      }
+    assert (reserved == num_workers);
+
+    THREAD_ENTRY *thread_p = thread_get_thread_entry_info ();
+    assert (thread_p != nullptr);
+
+    worker_manager *manager = (worker_manager *) db_private_alloc (thread_p, sizeof (worker_manager));
+    if (manager == nullptr)
+      {
+	worker_manager_global::get_manager().release_workers (reserved);
+	return nullptr;
+      }
+
+    manager = placement_new (manager);
+
+    assert (manager->m_reserved_workers == 0);
+    manager->m_reserved_workers = reserved;
+    assert (manager->m_active_tasks.load () == 0);
+
+    return manager;
+  }
+
   void worker_manager::release_workers ()
   {
     if (m_reserved_workers == 0)

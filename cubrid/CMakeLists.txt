@@ -413,6 +413,8 @@ set(PARALLEL_QUERY_SOURCES
   ${PARALLEL_QUERY_DIR}/px_thread_safe_queue.cpp
   ${PARALLEL_QUERY_DIR}/px_stream_channel.cpp
   ${PARALLEL_QUERY_DIR}/px_stream_source.cpp
+  ${PARALLEL_QUERY_DIR}/px_stream_pipeline.cpp
+  ${PARALLEL_QUERY_DIR}/px_stream_policy.cpp
   ${PARALLEL_QUERY_DIR}/px_parallel.cpp
   )
 
@@ -424,6 +426,8 @@ set(PARALLEL_QUERY_HEADERS
   ${PARALLEL_QUERY_DIR}/px_thread_safe_queue.hpp
   ${PARALLEL_QUERY_DIR}/px_stream_channel.hpp
   ${PARALLEL_QUERY_DIR}/px_stream_source.hpp
+  ${PARALLEL_QUERY_DIR}/px_stream_pipeline.hpp
+  ${PARALLEL_QUERY_DIR}/px_stream_policy.hpp
   ${PARALLEL_QUERY_DIR}/px_interrupt.hpp
   ${PARALLEL_QUERY_DIR}/px_parallel.hpp
   )

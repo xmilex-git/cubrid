@@ -67,6 +67,10 @@ namespace parallel_query
 
       /* methods */
       int try_reserve_workers (const int num_workers);
+      /* all-or-nothing variant for whole-pipeline reservations (C4/C7 OWN-5, R5/O3):
+       * one CAS subtracts EXACTLY num_workers or nothing -- never a partial grant.
+       * Additive: try_reserve_workers callers are untouched. */
+      int try_reserve_workers_exact (const int num_workers);
       void release_workers (const int num_workers);
       void push_task (cubthread::entry_task *task);
   };

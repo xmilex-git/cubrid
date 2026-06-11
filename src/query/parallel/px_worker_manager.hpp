@@ -38,6 +38,14 @@ namespace parallel_query
     public:
       static worker_manager *try_reserve_workers (int num_workers);
 
+      /* Streaming-pipeline reservation (C4/C7 OWN-5, SSOT R5/O3): ALL-OR-NOTHING.
+       * Returns a manager holding EXACTLY num_workers, or NULL with NOTHING reserved --
+       * a partial grant is impossible by construction (one CAS on the global available
+       * count; see worker_manager_global::try_reserve_workers_exact).  Contrast
+       * try_reserve_workers, which may grant fewer (down to min_degree).  Additive API:
+       * existing try_reserve_workers call sites are untouched. */
+      static worker_manager *try_reserve_workers_exact (int num_workers);
+
       worker_manager();
       ~worker_manager();
 

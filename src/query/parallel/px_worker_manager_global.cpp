@@ -25,6 +25,7 @@
 #endif /* !defined (SERVER_MODE) && !defined (SA_MODE) */
 
 #include "px_worker_manager_global.hpp"
+#include "px_stream_policy.hpp"	/* stream_try_reserve_exact */
 #include "system_parameter.h"
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -135,6 +136,23 @@ namespace parallel_query
 	/* CAS failed: available is updated with actual value, retry */
 	std::this_thread::yield ();
       }
+  }
+
+  int worker_manager_global::try_reserve_workers_exact (const int num_workers)
+  {
+    assert (num_workers > 0);
+
+    /* safe-guard */
+    if (num_workers <= 0)
+      {
+	return 0;
+      }
+
+    /* NOTE: no PRM_MAX_PARALLELISM clamp and no min_degree floor here -- a streamed
+     * pipeline reserves producer D + consumer D = 2*num in ONE atomic step (SSOT R5/O3);
+     * D itself was already clamped by compute_parallel_degree.  Any shortfall (including
+     * num_workers > capacity) reserves NOTHING: exact-or-fallback, never partial. */
+    return stream_try_reserve_exact (m_available, num_workers);
   }
 
   void worker_manager_global::release_workers (const int num_workers)
