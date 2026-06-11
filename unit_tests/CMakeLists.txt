@@ -36,6 +36,7 @@ option (UNIT_TEST_THREAD "Unit testing: thread module")
 option (UNIT_TEST_PACKING "Unit testing: packing")
 option (UNIT_TEST_RESOURCE_TRACKER "Unit testing: resource tracker")
 option (UNIT_TEST_MONITOR "Unit testing: monitor")
+option (UNIT_TEST_STREAM_CHANNEL "Unit testing: streaming row-batch channel")
 option (UNIT_TEST_LOADDB "Unit testing: loaddb module")
 option (UNIT_TEST_MEMORY_MONITOR "Unit testing: memory monitor")
 
@@ -102,6 +103,11 @@ if (UNIT_TESTS OR UNIT_TEST_MONITOR)
   message("    monitor")
   add_subdirectory(monitor)
 endif(UNIT_TESTS OR UNIT_TEST_MONITOR)
+
+if (UNIT_TESTS OR UNIT_TEST_STREAM_CHANNEL)
+  message("    stream_channel")
+  add_subdirectory(stream_channel)
+endif(UNIT_TESTS OR UNIT_TEST_STREAM_CHANNEL)
 
 #[[
 TODO compilation fails

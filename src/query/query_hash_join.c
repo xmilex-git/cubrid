@@ -505,6 +505,8 @@ hjoin_outer_fill_null_values (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manage
       goto error_exit;
     }
 
+  hjoin_sink_init_list (&context->sink, list_id);
+
   error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id);
   if (error != NO_ERROR)
     {
@@ -523,8 +525,8 @@ hjoin_outer_fill_null_values (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manage
   while ((scan_code = qfile_scan_list_next (thread_p, &probe->list_scan_id, &probe->tuple_record, PEEK)) == S_SUCCESS)
     {
       error =
-	hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record, manager->merge_info,
-				      &overflow_record);
+	hjoin_merge_tuple_to_list_id (thread_p, &context->sink, outer->fill_record, inner->fill_record,
+				      manager->merge_info, &overflow_record);
       if (error != NO_ERROR)
 	{
 	  break;
@@ -3318,6 +3320,8 @@ hjoin_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTE
 	  goto error_exit;
 	}
 
+      hjoin_sink_init_list (&context->sink, list_id);
+
       if (IS_OUTER_JOIN_TYPE (manager->join_type))
 	{
 	  error = hjoin_outer_probe (thread_p, manager, context, list_id);
@@ -3538,7 +3542,7 @@ hjoin_inner_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
 	  HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 	  error =
-	    hjoin_merge_tuple_to_list_id (thread_p, list_id, &outer->tuple_record, &inner->tuple_record,
+	    hjoin_merge_tuple_to_list_id (thread_p, &context->sink, &outer->tuple_record, &inner->tuple_record,
 					  manager->merge_info, &overflow_record);
 	  HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 
@@ -3682,7 +3686,7 @@ hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
 	      HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 	      error =
-		hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record,
+		hjoin_merge_tuple_to_list_id (thread_p, &context->sink, outer->fill_record, inner->fill_record,
 					      manager->merge_info, &overflow_record);
 	      HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 
@@ -3764,7 +3768,7 @@ hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
 		  HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 		  error =
-		    hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record,
+		    hjoin_merge_tuple_to_list_id (thread_p, &context->sink, outer->fill_record, inner->fill_record,
 						  manager->merge_info, &overflow_record);
 		  HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 
@@ -3856,7 +3860,7 @@ hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
 	  HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 	  error =
-	    hjoin_merge_tuple_to_list_id (thread_p, list_id, &outer->tuple_record, &inner->tuple_record,
+	    hjoin_merge_tuple_to_list_id (thread_p, &context->sink, &outer->tuple_record, &inner->tuple_record,
 					  manager->merge_info, &overflow_record);
 	  HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 
@@ -3880,7 +3884,7 @@ hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
 	  HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 	  error =
-	    hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record,
+	    hjoin_merge_tuple_to_list_id (thread_p, &context->sink, outer->fill_record, inner->fill_record,
 					  manager->merge_info, &overflow_record);
 	  HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
 
@@ -4063,17 +4067,68 @@ hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
 }
 
 /*
+ * hjoin_list_sink_emit() - Default sink adapter: write one merged tuple to a QFILE_LIST_ID.
+ *   return: Error code (NO_ERROR if successful, error code otherwise).
+ *   thread_p(in): Thread entry.
+ *   sink(in): Sink whose adapter_state is the destination QFILE_LIST_ID.
+ *   merged(in): Filled tuple descriptor for a normal-size tuple. (can be NULL).
+ *   oversized(in): Fully assembled record for an oversized tuple. (can be NULL).
+ *
+ * Note: Behaves exactly as the pre-seam direct calls did: the descriptor case
+ *       is qfile_generate_tuple_into_list on the list's own tpl_descr; the
+ *       oversized case is qfile_add_tuple_to_list.
+ */
+static int
+hjoin_list_sink_emit (THREAD_ENTRY * thread_p, HJOIN_SINK * sink, QFILE_TUPLE_DESCRIPTOR * merged,
+		      QFILE_TUPLE oversized)
+{
+  QFILE_LIST_ID *list_id = (QFILE_LIST_ID *) sink->adapter_state;
+
+  assert (list_id != NULL);
+  assert ((merged != NULL) != (oversized != NULL));
+
+  if (merged != NULL)
+    {
+      /* The producer filled the list's own descriptor (sink->tpl_descr). */
+      assert (merged == &list_id->tpl_descr);
+
+      return qfile_generate_tuple_into_list (thread_p, list_id, T_MERGE);
+    }
+  else
+    {
+      return qfile_add_tuple_to_list (thread_p, list_id, oversized);
+    }
+}
+
+/*
+ * hjoin_sink_init_list() - Bind the default list-file adapter to a sink.
+ *   return: None.
+ *   sink(in/out): Sink to initialize.
+ *   list_id(in): Destination list identifier.
+ */
+void
+hjoin_sink_init_list (HJOIN_SINK * sink, QFILE_LIST_ID * list_id)
+{
+  assert (sink != NULL);
+  assert (list_id != NULL);
+
+  sink->emit = hjoin_list_sink_emit;
+  sink->adapter_state = (void *) list_id;
+  sink->tpl_descr = &list_id->tpl_descr;
+}
+
+/*
  * hjoin_merge_tuple_to_list_id() -
  *   return: Error code (NO_ERROR if successful, error code otherwise).
  *   thread_p(in): Thread entry.
- *   list_id(in/out): List identifier to be merged.
+ *   sink(in/out): Output sink the merged tuple is emitted to.
  *   outer_record(in): Outer tuple to merge. (can be NULL).
  *   inner_record(in): Inner tuple to merge. (can be NULL).
  *   merge_info(in): Information used to merge the joined result.
  *   overflow_record(in/out): Space used for merging tuples too large to fit on a single page.
  */
 int
-hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
+hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, HJOIN_SINK * sink,
 			      QFILE_TUPLE_RECORD * outer_record,
 			      QFILE_TUPLE_RECORD * inner_record, QFILE_LIST_MERGE_INFO * merge_info,
 			      QFILE_TUPLE_RECORD * overflow_record)
@@ -4084,7 +4139,7 @@ hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
   int error = NO_ERROR;
 
   assert (thread_p != NULL);
-  assert (list_id != NULL);
+  assert (sink != NULL && sink->emit != NULL && sink->tpl_descr != NULL);
   assert (outer_record != NULL || inner_record != NULL);
   assert (merge_info != NULL);
   assert (overflow_record != NULL);
@@ -4097,13 +4152,13 @@ hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
 
   if (max_record_size < QFILE_MAX_TUPLE_SIZE_IN_PAGE)
     {
-      tuple_descriptor = &list_id->tpl_descr;
+      tuple_descriptor = sink->tpl_descr;
       tuple_descriptor->tpl_size = max_record_size;
       tuple_descriptor->tplrec1 = outer_record;
       tuple_descriptor->tplrec2 = inner_record;
       tuple_descriptor->merge_info = merge_info;
 
-      error = qfile_generate_tuple_into_list (thread_p, list_id, T_MERGE);
+      error = sink->emit (thread_p, sink, tuple_descriptor, NULL);
     }
   else
     {
@@ -4113,7 +4168,7 @@ hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
 	  goto error_exit;
 	}
 
-      error = qfile_add_tuple_to_list (thread_p, list_id, overflow_record->tpl);
+      error = sink->emit (thread_p, sink, NULL, overflow_record->tpl);
     }
 
   if (error != NO_ERROR)

@@ -337,6 +337,8 @@ error_exit:
 	  goto error_exit;
 	}
 
+      hjoin_sink_init_list (&context->sink, context->list_id);
+
       context->during_join_pred = single_context->during_join_pred;
       context->val_descr = single_context->val_descr;
 

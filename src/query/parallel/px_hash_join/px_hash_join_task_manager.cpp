@@ -1214,7 +1214,7 @@ cleanup:
 		  HJOIN_PRINT_TUPLE (build->list_id, build->tuple_record.tpl, HASHJOIN_PRINT_QUALIFIED_KEY);
 
 		  HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-		  error = hjoin_merge_tuple_to_list_id (&thread_ref, list_id,
+		  error = hjoin_merge_tuple_to_list_id (&thread_ref, &m_context->sink,
 							&outer->tuple_record, &inner->tuple_record,
 							m_manager->merge_info, &overflow_record);
 		  HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
@@ -1426,7 +1426,7 @@ cleanup:
 
 		  /* NULL key on preserved side — emit fill_record (null on null-supplying side) */
 		  HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-		  error = hjoin_merge_tuple_to_list_id (&thread_ref, list_id,
+		  error = hjoin_merge_tuple_to_list_id (&thread_ref, &m_context->sink,
 							outer->fill_record, inner->fill_record,
 							m_manager->merge_info, &overflow_record);
 		  HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
@@ -1541,7 +1541,7 @@ cleanup:
 		  HJOIN_PRINT_TUPLE (build->list_id, build->tuple_record.tpl, HASHJOIN_PRINT_QUALIFIED_KEY);
 
 		  HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-		  error = hjoin_merge_tuple_to_list_id (&thread_ref, list_id,
+		  error = hjoin_merge_tuple_to_list_id (&thread_ref, &m_context->sink,
 							&outer->tuple_record, &inner->tuple_record,
 							m_manager->merge_info, &overflow_record);
 		  HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
@@ -1569,7 +1569,7 @@ cleanup:
 
 		  /* no match — emit fill_record (null on null-supplying side) */
 		  HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-		  error = hjoin_merge_tuple_to_list_id (&thread_ref, list_id,
+		  error = hjoin_merge_tuple_to_list_id (&thread_ref, &m_context->sink,
 							outer->fill_record, inner->fill_record,
 							m_manager->merge_info, &overflow_record);
 		  HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);

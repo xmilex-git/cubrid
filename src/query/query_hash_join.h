@@ -354,10 +354,45 @@ typedef struct hashjoin_shared_join_info
   // *INDENT-ON*
 } HASHJOIN_SHARED_JOIN_INFO;
 
+/* HJOIN_SINK
+ *
+ * Output sink seam for the hash-join probe.  The probe emits each qualified,
+ * already-merged tuple through 'emit' without naming the destination.  The
+ * default adapter (bound with hjoin_sink_init_list) writes to a
+ * QFILE_LIST_ID exactly as the pre-seam code did; alternative adapters can
+ * be bound without touching the probe.
+ *
+ * Exactly one of 'merged' / 'oversized' is non-NULL per emit call:
+ *   merged    - normal tuple that fits in a page; the producer has already
+ *               filled the descriptor (merged == sink->tpl_descr).
+ *   oversized - tuple too large for a single page; fully assembled record.
+ * 'emit' returns NO_ERROR or a negative error code already er_set.
+ */
+typedef struct hjoin_sink HJOIN_SINK;
+
+typedef int (*HJOIN_SINK_EMIT) (THREAD_ENTRY * thread_p, HJOIN_SINK * sink, QFILE_TUPLE_DESCRIPTOR * merged,
+				QFILE_TUPLE oversized);
+
+struct hjoin_sink
+{
+  HJOIN_SINK_EMIT emit;		/* the one operation the producer calls */
+  void *adapter_state;		/* default adapter: QFILE_LIST_ID * */
+
+  /* Descriptor scratch the producer fills before a normal-size emit.
+   * The default list adapter points this at &list_id->tpl_descr so that
+   * the encode path (qfile_generate_tuple_into_list) is byte-identical
+   * to the pre-seam code. */
+  QFILE_TUPLE_DESCRIPTOR *tpl_descr;
+};
+
 /* HASHJOIN_CONTEXT*/
 typedef struct hashjoin_context
 {
   QFILE_LIST_ID *list_id;
+
+  /* Output sink; bound where the output list is opened, before the first
+   * emit, and never reassigned mid-probe. */
+  HJOIN_SINK sink;
 
   HASHJOIN_FETCH_INFO outer;
   HASHJOIN_FETCH_INFO inner;
@@ -478,9 +513,12 @@ int hjoin_fetch_key (THREAD_ENTRY * thread_p, HASHJOIN_FETCH_INFO * fetch_info, 
 void hjoin_update_tuple_hash_key (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * tuple_record, UINT32 hash_key);
 int hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST_SCAN_ID * list_scan_id,
 		     QFILE_TUPLE_RECORD * tuple_record);
-int hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
+int hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, HJOIN_SINK * sink,
 				  QFILE_TUPLE_RECORD * outer_record, QFILE_TUPLE_RECORD * inner_record,
 				  QFILE_LIST_MERGE_INFO * merge_info, QFILE_TUPLE_RECORD * overflow_record);
+
+/* Hash Join Output Sink */
+void hjoin_sink_init_list (HJOIN_SINK * sink, QFILE_LIST_ID * list_id);
 
 void hjoin_trace_start (THREAD_ENTRY * thread_p, HASHJOIN_START_STATS * start_stats);
 void hjoin_trace_end (THREAD_ENTRY * thread_p, HASHJOIN_INPUT_STATS * stats, HASHJOIN_START_STATS * start_stats);
