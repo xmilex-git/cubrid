@@ -2053,6 +2053,7 @@ qo_index_scan_new (QO_INFO * info, QO_NODE * node, QO_NODE_INDEX_ENTRY * ni_entr
 	       && !qo_is_index_iss_scan (plan) && !qo_is_index_loose_scan (plan)
 	       && index_entryp->ils_prefix_len == 0 && !index_entryp->is_iss_candidate
 	       && !qo_is_filter_index (index_entryp) && !qo_is_prefix_index (index_entryp)
+	       && index_entryp->constraints != NULL && index_entryp->constraints->func_index_info == NULL
 	       && bitset_is_empty (&(plan->plan_un.scan.terms)) && bitset_is_empty (&(plan->plan_un.scan.kf_terms))
 	       && bitset_is_empty (&(plan->sarged_terms)))
 	{
@@ -9283,24 +9284,6 @@ qo_search_planner (QO_PLANNER * planner)
 		      continue;	/* nop; go ahead */
 		    }
 
-		  /* Index fast full scan: covered, no key-range, all rows preserved -- a hash-join probe leaf can read a
-		   * narrow covering index instead of the heap. Off by default; only for join queries; only when EVERY
-		   * indexed column is NOT NULL (full scan skips NULL leading keys); never for ILS/ISS/filter/prefix index.
-		   */
-		  if (!n && prm_get_bool_value (PRM_ID_OPTIMIZER_INDEX_FULL_SCAN) && planner->N > 1
-		      && index_entry->cover_segments && QO_ENTRY_MULTI_COL (index_entry) && index_entry->force >= 0
-		      && !index_entry->is_iss_candidate && !(index_entry->ils_prefix_len > 0)
-		      && index_entry->constraints != NULL && index_entry->constraints->filter_predicate == NULL
-		      && !qo_is_prefix_index (index_entry) && qo_index_all_columns_not_null (index_entry))
-		    {
-		      assert (bitset_is_empty (&seg_terms));
-		      n =
-			qo_check_plan_on_info (info,
-					       qo_index_scan_new (info, node, ni_entry, QO_SCANMETHOD_INDEX_SCAN,
-								  &seg_terms /* empty range_terms => full unbounded scan */ ,
-								  NULL));
-		    }
-
 		  /* if the index didn't normally skipped the group/order by, we try the new plan, maybe this will be
 		   * better. DO NOT generate if there is no group/order by!
 		   */
@@ -9320,6 +9303,28 @@ qo_search_planner (QO_PLANNER * planner)
 			qo_check_plan_on_info (info,
 					       qo_index_scan_new (info, node, ni_entry,
 								  QO_SCANMETHOD_INDEX_ORDERBY_SCAN, &seg_terms, NULL));
+		    }
+
+		  /* Index fast full scan (gated, off by default): covered, no key-range, all rows preserved -- a
+		   * hash-join probe leaf can read a narrow covering index instead of the heap.  Tried only when no
+		   * stock candidate was generated above, so turning the gate ON only ADDS a candidate and never
+		   * shadows the group-by/order-by index scan candidates.  Only for join queries; only when EVERY
+		   * indexed column is NOT NULL (a full scan skips NULL keys); never for an ILS/ISS/filter/prefix/
+		   * function index (a function key can be NULL even when all its base columns are NOT NULL).
+		   */
+		  if (!n && prm_get_bool_value (PRM_ID_OPTIMIZER_INDEX_FULL_SCAN) && planner->N > 1
+		      && index_entry->cover_segments && QO_ENTRY_MULTI_COL (index_entry) && index_entry->force >= 0
+		      && !index_entry->is_iss_candidate && !(index_entry->ils_prefix_len > 0)
+		      && index_entry->constraints != NULL && index_entry->constraints->filter_predicate == NULL
+		      && index_entry->constraints->func_index_info == NULL && !qo_is_prefix_index (index_entry)
+		      && qo_index_all_columns_not_null (index_entry))
+		    {
+		      /* empty seg_terms => empty range_terms => full unbounded scan */
+		      assert (bitset_is_empty (&seg_terms));
+		      n =
+			qo_check_plan_on_info (info,
+					       qo_index_scan_new (info, node, ni_entry, QO_SCANMETHOD_INDEX_SCAN,
+								  &seg_terms, NULL));
 		    }
 		}
 	    }

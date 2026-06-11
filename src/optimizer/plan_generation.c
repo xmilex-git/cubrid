@@ -3114,7 +3114,8 @@ qo_mark_covered_full_iscan_parallel (QO_PLAN * scan_plan)
   /* only the covered, unbounded full index scan is partitionable by leaf page and row-preserving. */
   if (scan_plan->plan_un.scan.scan_method != QO_SCANMETHOD_INDEX_SCAN
       || !qo_is_index_covering_scan (scan_plan) || qo_is_index_iss_scan (scan_plan)
-      || qo_is_index_loose_scan (scan_plan) || !bitset_is_empty (&(scan_plan->plan_un.scan.terms)))
+      || qo_is_index_loose_scan (scan_plan) || !bitset_is_empty (&(scan_plan->plan_un.scan.terms))
+      || !bitset_is_empty (&(scan_plan->plan_un.scan.kf_terms)))
     {
       return;
     }
