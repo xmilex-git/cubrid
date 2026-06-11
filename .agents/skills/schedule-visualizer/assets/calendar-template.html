@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<!--
+  DAILY CALENDAR TEMPLATE  (single self-contained file — no external deps)
+  ────────────────────────────────────────────────────────────────────────
+  How to use:
+  1. Replace the title / kicker / h1 / .sub / .meta-pills with project facts.
+  2. Build one <tr> per week. Each week = wkcell + 5 day <td>s (Mon–Fri).
+  3. Fill each day with .chip blocks (see chip pattern below). Empty days = just
+     the date header. Holiday days get class="holiday" on the <td>. The merge/
+     milestone day gets class="mergeday". Buffer days get class="bufferday".
+  4. Fill the issue dictionary table at the bottom (exact id · bucket · summary ·
+     status). Out-of-scope items go in greyed <tr class="excl"> rows.
+  5. Keep only the legend entries for buckets you actually use.
+  6. Run ../scripts/verify_html.sh on the output before delivering.
+
+  CHIP PATTERN (copy, change bucket class c-* / a-* and text):
+    <div class="chip c-dev"><div class="top">
+        <span class="iss">TICKET-123</span><span class="act a-dev">PR</span></div>
+      <div class="desc">one-line summary in the user's language</div></div>
+
+  Buckets: dev refactor regress test sync proc merge buffer
+  (see references/design-system.md §3 for what each means)
+-->
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PROJECT — 일별 캘린더</title>
+<style>
+  :root{
+    --ink:#1f2430; --muted:#5b6573; --line:#d7dbe3; --line2:#e8ebf0;
+    --bg:#f4f6fa; --paper:#ffffff; --head:#2b3447;
+    --dev:#2f6df0; --dev-bg:#e8f0ff;
+    --refactor:#7c3aed; --refactor-bg:#f1ebfe;
+    --regress:#e8590c; --regress-bg:#fff0e6;
+    --test:#0ca678; --test-bg:#e3faf3;
+    --sync:#d9a000; --sync-bg:#fff7df;
+    --proc:#0b7285; --proc-bg:#e2f6fb;
+    --holiday:#adb5bd; --holiday-bg:#eef0f3;
+    --merge:#2f9e44; --merge-bg:#e6f8ea;
+    --buffer:#868e96; --buffer-bg:#f1f3f5;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Apple SD Gothic Neo","Noto Sans KR",Pretendard,Roboto,sans-serif;
+    padding:34px 28px 60px;-webkit-font-smoothing:antialiased;font-size:14px}
+  .wrap{max-width:1180px;margin:0 auto}
+  .kicker{font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:#7a8395;font-weight:700}
+  h1{font-size:26px;font-weight:800;margin:5px 0 6px;letter-spacing:-.02em}
+  .sub{color:#5b6573;font-size:13.5px;margin-bottom:6px}
+  .sub b{color:var(--ink);font-weight:700}
+  .meta-pills{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
+  .pill{background:#fff;border:1px solid var(--line);border-radius:999px;padding:4px 12px;font-size:12px;color:#3d4452}
+  .pill b{color:var(--ink)}
+
+  .legend{display:flex;flex-wrap:wrap;gap:8px 14px;margin:18px 0 14px}
+  .lg{display:flex;align-items:center;gap:6px;font-size:12px;color:#3d4452}
+  .sw{width:13px;height:13px;border-radius:3px;border:1px solid #00000014}
+
+  .cal{width:100%;border-collapse:separate;border-spacing:0;background:var(--paper);
+    border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:0 1px 3px #0000000d}
+  .cal th{background:var(--head);color:#eef1f6;font-size:12.5px;font-weight:700;padding:10px 12px;
+    text-align:left;border-right:1px solid #3a4256}
+  .cal th:last-child{border-right:none}
+  .cal th .wk{display:block;font-size:10.5px;color:#aeb6c6;font-weight:600;letter-spacing:.04em}
+  .weekno{width:46px;background:#3a4256 !important;text-align:center !important;color:#cfd6e4}
+  .cal td{vertical-align:top;border-right:1px solid var(--line2);border-top:1px solid var(--line2);
+    width:18%;padding:0}
+  .cal td:last-child{border-right:none}
+  .wkcell{width:46px;background:#f7f8fb;text-align:center;font-weight:800;color:#6b7280;font-size:13px;
+    border-right:1px solid var(--line)}
+  .wkcell small{display:block;font-weight:600;color:#9aa3b2;font-size:10px;margin-top:3px}
+
+  .day{min-height:138px;padding:7px 8px 10px}
+  .dhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px;
+    padding-bottom:5px;border-bottom:1px dashed #e1e5ec}
+  .ddate{font-weight:800;font-size:13px}
+  .dwd{font-size:11px;color:#98a1b0;font-weight:600}
+
+  .holiday .day{background:var(--holiday-bg);
+    background-image:repeating-linear-gradient(45deg,transparent,transparent 7px,#00000008 7px,#00000008 14px)}
+  .holiday .ddate{color:var(--holiday)}
+  .mergeday .day{background:var(--merge-bg)}
+  .mergeday .ddate{color:var(--merge)}
+  .bufferday .day{background:#fafbfc}
+
+  .chip{border-left:3px solid #ccc;background:#fafbfc;border-radius:5px;padding:5px 7px;margin-bottom:5px;
+    box-shadow:0 1px 1px #00000008}
+  .chip .top{display:flex;align-items:center;gap:5px;justify-content:space-between}
+  .chip .iss{font-size:11px;font-weight:800;letter-spacing:-.01em;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+  .chip .act{font-size:9.5px;font-weight:800;padding:1px 5px;border-radius:4px;color:#fff;white-space:nowrap}
+  .chip .desc{font-size:10.5px;color:#525a68;margin-top:2px;line-height:1.35}
+
+  .c-dev{border-color:var(--dev);background:var(--dev-bg)} .a-dev{background:var(--dev)}
+  .c-refactor{border-color:var(--refactor);background:var(--refactor-bg)} .a-refactor{background:var(--refactor)}
+  .c-regress{border-color:var(--regress);background:var(--regress-bg)} .a-regress{background:var(--regress)}
+  .c-test{border-color:var(--test);background:var(--test-bg)} .a-test{background:var(--test)}
+  .c-sync{border-color:var(--sync);background:var(--sync-bg)} .a-sync{background:var(--sync)}
+  .c-proc{border-color:var(--proc);background:var(--proc-bg)} .a-proc{background:var(--proc)}
+  .c-merge{border-color:var(--merge);background:var(--merge-bg)} .a-merge{background:var(--merge)}
+  .c-buffer{border-color:var(--buffer);background:var(--buffer-bg)} .a-buffer{background:var(--buffer)}
+  .holidaychip{color:var(--holiday);font-size:12px;font-weight:800;text-align:center;margin-top:24px}
+
+  h2{font-size:15px;font-weight:800;margin:30px 0 12px;letter-spacing:-.01em}
+  table.dict{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);
+    border-radius:10px;overflow:hidden;font-size:12.5px}
+  table.dict th{background:#eef1f6;text-align:left;padding:8px 12px;font-size:11px;color:#5b6573;
+    text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--line)}
+  table.dict td{padding:8px 12px;border-bottom:1px solid var(--line2);vertical-align:top}
+  table.dict tr:last-child td{border-bottom:none}
+  .iss-id{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-weight:800;white-space:nowrap}
+  .badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;color:#fff}
+  .st{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:999px}
+  .st-dev{background:#fff3bf;color:#856404} .st-conf{background:#d3f9d8;color:#2b6a2f}
+  .st-open{background:#ffe3e3;color:#c0392b} .st-done{background:#e7f5ff;color:#1971c2}
+  .excl td{color:#98a1b0;background:#fafbfc}
+
+  .note{margin-top:18px;background:#fff;border:1px solid var(--line);border-left:3px solid var(--regress);
+    border-radius:10px;padding:14px 18px;font-size:13px;color:#3d4452;line-height:1.7}
+  .note b{color:#c0392b}
+  footer{margin-top:24px;text-align:center;color:#98a1b0;font-size:11px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="kicker">PROJECT · branch / context</div>
+  <h1>PROJECT 일정 — 일별 캘린더</h1>
+  <div class="sub">게이트: <b>DEFINITION OF DONE</b> · 인력/속도 · <b>임계경로 = …</b></div>
+  <div class="meta-pills">
+    <span class="pill"><b>목표</b> · 6/17(수)</span>
+    <span class="pill"><b>버퍼</b> · 6/18–6/19</span>
+    <span class="pill"><b>공휴일</b> · 6/3(수)</span>
+    <span class="pill"><b>기준일</b> · 2026-06-01(월)</span>
+  </div>
+
+  <!-- keep only the buckets you actually use -->
+  <div class="legend">
+    <div class="lg"><span class="sw" style="background:var(--dev)"></span>개발</div>
+    <div class="lg"><span class="sw" style="background:var(--refactor)"></span>리팩터링</div>
+    <div class="lg"><span class="sw" style="background:var(--regress)"></span>회귀/버그</div>
+    <div class="lg"><span class="sw" style="background:var(--test)"></span>테스트/CI</div>
+    <div class="lg"><span class="sw" style="background:var(--proc)"></span>프로세스</div>
+    <div class="lg"><span class="sw" style="background:var(--merge)"></span>병합/마일스톤</div>
+    <div class="lg"><span class="sw" style="background:var(--buffer)"></span>버퍼</div>
+  </div>
+
+  <table class="cal">
+    <thead>
+      <tr>
+        <th class="weekno">주</th>
+        <th>월 <span class="wk">MON</span></th>
+        <th>화 <span class="wk">TUE</span></th>
+        <th>수 <span class="wk">WED</span></th>
+        <th>목 <span class="wk">THU</span></th>
+        <th>금 <span class="wk">FRI</span></th>
+      </tr>
+    </thead>
+    <tbody>
+
+    <!-- ===== WEEK 1 (example — note the holiday on Wed) ===== -->
+    <tr>
+      <td class="wkcell">W1<small>6/1–6/5</small></td>
+
+      <td><div class="day">
+        <div class="dhead"><span class="ddate">6/1</span><span class="dwd">월</span></div>
+        <div class="chip c-proc"><div class="top"><span class="iss">KICKOFF</span><span class="act a-proc">조율</span></div>
+          <div class="desc">우선순위 합의 / 리뷰어 큐 정렬</div></div>
+        <div class="chip c-regress"><div class="top"><span class="iss">TICKET-101</span><span class="act a-regress">fix</span></div>
+          <div class="desc">가장 분산 큰 항목 먼저 착수</div></div>
+      </div></td>
+
+      <td><div class="day">
+        <div class="dhead"><span class="ddate">6/2</span><span class="dwd">화</span></div>
+        <div class="chip c-dev"><div class="top"><span class="iss">TICKET-102</span><span class="act a-dev">PR</span></div>
+          <div class="desc">기능 마무리 — 리뷰 요청</div></div>
+      </div></td>
+
+      <td class="holiday"><div class="day">
+        <div class="dhead"><span class="ddate">6/3</span><span class="dwd">수</span></div>
+        <div class="holidaychip">공휴일</div>
+      </div></td>
+
+      <td><div class="day">
+        <div class="dhead"><span class="ddate">6/4</span><span class="dwd">목</span></div>
+        <div class="chip c-merge"><div class="top"><span class="iss">TICKET-102</span><span class="act a-merge">머지</span></div>
+          <div class="desc">리뷰 통과 → main</div></div>
+      </div></td>
+
+      <td><div class="day">
+        <div class="dhead"><span class="ddate">6/5</span><span class="dwd">금</span></div>
+        <div class="chip c-refactor"><div class="top"><span class="iss">TICKET-103</span><span class="act a-refactor">PR</span></div>
+          <div class="desc">정리/리팩터링 — 리뷰 요청</div></div>
+      </div></td>
+    </tr>
+
+    <!-- ===== WEEK 2 (example — merge + buffer at the end) ===== -->
+    <tr>
+      <td class="wkcell">W2<small>6/8–6/12</small></td>
+
+      <td><div class="day">
+        <div class="dhead"><span class="ddate">6/8</span><span class="dwd">월</span></div>
+        <div class="chip c-test"><div class="top"><span class="iss">CI</span><span class="act a-test">전체</span></div>
+          <div class="desc">회귀 트리거 + 결과 분석</div></div>
+      </div></td>
+
+      <td><div class="day">
+        <div class="dhead"><span class="ddate">6/9</span><span class="dwd">화</span></div>
+        <div class="chip c-test"><div class="top"><span class="iss">매뉴얼</span><span class="act a-test">~2h</span></div>
+          <div class="desc">시나리오 전수 (결과 즉시)</div></div>
+      </div></td>
+
+      <td class="mergeday"><div class="day">
+        <div class="dhead"><span class="ddate">6/10</span><span class="dwd">수</span></div>
+        <div class="chip c-merge"><div class="top"><span class="iss">💎 MERGE</span><span class="act a-merge">병합</span></div>
+          <div class="desc">branch → main 병합 완료</div></div>
+      </div></td>
+
+      <td class="bufferday"><div class="day">
+        <div class="dhead"><span class="ddate">6/11</span><span class="dwd">목</span></div>
+        <div class="chip c-buffer"><div class="top"><span class="iss">버퍼</span><span class="act a-buffer">예비</span></div>
+          <div class="desc">적체/예상외 대응</div></div>
+      </div></td>
+
+      <td class="bufferday"><div class="day">
+        <div class="dhead"><span class="ddate">6/12</span><span class="dwd">금</span></div>
+        <div class="chip c-buffer"><div class="top"><span class="iss">버퍼 한계</span><span class="act a-buffer">한계</span></div>
+          <div class="desc">최종 fallback 시점</div></div>
+      </div></td>
+    </tr>
+    </tbody>
+  </table>
+
+  <h2>이슈 사전 (정확한 번호 · 요약 · 상태)</h2>
+  <table class="dict">
+    <thead><tr><th style="width:120px">이슈</th><th style="width:80px">구분</th><th>요약</th><th style="width:90px">상태</th></tr></thead>
+    <tbody>
+      <tr><td class="iss-id">TICKET-101</td><td><span class="badge a-regress">회귀</span></td><td>전체 요약 한 줄</td><td><span class="st st-open">Open</span></td></tr>
+      <tr><td class="iss-id">TICKET-102</td><td><span class="badge a-dev">개발</span></td><td>전체 요약 한 줄</td><td><span class="st st-dev">진행중</span></td></tr>
+      <tr><td class="iss-id">TICKET-103</td><td><span class="badge a-refactor">리팩터링</span></td><td>전체 요약 한 줄</td><td><span class="st st-conf">확정</span></td></tr>
+      <tr class="excl"><td class="iss-id">TICKET-200</td><td>제외</td><td>이번 범위에서 제외 — 사유 한 줄</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <b>핵심 메모.</b> 임계경로가 무엇인지 한 문장으로. 버퍼·공휴일·제외 항목 같은
+    "읽는 사람이 놓치기 쉬운 전제"를 여기서 못박는다.
+  </div>
+
+  <footer>PROJECT · 일별 캘린더 · generated YYYY-MM-DD · (baked-in 전제: 공휴일 … · … 제외)</footer>
+</div>
+</body>
+</html>
