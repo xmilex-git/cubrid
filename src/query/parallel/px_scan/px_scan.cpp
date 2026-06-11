@@ -624,6 +624,18 @@ extern "C"
   int
   scan_reset_scan_block_parallel_list_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
   {
+    if (scan_id->s.pllsid_parallel.is_streamed_source)
+      {
+	/* R4 -- restartability guard (G3): a streamed hash-join result source is
+	 * single-pass; a backward reset (e.g. the generic scan_reset_scan_block at
+	 * query_executor.c:8342 rewinding the outer TARGET_LIST spec) would silently
+	 * re-read nothing and corrupt results.  Hard-fail: assert in debug, error in
+	 * release -- never a silent re-read. */
+	assert_release (false);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	return ER_QPROC_INVALID_XASLNODE;
+      }
+
     scan_id->single_fetched = false;
     scan_id->null_fetched = false;
     scan_id->qualified_block = false;
@@ -1015,6 +1027,9 @@ extern "C"
     scan_id->s.pllsid_parallel.result_type = local_result_type;
     scan_id->s.pllsid_parallel.manager = local_manager;
     scan_id->s.pllsid_parallel.trace_storage = nullptr;
+    /* materialized list source — rewindable; only the (gated) streamed result source
+     * open sets this true (SSOT R4) */
+    scan_id->s.pllsid_parallel.is_streamed_source = false;
 
     scan_id->type = S_PARALLEL_LIST_SCAN;
 

@@ -164,6 +164,8 @@ struct parallel_list_scan_id
   parallel_scan::RESULT_TYPE result_type;
   void * manager;
   parallel_scan::accumulative_trace_storage * trace_storage;
+  bool is_streamed_source;	/* true only for a streamed (single-pass) hash-join result
+				 * source; a backward reset must then hard-fail (SSOT R4) */
   #endif
   // *INDENT-ON*
 };				/* List PARALLEL Scan Identifier */
@@ -403,6 +405,9 @@ struct llist_scan_id
   QFILE_TUPLE_RECORD *tplrecp;	/* tuple record pointer; output param */
   HASH_LIST_SCAN hlsid;		/* for hash scan */
   bool is_read_only;		/* flag; when set, does not latch write */
+  bool is_streamed_source;	/* true only when this scan reads a streamed (single-pass)
+				 * hash-join result source; scan_reset_scan_block must then
+				 * hard-fail instead of silently re-reading (SSOT R4) */
 };
 
 typedef struct showstmt_scan_id SHOWSTMT_SCAN_ID;

@@ -4138,6 +4138,10 @@ scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 
   llsidp->is_read_only = is_read_only;
 
+  /* a materialized list file is rewindable; only the (gated) streamed result source open
+   * sets this true (SSOT R4) */
+  llsidp->is_streamed_source = false;
+
   /* check if hash list scan is possible? */
   llsidp->hlsid.hash_list_scan_type = check_hash_list_scan (llsidp, &val_cnt, hash_list_scan_yn);
   if (llsidp->hlsid.hash_list_scan_type != HASH_METH_NOT_USE)
@@ -4984,6 +4988,18 @@ scan_reset_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
       break;
 
     case S_LIST_SCAN:
+      if (s_id->s.llsid.is_streamed_source)
+	{
+	  /* R4 -- restartability guard (G3): a streamed hash-join result source is
+	   * single-pass; a backward reset / re-open would silently re-read nothing and
+	   * corrupt results.  Hard-fail: assert in debug, error in release -- never a
+	   * silent re-read. */
+	  assert_release (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	  status = S_ERROR;
+	  break;
+	}
+
       /* may have scanned some already so clean up */
       qfile_end_scan_fix (thread_p, &s_id->s.llsid.lsid);
       qfile_close_scan (thread_p, &s_id->s.llsid.lsid);

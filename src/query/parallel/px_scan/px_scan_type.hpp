@@ -26,9 +26,11 @@
 #include "px_scan_input_handler_heap.hpp"
 #include "px_scan_input_handler_index.hpp"
 #include "px_scan_input_handler_list.hpp"
+#include "px_scan_input_handler_stream.hpp"
 #include "px_scan_slot_iterator.hpp"
 #include "px_scan_slot_iterator_index.hpp"
 #include "px_scan_slot_iterator_list.hpp"
+#include "px_scan_slot_iterator_stream.hpp"
 #include "px_scan_type_enum.hpp"
 
 namespace parallel_scan
@@ -56,6 +58,16 @@ namespace parallel_scan
   {
     using input_handler_type = input_handler_index;
     using slot_iterator_type = slot_iterator_index;
+  };
+
+  /* Streamed hash-join result source (merged C3+C5): live row_batch intake from the C2
+   * channel + the Option-B stream slot iterator.  Selected only by the gated streaming
+   * consumer open (later wiring step); no existing path instantiates it. */
+  template <>
+  struct scan_traits<SCAN_TYPE::STREAM>
+  {
+    using input_handler_type = input_handler_stream;
+    using slot_iterator_type = slot_iterator_stream;
   };
 
 } /* namespace parallel_scan */

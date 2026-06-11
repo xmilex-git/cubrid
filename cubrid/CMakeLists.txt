@@ -364,6 +364,7 @@ set(PARALLEL_SCAN_SOURCES
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_heap.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_list.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_index.cpp
+  ${PARALLEL_SCAN_DIR}/px_scan_input_handler_stream.cpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_key_range_list.cpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_leaf_page_dispatcher.cpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_overflow_chain_pool.cpp
@@ -372,6 +373,7 @@ set(PARALLEL_SCAN_SOURCES
   ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator_list.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator_index.cpp
+  ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator_stream.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_result_handler.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_join_info.cpp
   ${PARALLEL_SCAN_DIR}/px_scan_task.cpp
@@ -383,6 +385,7 @@ set(PARALLEL_SCAN_HEADERS
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_heap.hpp
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_list.hpp
   ${PARALLEL_SCAN_DIR}/px_scan_input_handler_index.hpp
+  ${PARALLEL_SCAN_DIR}/px_scan_input_handler_stream.hpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_key_range_list.hpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_leaf_page_dispatcher.hpp
   ${PARALLEL_SCAN_DIR}/index/px_scan_index_overflow_chain_pool.hpp
@@ -393,6 +396,7 @@ set(PARALLEL_SCAN_HEADERS
   ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator.hpp
   ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator_list.hpp
   ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator_index.hpp
+  ${PARALLEL_SCAN_DIR}/px_scan_slot_iterator_stream.hpp
   ${PARALLEL_SCAN_DIR}/px_scan_join_info.hpp
   ${PARALLEL_SCAN_DIR}/px_scan_task.hpp
   ${PARALLEL_SCAN_DIR}/px_scan_trace_handler.hpp
@@ -408,6 +412,7 @@ set(PARALLEL_QUERY_SOURCES
   ${PARALLEL_QUERY_DIR}/px_sort.c
   ${PARALLEL_QUERY_DIR}/px_thread_safe_queue.cpp
   ${PARALLEL_QUERY_DIR}/px_stream_channel.cpp
+  ${PARALLEL_QUERY_DIR}/px_stream_source.cpp
   ${PARALLEL_QUERY_DIR}/px_parallel.cpp
   )
 
@@ -418,6 +423,7 @@ set(PARALLEL_QUERY_HEADERS
   ${PARALLEL_QUERY_DIR}/px_sort.h
   ${PARALLEL_QUERY_DIR}/px_thread_safe_queue.hpp
   ${PARALLEL_QUERY_DIR}/px_stream_channel.hpp
+  ${PARALLEL_QUERY_DIR}/px_stream_source.hpp
   ${PARALLEL_QUERY_DIR}/px_interrupt.hpp
   ${PARALLEL_QUERY_DIR}/px_parallel.hpp
   )

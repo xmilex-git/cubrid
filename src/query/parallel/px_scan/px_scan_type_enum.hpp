@@ -31,6 +31,8 @@ namespace parallel_scan
     HEAP = 0,
     LIST = 1,
     INDEX = 2,
+    STREAM = 3,			/* streamed hash-join result source (C3+C5); gated, never
+				 * constructed by any existing path -- SSOT R2 */
   };
 
 } /* namespace parallel_scan */
