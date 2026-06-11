@@ -162,3 +162,10 @@ build_x86_64_profile/
 
 # Built Visual Studio Code Extensions
 *.vsix
+CMakeUserPresets.json
+.claude
+.omc
+.agents
+
+# machine-local build/test workflow (preset-driven; not for upstream)
+/justfile

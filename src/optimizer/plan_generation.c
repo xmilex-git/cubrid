@@ -120,6 +120,8 @@ static int qo_get_multi_col_range_segs (QO_ENV * env, QO_PLAN * plan, QO_INDEX_E
 
 static QO_PLAN *qo_find_driving_scan_plan (QO_PLAN * plan);
 static void qo_apply_parallel_index_scan_threshold (QO_PLAN * plan);
+static void qo_mark_covered_full_iscan_parallel (QO_PLAN * scan_plan);
+static void qo_mark_hashjoin_build_feeds_parallel (QO_PLAN * plan);
 
 static int qo_init_projection_info (QO_ENV * env, QO_PLAN * plan, BITSET * pred_set, PROJECTION_INFO * info);
 static void qo_clear_projection_info (QO_ENV * env, PROJECTION_INFO * info);
@@ -3074,6 +3076,160 @@ qo_apply_parallel_index_scan_threshold (QO_PLAN * plan)
 }
 
 /*
+ * qo_mark_covered_full_iscan_parallel () - Assign a parallel degree to a covered,
+ *                                          unbounded (no key-range) index scan that
+ *                                          feeds a hash join, so the executor can run
+ *                                          it parallel-N like a heap sequential scan.
+ *   return: void
+ *   scan_plan(in): a QO_PLANTYPE_SCAN plan
+ *
+ * Note: The driving (leftmost) scan is handled by
+ *       qo_apply_parallel_index_scan_threshold().  A hash-join build/probe feed,
+ *       however, is NOT the driver, so its PT_SPEC keeps the default
+ *       num_parallel_threads (-> ACCESS_SPEC degree -1).  For an INDEX scan the
+ *       executor (scan_try_promote_parallel_index_scan) trusts that degree verbatim
+ *       and never auto-computes, so the feed stays serial -- unlike a heap scan,
+ *       which auto-computes its degree from page count.  Here we compute the degree
+ *       from the index leaf-page count (cum_stats->leafs) the same way the driving-scan
+ *       path does and write it onto the spec, but ONLY for the safe case: a covered,
+ *       no-predicate full index scan (partitionable by leaf-page range, all rows
+ *       preserved).  Gated by PRM_ID_OPTIMIZER_INDEX_FULL_SCAN; OFF = no-op.
+ */
+static void
+qo_mark_covered_full_iscan_parallel (QO_PLAN * scan_plan)
+{
+  PT_NODE *spec;
+  QO_NODE_INDEX_ENTRY *index_entry;
+  QO_ATTR_CUM_STATS *cum_stats;
+  double metric;
+  int threshold;
+  int cap;
+  int degree;
+
+  if (scan_plan == NULL || scan_plan->plan_type != QO_PLANTYPE_SCAN)
+    {
+      return;
+    }
+
+  /* only the covered, unbounded full index scan is partitionable by leaf page and row-preserving. */
+  if (scan_plan->plan_un.scan.scan_method != QO_SCANMETHOD_INDEX_SCAN
+      || !qo_is_index_covering_scan (scan_plan) || qo_is_index_iss_scan (scan_plan)
+      || qo_is_index_loose_scan (scan_plan) || !bitset_is_empty (&(scan_plan->plan_un.scan.terms)))
+    {
+      return;
+    }
+
+  index_entry = scan_plan->plan_un.scan.index;
+  if (index_entry == NULL)
+    {
+      return;
+    }
+
+  spec = QO_NODE_ENTITY_SPEC (scan_plan->plan_un.scan.node);
+  if (spec == NULL)
+    {
+      return;
+    }
+
+  /* do not override an explicit decision already taken (driver path / hint / no-parallel). */
+  if (PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_PARALLEL_THREAD)
+      || PT_IS_SPEC_FLAG_SET (spec, PT_SPEC_FLAG_NO_PARALLEL_SCAN))
+    {
+      return;
+    }
+
+  cum_stats = &index_entry->cum_stats;
+  if (!cum_stats->is_indexed || cum_stats->leafs <= 0)
+    {
+      return;
+    }
+
+  /* full scan -> selectivity 1.0 -> metric = all leaf pages. */
+  threshold = prm_get_integer_value (PRM_ID_PARALLEL_INDEX_SCAN_PAGE_THRESHOLD);
+  metric = (double) cum_stats->leafs;
+  if (metric < (double) threshold)
+    {
+      return;
+    }
+
+  {
+    UINT64 x = (UINT64) (metric / (threshold > 0 ? (double) threshold : 1.0));
+    /* degree = floor(log2(x)) + 2, matching compute_parallel_degree's start_degree=2 formula */
+    degree = (x <= 1) ? 2 : ((63 - __builtin_clzll (x)) + 2);
+  }
+  cap = prm_get_integer_value (PRM_ID_PARALLELISM);
+  if (cap <= 0)
+    {
+      return;
+    }
+  if (degree > cap)
+    {
+      degree = cap;
+    }
+  if (degree > PRM_MAX_PARALLELISM)
+    {
+      degree = PRM_MAX_PARALLELISM;
+    }
+
+  spec->info.spec.num_parallel_threads = degree;
+  spec->info.spec.flag = (PT_SPEC_FLAG) (spec->info.spec.flag | PT_SPEC_FLAG_PARALLEL_THREAD);
+}
+
+/*
+ * qo_mark_hashjoin_build_feeds_parallel () - Walk the plan tree and assign a parallel
+ *                                            degree to every covered full index scan
+ *                                            that feeds a hash join.
+ *   return: void
+ *   plan(in): root plan (or subtree)
+ *
+ * Note: Gated by PRM_ID_OPTIMIZER_INDEX_FULL_SCAN (caller checks).  Each side of a
+ *       hash join is materialized into its own BUILDLIST sub-XASL; a covered full
+ *       index-scan feed there is safe to parallelize (leaf-page-range partition,
+ *       MERGEABLE_LIST).  NL-join inners are not touched here (they are reached only
+ *       as scan_ptr inners at execution time and remain serial unless the separate
+ *       inner-NL gate is on).
+ */
+static void
+qo_mark_hashjoin_build_feeds_parallel (QO_PLAN * plan)
+{
+  if (plan == NULL)
+    {
+      return;
+    }
+
+  switch (plan->plan_type)
+    {
+    case QO_PLANTYPE_JOIN:
+      if (plan->plan_un.join.join_method == QO_JOINMETHOD_HASH_JOIN)
+	{
+	  /* both sides of a hash join are materialized feeds; mark covered full scans on either. */
+	  if (plan->plan_un.join.outer != NULL && plan->plan_un.join.outer->plan_type == QO_PLANTYPE_SCAN)
+	    {
+	      qo_mark_covered_full_iscan_parallel (plan->plan_un.join.outer);
+	    }
+	  if (plan->plan_un.join.inner != NULL && plan->plan_un.join.inner->plan_type == QO_PLANTYPE_SCAN)
+	    {
+	      qo_mark_covered_full_iscan_parallel (plan->plan_un.join.inner);
+	    }
+	}
+      qo_mark_hashjoin_build_feeds_parallel (plan->plan_un.join.outer);
+      qo_mark_hashjoin_build_feeds_parallel (plan->plan_un.join.inner);
+      break;
+
+    case QO_PLANTYPE_SORT:
+      qo_mark_hashjoin_build_feeds_parallel (plan->plan_un.sort.subplan);
+      break;
+
+    case QO_PLANTYPE_FOLLOW:
+      qo_mark_hashjoin_build_feeds_parallel (plan->plan_un.follow.head);
+      break;
+
+    default:
+      break;
+    }
+}
+
+/*
  * qo_to_xasl () -
  *   return: XASL_NODE *
  *   plan(in): The (already optimized) select statement to generate code for
@@ -3098,6 +3254,12 @@ qo_to_xasl (QO_PLAN * plan, xasl_node * xasl)
   if (plan && xasl && (env = (plan->info)->env))
     {
       qo_apply_parallel_index_scan_threshold (plan);
+
+      if (prm_get_bool_value (PRM_ID_OPTIMIZER_INDEX_FULL_SCAN))
+	{
+	  /* parallelize covered full index-scan hash-join feeds (gated; OFF = no-op). */
+	  qo_mark_hashjoin_build_feeds_parallel (plan);
+	}
 
       xasl = gen_outer (env, plan, &EMPTY_SET, NULL, NULL, xasl);
 
@@ -3403,6 +3565,14 @@ qo_get_xasl_index_info (QO_ENV * env, QO_PLAN * plan)
 	{
 	  /* Do not return if: 1. filtered index. 2. skip group by or skip order by 3. loose scan. 4. scan for b-tree
 	   * node info or key info. */
+	  ;
+	}
+      else if (prm_get_bool_value (PRM_ID_OPTIMIZER_INDEX_FULL_SCAN) && qo_is_iscan (plan)
+	       && qo_is_index_covering_scan (plan) && !qo_is_index_iss_scan (plan)
+	       && index_entryp->ils_prefix_len == 0 && !index_entryp->is_iss_candidate
+	       && !qo_is_prefix_index (index_entryp))
+	{
+	  /* gated index fast full scan: covered, no key-range/key-filter/data-filter -- emit index access spec. */
 	  ;
 	}
       else

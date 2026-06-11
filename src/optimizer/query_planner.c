@@ -91,6 +91,32 @@
 #define RBO_CHECK_RATIO 1.2
 #define RBO_CHECK_LIMIT_RATIO 10
 
+/* Parallel in-memory hash-join build/probe overhead factors (only used when PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN is
+ * on and the join is parallel-eligible). The stock serial 30/20 factors model a cache-missing / spilling serial
+ * hash table; an in-memory parallel build/probe is only a few ops per row. See qo_hjoin_cost(). */
+#define QO_HJ_PARALLEL_BUILD_FACTOR 8
+#define QO_HJ_PARALLEL_PROBE_FACTOR 5
+
+/* Consecutive nested-loop-chain probe multiplier (only used when PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN is on).
+ * A nested-loop (or index-) join whose OUTER subplan is itself a nested-loop join is a link in a consecutive
+ * serial-NL chain: its driving rows arrive from another serial probe loop, so the random-probe latency and
+ * serial intermediate materialization compound down the chain. The stock model adds each NL level's probe
+ * cost only once (no compounding), so it underweights deep serial NL chains. QO_HJ_NL_CHAIN_MULT is the factor
+ * by which such a link's OWN incremental probe (inner) CPU/IO cost is scaled up. It is applied only to this
+ * node's incremental term (not the inherited outer cost), so it does not compound across levels by itself.
+ * See qo_nljoin_cost(). */
+#define QO_HJ_NL_CHAIN_MULT 10.0
+
+/* Large-inner nested-loop penalty (only used when PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN is on).
+ * Textbook principle: a nested-loop / index-NL join whose INNER (probed) table is large performs one random
+ * B-tree descent + heap fetch per driving row -- millions of serial random page reads -- and should use a hash
+ * join instead. The stock model prices an FK equi-probe at sel ~= 1/keys (near zero), so it under-weights this
+ * and prefers index-probing a multi-million-row inner over seq-scanning + hashing it. QO_HJ_NL_LARGE_INNER_NCARD
+ * is the inner base-table NCARD above which the inner is "large"; QO_HJ_NL_LARGE_INNER_PENALTY is the flat cost
+ * added to such a join. See qo_nljoin_cost(). */
+#define QO_HJ_NL_LARGE_INNER_NCARD 10000000.0
+#define QO_HJ_NL_LARGE_INNER_PENALTY 120000.0
+
 #define	qo_scan_walk	qo_generic_walk
 #define	qo_worst_walk	qo_generic_walk
 
@@ -2022,6 +2048,17 @@ qo_index_scan_new (QO_INFO * info, QO_NODE * node, QO_NODE_INDEX_ENTRY * ni_entr
 
 	  ;			/* go ahead */
 	}
+      else if (prm_get_bool_value (PRM_ID_OPTIMIZER_INDEX_FULL_SCAN)
+	       && scan_method == QO_SCANMETHOD_INDEX_SCAN && qo_is_index_covering_scan (plan)
+	       && !qo_is_index_iss_scan (plan) && !qo_is_index_loose_scan (plan)
+	       && index_entryp->ils_prefix_len == 0 && !index_entryp->is_iss_candidate
+	       && !qo_is_filter_index (index_entryp) && !qo_is_prefix_index (index_entryp)
+	       && bitset_is_empty (&(plan->plan_un.scan.terms)) && bitset_is_empty (&(plan->plan_un.scan.kf_terms))
+	       && bitset_is_empty (&(plan->sarged_terms)))
+	{
+	  /* gated index fast full scan: covered, no key-range/key-filter/data-filter -- keep it. */
+	  ;			/* go ahead */
+	}
       else
 	{
 	  assert (false);
@@ -2227,6 +2264,10 @@ qo_iscan_cost (QO_PLAN * planp)
   /* index scan requires more CPU cost than sequential scan */
   planp->fixed_cpu_cost = 0.0;
   planp->fixed_io_cost = index_IO;
+  /* NOTE (PRM_ID_OPTIMIZER_INDEX_FULL_SCAN, optional/iterative): a covered full index scan reads all leaf pages,
+   * so its I/O (~index leaves) is already ~7x cheaper than the heap seq scan; no cost credit is applied here.
+   * If measurement shows the gated full-scan candidate is generated but the seq scan is still selected, add a
+   * parallel-leaf-split I/O credit under the same gate at this point (divide fixed_io_cost by parallelism). */
   planp->variable_cpu_cost = (leaf_access + heap_access) * (double) QO_CPU_WEIGHT;
   planp->variable_io_cost = object_IO;
   planp->info->scan_rows = MAX (1, (double) QO_NODE_NCARD (nodep) * sel * filter_sel);
@@ -3416,6 +3457,47 @@ qo_nljoin_cost (QO_PLAN * planp)
     planp->variable_io_cost += guessed_result_cardinality * ISCAN_IO_HIT_RATIO * subq_io_cost;	/* assume IO as # blocks */
   }
 
+  /* Consecutive nested-loop-chain probe penalty (gated, off by default).
+   *
+   * When this nested-loop (or index-) join's OUTER subplan is itself a nested-loop join, this join is a link
+   * in a consecutive serial-NL chain: every driving row arrives from another serial probe loop, so the random
+   * B-tree-descent latency and serial intermediate materialization compound down the chain. The stock model
+   * adds each NL level's probe cost only once and never accounts for chain depth, so a deep all-NL plan (a
+   * chain of consecutive NL joins) is under-priced relative to a parallel hash-join plan that breaks the chain
+   * (it materializes hash tables for the dimensions and keeps at most an isolated index-NL probe).
+   *
+   * When PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN is on we scale up the under-priced per-probe inner CPU/IO cost of
+   * each such chain link by QO_HJ_NL_CHAIN_MULT. The scale is applied ONLY to this node's own incremental probe
+   * term (inner_cpu_cost / inner_io_cost), never to the inherited outer cost, so the penalty does not compound
+   * by itself -- each link contributes its own penalized probe once. A join whose outer is a base scan, a hash
+   * join, a merge join or a sort (i.e. not an NL chain link) is left untouched.
+   *
+   * OFF (default) => byte-identical to stock: penalty is never applied.
+   */
+  if (prm_get_bool_value (PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN)
+      && outer->plan_type == QO_PLANTYPE_JOIN && QO_IS_NL_JOIN (outer))
+    {
+      planp->variable_cpu_cost += inner_cpu_cost * (QO_HJ_NL_CHAIN_MULT - 1.0);
+      planp->variable_io_cost += inner_io_cost * (QO_HJ_NL_CHAIN_MULT - 1.0);
+    }
+
+  /* Large-inner nested-loop penalty (gated, off by default).
+   *
+   * When this join index-NL-probes a large inner base table (NCARD >= QO_HJ_NL_LARGE_INNER_NCARD), it performs
+   * one random B-tree descent + heap fetch per driving row -- millions of serial random page reads. The stock
+   * model prices the FK equi-probe at near zero, so it under-prices index-probing a multi-million-row inner and
+   * wrongly prefers it over seq-scanning + hashing that table. We add a flat penalty so the optimizer picks the
+   * parallel seq-scan + hash for such a large inner (e.g. orders/lineitem) instead of a serial index-NL probe.
+   *
+   * OFF (default) => byte-identical to stock: penalty is never added.
+   */
+  if (prm_get_bool_value (PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN) && qo_is_iscan (inner)
+      && inner->plan_un.scan.node != NULL
+      && (double) QO_NODE_NCARD (inner->plan_un.scan.node) >= QO_HJ_NL_LARGE_INNER_NCARD)
+    {
+      planp->variable_cpu_cost += QO_HJ_NL_LARGE_INNER_PENALTY;
+    }
+
 #if TEST_DUMP_PLAN_JOIN_COST
   fprintf (stdout, "\nNested Loop Cost: \n");
   fprintf (stdout, "  -    Fixed CPU Cost: %lf\n", planp->fixed_cpu_cost);
@@ -3558,19 +3640,86 @@ qo_hjoin_cost (QO_PLAN * plan_p)
   plan_p->variable_cpu_cost = outer_plan_p->variable_cpu_cost + inner_plan_p->variable_cpu_cost;
   plan_p->variable_io_cost = outer_plan_p->variable_io_cost + inner_plan_p->variable_io_cost;
 
+  /* Parallel-degree credit for a parallel-eligible hash join (gated, off by default).
+   *
+   * The stock cost model sums the outer and inner subplan costs as if the hash join ran serially.
+   * In reality, when PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN is on, this hash join's parallel build/probe pipeline
+   * (degree = PRM_ID_PARALLELISM) reads its immediate base-table scan inputs and runs the per-row build/probe
+   * CPU at ~1/degree of the serial wall-clock.
+   *
+   * The credit is applied at a SINGLE level: an input's inherited variable cost is divided by hj_degree ONLY
+   * when that input is a base-table SCAN leaf (QO_PLANTYPE_SCAN) -- i.e. it is the immediate parallel scan this
+   * node drives. When an input is itself a JOIN subtree, its accumulated cost passes through UNDIVIDED (it
+   * already received whatever parallel credit it deserved at its own level). This avoids both failure modes:
+   * (a) dividing the accumulated subtree every level (cumulative collapse that wrongly favored the all-hash
+   * plan), and (b) never crediting the parallel base scans (under-credit that lost cF below NL). This node's
+   * own incremental build/probe term (STEP2/STEP3 below) is likewise credited /hj_degree, once.
+   *
+   * OFF (default) => byte-identical to stock: no credit, original overhead factors.
+   */
+  {
+    int hj_degree = 1;
+    double hj_build_factor = (double) HJ_BUILD_CPU_OVERHEAD_FACTOR;
+    double hj_probe_factor = (double) HJ_PROBE_CPU_OVERHEAD_FACTOR;
+    bool hj_parallel = (prm_get_bool_value (PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN)
+			&& (plan_p->parallel_opt_use == PLAN_PARALLEL_OPT_CAN_USE
+			    || plan_p->parallel_opt_use == PLAN_PARALLEL_OPT_USE));
+
+    if (hj_parallel)
+      {
+	/* realistic parallel in-memory build/probe factors (Lever A) */
+	hj_build_factor = QO_HJ_PARALLEL_BUILD_FACTOR;
+	hj_probe_factor = QO_HJ_PARALLEL_PROBE_FACTOR;
+
+	hj_degree = prm_get_integer_value (PRM_ID_PARALLELISM);
+	if (hj_degree < 1)
+	  {
+	    hj_degree = 1;
+	  }
+      }
+
+    if (hj_degree > 1)
+      {
+	/* single-level base-scan-input credit: divide only an input that is a base-table SCAN leaf */
+	double outer_var_cpu = (outer_plan_p->plan_type == QO_PLANTYPE_SCAN)
+	  ? outer_plan_p->variable_cpu_cost / hj_degree : outer_plan_p->variable_cpu_cost;
+	double inner_var_cpu = (inner_plan_p->plan_type == QO_PLANTYPE_SCAN)
+	  ? inner_plan_p->variable_cpu_cost / hj_degree : inner_plan_p->variable_cpu_cost;
+	double outer_var_io = (outer_plan_p->plan_type == QO_PLANTYPE_SCAN)
+	  ? outer_plan_p->variable_io_cost / hj_degree : outer_plan_p->variable_io_cost;
+	double inner_var_io = (inner_plan_p->plan_type == QO_PLANTYPE_SCAN)
+	  ? inner_plan_p->variable_io_cost / hj_degree : inner_plan_p->variable_io_cost;
+	double outer_fixed_io = (outer_plan_p->plan_type == QO_PLANTYPE_SCAN)
+	  ? outer_plan_p->fixed_io_cost / hj_degree : outer_plan_p->fixed_io_cost;
+	double inner_fixed_io = (inner_plan_p->plan_type == QO_PLANTYPE_SCAN)
+	  ? inner_plan_p->fixed_io_cost / hj_degree : inner_plan_p->fixed_io_cost;
+
+	plan_p->variable_cpu_cost = outer_var_cpu + inner_var_cpu;
+	plan_p->variable_io_cost = outer_var_io + inner_var_io;
+	plan_p->fixed_io_cost = outer_fixed_io + inner_fixed_io;
+      }
+
   /**
    * STEP 2: Calculate the cost when inner is used as build input.
    */
-  inner_build_cpu_cost = (inner_cardinality * QO_CPU_WEIGHT * HJ_BUILD_CPU_OVERHEAD_FACTOR);
-  inner_build_cpu_cost += (outer_cardinality * QO_CPU_WEIGHT * HJ_PROBE_CPU_OVERHEAD_FACTOR);
-  inner_build_io_cost = 0.0;
+    inner_build_cpu_cost = (inner_cardinality * QO_CPU_WEIGHT * hj_build_factor);
+    inner_build_cpu_cost += (outer_cardinality * QO_CPU_WEIGHT * hj_probe_factor);
+    inner_build_io_cost = 0.0;
 
   /**
    * STEP 3: Calculate the cost when outer is used as build input.
    */
-  outer_build_cpu_cost = (inner_cardinality * QO_CPU_WEIGHT * HJ_PROBE_CPU_OVERHEAD_FACTOR);
-  outer_build_cpu_cost += (outer_cardinality * QO_CPU_WEIGHT * HJ_BUILD_CPU_OVERHEAD_FACTOR);
-  outer_build_io_cost = 0.0;
+    outer_build_cpu_cost = (inner_cardinality * QO_CPU_WEIGHT * hj_probe_factor);
+    outer_build_cpu_cost += (outer_cardinality * QO_CPU_WEIGHT * hj_build_factor);
+    outer_build_io_cost = 0.0;
+
+    if (hj_degree > 1)
+      {
+	/* per-row build/probe CPU is divided across the parallel workers */
+	inner_build_cpu_cost /= hj_degree;
+	outer_build_cpu_cost /= hj_degree;
+      }
+  }
 
 #if 0
   /* No need to increase weight since partitioned hash join is used even when mem_limit is exceeded. */
@@ -6610,6 +6759,10 @@ qo_examine_hash_join (QO_INFO * info, JOIN_TYPE join_type, QO_INFO * outer, QO_I
       /* join hint: force nl-join, idx-join, m-join; skip hash-join */
       goto exit;
     }
+  else if (prm_get_bool_value (PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN))
+    {
+      /* optimizer prm: allow hash-join enumeration; fall through */
+    }
   else
     {
       /* default: disable hash-join */
@@ -8606,6 +8759,41 @@ qo_is_iscan (QO_PLAN * plan)
 }
 
 /*
+ * qo_index_all_columns_not_null () - true iff EVERY column of the index is NOT NULL
+ *   return: true/false
+ *   index_entryp(in): pointer to QO_INDEX_ENTRY
+ *
+ * Note: required for a row-preserving covered full index scan -- a covered full
+ *       scan skips rows whose leading indexed key is NULL (CUBRID B-tree behavior),
+ *       so a full scan would silently lose rows unless all indexed columns are NOT NULL.
+ */
+static bool
+qo_index_all_columns_not_null (QO_INDEX_ENTRY * index_entryp)
+{
+  SM_CLASS_CONSTRAINT *cons;
+  int i;
+
+  if (index_entryp == NULL || index_entryp->constraints == NULL)
+    {
+      return false;
+    }
+  cons = index_entryp->constraints;
+  if (cons->attributes == NULL)
+    {
+      return false;
+    }
+  /* cons->attributes is a NULL-terminated SM_ATTRIBUTE ** (class_object.h). */
+  for (i = 0; cons->attributes[i] != NULL; i++)
+    {
+      if (!(cons->attributes[i]->flags & SM_ATTFLAG_NON_NULL))
+	{
+	  return false;		/* a nullable indexed column -> full scan could lose rows */
+	}
+    }
+  return (i > 0);		/* non-empty and all NOT NULL */
+}
+
+/*
  * qo_generate_index_scan () - With index information, generates index scan plan
  *   return: num of index scan plans
  *   infop(in): pointer to QO_INFO (environment info node which holds plans)
@@ -9093,6 +9281,24 @@ qo_search_planner (QO_PLANNER * planner)
 		  if (tree->info.query.q.select.connect_by != NULL || qo_is_prefix_index (index_entry))
 		    {
 		      continue;	/* nop; go ahead */
+		    }
+
+		  /* Index fast full scan: covered, no key-range, all rows preserved -- a hash-join probe leaf can read a
+		   * narrow covering index instead of the heap. Off by default; only for join queries; only when EVERY
+		   * indexed column is NOT NULL (full scan skips NULL leading keys); never for ILS/ISS/filter/prefix index.
+		   */
+		  if (!n && prm_get_bool_value (PRM_ID_OPTIMIZER_INDEX_FULL_SCAN) && planner->N > 1
+		      && index_entry->cover_segments && QO_ENTRY_MULTI_COL (index_entry) && index_entry->force >= 0
+		      && !index_entry->is_iss_candidate && !(index_entry->ils_prefix_len > 0)
+		      && index_entry->constraints != NULL && index_entry->constraints->filter_predicate == NULL
+		      && !qo_is_prefix_index (index_entry) && qo_index_all_columns_not_null (index_entry))
+		    {
+		      assert (bitset_is_empty (&seg_terms));
+		      n =
+			qo_check_plan_on_info (info,
+					       qo_index_scan_new (info, node, ni_entry, QO_SCANMETHOD_INDEX_SCAN,
+								  &seg_terms /* empty range_terms => full unbounded scan */ ,
+								  NULL));
 		    }
 
 		  /* if the index didn't normally skipped the group/order by, we try the new plan, maybe this will be

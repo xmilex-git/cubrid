@@ -27,6 +27,7 @@
 #include "regu_var.hpp"
 #include "schema_manager.h"
 #include "storage_common.h"
+#include "system_parameter.h"
 #include "work_space.h"
 #include "xasl_predicate.hpp"
 #include "xasl.h"
@@ -848,7 +849,16 @@ namespace parallel_scan
       }
     for (XASL_NODE *xaslp = arg->scan_ptr; xaslp; xaslp = xaslp->scan_ptr)
       {
-	process_xasl_node_recursive_force_cannot_parallel (xaslp);
+	if (prm_get_bool_value (PRM_ID_PARALLEL_INNER_INDEX_NL)
+	    && !is_flag_set (check<false> (xaslp), CANNOT_PARALLEL_SCAN))
+	  {
+	    /* Safe inner index scan_ptr (covered range, no ISS/ILS/keylimit/orderby-skip/filtered/multi-spec):
+	     * leave it eligible so the per-worker pipeline runs the inner-NL probe. */
+	  }
+	else
+	  {
+	    process_xasl_node_recursive_force_cannot_parallel (xaslp);
+	  }
       }
     for (XASL_NODE *xaslp = arg->connect_by_ptr; xaslp; xaslp = xaslp->next)
       {
