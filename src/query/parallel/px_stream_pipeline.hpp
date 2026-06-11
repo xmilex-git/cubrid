@@ -207,6 +207,14 @@ namespace parallel_query
       {
 	return m_pool.reserved_workers;
       }
+
+      /* NON-OWNING pool handle (engine: the worker_manager holding the 2*D
+       * reservation) for dispatching consumer tasks; valid until the teardown
+       * runner's release step (HANDLE-LIFETIME) */
+      void *get_pool_handle () const
+      {
+	return m_pool.handle;
+      }
       bool is_abort_requested () const
       {
 	return m_abort_requested.load (std::memory_order_acquire);

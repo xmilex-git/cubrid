@@ -381,6 +381,15 @@ typedef struct hashjoin_proc_node
 #if defined (SERVER_MODE) || defined (SA_MODE)
   HASHJOIN_DOMAIN_INFO domain_info;
   HASHJOIN_STATS_GROUP stats_group;
+
+  /* Streaming hash-join runtime state (not serialized; zeroed on unpack).
+   * stream_candidate: set per execution by the mainblock driver when the gated streamed
+   * mode may apply to this join's output edge; cleared/re-decided on every execution.
+   * stream_pipeline: parallel_query::stream_pipeline ownership handle, non-NULL only
+   * while a streamed execution of this node is in flight; the mainblock driver runs
+   * join_all () + destroy () strictly before head-list cleanup of the same query. */
+  bool stream_candidate;
+  void *stream_pipeline;
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 } HASHJOIN_PROC_NODE;
 
@@ -772,7 +781,13 @@ typedef enum
   ACCESS_SPEC_FLAG_MERGEABLE_LIST = 0x1 << 3,	/* used with parallel heap scan. */
   ACCESS_SPEC_FLAG_BUILDVALUE_OPT = 0x1 << 4,	/* used with parallel heap scan buildvalue aggregate optimization. */
   ACCESS_SPEC_FLAG_ONLY_MIN_MAX_SCAN = 0x1 << 5,	/* used with min/max aggregate. */
-  ACCESS_SPEC_FLAG_FORCE_FIXED_SCAN = 0x1 << 6	/* used with keep page hint. */
+  ACCESS_SPEC_FLAG_FORCE_FIXED_SCAN = 0x1 << 6,	/* used with keep page hint. */
+  ACCESS_SPEC_FLAG_STREAM_HASHJOIN = 0x1 << 7	/* streaming hash-join CANDIDATE edge: a TARGET_LIST spec over a
+						 * HASHJOIN_PROC output that the client found shape-eligible for the
+						 * gated streamed execution mode.  Only a marker: the server decides
+						 * actual eligibility per execution (param + runtime checks), so a
+						 * cached plan compiled under either param value executes correctly
+						 * under the value at execution time (plan-cache safety). */
 } ACCESS_SPEC_FLAG;
 
 #define ACCESS_SPEC_IS_FLAGED(spec, f)		((ACCESS_SPEC_FLAGS(spec) & (int) (f)) != 0)

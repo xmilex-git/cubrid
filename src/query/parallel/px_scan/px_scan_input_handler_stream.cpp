@@ -44,12 +44,17 @@ namespace parallel_scan
 	return ER_QPROC_INVALID_XASLNODE;
       }
 
-    /* single-drain open; a second consumer or a re-open is refused inside (fan-out=1, R4) */
-    int error_code = source_p->open ();
-    if (error_code != NO_ERROR)
+    /* single-drain open; a second consumer or a re-open is refused inside (fan-out=1,
+     * R4).  The pipeline owner (stream_pipeline::open_consumer) already performed the
+     * one legal open on a fresh source; accept that state instead of re-opening. */
+    if (source_p->get_state () != parallel_query::stream_source::source_state::OPEN)
       {
-	m_source_p = nullptr;
-	return error_code;
+	int error_code = source_p->open ();
+	if (error_code != NO_ERROR)
+	  {
+	    m_source_p = nullptr;
+	    return error_code;
+	  }
       }
 
     m_source_p = source_p;

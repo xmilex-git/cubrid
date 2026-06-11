@@ -330,14 +330,26 @@ error_exit:
 	  context->probe = &context->outer;
 	}
 
-      context->list_id = qfile_open_list (&thread_ref, &manager->type_list, nullptr,
-					  manager->query_id, manager->qlist_flag, nullptr);
-      if (context->list_id == nullptr)
+#if !defined (WINDOWS)
+      if (manager->stream_pipeline != nullptr)
 	{
-	  goto error_exit;
+	  /* streaming: emits go through a per-worker stream sink straight into the
+	   * shared channel (bound in probe_execute_streamed); no per-worker output
+	   * list and no serial UNION merge ever exist on this path */
+	  assert (context->list_id == nullptr);
 	}
+      else
+#endif /* !defined (WINDOWS) */
+	{
+	  context->list_id = qfile_open_list (&thread_ref, &manager->type_list, nullptr,
+					      manager->query_id, manager->qlist_flag, nullptr);
+	  if (context->list_id == nullptr)
+	    {
+	      goto error_exit;
+	    }
 
-      hjoin_sink_init_list (&context->sink, context->list_id);
+	  hjoin_sink_init_list (&context->sink, context->list_id);
+	}
 
       context->during_join_pred = single_context->during_join_pred;
       context->val_descr = single_context->val_descr;
@@ -608,6 +620,126 @@ error_exit:
 
       goto cleanup;
     }
+
+#if !defined (WINDOWS)
+    /*
+     * probe_execute_streamed - detached parallel probe for the gated streaming mode.
+     *
+     * Each of the D probe workers pushes whole-tuple batches DIRECTLY into the shared
+     * stream channel; the per-worker list_id + serial UNION merge of probe_execute is
+     * bypassed entirely.  All producers are registered on the channel before any task
+     * is launched, so end-of-stream can only fire after the LAST producer finishes
+     * (INV-EOS / R10).  Returns without joining: the consumer overlaps the probe and
+     * the pipeline's join_all () joins the tasks at query teardown.
+     */
+    int
+    probe_execute_streamed (cubthread::entry &thread_ref, HASHJOIN_MANAGER *manager)
+    {
+      stream_pipeline *pipe;
+      stream_producer_state *state = nullptr;
+      HJOIN_STREAM_SINK_STATE *sink_states = nullptr;
+      HASHJOIN_CONTEXT *contexts;
+      UINT32 task_cnt, task_index;
+      bool sector_scan_opened = false;
+      int error = NO_ERROR;
+
+      assert (manager != nullptr);
+      assert (manager->single_context.status == HASHJOIN_STATUS_PARALLEL_PROBE);
+      assert (manager->px_worker_manager != nullptr);
+      assert (manager->stream_pipeline != nullptr);
+      assert (!manager->stream_detached);
+      assert (!thread_is_on_trace (&thread_ref));
+
+      pipe = (stream_pipeline *) manager->stream_pipeline;
+      contexts = manager->contexts;
+      task_cnt = manager->num_parallel_threads;
+      assert (contexts != nullptr);
+      assert (task_cnt > 1);
+      assert (pipe->get_reserved_workers () == (int) (2 * task_cnt));
+
+      THREAD_ENTRY *main_thread_p = thread_get_main_thread (&thread_ref);
+
+      state = (stream_producer_state *) db_private_alloc (&thread_ref, sizeof (stream_producer_state));
+      if (state == nullptr)
+	{
+	  goto error_exit;
+	}
+      state = placement_new (state, manager, *main_thread_p, pipe);
+
+      sink_states =
+	      (HJOIN_STREAM_SINK_STATE *) db_private_alloc (&thread_ref,
+							    task_cnt * sizeof (HJOIN_STREAM_SINK_STATE));
+      if (sink_states == nullptr)
+	{
+	  goto error_exit;
+	}
+      state->sink_states = sink_states;
+
+      /* collect data page sectors for the (already final) probe INPUT relation */
+      error = qfile_open_list_sector_scan (&thread_ref, manager->single_context.probe->list_id,
+					   &state->shared_info.sector_scan);
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+      sector_scan_opened = true;
+
+      for (task_index = 0; task_index < task_cnt; task_index++)
+	{
+	  hjoin_sink_init_stream (&contexts[task_index].sink, &sink_states[task_index],
+				  (void *) pipe->get_channel (), (void *) pipe->get_interrupt ());
+	}
+
+      state->tasks.set_detached_error_sink (&state->err_messages, pipe);
+
+      /* the pipeline takes ownership of the bundle; every producer is registered on the
+       * channel BEFORE any task can run (INV-EOS) */
+      error = pipe->launch_producers (&thread_ref, (int) task_cnt, (void *) state, stream_producer_state_free);
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+
+      /* point of no return: from here teardown is the pipeline's job */
+      manager->stream_detached = true;
+
+      for (task_index = 0; task_index < task_cnt; task_index++)
+	{
+	  stream_probe_task *task = new stream_probe_task (state->tasks, manager, &contexts[task_index],
+							   &state->shared_info, task_index, pipe,
+							   &sink_states[task_index]);
+	  state->tasks.push_task (task);
+	}
+
+      return NO_ERROR;
+
+error_exit:
+      /* strictly pre-launch (pre-emit): nothing is running; free the bundle here.  The
+       * caller (qexec_hash_join cleanup) tears the pipeline itself down. */
+      if (state != nullptr)
+	{
+	  if (sector_scan_opened)
+	    {
+	      qfile_close_list_sector_scan (&thread_ref, &state->shared_info.sector_scan);
+	    }
+	  if (state->sink_states != nullptr)
+	    {
+	      db_private_free (&thread_ref, state->sink_states);
+	      state->sink_states = nullptr;
+	    }
+	  state->~stream_producer_state ();
+	  db_private_free (&thread_ref, state);
+	}
+
+      if (error == NO_ERROR || er_errid () == NO_ERROR)
+	{
+	  assert_release_error (er_errid () != NO_ERROR);
+	  error = er_errid ();
+	}
+
+      return error;
+    }
+#endif /* !defined (WINDOWS) */
 
   } /* namespace hash_join */
 } /* namespace parallel_query */

@@ -159,15 +159,18 @@ namespace parallel_query
     row_batch batch;
     int drained = 0;
 
+    (void) thread_p;
+
     /* Channel contract: drain_one only after all producers are joined; the pipeline
      * teardown runner guarantees that ordering (C7 OWN-3). */
     assert (get_state () == source_state::CLOSED || get_state () == source_state::END_OF_STREAM);
 
     while (m_channel_p->drain_one (batch))
       {
+	/* batch payloads cross threads: global heap (malloc), never a per-thread one */
 	if (batch.buf != NULL)
 	  {
-	    db_private_free (thread_p, batch.buf);
+	    free_and_init (batch.buf);
 	  }
 	drained++;
       }

@@ -385,6 +385,34 @@ struct hjoin_sink
   QFILE_TUPLE_DESCRIPTOR *tpl_descr;
 };
 
+/* HJOIN_STREAM_SINK_STATE
+ *
+ * Per-probe-worker adapter state for the streaming sink (gated streaming hash-join).
+ * Accumulates whole T_MERGE tuples -- the EXACT bytes qfile_save_tuple(T_MERGE) writes
+ * to a materialized list page, length-prefixed, laid end-to-end with NO page header --
+ * into an owned batch buffer and pushes full batches into the pipeline's stream channel
+ * (parallel_query::stream_channel<row_batch>; the consumer-side slot_iterator_stream
+ * walks the same format).  An oversized tuple (>= QFILE_MAX_TUPLE_SIZE_IN_PAGE) travels
+ * as its own single-tuple batch.  channel/intr are non-owning handles into the C7
+ * pipeline; void* keeps this header C-friendly. */
+typedef struct hjoin_stream_sink_state
+{
+  void *channel;		/* parallel_query::stream_channel<parallel_query::row_batch> * */
+  void *intr;			/* parallel_query::interrupt * (shared pipeline interrupt) */
+
+  char *buf;			/* owned batch buffer under construction (db_private_alloc) */
+  int len;			/* used bytes in buf */
+  int capacity;			/* allocated bytes in buf */
+  int tuple_cnt;		/* whole tuples currently in buf */
+
+  /* R11: consumer closed early (channel aborted with no error/interrupt) -- emits become
+   * silent no-ops; the producer finishes without error and without pushing */
+  bool stopped;
+
+  /* descriptor scratch the producer fills before a normal-size emit (sink->tpl_descr) */
+  QFILE_TUPLE_DESCRIPTOR tpl_descr;
+} HJOIN_STREAM_SINK_STATE;
+
 /* HASHJOIN_CONTEXT*/
 typedef struct hashjoin_context
 {
@@ -446,6 +474,16 @@ typedef struct hashjoin_manager
 
   /* From HASHJOIN_PROC_NODE */
   HASHJOIN_STATS_GROUP *stats_group;
+
+  /* Streaming hash-join runtime state (SERVER_MODE only; always false/NULL otherwise).
+   * stream_candidate: this execution may stream (param ON + mainblock-marked edge).
+   * stream_pipeline:  parallel_query::stream_pipeline * once the 2*D reservation and
+   *                   pipeline exist; owned by the pipeline machinery, not the manager.
+   * stream_detached:  probe tasks were launched detached; the manager and all state the
+   *                   tasks reference are owned by the pipeline (freed at join_all). */
+  bool stream_candidate;
+  bool stream_detached;
+  void *stream_pipeline;
 
 #if HASHJOIN_DUMP_HASH_TABLE
   pthread_mutex_t dump_hash_table_mutex;
@@ -519,6 +557,14 @@ int hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, HJOIN_SINK * sink,
 
 /* Hash Join Output Sink */
 void hjoin_sink_init_list (HJOIN_SINK * sink, QFILE_LIST_ID * list_id);
+
+#if defined (SERVER_MODE)
+/* Streaming hash-join sink + detached-producer support (gated streaming mode) */
+void hjoin_sink_init_stream (HJOIN_SINK * sink, HJOIN_STREAM_SINK_STATE * state, void *channel, void *intr);
+int hjoin_stream_sink_flush (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state);
+void hjoin_stream_sink_discard (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state);
+void hjoin_stream_clear_manager_detached (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager);
+#endif /* defined (SERVER_MODE) */
 
 void hjoin_trace_start (THREAD_ENTRY * thread_p, HASHJOIN_START_STATS * start_stats);
 void hjoin_trace_end (THREAD_ENTRY * thread_p, HASHJOIN_INPUT_STATS * stats, HASHJOIN_START_STATS * start_stats);

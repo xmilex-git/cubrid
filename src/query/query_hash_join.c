@@ -32,6 +32,11 @@
 #include "px_hash_join.hpp"	/* parallel_query::hash_join::... */
 #include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
 #include "px_worker_manager.hpp"	/* parallel_query::worker_manager */
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+#include "px_stream_channel.hpp"	/* parallel_query::stream_channel, row_batch */
+#include "px_stream_pipeline.hpp"	/* parallel_query::stream_pipeline */
+#include "px_stream_policy.hpp"	/* stream_policy_try_begin, stream_policy_release_pool_handle */
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 #include "query_list.h"		/* JOIN_TYPE */
 #include "query_manager.h"	/* QMGR_TEMP_FILE */
 #include "system_parameter.h"	/* prm_get_bigint_value, PRM_ID_... */
@@ -49,6 +54,14 @@
 
 #define DUMP_HASH_TABLE_LIMIT 100
 #define DUMP_PROBE_LIMIT 20
+
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+/* streaming hash-join sink: batch buffer size (one list page worth of tuple bytes) and
+ * the bounded number of in-flight batches on the stream channel (the backpressure
+ * window; in-flight memory <= capacity * batch bytes, a few MB at most -- R7) */
+#define HJOIN_STREAM_BATCH_BYTES DB_PAGESIZE
+#define HJOIN_STREAM_CHANNEL_CAPACITY 64
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
 
 /*
@@ -97,6 +110,10 @@ static int hjoin_split_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manage
 /* Hash Join Parallel */
 static HASHJOIN_STATUS hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
 					   HASHJOIN_CONTEXT * single_context);
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+static HASHJOIN_STATUS hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
+							 HASHJOIN_CONTEXT * single_context);
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 static HASHJOIN_STATUS hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
 						 HASHJOIN_CONTEXT * single_context);
 
@@ -155,9 +172,13 @@ static void hjoin_print_tuple (QFILE_LIST_ID * list_id, QFILE_TUPLE tuple, HASHJ
 int
 qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, VAL_DESCR * val_descr)
 {
-  HASHJOIN_MANAGER manager;
-  HASHJOIN_CONTEXT *single_context;
+  HASHJOIN_MANAGER stack_manager;
+  HASHJOIN_MANAGER *manager = &stack_manager;
+  HASHJOIN_CONTEXT *single_context = NULL;
   HASHJOIN_STATUS status, part_status;
+
+  bool stream_candidate = false;
+  bool manager_is_heap = false;
 
   int error = NO_ERROR;
 
@@ -165,24 +186,52 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
   assert (xasl != NULL);
   assert (query_id != NULL_QUERY_ID);
 
-  error = hjoin_init_manager (thread_p, &manager, xasl, query_id, val_descr);
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+  /* Streaming hash-join (gated): re-decided on EVERY execution -- the candidate mark is
+   * set per execution by the mainblock driver, and the param is re-read here, so a
+   * cached plan compiled under either param value executes correctly under the value in
+   * effect now (plan-cache safety).  When this execution may detach probe tasks, the
+   * manager must outlive this frame: it moves to the heap and, on detach, its ownership
+   * passes to the stream pipeline (freed at join_all, before head-list cleanup). */
+  stream_candidate = (xasl->proc.hashjoin.stream_candidate && prm_get_bool_value (PRM_ID_STREAMING_HASH_JOIN)
+		      && !thread_is_on_trace (thread_p));
+  if (stream_candidate)
+    {
+      manager = (HASHJOIN_MANAGER *) db_private_alloc (thread_p, sizeof (HASHJOIN_MANAGER));
+      if (manager == NULL)
+	{
+	  /* pre-emit: silently fall back to the materialized path on the stack manager */
+	  er_clear ();
+	  manager = &stack_manager;
+	  stream_candidate = false;
+	}
+      else
+	{
+	  manager_is_heap = true;
+	}
+    }
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
+  error = hjoin_init_manager (thread_p, manager, xasl, query_id, val_descr);
   if (error != NO_ERROR)
     {
       goto error_exit;
     }
 
-  single_context = &manager.single_context;
+  manager->stream_candidate = stream_candidate;
 
-  status = hjoin_check_empty_inputs (&manager, single_context);
+  single_context = &manager->single_context;
+
+  status = hjoin_check_empty_inputs (manager, single_context);
   single_context->status = status;
   switch (status)
     {
     case HASHJOIN_STATUS_FILL_NULL_VALUES:
-      error = hjoin_outer_fill_null_values (thread_p, &manager, single_context);
+      error = hjoin_outer_fill_null_values (thread_p, manager, single_context);
       break;
 
     case HASHJOIN_STATUS_TRY:
-      part_status = hjoin_try_partition (thread_p, &manager, single_context);
+      part_status = hjoin_try_partition (thread_p, manager, single_context);
       single_context->status = part_status;
       switch (part_status)
 	{
@@ -190,11 +239,11 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 	  /* monitor */
 	  perfmon_inc_stat (thread_p, PSTAT_QM_NUM_HASHJOINS);
 
-	  error = hjoin_execute (thread_p, &manager, single_context);
+	  error = hjoin_execute (thread_p, manager, single_context);
 
 	  if (thread_is_on_trace (thread_p))
 	    {
-	      xasl->executed_parallelism = manager.num_parallel_threads;
+	      xasl->executed_parallelism = manager->num_parallel_threads;
 	    }
 	  break;
 
@@ -202,7 +251,7 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 	  /* monitor */
 	  perfmon_inc_stat (thread_p, PSTAT_QM_NUM_HASHJOINS_PARTITIONED);
 
-	  error = hjoin_execute_partitions (thread_p, &manager);
+	  error = hjoin_execute_partitions (thread_p, manager);
 	  break;
 
 #if defined (SERVER_MODE)
@@ -212,11 +261,11 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 
 	  if (thread_is_on_trace (thread_p))
 	    {
-	      xasl->executed_parallelism = manager.num_parallel_threads;
+	      xasl->executed_parallelism = manager->num_parallel_threads;
 	    }
 
 	  // *INDENT-OFF*
-	  error = parallel_query::hash_join::execute_partitions (*thread_p, &manager);
+	  error = parallel_query::hash_join::execute_partitions (*thread_p, manager);
 	  // *INDENT-ON*
 	  break;
 #endif /* defined (SERVER_MODE) */
@@ -259,6 +308,27 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
       goto error_exit;
     }
 
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+  if (manager->stream_detached)
+    {
+      /* Detached streaming producer: the probe tasks deliver the join output through the
+       * stream pipeline; xasl->list_id intentionally stays empty (the gated consumer
+       * never reads it).  Publish the pipeline handle on the XASL node so the consumer
+       * open and the mainblock teardown can reach it. */
+      assert (manager_is_heap);
+      assert (single_context->list_id == NULL);
+      assert (manager->stream_pipeline != NULL);
+
+      xasl->proc.hashjoin.stream_pipeline = manager->stream_pipeline;
+
+      ASSERT_NO_ERROR_OR_INTERRUPTED ();
+
+      /* the pipeline now owns the manager and every structure the detached tasks
+       * reference; freed by hjoin_stream_clear_manager_detached at join_all */
+      return NO_ERROR;
+    }
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
   if (single_context->list_id != NULL)
     {
       /* Check if qfile_close_list was called */
@@ -283,12 +353,36 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
     }
 
 cleanup:
-  if (thread_is_on_trace (thread_p) && manager.stats_group != NULL)
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+  if (manager->stream_pipeline != NULL && !manager->stream_detached)
     {
-      manager.stats_group->status = single_context->status;
+      /* A pipeline was created but the producer never detached (a failure between the
+       * reservation and the task launch).  Still strictly pre-emit: tear the pipeline
+       * down (releases the whole 2*D reservation exactly once) and continue on the
+       * normal error/cleanup path.  The pool handle inside the manager is non-owning. */
+      // *INDENT-OFF*
+      parallel_query::stream_pipeline *pipe = (parallel_query::stream_pipeline *) manager->stream_pipeline;
+
+      (void) pipe->join_all (thread_p);
+      parallel_query::stream_pipeline::destroy (thread_p, pipe);
+      // *INDENT-ON*
+
+      manager->stream_pipeline = NULL;
+      manager->px_worker_manager = NULL;
+    }
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
+  if (thread_is_on_trace (thread_p) && manager->stats_group != NULL && single_context != NULL)
+    {
+      manager->stats_group->status = single_context->status;
     }
 
-  hjoin_clear_manager (thread_p, &manager);
+  hjoin_clear_manager (thread_p, manager);
+
+  if (manager_is_heap)
+    {
+      db_private_free_and_init (thread_p, manager);
+    }
 
   return error;
 
@@ -654,9 +748,19 @@ cleanup:
   qfile_close_scan (thread_p, &build->list_scan_id);
   qfile_close_scan (thread_p, &probe->list_scan_id);
 
-  hjoin_destroy_qlist (thread_p, context);
+  if (manager->stream_detached)
+    {
+      /* Detached streaming probe tasks still read the input list files and the build
+       * hash table; both are destroyed by hjoin_stream_clear_manager_detached once the
+       * pipeline has joined all producers (strictly before head-list cleanup). */
+      assert (error == NO_ERROR);
+    }
+  else
+    {
+      hjoin_destroy_qlist (thread_p, context);
 
-  hjoin_scan_clear (thread_p, &context->hash_scan);
+      hjoin_scan_clear (thread_p, &context->hash_scan);
+    }
 
   return error;
 
@@ -2047,6 +2151,84 @@ error_exit:
     }
 }
 
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+/*
+ * hjoin_try_stream_parallel_probe() - Arm the gated streaming parallel probe.
+ *   return: HASHJOIN_STATUS_PARALLEL_PROBE with manager->stream_pipeline set when the
+ *           whole-pipeline reservation succeeded; HASHJOIN_STATUS_NONE on any refusal
+ *           (the caller then falls back to the normal materialized decision).
+ *   thread_p(in): Thread entry.
+ *   manager(in): Hash join manager containing shared state.
+ *   single_context(in): Hash join context for single-threaded execution.
+ *
+ * Note: Runs strictly BEFORE any output row is emitted (R3/R5): refusals here are the
+ *       legal pre-emit fallback to the always-correct materialized path.  Requirements:
+ *       in-memory(/hybrid) build hash table (non-spilling strategy -- a PARTITION
+ *       strategy never reaches this point), parallel degree >= 2 from the probe-INPUT
+ *       page count, and one atomic exactly-2*D worker reservation (producer D +
+ *       consumer D) so neither pipeline side can wedge holding a partial grant.
+ */
+static HASHJOIN_STATUS
+hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
+				 HASHJOIN_CONTEXT * single_context)
+{
+  assert (thread_p != NULL);
+  assert (manager != NULL);
+  assert (manager->context_cnt == 0);
+  assert (manager->stream_candidate);
+  assert (manager->stream_pipeline == NULL);
+  assert (single_context != NULL);
+  assert (single_context == &manager->single_context);
+
+  /* R3: stream only the definitively non-spilling strategies; the build hash table must
+   * be the in-memory (or hybrid) one decided by hjoin_scan_init before any emit */
+  if (single_context->hash_scan.hash_list_scan_type != HASH_METH_IN_MEM
+      && single_context->hash_scan.hash_list_scan_type != HASH_METH_HYBRID)
+    {
+      return HASHJOIN_STATUS_NONE;
+    }
+
+  /* I2: degree from the already-final probe-INPUT page count (the output size is unknown
+   * and never needed); same D for the producer and the consumer side */
+  UINT32 degree = parallel_query::compute_parallel_degree (parallel_query::parallel_type::HASH_JOIN,
+							   single_context->probe->list_id->page_cnt,
+							   manager->num_parallel_threads);
+  if (degree < 2)
+    {
+      return HASHJOIN_STATUS_NONE;
+    }
+
+  // *INDENT-OFF*
+  parallel_query::stream_policy_decision decision = parallel_query::stream_policy_try_begin (thread_p, (int) degree);
+  if (decision.policy != parallel_query::stream_policy_kind::STREAM)
+    {
+      /* shortfall reserves NOTHING; expected outcome, not an error */
+      return HASHJOIN_STATUS_NONE;
+    }
+
+  parallel_query::stream_pipeline::pool_binding pool;
+  pool.handle = (void *) decision.pool;
+  pool.reserved_workers = decision.pipeline_workers;
+  pool.release = parallel_query::stream_policy_release_pool_handle;
+
+  parallel_query::stream_pipeline *pipe =
+	  parallel_query::stream_pipeline::create (thread_p, pool, HJOIN_STREAM_CHANNEL_CAPACITY);
+  // *INDENT-ON*
+  if (pipe == NULL)
+    {
+      /* create released the reservation; still strictly pre-emit -- fall back */
+      er_clear ();
+      return HASHJOIN_STATUS_NONE;
+    }
+
+  manager->num_parallel_threads = (int) degree;
+  manager->px_worker_manager = decision.pool;	/* NON-OWNING: task dispatch only */
+  manager->stream_pipeline = (void *) pipe;
+
+  return HASHJOIN_STATUS_PARALLEL_PROBE;
+}
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
 /*
  * hjoin_try_parallel_probe() -
  *   return: One of the following HASHJOIN_STATUS values:
@@ -2472,7 +2654,20 @@ hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
 #if defined (SERVER_MODE)
   if (context == &manager->single_context)
     {
-      context->status = hjoin_try_parallel_probe (thread_p, manager, context);
+#if !defined (WINDOWS)
+      if (manager->stream_candidate)
+	{
+	  /* Gated streaming hash-join: try the whole-pipeline (2*D) reservation instead
+	   * of the plain D-worker probe reservation.  Decided strictly before any emit;
+	   * every refusal falls back to the materialized path below (R3/R5). */
+	  context->status = hjoin_try_stream_parallel_probe (thread_p, manager, context);
+	}
+#endif /* !defined (WINDOWS) */
+
+      if (manager->stream_pipeline == NULL)
+	{
+	  context->status = hjoin_try_parallel_probe (thread_p, manager, context);
+	}
       switch (context->status)
 	{
 	case HASHJOIN_STATUS_SINGLE:
@@ -3304,10 +3499,30 @@ hjoin_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTE
 	  goto error_exit;
 	}
 
-      error = parallel_query::hash_join::probe_execute (*thread_p, manager);
-      if (error != NO_ERROR)
+#if !defined (WINDOWS)
+      if (manager->stream_pipeline != NULL)
 	{
-	  goto error_exit;
+	  /* gated streaming mode: launch the D probe workers DETACHED, each pushing
+	   * batches directly into the shared stream channel; do not join here -- the
+	   * consumer overlaps the probe, and the pipeline joins at query teardown */
+	  error = parallel_query::hash_join::probe_execute_streamed (*thread_p, manager);
+	  if (error != NO_ERROR)
+	    {
+	      /* pre-launch failure (still pre-emit); qexec_hash_join's cleanup tears the
+	       * pipeline down and the query fails with the raised error */
+	      goto error_exit;
+	    }
+
+	  assert (manager->stream_detached);
+	}
+      else
+#endif /* !defined (WINDOWS) */
+	{
+	  error = parallel_query::hash_join::probe_execute (*thread_p, manager);
+	  if (error != NO_ERROR)
+	    {
+	      goto error_exit;
+	    }
 	}
       // *INDENT-ON*
     }
@@ -4116,6 +4331,305 @@ hjoin_sink_init_list (HJOIN_SINK * sink, QFILE_LIST_ID * list_id)
   sink->adapter_state = (void *) list_id;
   sink->tpl_descr = &list_id->tpl_descr;
 }
+
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+
+/*
+ * hjoin_stream_sink_push() - Push the accumulated batch into the stream channel.
+ *   return: Error code (NO_ERROR if successful, error code otherwise).
+ *   thread_p(in): Thread entry.
+ *   state(in/out): Stream sink state owning the batch under construction.
+ *
+ * Note: On a refused push, ownership of the buffer is RETAINED (channel INV-FAILPUSH)
+ *       and freed here.  A refusal with no interrupt and no pipeline abort is the R11
+ *       consumer-early-close: the sink turns itself off quietly (no error).  Any other
+ *       refusal keeps/raises an error -- never a silent path switch after the first
+ *       emitted row (R3), and never an er_clear on this path.
+ */
+static int
+hjoin_stream_sink_push (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state)
+{
+  // *INDENT-OFF*
+  parallel_query::stream_channel<parallel_query::row_batch> *channel =
+	  (parallel_query::stream_channel<parallel_query::row_batch> *) state->channel;
+  parallel_query::interrupt *intr = (parallel_query::interrupt *) state->intr;
+  parallel_query::row_batch batch;
+  // *INDENT-ON*
+
+  assert (state->buf != NULL);
+  assert (state->tuple_cnt > 0);
+  assert (state->len > 0 && state->len <= state->capacity);
+
+  batch.buf = state->buf;
+  batch.len = state->len;
+  batch.tuple_cnt = state->tuple_cnt;
+
+  if (channel->push (batch, *intr))
+    {
+      /* ownership transferred to the channel (INV-OWN) */
+      state->buf = NULL;
+      state->len = 0;
+      state->capacity = 0;
+      state->tuple_cnt = 0;
+
+      return NO_ERROR;
+    }
+
+  /* ownership retained: free the un-pushed batch exactly once (INV-FAILPUSH).
+   * Batch buffers cross threads (producer worker -> consumer worker / teardown driver),
+   * so they live on the global heap: malloc/free, never per-thread db_private_alloc. */
+  free_and_init (state->buf);
+  state->len = 0;
+  state->capacity = 0;
+  state->tuple_cnt = 0;
+
+  // *INDENT-OFF*
+  if (intr->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT && channel->is_aborted ())
+  // *INDENT-ON*
+    {
+      /* R11: normal consumer early termination (channel aborted with no error code
+       * published).  Stop emitting quietly; the already-consumed prefix is the correct
+       * result and no spurious error may reach the client. */
+      state->stopped = true;
+
+      return NO_ERROR;
+    }
+
+  /* a real abort/cancel is in progress (H1-H4 / R6): surface an error on this worker so
+   * the existing probe error path propagates it */
+  if (er_errid () == NO_ERROR)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+    }
+
+  return er_errid ();
+}
+
+/*
+ * hjoin_stream_sink_emit() - Streaming sink adapter: append one merged tuple to the
+ *                            owned batch, pushing full batches into the stream channel.
+ *   return: Error code (NO_ERROR if successful, error code otherwise).
+ *   thread_p(in): Thread entry.
+ *   sink(in): Sink whose adapter_state is an HJOIN_STREAM_SINK_STATE.
+ *   merged(in): Filled tuple descriptor for a normal-size tuple. (can be NULL).
+ *   oversized(in): Fully assembled record for an oversized tuple. (can be NULL).
+ *
+ * Note: The batch carries the EXACT bytes the materialized path writes: the descriptor
+ *       case runs the same qfile_save_tuple(T_MERGE) encoder into the batch buffer; the
+ *       oversized case copies the already-assembled record verbatim as its own
+ *       single-tuple batch (channel INV-OVERSIZE; no overflow chain on the wire).
+ *       Whole-tuple invariant: the batch-full test runs BETWEEN tuples only.
+ */
+static int
+hjoin_stream_sink_emit (THREAD_ENTRY * thread_p, HJOIN_SINK * sink, QFILE_TUPLE_DESCRIPTOR * merged,
+			QFILE_TUPLE oversized)
+{
+  HJOIN_STREAM_SINK_STATE *state = (HJOIN_STREAM_SINK_STATE *) sink->adapter_state;
+  int tuple_length;
+  int error = NO_ERROR;
+
+  assert (state != NULL);
+  assert ((merged != NULL) != (oversized != NULL));
+
+  if (state->stopped)
+    {
+      /* R11 early close: drop quietly, no error, no further pushes */
+      return NO_ERROR;
+    }
+
+  if (merged != NULL)
+    {
+      /* tpl_size is the safe upper bound of the merged tuple (same bound the list page
+       * allocator uses); the actual written length is computed by the encoder */
+      int need = merged->tpl_size;
+
+      assert (merged == &state->tpl_descr);
+      assert (need < QFILE_MAX_TUPLE_SIZE_IN_PAGE);
+
+      if (state->buf != NULL && (state->capacity - state->len) < need)
+	{
+	  error = hjoin_stream_sink_push (thread_p, state);
+	  if (error != NO_ERROR)
+	    {
+	      return error;
+	    }
+	  if (state->stopped)
+	    {
+	      return NO_ERROR;
+	    }
+	}
+
+      if (state->buf == NULL)
+	{
+	  state->capacity = MAX (HJOIN_STREAM_BATCH_BYTES, need);
+	  state->buf = (char *) malloc (state->capacity);
+	  if (state->buf == NULL)
+	    {
+	      /* H1: batch-arena allocation failure (possibly after the first emitted
+	       * row).  Propagate as a hard error -- the caller aborts the pipeline;
+	       * never a silent switch back to the materialized path (R3). */
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) state->capacity);
+	      state->capacity = 0;
+	      return ER_OUT_OF_VIRTUAL_MEMORY;
+	    }
+	  state->len = 0;
+	  state->tuple_cnt = 0;
+	}
+
+      tuple_length = 0;
+      if (qfile_save_tuple (merged, T_MERGE, state->buf + state->len, &tuple_length) != NO_ERROR)
+	{
+	  /* impossible for T_MERGE; keep the error model intact if it ever changes */
+	  assert_release_error (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	  return ER_QPROC_INVALID_XASLNODE;
+	}
+
+      assert (tuple_length > 0 && tuple_length <= need);
+      state->len += tuple_length;
+      state->tuple_cnt++;
+
+      return NO_ERROR;
+    }
+  else
+    {
+      /* oversized tuple: never split across batches -- flush the partial batch, then
+       * ship the whole record as its own single-tuple batch */
+      tuple_length = QFILE_GET_TUPLE_LENGTH (oversized);
+      assert (tuple_length > 0);
+
+      if (state->buf != NULL)
+	{
+	  error = hjoin_stream_sink_push (thread_p, state);
+	  if (error != NO_ERROR)
+	    {
+	      return error;
+	    }
+	}
+      if (state->stopped)
+	{
+	  return NO_ERROR;
+	}
+
+      state->buf = (char *) malloc (tuple_length);
+      if (state->buf == NULL)
+	{
+	  /* H1 (oversized arena) */
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) tuple_length);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      state->capacity = tuple_length;
+
+      memcpy (state->buf, oversized, tuple_length);
+      state->len = tuple_length;
+      state->tuple_cnt = 1;
+
+      return hjoin_stream_sink_push (thread_p, state);
+    }
+}
+
+/*
+ * hjoin_sink_init_stream() - Bind the streaming-channel adapter to a sink.
+ *   return: None.
+ *   sink(in/out): Sink to initialize.
+ *   state(in/out): Per-worker stream sink state (zeroed here).
+ *   channel(in): parallel_query::stream_channel<row_batch> * of the pipeline.
+ *   intr(in): parallel_query::interrupt * shared pipeline interrupt.
+ */
+void
+hjoin_sink_init_stream (HJOIN_SINK * sink, HJOIN_STREAM_SINK_STATE * state, void *channel, void *intr)
+{
+  assert (sink != NULL);
+  assert (state != NULL);
+  assert (channel != NULL);
+  assert (intr != NULL);
+
+  memset (state, 0, sizeof (HJOIN_STREAM_SINK_STATE));
+  state->channel = channel;
+  state->intr = intr;
+
+  sink->emit = hjoin_stream_sink_emit;
+  sink->adapter_state = (void *) state;
+  sink->tpl_descr = &state->tpl_descr;
+}
+
+/*
+ * hjoin_stream_sink_flush() - Push the final partial batch at clean producer EOS.
+ *   return: Error code (NO_ERROR if successful, error code otherwise).
+ *   thread_p(in): Thread entry.
+ *   state(in/out): Stream sink state.
+ */
+int
+hjoin_stream_sink_flush (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state)
+{
+  assert (state != NULL);
+
+  if (state->buf == NULL)
+    {
+      return NO_ERROR;
+    }
+  if (state->stopped)
+    {
+      /* defensive: a stopped sink never holds a batch, but never leak one either */
+      assert (false);
+      free_and_init (state->buf);
+      state->len = 0;
+      state->capacity = 0;
+      state->tuple_cnt = 0;
+      return NO_ERROR;
+    }
+
+  return hjoin_stream_sink_push (thread_p, state);
+}
+
+/*
+ * hjoin_stream_sink_discard() - Free a still-owned batch on the producer error path.
+ *   return: None.
+ *   thread_p(in): Thread entry.
+ *   state(in/out): Stream sink state.
+ */
+void
+hjoin_stream_sink_discard (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state)
+{
+  assert (state != NULL);
+
+  if (state->buf != NULL)
+    {
+      free_and_init (state->buf);
+    }
+  state->len = 0;
+  state->capacity = 0;
+  state->tuple_cnt = 0;
+}
+
+/*
+ * hjoin_stream_clear_manager_detached() - Deferred manager teardown for a detached
+ *                                         streaming producer.
+ *   return: None.
+ *   thread_p(in): Thread entry (the pipeline teardown runner / mainblock driver).
+ *   manager(in): Heap-allocated hash join manager owned by the stream pipeline.
+ *
+ * Note: Runs from the pipeline's join_all free step, strictly AFTER all probe tasks are
+ *       joined -- only then may the build hash table and the input list files die.  The
+ *       worker reservation is pipeline-owned and released by the pipeline itself, so the
+ *       manager's non-owning pool handle is detached first.
+ */
+void
+hjoin_stream_clear_manager_detached (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager)
+{
+  assert (thread_p != NULL);
+  assert (manager != NULL);
+  assert (manager->stream_detached);
+
+  hjoin_scan_clear (thread_p, &manager->single_context.hash_scan);
+
+  /* the 2*D reservation belongs to the pipeline (released exactly once there) */
+  manager->px_worker_manager = NULL;
+
+  hjoin_clear_manager (thread_p, manager);
+}
+
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
 /*
  * hjoin_merge_tuple_to_list_id() -

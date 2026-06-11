@@ -34,6 +34,7 @@
 #include "px_scan_task.hpp"
 #include "px_scan_input_handler_heap.hpp"
 #include "px_parallel.hpp"			/* parallel_query::compute_parallel_degree */
+#include "px_stream_pipeline.hpp"		/* parallel_query::stream_pipeline (streaming hash join) */
 #include "list_file.h"				/* qfile_close_list, qfile_destroy_list */
 #include "heap_file.h"				/* heap_attrinfo_end */
 #include "file_manager.h"			/* file_get_num_user_pages */
@@ -596,10 +597,19 @@ extern "C"
   SCAN_CODE
   scan_next_parallel_list_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
   {
+    const bool is_streamed = scan_id->s.pllsid_parallel.is_streamed_source;
+
     switch (scan_id->s.pllsid_parallel.result_type)
       {
       case parallel_scan::RESULT_TYPE::MERGEABLE_LIST:
       {
+	if (is_streamed)
+	  {
+	    using manager_type = parallel_scan::manager
+				 < parallel_scan::RESULT_TYPE::MERGEABLE_LIST, parallel_scan::SCAN_TYPE::STREAM >;
+	    manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
+	    return manager_p->next();
+	  }
 	using manager_type = parallel_scan::manager
 			     < parallel_scan::RESULT_TYPE::MERGEABLE_LIST, parallel_scan::SCAN_TYPE::LIST >;
 	manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
@@ -608,6 +618,13 @@ extern "C"
 
       case parallel_scan::RESULT_TYPE::BUILDVALUE_OPT:
       {
+	if (is_streamed)
+	  {
+	    using manager_type = parallel_scan::manager
+				 < parallel_scan::RESULT_TYPE::BUILDVALUE_OPT, parallel_scan::SCAN_TYPE::STREAM >;
+	    manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
+	    return manager_p->next();
+	  }
 	using manager_type = parallel_scan::manager
 			     < parallel_scan::RESULT_TYPE::BUILDVALUE_OPT, parallel_scan::SCAN_TYPE::LIST >;
 	manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
@@ -730,10 +747,20 @@ extern "C"
 	scan_id->direction = S_FORWARD;
       }
 
+    const bool is_streamed = scan_id->s.pllsid_parallel.is_streamed_source;
+
     switch (scan_id->s.pllsid_parallel.result_type)
       {
       case parallel_scan::RESULT_TYPE::MERGEABLE_LIST:
       {
+	if (is_streamed)
+	  {
+	    using manager_type = parallel_scan::manager
+				 < parallel_scan::RESULT_TYPE::MERGEABLE_LIST, parallel_scan::SCAN_TYPE::STREAM >;
+	    manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
+	    manager_p->end();
+	    break;
+	  }
 	using manager_type = parallel_scan::manager
 			     < parallel_scan::RESULT_TYPE::MERGEABLE_LIST, parallel_scan::SCAN_TYPE::LIST >;
 	manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
@@ -743,6 +770,14 @@ extern "C"
 
       case parallel_scan::RESULT_TYPE::BUILDVALUE_OPT:
       {
+	if (is_streamed)
+	  {
+	    using manager_type = parallel_scan::manager
+				 < parallel_scan::RESULT_TYPE::BUILDVALUE_OPT, parallel_scan::SCAN_TYPE::STREAM >;
+	    manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
+	    manager_p->end();
+	    break;
+	  }
 	using manager_type = parallel_scan::manager
 			     < parallel_scan::RESULT_TYPE::BUILDVALUE_OPT, parallel_scan::SCAN_TYPE::LIST >;
 	manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
@@ -762,6 +797,37 @@ extern "C"
   {
     using accumulative_trace_storage = parallel_scan::accumulative_trace_storage;
 
+    if (scan_id->s.pllsid_parallel.is_streamed_source)
+      {
+	/* streamed result source: no trace storage (streaming refuses trace runs) */
+	switch (scan_id->s.pllsid_parallel.result_type)
+	  {
+	  case parallel_scan::RESULT_TYPE::MERGEABLE_LIST:
+	  {
+	    using manager_type = parallel_scan::manager
+				 < parallel_scan::RESULT_TYPE::MERGEABLE_LIST, parallel_scan::SCAN_TYPE::STREAM >;
+	    manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
+	    manager_p->close();
+	    break;
+	  }
+
+	  case parallel_scan::RESULT_TYPE::BUILDVALUE_OPT:
+	  {
+	    using manager_type = parallel_scan::manager
+				 < parallel_scan::RESULT_TYPE::BUILDVALUE_OPT, parallel_scan::SCAN_TYPE::STREAM >;
+	    manager_type *manager_p = (manager_type *) scan_id->s.pllsid_parallel.manager;
+	    manager_p->close();
+	    break;
+	  }
+
+	  default:
+	    /* impossible case */
+	    assert_release_error (false);
+	    break;
+	  }
+	return;
+      }
+
     switch (scan_id->s.pllsid_parallel.result_type)
       {
       case parallel_scan::RESULT_TYPE::MERGEABLE_LIST:
@@ -835,6 +901,162 @@ extern "C"
 	assert_release_error (false);
 	break;
       }
+  }
+
+  /*
+   * scan_open_stream_hashjoin_scan () - open the gated streamed hash-join result source
+   *                                     (SCAN_TYPE::STREAM) on the pipeline's channel.
+   *
+   * The producer probe workers are ALREADY streaming into the channel, so this open is
+   * MANDATORY: any failure here is a query error (post-emit rule R3) -- never a silent
+   * fallback to reading the materialized list, which is intentionally empty on this
+   * path and would silently return wrong results.
+   */
+  static int
+  scan_open_stream_hashjoin_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, VAL_DESCR *vd, ACCESS_SPEC_TYPE *spec,
+				  QFILE_LIST_ID *list_id, XASL_NODE *xasl, QUERY_ID query_id,
+				  parallel_query::stream_pipeline *pipe)
+  {
+    int error = NO_ERROR;
+
+    assert (pipe != nullptr);
+    assert (thread_p->private_heap_id != 0);	/* arm-time check: driver thread only */
+
+    /* result type was vetted at arm time; anything else is a wiring bug */
+    parallel_scan::RESULT_TYPE local_result_type;
+    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST))
+      {
+	local_result_type = parallel_scan::RESULT_TYPE::MERGEABLE_LIST;
+      }
+    else if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT))
+      {
+	local_result_type = parallel_scan::RESULT_TYPE::BUILDVALUE_OPT;
+      }
+    else
+      {
+	assert_release_error (false);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	return ER_QPROC_INVALID_XASLNODE;
+      }
+
+    /* I2: consumer degree D == producer degree (one exact 2*D pipeline reservation);
+     * the worker pool handle is NON-OWNING -- the pipeline releases it exactly once */
+    int num_parallel_threads = pipe->get_reserved_workers () / 2;
+    parallel_query::worker_manager *pool_p = (parallel_query::worker_manager *) pipe->get_pool_handle ();
+
+    assert (num_parallel_threads >= 2);
+    assert (pool_p != nullptr);
+
+    parallel_query::stream_source *source_p = pipe->open_consumer (thread_p, num_parallel_threads);
+    if (source_p == nullptr)
+      {
+	assert_release_error (er_errid () != NO_ERROR);
+	return er_errid ();
+      }
+
+    HFID null_hfid = HFID_INITIALIZER;
+    OID null_oid = OID_INITIALIZER;
+    void *local_manager = nullptr;
+
+    switch (local_result_type)
+      {
+      case parallel_scan::RESULT_TYPE::MERGEABLE_LIST:
+      {
+	using manager_type =
+		parallel_scan::manager < parallel_scan::RESULT_TYPE::MERGEABLE_LIST, parallel_scan::SCAN_TYPE::STREAM >;
+
+	local_manager = (void *) db_private_alloc (thread_p, sizeof (manager_type));
+	if (local_manager == nullptr)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    error = er_errid ();
+	    break;
+	  }
+
+	local_manager = placement_new ((manager_type *) local_manager,
+				       thread_p, query_id, scan_id, xasl,
+				       num_parallel_threads, null_hfid, null_oid, vd,
+				       false, false, pool_p, list_id, nullptr, source_p);
+	assert (local_manager != nullptr);
+
+	error = ((manager_type *) local_manager)->open ();
+	if (error != NO_ERROR)
+	  {
+	    ((manager_type *) local_manager)->~manager ();
+	    db_private_free_and_init (thread_p, local_manager);
+
+	    assert_release_error (er_errid () != NO_ERROR);
+	    error = er_errid ();
+	  }
+
+	break;
+      }
+
+      case parallel_scan::RESULT_TYPE::BUILDVALUE_OPT:
+      {
+	using manager_type =
+		parallel_scan::manager < parallel_scan::RESULT_TYPE::BUILDVALUE_OPT, parallel_scan::SCAN_TYPE::STREAM >;
+
+	local_manager = (void *) db_private_alloc (thread_p, sizeof (manager_type));
+	if (local_manager == nullptr)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    error = er_errid ();
+	    break;
+	  }
+
+	local_manager = placement_new ((manager_type *) local_manager,
+				       thread_p, query_id, scan_id, xasl,
+				       num_parallel_threads, null_hfid, null_oid, vd,
+				       false, false, pool_p, list_id, nullptr, source_p);
+	assert (local_manager != nullptr);
+
+	error = ((manager_type *) local_manager)->open ();
+	if (error != NO_ERROR)
+	  {
+	    ((manager_type *) local_manager)->~manager ();
+	    db_private_free_and_init (thread_p, local_manager);
+
+	    assert_release_error (er_errid () != NO_ERROR);
+	    error = er_errid ();
+	  }
+
+	break;
+      }
+
+      default:
+	/* impossible case */
+	assert_release_error (false);
+	error = er_errid ();
+	break;
+      }	/* switch (local_result_type) */
+
+    if (error != NO_ERROR)
+      {
+	/* post-emit failure (H4 family): close the consumer side so push-blocked
+	 * producers wake, keep the error -- the query fails; the pipeline's join_all at
+	 * mainblock teardown completes the cleanup.  NEVER a silent path switch. */
+	pipe->close_consumer (thread_p);
+
+	if (error == NO_ERROR || er_errid () == NO_ERROR)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    error = er_errid ();
+	  }
+	return error;
+      }
+
+    /* success: manager open on the streamed source -- safe to publish pllsid_parallel */
+    scan_id->s.pllsid_parallel.result_type = local_result_type;
+    scan_id->s.pllsid_parallel.manager = local_manager;
+    scan_id->s.pllsid_parallel.trace_storage = nullptr;
+    /* single-pass streamed source: any backward reset must hard-fail (SSOT R4) */
+    scan_id->s.pllsid_parallel.is_streamed_source = true;
+
+    scan_id->type = S_PARALLEL_LIST_SCAN;
+
+    ASSERT_NO_ERROR_OR_INTERRUPTED ();
+    return NO_ERROR;
   }
 
   int
@@ -855,6 +1077,19 @@ extern "C"
     assert (vd != nullptr);
 
     scan_id->type = S_LIST_SCAN;
+
+    /* gated streaming hash-join consumer: when this spec's producer detached into a
+     * stream pipeline, opening the stream source is MANDATORY -- the materialized list
+     * is intentionally empty on that path (checked before every other early-out) */
+    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_STREAM_HASHJOIN)
+	&& ACCESS_SPEC_XASL_NODE (spec) != nullptr && ACCESS_SPEC_XASL_NODE (spec)->type == HASHJOIN_PROC
+	&& ACCESS_SPEC_XASL_NODE (spec)->proc.hashjoin.stream_pipeline != nullptr)
+      {
+	parallel_query::stream_pipeline *pipe =
+		(parallel_query::stream_pipeline *) ACCESS_SPEC_XASL_NODE (spec)->proc.hashjoin.stream_pipeline;
+
+	return scan_open_stream_hashjoin_scan (thread_p, scan_id, vd, spec, list_id, xasl, query_id, pipe);
+      }
 
     if (thread_p->private_heap_id == 0)
       {
@@ -1573,8 +1808,23 @@ namespace parallel_scan
   {
     if (m_worker_manager != nullptr)
       {
-	m_worker_manager->release_workers ();
-	m_worker_manager = nullptr;
+	if constexpr (ST == SCAN_TYPE::STREAM)
+	  {
+	    /* the 2*D pool belongs to the stream pipeline (released exactly once at its
+	     * join_all): wake any blocked side first (channel abort via source close),
+	     * drain the tasks accounted on the shared pool, then detach WITHOUT release */
+	    if (m_input_handler != nullptr)
+	      {
+		m_input_handler->cleanup_on_main (m_thread_p);
+	      }
+	    m_worker_manager->wait_workers ();
+	    m_worker_manager = nullptr;
+	  }
+	else
+	  {
+	    m_worker_manager->release_workers ();
+	    m_worker_manager = nullptr;
+	  }
       }
     if (m_input_handler != nullptr)
       {
@@ -1582,7 +1832,7 @@ namespace parallel_scan
 	  {
 	    m_input_handler->cleanup_keys (m_thread_p);
 	  }
-	else if constexpr (ST == SCAN_TYPE::LIST)
+	else if constexpr (ST == SCAN_TYPE::LIST || ST == SCAN_TYPE::STREAM)
 	  {
 	    m_input_handler->cleanup_on_main (m_thread_p);
 	  }
@@ -1678,6 +1928,10 @@ namespace parallel_scan
       if constexpr (ST == SCAN_TYPE::LIST)
 	{
 	  init_err = m_input_handler->init_on_main (m_thread_p, m_list_id, m_parallelism);
+	}
+      else if constexpr (ST == SCAN_TYPE::STREAM)
+	{
+	  init_err = m_input_handler->init_on_main (m_thread_p, m_stream_source_p, m_parallelism);
 	}
       else if constexpr (ST == SCAN_TYPE::INDEX)
 	{
@@ -1878,8 +2132,19 @@ namespace parallel_scan
 	      }
 	    if (m_worker_manager != nullptr)
 	      {
-		m_worker_manager->release_workers ();
-		m_worker_manager = nullptr;
+		if constexpr (ST == SCAN_TYPE::STREAM)
+		  {
+		    /* H4 path: abort the stream first (wakes blocked producers), drain
+		     * tasks; the pipeline (not this manager) releases the pool */
+		    m_input_handler->cleanup_on_main (m_thread_p);
+		    m_worker_manager->wait_workers ();
+		    m_worker_manager = nullptr;
+		  }
+		else
+		  {
+		    m_worker_manager->release_workers ();
+		    m_worker_manager = nullptr;
+		  }
 	      }
 	  }
 
@@ -1954,8 +2219,18 @@ namespace parallel_scan
 	  }
 	if (m_worker_manager != nullptr)
 	  {
-	    m_worker_manager->release_workers ();
-	    m_worker_manager = nullptr;
+	    if constexpr (ST == SCAN_TYPE::STREAM)
+	      {
+		/* H4 path: abort the stream first; pool stays pipeline-owned */
+		m_input_handler->cleanup_on_main (m_thread_p);
+		m_worker_manager->wait_workers ();
+		m_worker_manager = nullptr;
+	      }
+	    else
+	      {
+		m_worker_manager->release_workers ();
+		m_worker_manager = nullptr;
+	      }
 	  }
       }
 
@@ -1972,6 +2247,12 @@ namespace parallel_scan
 	    /* drain workers so every err_messages.push_back is visible before reading [0] */
 	    if (m_worker_manager != nullptr)
 	      {
+		if constexpr (ST == SCAN_TYPE::STREAM)
+		  {
+		    /* a blocked producer is woken only by a pop or a channel abort --
+		     * abort via source close BEFORE waiting on the shared pool (R6) */
+		    m_input_handler->cleanup_on_main (m_thread_p);
+		  }
 		m_worker_manager->wait_workers ();
 	      }
 	    std::lock_guard<std::mutex> lock (m_err_messages.m_mutex);
@@ -2004,6 +2285,15 @@ namespace parallel_scan
       }
     if (m_worker_manager != nullptr)
       {
+	if constexpr (ST == SCAN_TYPE::STREAM)
+	  {
+	    /* unblock channel waiters (consumer pops AND producer pushes) before
+	     * waiting on the shared 2*D pool, or the wait can never finish (R6/R11) */
+	    if (m_input_handler != nullptr)
+	      {
+		m_input_handler->cleanup_on_main (m_thread_p);
+	      }
+	  }
 	m_worker_manager->wait_workers ();
       }
   }
@@ -2012,6 +2302,15 @@ namespace parallel_scan
   int manager<result_type, ST>::reset ()
   {
     int err_code = NO_ERROR;
+
+    if constexpr (ST == SCAN_TYPE::STREAM)
+      {
+	/* R4: a streamed source is single-pass; a reset/re-open would silently re-read
+	 * nothing.  Hard-fail (the dispatch wrapper already guards; double safety). */
+	assert_release (false);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	return ER_QPROC_INVALID_XASLNODE;
+      }
 
     /* callers must drain workers via wait_for_workers() before merge_stats / add_stats; reset is finalize-only */
     m_result_handler->read_finalize (m_thread_p);
@@ -2070,7 +2369,7 @@ namespace parallel_scan
       }
 
     /* Finalize setup */
-    if constexpr (ST == SCAN_TYPE::LIST)
+    if constexpr (ST == SCAN_TYPE::LIST || ST == SCAN_TYPE::STREAM)
       {
 	m_scan_id->s.pllsid_parallel.manager = this;
       }
@@ -2127,8 +2426,23 @@ namespace parallel_scan
       }
     if (m_worker_manager != nullptr)
       {
-	m_worker_manager->release_workers ();
-	m_worker_manager = nullptr;
+	if constexpr (ST == SCAN_TYPE::STREAM)
+	  {
+	    /* R11 early-close feedback: closing the source aborts the channel if EOS
+	     * was not reached, so push-blocked producers wake promptly; the shared 2*D
+	     * pool is pipeline-owned (released exactly once at join_all), never here */
+	    if (m_input_handler != nullptr)
+	      {
+		m_input_handler->cleanup_on_main (m_thread_p);
+	      }
+	    m_worker_manager->wait_workers ();
+	    m_worker_manager = nullptr;
+	  }
+	else
+	  {
+	    m_worker_manager->release_workers ();
+	    m_worker_manager = nullptr;
+	  }
       }
     err_code = merge_stats();
     m_result_handler->read_finalize (m_thread_p);
@@ -2139,7 +2453,7 @@ namespace parallel_scan
   int manager<result_type, ST>::close()
   {
     THREAD_ENTRY *thread_p = m_thread_p;
-    if constexpr (ST == SCAN_TYPE::LIST)
+    if constexpr (ST == SCAN_TYPE::LIST || ST == SCAN_TYPE::STREAM)
       {
 	m_scan_id->s.pllsid_parallel.manager = nullptr;
       }
@@ -2163,6 +2477,9 @@ namespace parallel_scan
 
   template class manager<RESULT_TYPE::MERGEABLE_LIST, SCAN_TYPE::LIST>;
   template class manager<RESULT_TYPE::BUILDVALUE_OPT, SCAN_TYPE::LIST>;
+
+  template class manager<RESULT_TYPE::MERGEABLE_LIST, SCAN_TYPE::STREAM>;
+  template class manager<RESULT_TYPE::BUILDVALUE_OPT, SCAN_TYPE::STREAM>;
 
   template class manager<RESULT_TYPE::MERGEABLE_LIST, SCAN_TYPE::INDEX>;
   template class manager<RESULT_TYPE::BUILDVALUE_OPT, SCAN_TYPE::INDEX>;

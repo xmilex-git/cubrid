@@ -51,5 +51,14 @@ namespace parallel_query
 
     int probe_prepare (cubthread::entry &thread_ref, HASHJOIN_MANAGER *manager);
     int probe_execute (cubthread::entry &thread_ref, HASHJOIN_MANAGER *manager);
+
+#if !defined (WINDOWS)
+    /* Gated streaming hash join: launch the D probe workers DETACHED, each pushing
+     * batches directly into the pipeline's shared channel (no per-worker output list,
+     * no serial UNION merge), and return WITHOUT joining.  On success the producer
+     * bundle ownership has passed to the stream pipeline and manager->stream_detached
+     * is set; any error return is strictly pre-launch (pre-emit). */
+    int probe_execute_streamed (cubthread::entry &thread_ref, HASHJOIN_MANAGER *manager);
+#endif /* !defined (WINDOWS) */
   } /* namespace hash_join */
 } /* namespace parallel_query */

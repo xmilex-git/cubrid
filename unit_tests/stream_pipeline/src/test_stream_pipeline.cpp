@@ -128,7 +128,9 @@ make_batch (std::uint64_t tag)
   std::memcpy (b.buf, &tag, sizeof (tag));
   b.len = (int) sizeof (tag);
   b.tuple_cnt = 1;
-  g_live_buffers.fetch_add (1);
+  /* batches are NOT ledgered: engine code frees payloads with plain free () (they cross
+   * threads -- global heap), which this stub cannot observe; residue accounting is
+   * asserted via get_residue_drained_count () instead */
   return b;
 }
 
@@ -147,7 +149,6 @@ free_batch_direct (row_batch &b)
     {
       std::free (b.buf);
       b.buf = NULL;
-      g_live_buffers.fetch_sub (1);
     }
 }
 

@@ -30,7 +30,11 @@
 
 #include "error_context.hpp"		/* cuberr::context */
 #include "px_hash_join_spawn_manager.hpp"	/* parallel_query::hash_join::spawn_manager */
+#include "px_interrupt.hpp"		/* parallel_query::err_messages_with_lock */
 #include "px_worker_manager.hpp"	/* parallel_query::worker_manager */
+#if !defined (WINDOWS)
+#include "px_stream_pipeline.hpp"	/* parallel_query::stream_pipeline (streaming hash join) */
+#endif /* !defined (WINDOWS) */
 #include "storage_common.h"		/* NULL_TRAN_INDEX */
 #include "thread_entry.hpp"		/* cubthread::entry */
 #include "thread_entry_task.hpp"	/* cubthread::entry_task */
@@ -72,6 +76,16 @@ namespace parallel_query
 	void end_task ();
 	void join ();
 
+#if !defined (WINDOWS)
+	/* Detached streaming-producer mode: the driver thread is NOT parked in join (),
+	 * so handle_error must never swap into the driver's live error context nor
+	 * interrupt the transaction (the query may be finishing normally after a
+	 * consumer early close).  Errors are parked in the bundle's message list and
+	 * the pipeline is aborted instead. */
+	void set_detached_error_sink (parallel_query::err_messages_with_lock *err_messages_p,
+				      parallel_query::stream_pipeline *pipe);
+#endif /* !defined (WINDOWS) */
+
 	inline bool has_error () const noexcept
 	{
 	  return m_has_error.load (std::memory_order_acquire);
@@ -94,6 +108,12 @@ namespace parallel_query
 	int m_active_tasks;
 
 	std::atomic<bool> m_has_error;
+
+#if !defined (WINDOWS)
+	/* detached streaming-producer error sink (NULL: normal joined mode) */
+	parallel_query::err_messages_with_lock *m_detached_err_messages = nullptr;
+	parallel_query::stream_pipeline *m_detached_pipe = nullptr;
+#endif /* !defined (WINDOWS) */
     };
 
     /*
@@ -239,12 +259,67 @@ namespace parallel_query
 		    HASHJOIN_CONTEXT *context, HASHJOIN_SHARED_PROBE_INFO *shared_info, int index);
 	void execute (cubthread::entry &thread_ref) override;
 
-      private:
+      protected:
 	HASHJOIN_CONTEXT *m_context;
 	HASHJOIN_SHARED_PROBE_INFO *m_shared_info;
 
+      private:
 	void execute_inner (cubthread::entry &thread_ref);
 	void execute_outer (cubthread::entry &thread_ref);
     };
+
+#if !defined (WINDOWS)
+    /*
+     * stream_producer_state - detached streaming-producer bundle (gated streaming
+     * hash join).  Owns everything the detached probe tasks reference that must
+     * outlive qexec_hash_join's frame.  Ownership passes to the C7 stream_pipeline at
+     * launch_producers (); freed exactly once, post-join, by stream_producer_state_free.
+     */
+    struct stream_producer_state
+    {
+      HASHJOIN_MANAGER *manager;	/* heap manager (hjoin_stream_clear_manager_detached frees its guts) */
+      HASHJOIN_SHARED_PROBE_INFO shared_info;
+      task_manager tasks;
+      parallel_query::err_messages_with_lock err_messages;	/* parked producer errors */
+      HJOIN_STREAM_SINK_STATE *sink_states;	/* D per-worker stream sink states */
+      parallel_query::stream_pipeline *pipe;	/* non-owning back reference */
+
+      stream_producer_state (HASHJOIN_MANAGER *manager_arg, cubthread::entry &main_thread_ref,
+			     parallel_query::stream_pipeline *pipe_arg)
+	: manager (manager_arg)
+	, shared_info ()
+	, tasks (manager_arg->px_worker_manager, main_thread_ref)
+	, err_messages ()
+	, sink_states (nullptr)
+	, pipe (pipe_arg)
+      {
+      }
+    };
+
+    /* stream_pipeline::producer_state_free_fn for the bundle above */
+    void stream_producer_state_free (THREAD_ENTRY *thread_p, void *state_arg);
+
+    /*
+     * stream_probe_task - probe task variant for the detached streaming producer:
+     * same probe body (emits route through the context's stream sink into the shared
+     * channel), plus the streaming epilogue -- flush-or-discard the final partial
+     * batch, signal producer EOS (INV-EOS: exactly one producer_done per registered
+     * producer on EVERY exit path), and make producer_task_finished () the task's very
+     * last touch of pipeline-owned state (in retire (), after end_task ()).
+     */
+    class stream_probe_task: public probe_task
+    {
+      public:
+	stream_probe_task (task_manager &task_manager, HASHJOIN_MANAGER *manager,
+			   HASHJOIN_CONTEXT *context, HASHJOIN_SHARED_PROBE_INFO *shared_info, int index,
+			   parallel_query::stream_pipeline *pipe, HJOIN_STREAM_SINK_STATE *sink_state);
+	void execute (cubthread::entry &thread_ref) override;
+	void retire () override;
+
+      private:
+	parallel_query::stream_pipeline *m_pipe;
+	HJOIN_STREAM_SINK_STATE *m_sink_state;
+    };
+#endif /* !defined (WINDOWS) */
   } /* namespace hash_join */
 } /* namespace parallel_query */

@@ -129,6 +129,28 @@ namespace parallel_scan
 		  }
 		err_code = scan_start_scan (&thread_ref, m_scan_id);
 	      }
+	    else if constexpr (ST == SCAN_TYPE::STREAM)
+	      {
+		/* streamed hash-join result source: the channel supplies the tuple bytes;
+		 * the clone's (empty) list_id only seeds the llsid metadata -- predicates
+		 * and regu lists -- that the stream slot iterator evaluates per tuple */
+		LIST_SPEC_TYPE *list_node = &spec->s.list_node;
+		err_code = scan_open_list_scan (&thread_ref, m_scan_id,
+						false, spec->single_fetch, spec->s_dbval,
+						m_xasl->val_list, m_vd,
+						ACCESS_SPEC_LIST_ID (spec),
+						list_node->list_regu_list_pred, spec->where_pred,
+						list_node->list_regu_list_rest, list_node->list_regu_list_build,
+						list_node->list_regu_list_probe,
+						0 /* never hash-list-scan a stream */, false);
+		if (err_code != NO_ERROR)
+		  {
+		    return err_code;
+		  }
+		/* R4 guard (G3) on the worker-side scan too: a reset must fail loud */
+		m_scan_id->s.llsid.is_streamed_source = true;
+		err_code = scan_start_scan (&thread_ref, m_scan_id);
+	      }
 	    else if constexpr (ST == SCAN_TYPE::INDEX)
 	      {
 		/* clone_xasl restores parent compile-time BTID from XASL stream; override with partition BTID */
@@ -346,7 +368,7 @@ namespace parallel_scan
 	m_slot_iterator.set_input_handler (m_input_handler);
 	m_input_handler->initialize (&thread_ref, nullptr, m_scan_id);
       }
-    else if constexpr (ST == SCAN_TYPE::LIST)
+    else if constexpr (ST == SCAN_TYPE::LIST || ST == SCAN_TYPE::STREAM)
       {
 	m_input_handler->initialize (&thread_ref, nullptr, m_scan_id);
       }
@@ -702,6 +724,7 @@ namespace parallel_scan
     PAGE_PTR list_page = nullptr;
     QMGR_TEMP_FILE *list_tfile = nullptr;
     PAGE_PTR index_page = nullptr;
+    parallel_query::row_batch stream_batch = { nullptr, 0, 0 };
 
     INT16 index_slot_hint = NULL_SLOTID;
     int index_range_idx = -1;
@@ -756,6 +779,20 @@ namespace parallel_scan
 	    list_tfile = nullptr;
 	    scan_code = m_input_handler->get_next_page_with_fix (&thread_ref, list_page, list_tfile);
 	  }
+	else if constexpr (ST == SCAN_TYPE::STREAM)
+	  {
+	    stream_batch.buf = nullptr;
+	    stream_batch.len = 0;
+	    stream_batch.tuple_cnt = 0;
+	    scan_code = m_input_handler->get_next_batch (&thread_ref, stream_batch);
+	    if (scan_code == S_ERROR && er_errid () == NO_ERROR)
+	      {
+		/* channel aborted: the aborting side parked its error in the pipeline
+		 * bundle; raise a generic interrupt so the shared error path below has
+		 * a message to move (the real cause is surfaced at pipeline teardown) */
+	        er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+	      }
+	  }
 	else if constexpr (ST == SCAN_TYPE::INDEX)
 	  {
 	    index_page = nullptr;
@@ -799,6 +836,12 @@ namespace parallel_scan
 	if constexpr (ST == SCAN_TYPE::LIST)
 	  {
 	    set_page_err = m_slot_iterator.set_page (&thread_ref, list_page, list_tfile);
+	  }
+	else if constexpr (ST == SCAN_TYPE::STREAM)
+	  {
+	    /* adopts ownership of stream_batch.buf; pinned until the next set_batch /
+	     * finalize (R7 batch lifetime rule) */
+	    set_page_err = m_slot_iterator.set_batch (&thread_ref, stream_batch);
 	  }
 	else if constexpr (ST == SCAN_TYPE::INDEX)
 	  {
@@ -893,6 +936,9 @@ namespace parallel_scan
 
   template class task<RESULT_TYPE::MERGEABLE_LIST, SCAN_TYPE::LIST>;
   template class task<RESULT_TYPE::BUILDVALUE_OPT, SCAN_TYPE::LIST>;
+
+  template class task<RESULT_TYPE::MERGEABLE_LIST, SCAN_TYPE::STREAM>;
+  template class task<RESULT_TYPE::BUILDVALUE_OPT, SCAN_TYPE::STREAM>;
 
   template class task<RESULT_TYPE::MERGEABLE_LIST, SCAN_TYPE::INDEX>;
   template class task<RESULT_TYPE::BUILDVALUE_OPT, SCAN_TYPE::INDEX>;

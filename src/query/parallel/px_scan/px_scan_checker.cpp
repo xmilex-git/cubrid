@@ -1046,6 +1046,209 @@ namespace parallel_scan
   }
 }
 
+namespace parallel_scan
+{
+  /* count TARGET_LIST access specs (anywhere in the reachable XASL graph) that consume
+   * the given producer node's output list -- a streamed source is single-drain, so any
+   * second consumer refuses the candidate marking (SSOT section 6: exactly one consumer) */
+  static void
+  count_list_consumers_recursive (XASL_NODE *arg, const XASL_NODE *producer, int &count,
+				  std::unordered_set<XASL_NODE *> &visited)
+  {
+    if (arg == NULL || visited.find (arg) != visited.end ())
+      {
+	return;
+      }
+
+    for (XASL_NODE *xaslp = arg; xaslp != NULL; xaslp = xaslp->scan_ptr)
+      {
+	if (visited.find (xaslp) != visited.end ())
+	  {
+	    break;
+	  }
+	visited.insert (xaslp);
+
+	ACCESS_SPEC_TYPE *spec_lists[2] = { xaslp->spec_list, xaslp->merge_spec };
+
+	for (int i = 0; i < 2; i++)
+	  {
+	    for (ACCESS_SPEC_TYPE *specp = spec_lists[i]; specp != NULL; specp = specp->next)
+	      {
+		if (specp->type == TARGET_LIST && ACCESS_SPEC_XASL_NODE (specp) == producer)
+		  {
+		    count++;
+		  }
+	      }
+	  }
+
+	for (XASL_NODE *sub = xaslp->aptr_list; sub != NULL; sub = sub->next)
+	  {
+	    count_list_consumers_recursive (sub, producer, count, visited);
+	  }
+	for (XASL_NODE *sub = xaslp->bptr_list; sub != NULL; sub = sub->next)
+	  {
+	    count_list_consumers_recursive (sub, producer, count, visited);
+	  }
+	for (XASL_NODE *sub = xaslp->dptr_list; sub != NULL; sub = sub->next)
+	  {
+	    count_list_consumers_recursive (sub, producer, count, visited);
+	  }
+	for (XASL_NODE *sub = xaslp->fptr_list; sub != NULL; sub = sub->next)
+	  {
+	    count_list_consumers_recursive (sub, producer, count, visited);
+	  }
+	if (xaslp->connect_by_ptr != NULL)
+	  {
+	    count_list_consumers_recursive (xaslp->connect_by_ptr, producer, count, visited);
+	  }
+      }
+  }
+
+  /* Streaming hash-join candidate node check (gate 1, client side).
+   *
+   * Returns true (and sets the flag) when this driver node's single TARGET_LIST spec
+   * consumes a HASHJOIN_PROC aptr's output in the streamed-eligible shape.  Only a
+   * CANDIDATE marker: the server re-decides eligibility on every execution (param
+   * value + runtime checks), so plan-cache reuse across param flips stays correct.
+   * Param OFF => the bit is never set => serialized XASL bytes are identical to the
+   * pre-feature engine (R2).  `root` is the statement's top XASL, used for the
+   * exactly-one-consumer scan over the whole graph. */
+  static bool
+  mark_stream_hashjoin_candidate_node (XASL_NODE *root, XASL_NODE *xasl)
+  {
+    if (xasl == NULL || (xasl->type != BUILDLIST_PROC && xasl->type != BUILDVALUE_PROC))
+      {
+	return false;
+      }
+
+    /* I8 exclusions and rewind/order-sensitive shapes: refuse marking */
+    if (xasl->selected_upd_list != NULL || xasl->is_single_tuple || xasl->merge_spec != NULL
+	|| XASL_IS_FLAGED (xasl, XASL_HAS_CONNECT_BY))
+      {
+	return false;
+      }
+
+    /* exactly one spec at the driver level; must be a TARGET_LIST over a hash join */
+    ACCESS_SPEC_TYPE *spec = xasl->spec_list;
+    if (spec == NULL || spec->next != NULL || spec->type != TARGET_LIST)
+      {
+	return false;
+      }
+
+    XASL_NODE *producer = ACCESS_SPEC_XASL_NODE (spec);
+    if (producer == NULL || producer == xasl /* connect-by self reference */
+	|| producer->type != HASHJOIN_PROC)
+      {
+	return false;
+      }
+
+    /* the streamed consumer rides the parallel list-scan worker machinery; the spec must
+     * already be vetted for it (MERGEABLE_LIST / BUILDVALUE_OPT) and not blocked */
+    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN)
+	|| ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_FOR_UPDATE))
+      {
+	return false;
+      }
+    if (!ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST)
+	&& !ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT))
+      {
+	return false;
+      }
+
+    /* R4: plain "0 or n qualified rows" drive only (no single-fetch / NULL-row re-drive
+     * of the outer) */
+    if (spec->single_fetch != QPROC_NO_SINGLE_INNER)
+      {
+	return false;
+      }
+
+    /* no hash list scan over a stream: it engages only when BOTH build and probe regu
+     * lists exist (check_hash_list_scan) -- the bare hint flag alone is inert */
+    if (spec->s.list_node.hash_list_scan_yn != 0
+	&& spec->s.list_node.list_regu_list_build != NULL && spec->s.list_node.list_regu_list_probe != NULL)
+      {
+	return false;
+      }
+
+    /* the producer must be one of this driver's own aptrs */
+    bool producer_is_aptr = false;
+    for (XASL_NODE *sub = xasl->aptr_list; sub != NULL; sub = sub->next)
+      {
+	if (sub == producer)
+	  {
+	    producer_is_aptr = true;
+	    break;
+	  }
+      }
+    if (!producer_is_aptr)
+      {
+	return false;
+      }
+
+    /* exactly one consumer of the streamed output (single-drain transport), counted
+     * over the WHOLE statement graph from the root */
+    {
+      int consumer_count = 0;
+      std::unordered_set<XASL_NODE *> visited;
+
+      count_list_consumers_recursive (root, producer, consumer_count, visited);
+      if (consumer_count != 1)
+	{
+	  return false;
+	}
+    }
+
+    ACCESS_SPEC_SET_FLAG (spec, ACCESS_SPEC_FLAG_STREAM_HASHJOIN);
+    return true;
+  }
+
+  /* Post-order walk marking AT MOST ONE streamed edge per statement (SSOT section 6).
+   * Deeper aptr subtrees are visited first so the heaviest (innermost) eligible
+   * hash-join edge wins -- e.g. the orders x customer probe feeding the lineitem
+   * idx-NL driver, which is itself an input of a further join. */
+  static bool
+  mark_stream_hashjoin_candidate_recursive (XASL_NODE *root, XASL_NODE *arg,
+					    std::unordered_set<XASL_NODE *> &visited)
+  {
+    if (arg == NULL || visited.find (arg) != visited.end ())
+      {
+	return false;
+      }
+
+    for (XASL_NODE *xaslp = arg; xaslp != NULL; xaslp = xaslp->scan_ptr)
+      {
+	if (visited.find (xaslp) != visited.end ())
+	  {
+	    break;
+	  }
+	visited.insert (xaslp);
+
+	for (XASL_NODE *sub = xaslp->aptr_list; sub != NULL; sub = sub->next)
+	  {
+	    if (mark_stream_hashjoin_candidate_recursive (root, sub, visited))
+	      {
+		return true;
+	      }
+	  }
+      }
+
+    return mark_stream_hashjoin_candidate_node (root, arg);
+  }
+
+  static void
+  mark_stream_hashjoin_candidate (XASL_NODE *xasl)
+  {
+    if (!prm_get_bool_value (PRM_ID_STREAMING_HASH_JOIN))
+      {
+	return;
+      }
+
+    std::unordered_set<XASL_NODE *> visited;
+
+    (void) mark_stream_hashjoin_candidate_recursive (xasl, xasl, visited);
+  }
+}
+
 extern int
 scan_check_parallel_scan_possible (XASL_NODE *xasl)
 {
@@ -1056,6 +1259,10 @@ scan_check_parallel_scan_possible (XASL_NODE *xasl)
 
   parallel_scan::xasl_check_cache.clear ();
   parallel_scan::xasl_processing_set.clear ();
+
+  /* streaming hash-join candidate edge (gate 1): marked only after the parallel-scan
+   * flags above are final, since the candidate shape requires them */
+  parallel_scan::mark_stream_hashjoin_candidate (xasl);
 
   return NO_ERROR;
 }

@@ -33,6 +33,11 @@
 #include "px_scan_join_info.hpp"
 #include "px_scan_type.hpp"
 
+namespace parallel_query
+{
+  class stream_source;		/* streamed hash-join result source (C3+C5) */
+}
+
 namespace parallel_scan
 {
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
@@ -49,7 +54,8 @@ namespace parallel_scan
 	       bool is_fixed, bool is_grouped,
 	       worker_manager *worker_manager,
 	       QFILE_LIST_ID *list_id = nullptr,
-	       INDX_INFO *indx_info = nullptr)
+	       INDX_INFO *indx_info = nullptr,
+	       parallel_query::stream_source *stream_source_p = nullptr)
 	: m_thread_p (thread_p),
 	  m_query_id (query_id),
 	  m_scan_id (scan_id),
@@ -75,7 +81,8 @@ namespace parallel_scan
 	  m_uses_xasl_clone (false),
 	  m_g_agg_domain_resolve_need (false),
 	  m_list_id (list_id),
-	  m_indx_info (indx_info)
+	  m_indx_info (indx_info),
+	  m_stream_source_p (stream_source_p)
       {}
       ~manager();
       int open();
@@ -123,6 +130,10 @@ namespace parallel_scan
       bool m_g_agg_domain_resolve_need;
       QFILE_LIST_ID *m_list_id;
       INDX_INFO *m_indx_info;
+
+      /* STREAM only: NON-OWNING handle to the pipeline-owned streamed result source;
+       * the pool in m_worker_manager is then also pipeline-owned (never released here) */
+      parallel_query::stream_source *m_stream_source_p;
   };
 }
 

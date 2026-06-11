@@ -539,10 +539,12 @@ enum param_id
 
   PRM_ID_PARALLEL_INNER_INDEX_NL,
 
-  /* change PRM_LAST_ID when adding new system parameters */
   PRM_ID_OPTIMIZER_INDEX_FULL_SCAN,
 
-  PRM_LAST_ID = PRM_ID_OPTIMIZER_INDEX_FULL_SCAN
+  /* change PRM_LAST_ID when adding new system parameters */
+  PRM_ID_STREAMING_HASH_JOIN,
+
+  PRM_LAST_ID = PRM_ID_STREAMING_HASH_JOIN
 };
 typedef enum param_id PARAM_ID;
 

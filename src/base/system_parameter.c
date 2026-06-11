@@ -258,6 +258,8 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_OPTIMIZER_INDEX_FULL_SCAN "optimizer_index_full_scan"
 
+#define PRM_NAME_STREAMING_HASH_JOIN "streaming_hash_join"
+
 #define PRM_NAME_ENABLE_HISTO "communication_histogram"
 
 #define PRM_NAME_MUTEX_BUSY_WAITING_CNT "mutex_busy_waiting_cnt"
@@ -5414,6 +5416,17 @@ SYSPRM_PARAM prm_Def[] = {
   {PRM_ID_OPTIMIZER_INDEX_FULL_SCAN,
    PRM_NAME_OPTIMIZER_INDEX_FULL_SCAN,
    (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE, NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_STREAMING_HASH_JOIN,
+   PRM_NAME_STREAMING_HASH_JOIN,
+   (PRM_USER_CHANGE | PRM_FOR_CLIENT | PRM_FOR_SERVER | PRM_FOR_SESSION | PRM_FOR_QRY_STRING),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},

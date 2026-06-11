@@ -89,6 +89,7 @@
 #include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
 #include "px_scan_trace_handler.hpp"
 #include "px_scan.hpp"
+#include "px_stream_pipeline.hpp"	/* parallel_query::stream_pipeline (streaming hash join) */
 #endif /* SERVER_MODE && !WINDOWS */
 #include "px_query_executor.hpp"
 #include <vector>
@@ -15385,6 +15386,156 @@ qexec_setup_fixed_scan (XASL_NODE * xasl, bool force_select_lock)
     }
 }
 
+#if SERVER_MODE && !WINDOWS
+/*
+ * qexec_stream_hjoin_check_candidate () - Per-execution server-side eligibility marking
+ *                                         for the gated streaming hash-join edge.
+ *   return: true when the aptr may stream this execution (candidate armed), else false.
+ *   thread_p(in): Thread entry (the mainblock driver).
+ *   xasl(in): The driver XASL whose aptr list is being executed.
+ *   xptr(in): The scan-chain level currently dispatching aptrs.
+ *   aptr(in): The aptr subplan under consideration.
+ *
+ * Note: Decided on EVERY execution from the execution-time parameter value plus the
+ *       client-marked candidate flag and the runtime placement checks (plan-cache
+ *       safety: a stale flag compiled under a different param value is inert).  The
+ *       streamed edge requires the TOP-MOST driver (one streamed edge per query), its
+ *       single TARGET_LIST outer spec, the parallel-scan vetted shape, and none of the
+ *       I8 exclusions.  Every refusal silently keeps the materialized path (pre-emit).
+ */
+static bool
+qexec_stream_hjoin_check_candidate (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_NODE * xptr, XASL_NODE * aptr)
+{
+  ACCESS_SPEC_TYPE *spec;
+
+  if (aptr->type != HASHJOIN_PROC)
+    {
+      return false;
+    }
+
+  if (!prm_get_bool_value (PRM_ID_STREAMING_HASH_JOIN))
+    {
+      return false;
+    }
+
+  /* driver/main thread only (the pipeline parent and teardown runner) */
+  if (thread_p->private_heap_id == 0)
+    {
+      return false;
+    }
+
+  /* the consumer spec must be at this driver block's own (outer) level; one edge per
+   * query is enforced by the client marking exactly one spec */
+  if (xptr != xasl)
+    {
+      return false;
+    }
+
+  if (xasl->type != BUILDLIST_PROC && xasl->type != BUILDVALUE_PROC)
+    {
+      return false;
+    }
+
+  /* I8 exclusions + shapes the streamed consumer cannot serve */
+  if (xasl->selected_upd_list != NULL || xasl->is_single_tuple || xasl->merge_spec != NULL
+      || xasl->topn_items != NULL || XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED)
+      || XASL_IS_FLAGED (xasl, XASL_HAS_CONNECT_BY))
+    {
+      return false;
+    }
+
+  /* v1: trace runs keep the fully-instrumented materialized path */
+  if (thread_is_on_trace (thread_p))
+    {
+      return false;
+    }
+
+  /* the consumer placement: the driver's single outer TARGET_LIST spec over THIS aptr,
+   * client-marked as a stream candidate and vetted for the parallel-scan machinery */
+  spec = xasl->spec_list;
+  if (spec == NULL || spec->next != NULL || spec->type != TARGET_LIST)
+    {
+      return false;
+    }
+  if (!ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_STREAM_HASHJOIN))
+    {
+      return false;
+    }
+  if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN)
+      || ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_FOR_UPDATE))
+    {
+      return false;
+    }
+  if (!ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST)
+      && !ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT))
+    {
+      return false;
+    }
+
+  /* R4: plain forward drive only; no single-fetch re-drive */
+  if (spec->single_fetch != QPROC_NO_SINGLE_INNER)
+    {
+      return false;
+    }
+
+  /* no hash list scan over a stream: it engages only when BOTH build and probe regu
+   * lists exist (check_hash_list_scan) -- the bare hint flag alone is inert */
+  if (spec->s.list_node.hash_list_scan_yn != 0
+      && spec->s.list_node.list_regu_list_build != NULL && spec->s.list_node.list_regu_list_probe != NULL)
+    {
+      return false;
+    }
+
+  /* exactly this consumer: the spec must reference exactly this hash join's output */
+  if (ACCESS_SPEC_XASL_NODE (spec) != aptr)
+    {
+      return false;
+    }
+
+  return true;
+}
+
+/*
+ * qexec_stream_hjoin_teardown () - Join and destroy every streaming hash-join pipeline
+ *                                  owned by this mainblock's aptrs.
+ *   return: None.
+ *   thread_p(in): Thread entry (the mainblock driver -- the single teardown runner).
+ *   xasl(in): The driver XASL.
+ *
+ * Note: MUST run strictly before qexec_clear_head_lists-time cleanup (and on the error
+ *       path before returning): join_all is the sole teardown runner -- it closes the
+ *       consumer (waking any blocked producer), joins the detached probe tasks, drains
+ *       channel residue, releases the 2*D reservation exactly once and frees the
+ *       producer bundle (build hash table, input list files, manager).  Idempotent and
+ *       cheap when no pipeline exists.
+ */
+static void
+qexec_stream_hjoin_teardown (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
+{
+  XASL_NODE *xptr, *aptr;
+
+  for (xptr = xasl; xptr != NULL; xptr = xptr->scan_ptr)
+    {
+      for (aptr = xptr->aptr_list; aptr != NULL; aptr = aptr->next)
+	{
+	  if (aptr->type == HASHJOIN_PROC && aptr->proc.hashjoin.stream_pipeline != NULL)
+	    {
+	      // *INDENT-OFF*
+	      parallel_query::stream_pipeline *pipe =
+		      (parallel_query::stream_pipeline *) aptr->proc.hashjoin.stream_pipeline;
+
+	      (void) pipe->join_all (thread_p);
+	      parallel_query::stream_pipeline::destroy (thread_p, pipe);
+	      // *INDENT-ON*
+
+	      aptr->proc.hashjoin.stream_pipeline = NULL;
+	      aptr->proc.hashjoin.stream_candidate = false;
+	    }
+	}
+    }
+}
+#endif /* SERVER_MODE && !WINDOWS */
+
 /*
  * qexec_execute_mainblock_internal () -
  *   return: NO_ERROR, or ER_code
@@ -15804,6 +15955,19 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 		  else
 		    {
 #if SERVER_MODE && !WINDOWS
+		      /* Streaming hash-join (gated): decide candidacy per execution.  An
+		       * armed candidate must run INLINE on this (driver) thread -- it
+		       * becomes the pipeline parent and the teardown runner -- never as
+		       * a detached px job. */
+		      bool stream_hjoin_inline = false;
+		      if (xptr2->type == HASHJOIN_PROC)
+			{
+			  xptr2->proc.hashjoin.stream_candidate =
+			    qexec_stream_hjoin_check_candidate (thread_p, xasl, xptr, xptr2);
+			  xptr2->proc.hashjoin.stream_pipeline = NULL;
+			  stream_hjoin_inline = xptr2->proc.hashjoin.stream_candidate;
+			}
+
 		      if (!XASL_IS_FLAGED (xasl, XASL_NO_PARALLEL_SUBQUERY) && XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL)
 			  && xasl->px_executor == nullptr)
 			{
@@ -15838,7 +16002,7 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 			      xasl->executed_parallelism = 0;
 			    }
 			}
-		      if (xasl->px_executor)
+		      if (xasl->px_executor && !stream_hjoin_inline)
 			{
 			  if (!xasl->px_executor->add_job (thread_p, xptr2, xasl_state))
 			    {
@@ -16386,11 +16550,26 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
       qexec_clear_a_eval_values (thread_p, xasl->proc.buildlist.a_eval_list);
     }
 
+#if SERVER_MODE && !WINDOWS
+  /* streaming hash-join: join + destroy any pipeline owned by this block's aptrs --
+   * strictly BEFORE qexec_clear_head_lists-time cleanup of the same query (P5) */
+  qexec_stream_hjoin_teardown (thread_p, xasl);
+#endif /* SERVER_MODE && !WINDOWS */
+
   /* clear only non-zero correlation-level uncorrelated subquery list files */
   for (xptr = xasl; xptr; xptr = xptr->scan_ptr)
     {
       if (xptr->aptr_list)
 	{
+#if SERVER_MODE && !WINDOWS
+	  if (xptr->type == HASHJOIN_PROC && xptr->proc.hashjoin.stream_pipeline != NULL)
+	    {
+	      /* detached streaming producer: this block's aptr inputs are still being
+	       * read by the probe tasks; their cleanup is deferred to the pipeline
+	       * teardown (join_all) run by the consumer-side driver */
+	      continue;
+	    }
+#endif /* SERVER_MODE && !WINDOWS */
 	  qexec_clear_head_lists (thread_p, xptr->aptr_list);
 	}
     }
@@ -16444,6 +16623,12 @@ exit_on_error:
 	  xptr->curr_spec = NULL;
 	}
     }
+
+#if SERVER_MODE && !WINDOWS
+  /* streaming hash-join: even on the error path, join + destroy any pipeline owned by
+   * this block's aptrs before the query's list files / hash tables can be cleaned */
+  qexec_stream_hjoin_teardown (thread_p, xasl);
+#endif /* SERVER_MODE && !WINDOWS */
 
   if (tplrec.tpl)
     {

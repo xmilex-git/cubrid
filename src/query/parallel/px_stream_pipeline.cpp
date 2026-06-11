@@ -335,9 +335,11 @@ namespace parallel_query
 
 	  while (m_channel_p->drain_one (batch))
 	    {
+	      /* batch payloads cross threads: they live on the global heap (malloc),
+	       * never on a per-thread private heap */
 	      if (batch.buf != NULL)
 		{
-		  db_private_free (thread_p, batch.buf);
+		  free_and_init (batch.buf);
 		}
 	      drained++;
 	    }

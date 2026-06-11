@@ -90,10 +90,13 @@ namespace parallel_scan
   void
   slot_iterator_stream::free_pinned_batch (THREAD_ENTRY *thread_p)
   {
+    (void) thread_p;
+
     if (m_batch.buf != nullptr)
       {
-	db_private_free (thread_p, m_batch.buf);
-	m_batch.buf = nullptr;
+	/* batch payloads cross threads (allocated on a producer probe worker): they live
+	 * on the global heap -- free (), never a per-thread private-heap free */
+	free_and_init (m_batch.buf);
       }
     m_batch.len = 0;
     m_batch.tuple_cnt = 0;

@@ -92,6 +92,28 @@ namespace parallel_query
     void
     task_manager::handle_error (cubthread::entry &thread_ref)
     {
+#if !defined (WINDOWS)
+      if (m_detached_err_messages != nullptr)
+	{
+	  /* Detached streaming producer: the driver is NOT parked in join () -- never
+	   * swap into its live error context (data race) and never interrupt the
+	   * transaction (the query may be completing normally after an R11 consumer
+	   * early close).  Park the first error in the bundle and abort the pipeline so
+	   * both blocked channel ends wake (R6); the driver surfaces the parked error
+	   * at pipeline teardown when appropriate. */
+	  if (!m_has_error.exchange (true, std::memory_order_acq_rel))
+	    {
+	      m_detached_err_messages->move_top_error_message_to_this ();
+	    }
+	  if (m_detached_pipe != nullptr)
+	    {
+	      m_detached_pipe->abort (&thread_ref,
+				      parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+	    }
+	  return;
+	}
+#endif /* !defined (WINDOWS) */
+
       if (!m_has_error.exchange (true, std::memory_order_acq_rel))
 	{
 	  m_main_error_context.get_current_error_level ().swap (cuberr::context::get_thread_local_error ());
@@ -99,6 +121,19 @@ namespace parallel_query
 	}
       logtb_set_tran_index_interrupt (&thread_ref, thread_ref.tran_index, true);
     }
+
+#if !defined (WINDOWS)
+    void
+    task_manager::set_detached_error_sink (parallel_query::err_messages_with_lock *err_messages_p,
+					   parallel_query::stream_pipeline *pipe)
+    {
+      assert (err_messages_p != nullptr);
+      assert (pipe != nullptr);
+
+      m_detached_err_messages = err_messages_p;
+      m_detached_pipe = pipe;
+    }
+#endif /* !defined (WINDOWS) */
 
     void
     task_manager::notify_stop ()
@@ -973,6 +1008,7 @@ namespace parallel_query
 	}
 
 cleanup:
+      /* streaming contexts have no per-worker output list (qfile_close_list is NULL-safe) */
       qfile_close_list (&thread_ref, m_context->list_id);
 
       qfile_close_scan (&thread_ref, &m_context->build->list_scan_id);
@@ -1615,6 +1651,115 @@ cleanup:
 	  db_private_free_and_init (&thread_ref, overflow_record.tpl);
 	}
     }
+
+#if !defined (WINDOWS)
+    /*
+     * stream_probe_task (gated streaming hash join)
+     */
+
+    stream_probe_task::stream_probe_task (task_manager &task_manager, HASHJOIN_MANAGER *manager,
+					  HASHJOIN_CONTEXT *context, HASHJOIN_SHARED_PROBE_INFO *shared_info,
+					  int index, parallel_query::stream_pipeline *pipe,
+					  HJOIN_STREAM_SINK_STATE *sink_state)
+      : probe_task (task_manager, manager, context, shared_info, index)
+      , m_pipe (pipe)
+      , m_sink_state (sink_state)
+    {
+      assert (m_pipe != nullptr);
+      assert (m_sink_state != nullptr);
+    }
+
+    void
+    stream_probe_task::execute (cubthread::entry &thread_ref)
+    {
+      probe_task::execute (thread_ref);
+
+      if (!m_task_manager.has_error () && !m_pipe->is_abort_requested ())
+	{
+	  /* clean producer EOS: ship the final partial batch (whole tuples only) */
+	  if (hjoin_stream_sink_flush (&thread_ref, m_sink_state) != NO_ERROR)
+	    {
+	      m_task_manager.handle_error (thread_ref);
+	    }
+	}
+      else
+	{
+	  /* error/abort path: free the still-owned batch exactly once (INV-OWN) */
+	  hjoin_stream_sink_discard (&thread_ref, m_sink_state);
+	}
+
+      /* INV-EOS / R10: exactly one producer_done per registered producer on EVERY exit
+       * path; end-of-stream becomes observable only after the LAST producer's call */
+      m_pipe->get_channel ()->producer_done ();
+    }
+
+    void
+    stream_probe_task::retire ()
+    {
+      parallel_query::stream_pipeline *pipe = m_pipe;
+
+      m_task_manager.end_task ();
+      delete this;
+
+      /* the task's very LAST touch of pipeline-owned state: only after this may the
+       * teardown runner's join complete and free the producer bundle */
+      pipe->producer_task_finished ();
+    }
+
+    /*
+     * stream_producer_state_free () - free the detached streaming-producer bundle.
+     *
+     * Runs on the pipeline teardown runner (the mainblock driver), strictly AFTER all
+     * producer tasks are joined: only now may the build hash table, the input list
+     * files, the shared sector scan and the manager die.
+     */
+    void
+    stream_producer_state_free (THREAD_ENTRY *thread_p, void *state_arg)
+    {
+      stream_producer_state *state = (stream_producer_state *) state_arg;
+
+      if (state == nullptr)
+	{
+	  return;
+	}
+
+      qfile_close_list_sector_scan (thread_p, &state->shared_info.sector_scan);
+
+      /* surface a parked producer error: only when the pipeline really aborted (an R11
+       * early close never sets abort_requested -- no spurious error, A8) and the driver
+       * has nothing better than a generic interrupt */
+      if (state->pipe != nullptr && state->pipe->is_abort_requested ())
+	{
+	  std::lock_guard<std::mutex> lock (state->err_messages.m_mutex);
+	  if (!state->err_messages.m_error_messages.empty ()
+	      && (er_errid () == NO_ERROR || er_errid () == ER_INTERRUPTED))
+	    {
+	      cuberr::context::get_thread_local_error ().swap (*state->err_messages.m_error_messages[0]);
+	    }
+	}
+
+      if (state->sink_states != nullptr)
+	{
+	  /* defensive: every task flushed/discarded its sink on exit already */
+	  for (int i = 0; i < state->manager->num_parallel_threads; i++)
+	    {
+	      hjoin_stream_sink_discard (thread_p, &state->sink_states[i]);
+	    }
+	}
+
+      hjoin_stream_clear_manager_detached (thread_p, state->manager);
+      db_private_free_and_init (thread_p, state->manager);
+
+      if (state->sink_states != nullptr)
+	{
+	  db_private_free (thread_p, state->sink_states);
+	  state->sink_states = nullptr;
+	}
+
+      state->~stream_producer_state ();
+      db_private_free (thread_p, state);
+    }
+#endif /* !defined (WINDOWS) */
 
   } /* namespace hash_join */
 } /* namespace parallel_query */

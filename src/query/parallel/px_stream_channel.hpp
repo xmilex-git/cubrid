@@ -84,7 +84,7 @@ namespace parallel_query
    * nothing; buf is freed explicitly by whoever owns the batch per INV-OWN. */
   struct row_batch
   {
-    char *buf;			/* owned payload bytes (db_private_alloc'd by the producer) */
+    char *buf;			/* owned payload bytes; GLOBAL heap (malloc) -- payloads cross threads */
     int len;			/* used bytes in buf */
     int tuple_cnt;		/* whole tuples in buf; a tuple is never split (INV-OVERSIZE) */
   };
