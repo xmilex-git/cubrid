@@ -15505,7 +15505,7 @@ qexec_stream_hjoin_check_candidate (THREAD_ENTRY * thread_p, XASL_NODE * xasl, X
  * Note: MUST run strictly before qexec_clear_head_lists-time cleanup (and on the error
  *       path before returning): join_all is the sole teardown runner -- it closes the
  *       consumer (waking any blocked producer), joins the detached probe tasks, drains
- *       channel residue, releases the 2*D reservation exactly once and frees the
+ *       channel residue, releases the pipeline (D_p + D_c) reservation exactly once and frees the
  *       producer bundle (build hash table, input list files, manager).  Idempotent and
  *       cheap when no pipeline exists.
  */

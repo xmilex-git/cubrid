@@ -39,27 +39,29 @@
 namespace parallel_query
 {
   stream_policy_decision
-  stream_policy_try_begin (THREAD_ENTRY *thread_p, int degree)
+  stream_policy_try_begin (THREAD_ENTRY *thread_p, int degree_producer, int degree_consumer)
   {
     stream_policy_decision decision;
 
     (void) thread_p;
 
     decision.policy = stream_policy_kind::FALLBACK_INELIGIBLE;
-    decision.degree = degree;
+    decision.degree_producer = degree_producer;
+    decision.degree_consumer = degree_consumer;
     decision.pipeline_workers = 0;
     decision.pool = NULL;
 
-    if (degree < 1)
+    if (degree_producer < 1 || degree_consumer < 1)
       {
 	/* not a parallelizable edge; materialized path */
 	return decision;
       }
 
-    /* one atomic whole-pipeline reservation (R5/O3): producer D + consumer D.
-     * try_reserve_workers_exact is all-or-nothing by construction, so a partial
-     * reservation can never reach a pipeline (OWN-5 exact-2*D-or-fallback). */
-    int pipeline_workers = 2 * degree;
+    /* one atomic whole-pipeline reservation (R5/O3): producer D_p + consumer D_c.
+     * The degrees may be asymmetric (consumer-bound edges run D_c > D_p); the grant is
+     * still ONE all-or-nothing CAS, so a partial reservation can never reach a pipeline
+     * (OWN-5 exact-or-fallback). */
+    int pipeline_workers = degree_producer + degree_consumer;
 
     decision.pool = worker_manager::try_reserve_workers_exact (pipeline_workers);
     if (decision.pool == NULL)

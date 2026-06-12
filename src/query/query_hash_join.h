@@ -478,7 +478,7 @@ typedef struct hashjoin_manager
 
   /* Streaming hash-join runtime state (SERVER_MODE only; always false/NULL otherwise).
    * stream_candidate: this execution may stream (param ON + mainblock-marked edge).
-   * stream_pipeline:  parallel_query::stream_pipeline * once the 2*D reservation and
+   * stream_pipeline:  parallel_query::stream_pipeline * once the pipeline (D_p + D_c) reservation and
    *                   pipeline exist; owned by the pipeline machinery, not the manager.
    * stream_detached:  probe tasks were launched detached; the manager and all state the
    *                   tasks reference are owned by the pipeline (freed at join_all). */

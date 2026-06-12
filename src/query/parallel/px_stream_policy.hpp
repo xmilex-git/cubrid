@@ -20,21 +20,22 @@
  * px_stream_policy.hpp - streaming hash-join orchestration policy (component C4)
  *
  * The THIN policy layer over the C7 lifetime owner (px_stream_pipeline.hpp): decide, for
- * one eligible hash-join edge of degree D, whether the whole pipeline's 2*D workers can be
- * reserved ATOMICALLY -- and on any shortfall report fallback to the materialized path.
+ * one eligible hash-join edge with producer degree D_p and consumer degree D_c, whether
+ * the whole pipeline's D_p + D_c workers can be reserved ATOMICALLY -- and on any
+ * shortfall report fallback to the materialized path.
  * The policy owns nothing with a lifetime; a successful reservation is handed to the C7
  * stream_pipeline, which releases it exactly once (architecture_deepening_designs.md C4/C7,
  * OWN-1/OWN-5).
  *
  * Whole-pipeline reservation atomicity (SSOT R5 / O3):
- *  - The streamed pipeline needs producer D + consumer D = 2*D workers BEFORE either side
+ *  - The streamed pipeline needs producer D_p + consumer D_c workers BEFORE either side
  *    can block on the bounded channel.  Reserving them in two steps (the two independent
  *    sites today: query_hash_join.c producer reservation and px_scan.cpp consumer
  *    reservation) can deadlock against the shared global pool and other concurrent
- *    pipelines: each of two queries grabs D and waits forever for the other D.
+ *    pipelines: each of two queries grabs one side and waits forever for the other.
  *  - Therefore the reservation is ONE atomic all-or-nothing step:
  *    stream_try_reserve_exact () below -- a single successful CAS on the pool's available
- *    count subtracts exactly 2*D, or nothing at all.  A partial reservation is impossible
+ *    count subtracts exactly D_p + D_c, or nothing at all.  A partial reservation is impossible
  *    by construction: there is no code path that subtracts fewer than the requested
  *    workers (contrast worker_manager_global::try_reserve_workers, which may legally
  *    grant fewer, down to min_degree -- that path is NOT used for pipelines).
@@ -99,16 +100,17 @@ namespace parallel_query
   /* C4 decision: stream this edge, or fall back to the materialized path */
   enum class stream_policy_kind : int
   {
-    STREAM = 0,			/* exactly 2*D workers reserved; caller hands them to the C7 pipeline */
+    STREAM = 0,			/* exactly D_p + D_c workers reserved; caller hands them to the C7 pipeline */
     FALLBACK_INELIGIBLE,	/* edge/degree ineligible -- materialized path */
-    FALLBACK_NO_WORKERS		/* atomic 2*D reservation failed -- materialized path (pre-emit only, R3/R5) */
+    FALLBACK_NO_WORKERS		/* atomic D_p + D_c reservation failed -- materialized path (pre-emit only, R3/R5) */
   };
 
   struct stream_policy_decision
   {
     stream_policy_kind policy;
-    int degree;			/* D: producer degree == consumer degree (C6 deferred) */
-    int pipeline_workers;	/* exactly 2*D when policy == STREAM; otherwise 0 */
+    int degree_producer;	/* D_p: producer-side degree (probe workers) */
+    int degree_consumer;	/* D_c: consumer-side degree (channel poppers); may exceed D_p */
+    int pipeline_workers;	/* exactly D_p + D_c when policy == STREAM; otherwise 0 */
     worker_manager *pool;	/* the atomically reserved pool; NULL unless policy == STREAM.
 				 * Ownership: hand to stream_pipeline::create () (which then owns
 				 * the exactly-once release), or return it via
@@ -116,10 +118,11 @@ namespace parallel_query
 				 * fails before the pipeline takes ownership. */
   };
 
-  /* Decide-to-stream for ONE eligible edge: attempt the single atomic 2*D reservation;
-   * on any shortfall report fallback.  Never holds (and can never hold) a partial
-   * reservation.  Pure decision + reservation -- no producer/consumer is launched here. */
-  stream_policy_decision stream_policy_try_begin (THREAD_ENTRY *thread_p, int degree);
+  /* Decide-to-stream for ONE eligible edge: attempt the single atomic D_p + D_c
+   * reservation; on any shortfall report fallback.  Never holds (and can never hold) a
+   * partial reservation.  Pure decision + reservation -- no producer/consumer is
+   * launched here. */
+  stream_policy_decision stream_policy_try_begin (THREAD_ENTRY *thread_p, int degree_producer, int degree_consumer);
 
   /* Release a STREAM decision's reservation when the pipeline could not be constructed
    * (still strictly before any emit, so the materialized fallback remains legal). */

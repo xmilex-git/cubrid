@@ -655,7 +655,10 @@ error_exit:
       task_cnt = manager->num_parallel_threads;
       assert (contexts != nullptr);
       assert (task_cnt > 1);
-      assert (pipe->get_reserved_workers () == (int) (2 * task_cnt));
+      /* asymmetric degrees (D2): task_cnt is the PRODUCER side; the consumer side may
+       * run more workers (D_c >= D_p) -- the one atomic reservation covers both exactly */
+      assert (pipe->get_producer_degree () == (int) task_cnt);
+      assert (pipe->get_reserved_workers () == pipe->get_producer_degree () + pipe->get_consumer_degree ());
 
       THREAD_ENTRY *main_thread_p = thread_get_main_thread (&thread_ref);
 

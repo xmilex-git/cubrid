@@ -939,12 +939,15 @@ extern "C"
 	return ER_QPROC_INVALID_XASLNODE;
       }
 
-    /* I2: consumer degree D == producer degree (one exact 2*D pipeline reservation);
-     * the worker pool handle is NON-OWNING -- the pipeline releases it exactly once */
-    int num_parallel_threads = pipe->get_reserved_workers () / 2;
+    /* D2: EXPLICIT consumer degree D_c from the pipeline (asymmetric split; may exceed
+     * the producer degree -- never derived as reserved/2).  The worker pool handle is
+     * NON-OWNING -- the pipeline releases it exactly once; D_p producer tasks + D_c
+     * consumer tasks together fill the one exact (D_p + D_c) reservation. */
+    int num_parallel_threads = pipe->get_consumer_degree ();
     parallel_query::worker_manager *pool_p = (parallel_query::worker_manager *) pipe->get_pool_handle ();
 
     assert (num_parallel_threads >= 2);
+    assert (num_parallel_threads + pipe->get_producer_degree () == pipe->get_reserved_workers ());
     assert (pool_p != nullptr);
 
     parallel_query::stream_source *source_p = pipe->open_consumer (thread_p, num_parallel_threads);
@@ -1810,7 +1813,7 @@ namespace parallel_scan
       {
 	if constexpr (ST == SCAN_TYPE::STREAM)
 	  {
-	    /* the 2*D pool belongs to the stream pipeline (released exactly once at its
+	    /* the pipeline (D_p + D_c) pool belongs to the stream pipeline (released exactly once at its
 	     * join_all): wake any blocked side first (channel abort via source close),
 	     * drain the tasks accounted on the shared pool, then detach WITHOUT release */
 	    if (m_input_handler != nullptr)
@@ -2288,7 +2291,7 @@ namespace parallel_scan
 	if constexpr (ST == SCAN_TYPE::STREAM)
 	  {
 	    /* unblock channel waiters (consumer pops AND producer pushes) before
-	     * waiting on the shared 2*D pool, or the wait can never finish (R6/R11) */
+	     * waiting on the shared pipeline pool, or the wait can never finish (R6/R11) */
 	    if (m_input_handler != nullptr)
 	      {
 		m_input_handler->cleanup_on_main (m_thread_p);
@@ -2429,7 +2432,7 @@ namespace parallel_scan
 	if constexpr (ST == SCAN_TYPE::STREAM)
 	  {
 	    /* R11 early-close feedback: closing the source aborts the channel if EOS
-	     * was not reached, so push-blocked producers wake promptly; the shared 2*D
+	     * was not reached, so push-blocked producers wake promptly; the shared pipeline
 	     * pool is pipeline-owned (released exactly once at join_all), never here */
 	    if (m_input_handler != nullptr)
 	      {

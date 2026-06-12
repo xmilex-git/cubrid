@@ -466,7 +466,7 @@ namespace parallel_query
 		  "join_claim=%.1f join_done=%.1f | producer=[%.1f..%.1f] dur=%.1f | consumer=[%.1f..%.1f] dur=%.1f | "
 		  "overlap=%.1f (%.0f%% of producer) | push_block=%.1fms (%llu waits) pop_block=%.1fms (%llu waits) | "
 		  "batches=%llu bytes=%llu tuples=%llu | gather_tail(closed->join_claim)=%.1f teardown=%.1f | "
-		  "degree=%d reserved=%d\n",
+		  "degree_p=%d degree_c=%d reserved=%d\n",
 		  PX_REL_MS (m.t_launch_us.load (std::memory_order_relaxed)),
 		  PX_REL_MS (m.t_consumer_open_us.load (std::memory_order_relaxed)),
 		  PX_REL_MS (m.t_consumer_closed_us.load (std::memory_order_relaxed)),
@@ -491,7 +491,7 @@ namespace parallel_query
 		   > m.t_join_claim_us.load (std::memory_order_relaxed))
 		  ? (double) (m.t_join_done_us.load (std::memory_order_relaxed)
 			      - m.t_join_claim_us.load (std::memory_order_relaxed)) / 1000.0 : 0.0,
-		  m_producer_count, m_pool.reserved_workers);
+		  m_producer_count, m_pool.consumer_degree, m_pool.reserved_workers);
 
 #undef PX_REL_MS
   }

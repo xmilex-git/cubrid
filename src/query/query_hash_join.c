@@ -61,6 +61,11 @@
  * window; in-flight memory <= capacity * batch bytes, a few MB at most -- R7) */
 #define HJOIN_STREAM_BATCH_BYTES DB_PAGESIZE
 #define HJOIN_STREAM_CHANNEL_CAPACITY 64
+/* asymmetric pipeline degrees (D2): the consumer side (e.g. an idx-NL scan over the
+ * streamed join output) is typically the wall, so it gets D_c = 2 * D_p consumers,
+ * conservatively capped -- the whole D_p + D_c ask is still ONE atomic grant and any
+ * shortfall is a clean pre-emit refusal to the materialized path (R3/R5) */
+#define HJOIN_STREAM_CONSUMER_DEGREE_CAP 8
 #endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
 
@@ -358,7 +363,7 @@ cleanup:
     {
       /* A pipeline was created but the producer never detached (a failure between the
        * reservation and the task launch).  Still strictly pre-emit: tear the pipeline
-       * down (releases the whole 2*D reservation exactly once) and continue on the
+       * down (releases the whole pipeline (D_p + D_c) reservation exactly once) and continue on the
        * normal error/cleanup path.  The pool handle inside the manager is non-owning. */
       // *INDENT-OFF*
       parallel_query::stream_pipeline *pipe = (parallel_query::stream_pipeline *) manager->stream_pipeline;
@@ -2164,9 +2169,10 @@ error_exit:
  * Note: Runs strictly BEFORE any output row is emitted (R3/R5): refusals here are the
  *       legal pre-emit fallback to the always-correct materialized path.  Requirements:
  *       in-memory(/hybrid) build hash table (non-spilling strategy -- a PARTITION
- *       strategy never reaches this point), parallel degree >= 2 from the probe-INPUT
- *       page count, and one atomic exactly-2*D worker reservation (producer D +
- *       consumer D) so neither pipeline side can wedge holding a partial grant.
+ *       strategy never reaches this point), producer degree >= 2 from the probe-INPUT
+ *       page count, and one atomic exactly-(D_p + D_c) worker reservation (asymmetric
+ *       D2 split: D_c = MIN (2 * D_p, cap) because the consumer side of the edge is the
+ *       wall) so neither pipeline side can wedge holding a partial grant.
  */
 static HASHJOIN_STATUS
 hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
@@ -2188,8 +2194,8 @@ hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * man
       return HASHJOIN_STATUS_NONE;
     }
 
-  /* I2: degree from the already-final probe-INPUT page count (the output size is unknown
-   * and never needed); same D for the producer and the consumer side */
+  /* I2: producer degree from the already-final probe-INPUT page count (the output size
+   * is unknown and never needed) */
   UINT32 degree = parallel_query::compute_parallel_degree (parallel_query::parallel_type::HASH_JOIN,
 							   single_context->probe->list_id->page_cnt,
 							   manager->num_parallel_threads);
@@ -2198,8 +2204,15 @@ hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * man
       return HASHJOIN_STATUS_NONE;
     }
 
+  /* D2: asymmetric degrees -- the consumer (downstream scan over the streamed output) is
+   * the wall, the D_p producers have measured >= 1.5x feed headroom over 2*D_p
+   * consumers; both degrees are explicit (no reserved/2 convention downstream) */
+  int degree_p = (int) degree;
+  int degree_c = MIN (2 * degree_p, HJOIN_STREAM_CONSUMER_DEGREE_CAP);
+
   // *INDENT-OFF*
-  parallel_query::stream_policy_decision decision = parallel_query::stream_policy_try_begin (thread_p, (int) degree);
+  parallel_query::stream_policy_decision decision =
+	  parallel_query::stream_policy_try_begin (thread_p, degree_p, degree_c);
   if (decision.policy != parallel_query::stream_policy_kind::STREAM)
     {
       /* shortfall reserves NOTHING; expected outcome, not an error */
@@ -2210,6 +2223,8 @@ hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * man
   pool.handle = (void *) decision.pool;
   pool.reserved_workers = decision.pipeline_workers;
   pool.release = parallel_query::stream_policy_release_pool_handle;
+  pool.producer_degree = decision.degree_producer;
+  pool.consumer_degree = decision.degree_consumer;
 
   parallel_query::stream_pipeline *pipe =
 	  parallel_query::stream_pipeline::create (thread_p, pool, HJOIN_STREAM_CHANNEL_CAPACITY);
@@ -2221,16 +2236,16 @@ hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * man
       return HASHJOIN_STATUS_NONE;
     }
 
-  manager->num_parallel_threads = (int) degree;
+  manager->num_parallel_threads = degree_p;	/* producer-side tasks/contexts only */
   manager->px_worker_manager = decision.pool;	/* NON-OWNING: task dispatch only */
   manager->stream_pipeline = (void *) pipe;
 
-  /* A7 diagnostics: which edge streamed, with what degree, from what input sizes
-   * (gated by the er_log_debug system parameter; streamed path only) */
+  /* A7 diagnostics: which edge streamed, with what per-side degrees, from what input
+   * sizes (gated by the er_log_debug system parameter; streamed path only) */
   er_log_debug (ARG_FILE_LINE,
-		"HJSTREAM arm: degree=%u pipeline_workers=%d probe_pages=%d probe_tuples=%lld "
+		"HJSTREAM arm: degree_p=%d degree_c=%d pipeline_workers=%d probe_pages=%d probe_tuples=%lld "
 		"build_pages=%d build_tuples=%lld channel_capacity=%d batch_bytes=%d\n",
-		degree, decision.pipeline_workers,
+		degree_p, degree_c, decision.pipeline_workers,
 		single_context->probe->list_id->page_cnt, (long long) single_context->probe->list_id->tuple_cnt,
 		single_context->build->list_id->page_cnt, (long long) single_context->build->list_id->tuple_cnt,
 		HJOIN_STREAM_CHANNEL_CAPACITY, HJOIN_STREAM_BATCH_BYTES);
@@ -2667,7 +2682,7 @@ hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
 #if !defined (WINDOWS)
       if (manager->stream_candidate)
 	{
-	  /* Gated streaming hash-join: try the whole-pipeline (2*D) reservation instead
+	  /* Gated streaming hash-join: try the whole-pipeline (D_p + D_c) reservation instead
 	   * of the plain D-worker probe reservation.  Decided strictly before any emit;
 	   * every refusal falls back to the materialized path below (R3/R5). */
 	  context->status = hjoin_try_stream_parallel_probe (thread_p, manager, context);
@@ -4663,7 +4678,7 @@ hjoin_stream_clear_manager_detached (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER *
 
   hjoin_scan_clear (thread_p, &manager->single_context.hash_scan);
 
-  /* the 2*D reservation belongs to the pipeline (released exactly once there) */
+  /* the pipeline (D_p + D_c) reservation belongs to the pipeline (released exactly once there) */
   manager->px_worker_manager = NULL;
 
   hjoin_clear_manager (thread_p, manager);

@@ -23,8 +23,9 @@
  * hash-join edge (architecture_deepening_designs.md C7).  It owns:
  *   - the C2 stream_channel (created at create (), freed in the RELEASED transition),
  *   - the shared interrupt (member; alive until destroy ()),
- *   - the whole-pipeline worker reservation (exactly 2*D, acquired atomically by the C4
- *     policy and handed in at create (); released EXACTLY ONCE, post-JOINED -- OWN-1),
+ *   - the whole-pipeline worker reservation (exactly D_p + D_c, acquired atomically by
+ *     the C4 policy and handed in at create (); released EXACTLY ONCE, post-JOINED --
+ *     OWN-1),
  *   - the consumer-side stream_source it hands out as a NON-OWNING handle,
  *   - opaque producer-side state (XASL_STATE / hash table / HASHJOIN_CONTEXT bundle)
  *     registered at launch_producers (); freed exactly once in RELEASED (OWN-2).
@@ -106,7 +107,7 @@ namespace parallel_query
     public:
       enum class pipe_state : int
       {
-	BEGIN = 0,		/* created; exact 2*D reservation owned; nothing launched */
+	BEGIN = 0,		/* created; exact D_p + D_c reservation owned; nothing launched */
 	PRODUCER_STARTED,	/* producer tasks registered/launched; channel being fed */
 	CONSUMER_OPEN,		/* consumer source opened on the channel, draining */
 	CONSUMER_CLOSED,	/* no further pop will occur; consumer handles now INVALID */
@@ -115,18 +116,22 @@ namespace parallel_query
       };
 
       /* The whole-pipeline worker reservation the pipeline owns from creation on.
-       * reserved_workers is EXACTLY 2*D by construction (the C4 policy's atomic
-       * all-or-nothing reservation, OWN-5); release (handle) is called EXACTLY ONCE,
-       * by the single teardown runner, only after JOINED (OWN-1/HANDLE-LIFETIME).
-       * C-style hook so the lifetime logic links without the engine pool in unit
-       * tests; the engine binds { worker_manager*, 2*D,
-       * stream_policy_release_pool_handle }.  release == NULL means "no pool owned"
-       * (test pipelines); handle may be anything release understands. */
+       * reserved_workers is EXACTLY producer_degree + consumer_degree by construction
+       * (the C4 policy's atomic all-or-nothing reservation, OWN-5); release (handle) is
+       * called EXACTLY ONCE, by the single teardown runner, only after JOINED
+       * (OWN-1/HANDLE-LIFETIME).  The per-side degrees are EXPLICIT fields (no
+       * reserved/2 convention): consumer-bound edges legally run consumer_degree >
+       * producer_degree.  C-style hook so the lifetime logic links without the engine
+       * pool in unit tests; the engine binds { worker_manager*, D_p + D_c,
+       * stream_policy_release_pool_handle, D_p, D_c }.  release == NULL means "no pool
+       * owned" (test pipelines); handle may be anything release understands. */
       struct pool_binding
       {
 	void *handle;
 	int reserved_workers;
 	void (*release) (void *handle);
+	int producer_degree = 0;	/* D_p: probe (producer) workers */
+	int consumer_degree = 0;	/* D_c: channel-popping consumer workers */
       };
 
       /* frees the opaque producer-side state bundle exactly once, post-JOINED */
@@ -209,13 +214,24 @@ namespace parallel_query
 	return m_pool.reserved_workers;
       }
 
+      /* explicit per-side degrees (replace the old reserved/2 convention); 0 on test
+       * pipelines that never set them */
+      int get_producer_degree () const
+      {
+	return m_pool.producer_degree;
+      }
+      int get_consumer_degree () const
+      {
+	return m_pool.consumer_degree;
+      }
+
       /* A7 overlap metrics (diagnostics only; emitted once by the teardown runner) */
       stream_metrics *get_metrics ()
       {
 	return &m_metrics;
       }
 
-      /* NON-OWNING pool handle (engine: the worker_manager holding the 2*D
+      /* NON-OWNING pool handle (engine: the worker_manager holding the D_p + D_c
        * reservation) for dispatching consumer tasks; valid until the teardown
        * runner's release step (HANDLE-LIFETIME) */
       void *get_pool_handle () const
