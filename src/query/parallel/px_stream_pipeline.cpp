@@ -39,6 +39,7 @@
 #include "error_code.h"
 #include "error_manager.h"
 #include "memory_alloc.h"
+#include "system_parameter.h"	/* er_log_debug gate (PRM_ID_ER_LOG_DEBUG) */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -114,6 +115,8 @@ namespace parallel_query
       }
     pipe->m_channel_p = placement_new (channel_p, channel_capacity);
 
+    pipe->m_metrics.t_create_us.store (stream_metrics_now_us (), std::memory_order_relaxed);
+
     return pipe;		/* state BEGIN */
   }
 
@@ -174,6 +177,8 @@ namespace parallel_query
 	m_channel_p->register_producer ();
       }
 
+    m_metrics.t_launch_us.store (stream_metrics_now_us (), std::memory_order_relaxed);
+
     return NO_ERROR;
   }
 
@@ -202,7 +207,7 @@ namespace parallel_query
 	/* db_private_alloc reports its own OOM error */
 	return NULL;
       }
-    source_p = placement_new (source_p, m_channel_p, &m_interrupt, degree);
+    source_p = placement_new (source_p, m_channel_p, &m_interrupt, degree, &m_metrics);
 
     expected = (int) pipe_state::PRODUCER_STARTED;
     if (!m_state.compare_exchange_strong (expected, (int) pipe_state::CONSUMER_OPEN,
@@ -224,6 +229,8 @@ namespace parallel_query
 
     /* first open on a fresh source always succeeds (fan-out=1 is enforced inside) */
     (void) source_p->open ();
+
+    m_metrics.t_consumer_open_us.store (stream_metrics_now_us (), std::memory_order_relaxed);
 
     /* NON-OWNING handle (HANDLE-LIFETIME): invalid once state reaches CONSUMER_CLOSED */
     return source_p;
@@ -255,6 +262,8 @@ namespace parallel_query
 	/* idempotent: someone already closed (or teardown already past it) */
 	return;
       }
+
+    m_metrics.t_consumer_closed_us.store (stream_metrics_now_us (), std::memory_order_relaxed);
 
     /* Exactly-once close side effect, by the transition winner (R11): make every
      * producer that may still be running unblockable.  Touch the source/channel only
@@ -290,6 +299,8 @@ namespace parallel_query
       }
 
     /* ---- the SINGLE teardown runner: ordered teardown (OWN-3) ---- */
+
+    m_metrics.t_join_claim_us.store (stream_metrics_now_us (), std::memory_order_relaxed);
 
     /* 0. close the consumer: after this no new pop occurs, consumer handles are
      *    invalid (HANDLE-LIFETIME), and any producer still running was made
@@ -400,10 +411,89 @@ namespace parallel_query
     }
     m_seq_state_freed.store (next_seq (), std::memory_order_release);
 
+    m_metrics.t_join_done_us.store (stream_metrics_now_us (), std::memory_order_relaxed);
+    emit_metrics ();
+
     /* publish RELEASED: observers (join_all losers, destroy) may proceed */
     m_state.store ((int) pipe_state::RELEASED, std::memory_order_release);
 
     return NO_ERROR;
+  }
+
+  /*
+   * emit_metrics () - A7 overlap metrics: ONE summary line from the teardown runner.
+   *
+   * Emission is gated by the er_log_debug system parameter (server error log); the
+   * counters themselves only ever updated on the gated streamed path, so OFF stays
+   * observable-identical (R2).  All times relative to t_create (pipeline arm) in ms.
+   */
+  void
+  stream_pipeline::emit_metrics ()
+  {
+    const stream_metrics &m = m_metrics;
+    std::uint64_t t0 = m.t_create_us.load (std::memory_order_relaxed);
+
+    if (t0 == 0)
+      {
+	return;
+      }
+
+    /* relative ms helper; 0 stays 0 ("never happened") */
+#define PX_REL_MS(t) ((t) == 0 ? -1.0 : ((double) ((t) - t0)) / 1000.0)
+
+    std::uint64_t prod_s = m.prod_first_start_us.load (std::memory_order_relaxed);
+    std::uint64_t prod_e = m.prod_last_end_us.load (std::memory_order_relaxed);
+    std::uint64_t cons_s = m.cons_first_pop_us.load (std::memory_order_relaxed);
+    std::uint64_t cons_e = m.cons_last_ret_us.load (std::memory_order_relaxed);
+
+    double overlap_ms = 0.0;
+    double prod_ms = (prod_s != 0 && prod_e > prod_s) ? (double) (prod_e - prod_s) / 1000.0 : 0.0;
+    double cons_ms = (cons_s != 0 && cons_e > cons_s) ? (double) (cons_e - cons_s) / 1000.0 : 0.0;
+
+    if (prod_s != 0 && cons_s != 0)
+      {
+	std::uint64_t lo = (prod_s > cons_s) ? prod_s : cons_s;
+	std::uint64_t hi = (prod_e < cons_e) ? prod_e : cons_e;
+
+	if (hi > lo)
+	  {
+	    overlap_ms = (double) (hi - lo) / 1000.0;
+	  }
+      }
+
+    er_log_debug (ARG_FILE_LINE,
+		  "HJSTREAM metrics (ms rel to arm): launch=%.1f consumer_open=%.1f consumer_closed=%.1f "
+		  "join_claim=%.1f join_done=%.1f | producer=[%.1f..%.1f] dur=%.1f | consumer=[%.1f..%.1f] dur=%.1f | "
+		  "overlap=%.1f (%.0f%% of producer) | push_block=%.1fms (%llu waits) pop_block=%.1fms (%llu waits) | "
+		  "batches=%llu bytes=%llu tuples=%llu | gather_tail(closed->join_claim)=%.1f teardown=%.1f | "
+		  "degree=%d reserved=%d\n",
+		  PX_REL_MS (m.t_launch_us.load (std::memory_order_relaxed)),
+		  PX_REL_MS (m.t_consumer_open_us.load (std::memory_order_relaxed)),
+		  PX_REL_MS (m.t_consumer_closed_us.load (std::memory_order_relaxed)),
+		  PX_REL_MS (m.t_join_claim_us.load (std::memory_order_relaxed)),
+		  PX_REL_MS (m.t_join_done_us.load (std::memory_order_relaxed)),
+		  PX_REL_MS (prod_s), PX_REL_MS (prod_e), prod_ms,
+		  PX_REL_MS (cons_s), PX_REL_MS (cons_e), cons_ms,
+		  overlap_ms, (prod_ms > 0.0) ? (overlap_ms * 100.0 / prod_ms) : 0.0,
+		  (double) m.push_block_us.load (std::memory_order_relaxed) / 1000.0,
+		  (unsigned long long) m.push_blocked_cnt.load (std::memory_order_relaxed),
+		  (double) m.pop_block_us.load (std::memory_order_relaxed) / 1000.0,
+		  (unsigned long long) m.pop_blocked_cnt.load (std::memory_order_relaxed),
+		  (unsigned long long) m.batches_pushed.load (std::memory_order_relaxed),
+		  (unsigned long long) m.bytes_pushed.load (std::memory_order_relaxed),
+		  (unsigned long long) m.tuples_pushed.load (std::memory_order_relaxed),
+		  (m.t_consumer_closed_us.load (std::memory_order_relaxed) != 0
+		   && m.t_join_claim_us.load (std::memory_order_relaxed)
+		   > m.t_consumer_closed_us.load (std::memory_order_relaxed))
+		  ? (double) (m.t_join_claim_us.load (std::memory_order_relaxed)
+			      - m.t_consumer_closed_us.load (std::memory_order_relaxed)) / 1000.0 : 0.0,
+		  (m.t_join_done_us.load (std::memory_order_relaxed)
+		   > m.t_join_claim_us.load (std::memory_order_relaxed))
+		  ? (double) (m.t_join_done_us.load (std::memory_order_relaxed)
+			      - m.t_join_claim_us.load (std::memory_order_relaxed)) / 1000.0 : 0.0,
+		  m_producer_count, m_pool.reserved_workers);
+
+#undef PX_REL_MS
   }
 
   void

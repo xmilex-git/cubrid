@@ -399,6 +399,7 @@ typedef struct hjoin_stream_sink_state
 {
   void *channel;		/* parallel_query::stream_channel<parallel_query::row_batch> * */
   void *intr;			/* parallel_query::interrupt * (shared pipeline interrupt) */
+  void *metrics;		/* parallel_query::stream_metrics * (A7 overlap metrics; may be NULL) */
 
   char *buf;			/* owned batch buffer under construction (db_private_alloc) */
   int len;			/* used bytes in buf */
@@ -560,7 +561,8 @@ void hjoin_sink_init_list (HJOIN_SINK * sink, QFILE_LIST_ID * list_id);
 
 #if defined (SERVER_MODE)
 /* Streaming hash-join sink + detached-producer support (gated streaming mode) */
-void hjoin_sink_init_stream (HJOIN_SINK * sink, HJOIN_STREAM_SINK_STATE * state, void *channel, void *intr);
+void hjoin_sink_init_stream (HJOIN_SINK * sink, HJOIN_STREAM_SINK_STATE * state, void *channel, void *intr,
+			     void *metrics);
 int hjoin_stream_sink_flush (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state);
 void hjoin_stream_sink_discard (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state);
 void hjoin_stream_clear_manager_detached (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager);

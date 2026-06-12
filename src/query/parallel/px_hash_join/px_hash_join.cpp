@@ -687,7 +687,8 @@ error_exit:
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
 	  hjoin_sink_init_stream (&contexts[task_index].sink, &sink_states[task_index],
-				  (void *) pipe->get_channel (), (void *) pipe->get_interrupt ());
+				  (void *) pipe->get_channel (), (void *) pipe->get_interrupt (),
+				  (void *) pipe->get_metrics ());
 	}
 
       state->tasks.set_detached_error_sink (&state->err_messages, pipe);

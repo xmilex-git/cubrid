@@ -62,6 +62,7 @@
 
 #include "px_interrupt.hpp"
 #include "px_stream_channel.hpp"
+#include "px_stream_metrics.hpp"
 #include "storage_common.h"	/* SCAN_CODE */
 #include "thread_compat.hpp"
 
@@ -80,8 +81,10 @@ namespace parallel_query
 
       /* channel_p/interrupt_p are NON-OWNING handles into the pipeline owner's state (C7);
        * degree is the consumer parallel degree decided from the probe-INPUT estimate
-       * (never from the unknown output page_cnt -- spec I2). */
-      stream_source (stream_channel<row_batch> *channel_p, interrupt *interrupt_p, int degree);
+       * (never from the unknown output page_cnt -- spec I2).  metrics_p (optional,
+       * non-owning) receives A7 pop-side overlap counters. */
+      stream_source (stream_channel<row_batch> *channel_p, interrupt *interrupt_p, int degree,
+		     stream_metrics *metrics_p = NULL);
       ~stream_source ();
 
       stream_source (const stream_source &) = delete;
@@ -140,6 +143,7 @@ namespace parallel_query
       stream_channel<row_batch> *m_channel_p;	/* non-owning (owned by the pipeline, C7) */
       interrupt *m_interrupt_p;			/* non-owning shared pipeline interrupt */
       int m_degree;				/* consumer degree, from the probe-input estimate */
+      stream_metrics *m_metrics_p;		/* non-owning A7 metrics sink (may be NULL) */
 
       std::atomic<int> m_state;			/* source_state; forward-only transitions */
       std::atomic<std::uint64_t> m_batches_delivered;

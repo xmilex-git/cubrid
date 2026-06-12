@@ -15966,6 +15966,14 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 			    qexec_stream_hjoin_check_candidate (thread_p, xasl, xptr, xptr2);
 			  xptr2->proc.hashjoin.stream_pipeline = NULL;
 			  stream_hjoin_inline = xptr2->proc.hashjoin.stream_candidate;
+
+			  if (stream_hjoin_inline)
+			    {
+			      /* A7 diagnostics anchor: pre-input-materialization stamp; the
+			       * arm/metrics lines bracket the remaining phases (gated) */
+			      er_log_debug (ARG_FILE_LINE, "HJSTREAM candidate: driver block %p aptr %p\n",
+					    (void *) xasl, (void *) xptr2);
+			    }
 			}
 
 		      if (!XASL_IS_FLAGED (xasl, XASL_NO_PARALLEL_SUBQUERY) && XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL)

@@ -95,6 +95,7 @@
 
 #include "px_interrupt.hpp"
 #include "px_stream_channel.hpp"
+#include "px_stream_metrics.hpp"
 #include "px_stream_source.hpp"
 #include "thread_compat.hpp"
 
@@ -208,6 +209,12 @@ namespace parallel_query
 	return m_pool.reserved_workers;
       }
 
+      /* A7 overlap metrics (diagnostics only; emitted once by the teardown runner) */
+      stream_metrics *get_metrics ()
+      {
+	return &m_metrics;
+      }
+
       /* NON-OWNING pool handle (engine: the worker_manager holding the 2*D
        * reservation) for dispatching consumer tasks; valid until the teardown
        * runner's release step (HANDLE-LIFETIME) */
@@ -261,6 +268,9 @@ namespace parallel_query
        * true iff THIS call performed the transition (exactly-once side effects) */
       bool transition_to_consumer_closed ();
 
+      /* A7: one gated er_log_debug summary line, from the teardown runner only */
+      void emit_metrics ();
+
       std::uint64_t next_seq ()
       {
 	return m_seq_counter.fetch_add (1, std::memory_order_acq_rel) + 1;
@@ -287,6 +297,9 @@ namespace parallel_query
 
       void *m_producer_state;			/* opaque owned bundle (OWN-2) */
       producer_state_free_fn m_producer_state_free;
+
+      /* A7 overlap metrics (see px_stream_metrics.hpp; emitted in join_all) */
+      stream_metrics m_metrics;
 
       /* instrumentation */
       std::atomic<std::uint64_t> m_seq_counter;

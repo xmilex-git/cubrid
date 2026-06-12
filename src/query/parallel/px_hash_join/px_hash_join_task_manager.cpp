@@ -1672,6 +1672,10 @@ cleanup:
     void
     stream_probe_task::execute (cubthread::entry &thread_ref)
     {
+      /* A7 metrics: producer active interval (min start over the D probe tasks) */
+      parallel_query::stream_metrics *metrics = m_pipe->get_metrics ();
+      metrics->note_min (metrics->prod_first_start_us, parallel_query::stream_metrics_now_us ());
+
       probe_task::execute (thread_ref);
 
       if (!m_task_manager.has_error () && !m_pipe->is_abort_requested ())
@@ -1691,6 +1695,9 @@ cleanup:
       /* INV-EOS / R10: exactly one producer_done per registered producer on EVERY exit
        * path; end-of-stream becomes observable only after the LAST producer's call */
       m_pipe->get_channel ()->producer_done ();
+
+      /* A7 metrics: producer active interval (max end over the D probe tasks) */
+      metrics->note_max (metrics->prod_last_end_us, parallel_query::stream_metrics_now_us ());
     }
 
     void

@@ -37,10 +37,12 @@
 
 namespace parallel_query
 {
-  stream_source::stream_source (stream_channel<row_batch> *channel_p, interrupt *interrupt_p, int degree)
+  stream_source::stream_source (stream_channel<row_batch> *channel_p, interrupt *interrupt_p, int degree,
+				stream_metrics *metrics_p)
     : m_channel_p (channel_p),
       m_interrupt_p (interrupt_p),
       m_degree (degree),
+      m_metrics_p (metrics_p),
       m_state ((int) source_state::CREATED),
       m_batches_delivered (0)
   {
@@ -98,7 +100,30 @@ namespace parallel_query
 	return S_ERROR;
       }
 
-    if (m_channel_p->pop (out_batch, *m_interrupt_p))
+    /* A7 metrics: consumer active interval + pop-block time (streamed path only) */
+    std::uint64_t t_pop_begin = 0;
+    if (m_metrics_p != NULL)
+      {
+	t_pop_begin = stream_metrics_now_us ();
+	m_metrics_p->note_min (m_metrics_p->cons_first_pop_us, t_pop_begin);
+      }
+
+    bool popped = m_channel_p->pop (out_batch, *m_interrupt_p);
+
+    if (m_metrics_p != NULL)
+      {
+	std::uint64_t t_pop_end = stream_metrics_now_us ();
+	std::uint64_t waited = t_pop_end - t_pop_begin;
+
+	m_metrics_p->note_max (m_metrics_p->cons_last_ret_us, t_pop_end);
+	m_metrics_p->pop_block_us.fetch_add (waited, std::memory_order_relaxed);
+	if (waited > 100)
+	  {
+	    m_metrics_p->pop_blocked_cnt.fetch_add (1, std::memory_order_relaxed);
+	  }
+      }
+
+    if (popped)
       {
 	/* INV-OWN: ownership of out_batch.buf transferred to the caller */
 	m_batches_delivered.fetch_add (1, std::memory_order_relaxed);

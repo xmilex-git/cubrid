@@ -2225,6 +2225,16 @@ hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * man
   manager->px_worker_manager = decision.pool;	/* NON-OWNING: task dispatch only */
   manager->stream_pipeline = (void *) pipe;
 
+  /* A7 diagnostics: which edge streamed, with what degree, from what input sizes
+   * (gated by the er_log_debug system parameter; streamed path only) */
+  er_log_debug (ARG_FILE_LINE,
+		"HJSTREAM arm: degree=%u pipeline_workers=%d probe_pages=%d probe_tuples=%lld "
+		"build_pages=%d build_tuples=%lld channel_capacity=%d batch_bytes=%d\n",
+		degree, decision.pipeline_workers,
+		single_context->probe->list_id->page_cnt, (long long) single_context->probe->list_id->tuple_cnt,
+		single_context->build->list_id->page_cnt, (long long) single_context->build->list_id->tuple_cnt,
+		HJOIN_STREAM_CHANNEL_CAPACITY, HJOIN_STREAM_BATCH_BYTES);
+
   return HASHJOIN_STATUS_PARALLEL_PROBE;
 }
 #endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
@@ -4353,8 +4363,11 @@ hjoin_stream_sink_push (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state
   parallel_query::stream_channel<parallel_query::row_batch> *channel =
 	  (parallel_query::stream_channel<parallel_query::row_batch> *) state->channel;
   parallel_query::interrupt *intr = (parallel_query::interrupt *) state->intr;
+  parallel_query::stream_metrics *metrics = (parallel_query::stream_metrics *) state->metrics;
   parallel_query::row_batch batch;
   // *INDENT-ON*
+  UINT64 t_push_begin = 0;
+  bool pushed;
 
   assert (state->buf != NULL);
   assert (state->tuple_cnt > 0);
@@ -4364,7 +4377,32 @@ hjoin_stream_sink_push (THREAD_ENTRY * thread_p, HJOIN_STREAM_SINK_STATE * state
   batch.len = state->len;
   batch.tuple_cnt = state->tuple_cnt;
 
-  if (channel->push (batch, *intr))
+  /* A7 metrics: push-block time + traffic (streamed path only; gated emission) */
+  if (metrics != NULL)
+    {
+      t_push_begin = parallel_query::stream_metrics_now_us ();
+    }
+
+  pushed = channel->push (batch, *intr);
+
+  if (metrics != NULL)
+    {
+      UINT64 waited = parallel_query::stream_metrics_now_us () - t_push_begin;
+
+      metrics->push_block_us.fetch_add (waited, std::memory_order_relaxed);
+      if (waited > 100)
+	{
+	  metrics->push_blocked_cnt.fetch_add (1, std::memory_order_relaxed);
+	}
+      if (pushed)
+	{
+	  metrics->batches_pushed.fetch_add (1, std::memory_order_relaxed);
+	  metrics->bytes_pushed.fetch_add ((UINT64) batch.len, std::memory_order_relaxed);
+	  metrics->tuples_pushed.fetch_add ((UINT64) batch.tuple_cnt, std::memory_order_relaxed);
+	}
+    }
+
+  if (pushed)
     {
       /* ownership transferred to the channel (INV-OWN) */
       state->buf = NULL;
@@ -4535,9 +4573,10 @@ hjoin_stream_sink_emit (THREAD_ENTRY * thread_p, HJOIN_SINK * sink, QFILE_TUPLE_
  *   state(in/out): Per-worker stream sink state (zeroed here).
  *   channel(in): parallel_query::stream_channel<row_batch> * of the pipeline.
  *   intr(in): parallel_query::interrupt * shared pipeline interrupt.
+ *   metrics(in): parallel_query::stream_metrics * A7 overlap metrics (may be NULL).
  */
 void
-hjoin_sink_init_stream (HJOIN_SINK * sink, HJOIN_STREAM_SINK_STATE * state, void *channel, void *intr)
+hjoin_sink_init_stream (HJOIN_SINK * sink, HJOIN_STREAM_SINK_STATE * state, void *channel, void *intr, void *metrics)
 {
   assert (sink != NULL);
   assert (state != NULL);
@@ -4547,6 +4586,7 @@ hjoin_sink_init_stream (HJOIN_SINK * sink, HJOIN_STREAM_SINK_STATE * state, void
   memset (state, 0, sizeof (HJOIN_STREAM_SINK_STATE));
   state->channel = channel;
   state->intr = intr;
+  state->metrics = metrics;
 
   sink->emit = hjoin_stream_sink_emit;
   sink->adapter_state = (void *) state;

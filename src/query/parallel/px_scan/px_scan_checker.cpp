@@ -34,6 +34,7 @@
 #include "xasl_aggregate.hpp"
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -1104,17 +1105,28 @@ namespace parallel_scan
       }
   }
 
+  /* one eligible streamed-edge candidate (gate 1): the consumer driver block, its
+   * single TARGET_LIST spec, and the producer HASHJOIN_PROC the spec consumes */
+  struct stream_hashjoin_candidate
+  {
+    XASL_NODE *consumer;
+    ACCESS_SPEC_TYPE *spec;
+    XASL_NODE *producer;
+  };
+
   /* Streaming hash-join candidate node check (gate 1, client side).
    *
-   * Returns true (and sets the flag) when this driver node's single TARGET_LIST spec
-   * consumes a HASHJOIN_PROC aptr's output in the streamed-eligible shape.  Only a
-   * CANDIDATE marker: the server re-decides eligibility on every execution (param
-   * value + runtime checks), so plan-cache reuse across param flips stays correct.
-   * Param OFF => the bit is never set => serialized XASL bytes are identical to the
-   * pre-feature engine (R2).  `root` is the statement's top XASL, used for the
-   * exactly-one-consumer scan over the whole graph. */
+   * Returns true (and appends a candidate) when this driver node's single TARGET_LIST
+   * spec consumes a HASHJOIN_PROC aptr's output in the streamed-eligible shape.  Only
+   * a CANDIDATE: the selection over all candidates happens in
+   * mark_stream_hashjoin_candidate () and the server re-decides eligibility on every
+   * execution (param value + runtime checks), so plan-cache reuse across param flips
+   * stays correct.  Param OFF => the bit is never set => serialized XASL bytes are
+   * identical to the pre-feature engine (R2).  `root` is the statement's top XASL,
+   * used for the exactly-one-consumer scan over the whole graph. */
   static bool
-  mark_stream_hashjoin_candidate_node (XASL_NODE *root, XASL_NODE *xasl)
+  mark_stream_hashjoin_candidate_node (XASL_NODE *root, XASL_NODE *xasl,
+				       std::vector<stream_hashjoin_candidate> &candidates)
   {
     if (xasl == NULL || (xasl->type != BUILDLIST_PROC && xasl->type != BUILDVALUE_PROC))
       {
@@ -1198,21 +1210,21 @@ namespace parallel_scan
 	}
     }
 
-    ACCESS_SPEC_SET_FLAG (spec, ACCESS_SPEC_FLAG_STREAM_HASHJOIN);
+    candidates.push_back (stream_hashjoin_candidate { xasl, spec, producer });
     return true;
   }
 
-  /* Post-order walk marking AT MOST ONE streamed edge per statement (SSOT section 6).
-   * Deeper aptr subtrees are visited first so the heaviest (innermost) eligible
-   * hash-join edge wins -- e.g. the orders x customer probe feeding the lineitem
-   * idx-NL driver, which is itself an input of a further join. */
-  static bool
+  /* Post-order walk COLLECTING every eligible streamed edge (deepest first); the
+   * selection of the single marked edge (SSOT section 6: at most one per statement)
+   * happens afterwards in mark_stream_hashjoin_candidate (). */
+  static void
   mark_stream_hashjoin_candidate_recursive (XASL_NODE *root, XASL_NODE *arg,
-					    std::unordered_set<XASL_NODE *> &visited)
+					    std::unordered_set<XASL_NODE *> &visited,
+					    std::vector<stream_hashjoin_candidate> &candidates)
   {
     if (arg == NULL || visited.find (arg) != visited.end ())
       {
-	return false;
+	return;
       }
 
     for (XASL_NODE *xaslp = arg; xaslp != NULL; xaslp = xaslp->scan_ptr)
@@ -1225,14 +1237,11 @@ namespace parallel_scan
 
 	for (XASL_NODE *sub = xaslp->aptr_list; sub != NULL; sub = sub->next)
 	  {
-	    if (mark_stream_hashjoin_candidate_recursive (root, sub, visited))
-	      {
-		return true;
-	      }
+	    mark_stream_hashjoin_candidate_recursive (root, sub, visited, candidates);
 	  }
       }
 
-    return mark_stream_hashjoin_candidate_node (root, arg);
+    (void) mark_stream_hashjoin_candidate_node (root, arg, candidates);
   }
 
   static void
@@ -1244,8 +1253,42 @@ namespace parallel_scan
       }
 
     std::unordered_set<XASL_NODE *> visited;
+    std::vector<stream_hashjoin_candidate> candidates;
 
-    (void) mark_stream_hashjoin_candidate_recursive (xasl, xasl, visited);
+    mark_stream_hashjoin_candidate_recursive (xasl, xasl, visited, candidates);
+
+    if (candidates.empty ())
+      {
+	return;
+      }
+
+    /* HEAVIEST-edge selection.  The previous "first (deepest) eligible wins" rule
+     * streamed the innermost edge -- on TPC-H Q7 the trivial customer x nation probe
+     * (~53 ms of a ~7 s query) -- leaving the heavy orders x customer edge and its
+     * lineitem idx-NL consumer fully materialized: zero overlap was available (A7
+     * metrics, 2026-06-12).  Select instead by the optimizer's estimated producer
+     * output cardinality (stamped on the HASHJOIN_PROC xasl by make_hashjoin_proc);
+     * tie-breaks: (a) a consumer with a downstream scan_ptr chain has real per-row
+     * join work to overlap -- prefer it; (b) otherwise keep the earlier-collected
+     * (deeper) edge. */
+    stream_hashjoin_candidate *best = &candidates[0];
+
+    for (size_t i = 1; i < candidates.size (); i++)
+      {
+	stream_hashjoin_candidate *cand = &candidates[i];
+
+	if (cand->producer->cardinality > best->producer->cardinality)
+	  {
+	    best = cand;
+	  }
+	else if (cand->producer->cardinality == best->producer->cardinality
+		 && cand->consumer->scan_ptr != NULL && best->consumer->scan_ptr == NULL)
+	  {
+	    best = cand;
+	  }
+      }
+
+    ACCESS_SPEC_SET_FLAG (best->spec, ACCESS_SPEC_FLAG_STREAM_HASHJOIN);
   }
 }
 

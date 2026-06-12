@@ -596,6 +596,12 @@ make_hashjoin_proc (QO_ENV * env, QO_PLAN * plan, XASL_NODE * outer_xasl, XASL_N
       goto error_exit;
     }
 
+  /* Estimated output cardinality of this join, for the streaming hash-join candidate
+   * selection (heaviest eligible edge wins; px_scan_checker.cpp).  Client-side-only
+   * field: not serialized (xasl_to_stream) and read nowhere else for a HASHJOIN_PROC,
+   * so the wire bytes and the server plan are identical with the feature ON or OFF. */
+  xasl->cardinality = (plan->info != NULL) ? plan->info->cardinality : 0.0;
+
   proc = &xasl->proc.hashjoin;
 
   /* proc->outer.regu_list_pred */
