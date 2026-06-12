@@ -695,6 +695,9 @@ static void heap_attrvalue_point_variable (RECDES * recdes, HEAP_CACHE_ATTRINFO 
 static int heap_attrvalue_transform_to_dbvalue (HEAP_ATTRVALUE * value, OR_ATTRIBUTE * attrepr, RECDES * raw);
 static int heap_attrvalue_read (RECDES * recdes, HEAP_ATTRVALUE * value, HEAP_CACHE_ATTRINFO * attr_info);
 
+static int heap_attrinfo_fastdecode_build (THREAD_ENTRY * thread_p, HEAP_CACHE_ATTRINFO * attr_info);
+static int heap_attrinfo_read_dbvalues_fast (RECDES * recdes, HEAP_CACHE_ATTRINFO * attr_info);
+
 static int heap_midxkey_get_value (RECDES * recdes, OR_ATTRIBUTE * att, DB_VALUE * value,
 				   HEAP_CACHE_ATTRINFO * attr_info);
 static OR_ATTRIBUTE *heap_locate_attribute (ATTR_ID attrid, HEAP_CACHE_ATTRINFO * attr_info);
@@ -7682,6 +7685,21 @@ error:
 }
 
 /*
+ * heap_or_mvcc_get_header_gated () - or_mvcc_get_header, or its direct-parse
+ *   equivalent when heap_record_decode_fast is enabled.  Used ONLY by
+ *   heap_get_mvcc_header and heap_scan_get_visible_version.
+ */
+STATIC_INLINE int
+heap_or_mvcc_get_header_gated (RECDES * recdes, MVCC_REC_HEADER * mvcc_header)
+{
+  if (prm_get_bool_value (PRM_ID_HEAP_RECORD_DECODE_FAST))
+    {
+      return or_mvcc_get_header_fast (recdes, mvcc_header);
+    }
+  return or_mvcc_get_header (recdes, mvcc_header);
+}
+
+/*
  * heap_get_mvcc_header () - Get record MVCC header.
  *
  * return	     : SCAN_CODE: S_SUCCESS, S_ERROR or S_DOESNT_EXIST.
@@ -7726,7 +7744,7 @@ heap_get_mvcc_header (THREAD_ENTRY * thread_p, HEAP_GET_CONTEXT * context, MVCC_
 	  assert (false);
 	  return S_ERROR;
 	}
-      if (or_mvcc_get_header (&peek_recdes, mvcc_header) != NO_ERROR)
+      if (heap_or_mvcc_get_header_gated (&peek_recdes, mvcc_header) != NO_ERROR)
 	{
 	  /* Unexpected. */
 	  assert (false);
@@ -7751,7 +7769,7 @@ heap_get_mvcc_header (THREAD_ENTRY * thread_p, HEAP_GET_CONTEXT * context, MVCC_
 	  assert (false);
 	  return S_ERROR;
 	}
-      if (or_mvcc_get_header (&peek_recdes, mvcc_header) != NO_ERROR)
+      if (heap_or_mvcc_get_header_gated (&peek_recdes, mvcc_header) != NO_ERROR)
 	{
 	  /* Unexpected. */
 	  assert (false);
@@ -9813,6 +9831,7 @@ heap_attrinfo_start (THREAD_ENTRY * thread_p, const OID * class_oid, int request
   OID_SET_NULL (&attr_info->inst_oid);
   attr_info->inst_chn = NULL_CHN;
   attr_info->values = NULL;
+  attr_info->fastdecode = NULL;
   attr_info->num_values = -1;	/* initialize attr_info */
 
   /*
@@ -10222,6 +10241,15 @@ heap_attrinfo_recache (THREAD_ENTRY * thread_p, REPR_ID reprid, HEAP_CACHE_ATTRI
 	}
       attr_info->read_classrepr = attr_info->last_classrepr;
       attr_info->read_cacheindex = -1;	/* Don't need to free this one */
+
+      if (prm_get_bool_value (PRM_ID_HEAP_RECORD_DECODE_FAST))
+	{
+	  ret = heap_attrinfo_fastdecode_build (thread_p, attr_info);
+	  if (ret != NO_ERROR)
+	    {
+	      goto exit_on_error;
+	    }
+	}
       return NO_ERROR;
     }
 
@@ -10248,6 +10276,15 @@ heap_attrinfo_recache (THREAD_ENTRY * thread_p, REPR_ID reprid, HEAP_CACHE_ATTRI
       heap_classrepr_free_and_init (attr_info->read_classrepr, &attr_info->read_cacheindex);
 
       goto exit_on_error;
+    }
+
+  if (prm_get_bool_value (PRM_ID_HEAP_RECORD_DECODE_FAST))
+    {
+      ret = heap_attrinfo_fastdecode_build (thread_p, attr_info);
+      if (ret != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
     }
 
   return ret;
@@ -10290,6 +10327,10 @@ heap_attrinfo_end (THREAD_ENTRY * thread_p, HEAP_CACHE_ATTRINFO * attr_info)
   if (attr_info->values)
     {
       db_private_free_and_init (thread_p, attr_info->values);
+    }
+  if (attr_info->fastdecode != NULL)
+    {
+      db_private_free_and_init (thread_p, attr_info->fastdecode);
     }
   OID_SET_NULL (&attr_info->class_oid);
 
@@ -10533,6 +10574,254 @@ heap_attrvalue_read (RECDES * recdes, HEAP_ATTRVALUE * value, HEAP_CACHE_ATTRINF
 }
 
 /*
+ * Record-decode fast path (heap_record_decode_fast system parameter).
+ *
+ * When enabled, heap_attrinfo_recache resolves, once per cached representation,
+ * everything heap_attrvalue_read re-derives per attribute on every record:
+ * the fixed-area location, the bound-bit position, the disk size and the
+ * primitive type handler.  heap_attrinfo_read_dbvalues then hoists the
+ * per-record header arithmetic (header size, offset size, fixed-area base,
+ * bound-bit base) once per record and decodes eligible fixed attributes
+ * inline; attributes that are not eligible (variable, shared, class, default
+ * or deduplicate-key attributes) fall back to heap_attrvalue_read within the
+ * same record pass.  With the parameter off (default), nothing is built and
+ * the historical code path runs unchanged.
+ */
+typedef struct heap_attrinfo_fastdecode_col HEAP_ATTRINFO_FASTDECODE_COL;
+struct heap_attrinfo_fastdecode_col
+{
+  const PR_TYPE *pr_type;	/* primitive type handler for read_attrepr->type */
+  TP_DOMAIN *domain;		/* read_attrepr->domain */
+  int location;			/* offset within the fixed attribute area */
+  int position;			/* bound-bit position */
+  int disk_size;		/* tp_domain_disk_size (domain) */
+  DB_TYPE type;			/* read_attrepr->type */
+  bool fast_ok;			/* eligible for the inline fixed decode */
+  bool skip_clear_ok;		/* prior fast value never owns memory; pr_clear_value can be skipped */
+};
+
+struct heap_attrinfo_fastdecode
+{
+  OR_CLASSREP *classrepr;	/* read_classrepr the cache was built for */
+  REPR_ID repr_id;		/* and its representation id */
+  bool any_fast;		/* at least one column is fast_ok */
+  HEAP_ATTRINFO_FASTDECODE_COL cols[1];	/* really num_values entries */
+};
+
+/*
+ * heap_attrinfo_fastdecode_usable () - Is the decode fast-path cache valid for
+ *                                      the currently cached read representation?
+ *   return: true if heap_attrinfo_read_dbvalues_fast may be used
+ *   attr_info(in): The attribute information structure
+ */
+STATIC_INLINE bool
+heap_attrinfo_fastdecode_usable (HEAP_CACHE_ATTRINFO * attr_info)
+{
+  HEAP_ATTRINFO_FASTDECODE *fd = attr_info->fastdecode;
+
+  return (fd != NULL && fd->any_fast && fd->classrepr != NULL && fd->classrepr == attr_info->read_classrepr
+	  && fd->repr_id == attr_info->read_classrepr->id);
+}
+
+/*
+ * heap_attrinfo_fastdecode_build () - Resolve the per-attribute decode fast-path
+ *                                     information for the current read_classrepr
+ *   return: NO_ERROR or error code
+ *   attr_info(in/out): The attribute information structure
+ *
+ * Note: Called from heap_attrinfo_recache when heap_record_decode_fast is
+ * enabled and a read representation has just been cached.  The cache memory
+ * is allocated once (num_values never changes) and rebuilt in place whenever
+ * the read representation changes.
+ */
+static int
+heap_attrinfo_fastdecode_build (THREAD_ENTRY * thread_p, HEAP_CACHE_ATTRINFO * attr_info)
+{
+  HEAP_ATTRINFO_FASTDECODE *fd;
+  HEAP_ATTRVALUE *value;
+  OR_ATTRIBUTE *attrepr;
+  int i;
+
+  assert (attr_info->read_classrepr != NULL);
+
+  if (attr_info->num_values <= 0 || attr_info->values == NULL)
+    {
+      return NO_ERROR;
+    }
+
+  fd = attr_info->fastdecode;
+  if (fd == NULL)
+    {
+      size_t size = (offsetof (HEAP_ATTRINFO_FASTDECODE, cols)
+		     + ((size_t) attr_info->num_values) * sizeof (HEAP_ATTRINFO_FASTDECODE_COL));
+
+      fd = (HEAP_ATTRINFO_FASTDECODE *) db_private_alloc (thread_p, size);
+      if (fd == NULL)
+	{
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      attr_info->fastdecode = fd;
+    }
+
+  fd->classrepr = attr_info->read_classrepr;
+  fd->repr_id = attr_info->read_classrepr->id;
+  fd->any_fast = false;
+
+  for (i = 0; i < attr_info->num_values; i++)
+    {
+      HEAP_ATTRINFO_FASTDECODE_COL *col = &fd->cols[i];
+
+      value = &attr_info->values[i];
+      attrepr = value->read_attrepr;
+
+      col->fast_ok = false;
+      col->skip_clear_ok = false;
+
+      if (value->attr_type != HEAP_INSTANCE_ATTR || attrepr == NULL || attrepr->is_fixed == 0
+	  || attrepr->domain == NULL || IS_DEDUPLICATE_KEY_ATTR_ID (value->attrid))
+	{
+	  continue;
+	}
+
+      switch (attrepr->type)
+	{
+	case DB_TYPE_INTEGER:
+	case DB_TYPE_BIGINT:
+	case DB_TYPE_SHORT:
+	case DB_TYPE_DATE:
+	case DB_TYPE_TIME:
+	case DB_TYPE_TIMESTAMP:
+	case DB_TYPE_FLOAT:
+	case DB_TYPE_DOUBLE:
+	case DB_TYPE_NUMERIC:
+	case DB_TYPE_CHAR:
+	  break;
+	default:
+	  continue;
+	}
+
+      col->pr_type = pr_type_from_id (attrepr->type);
+      col->domain = attrepr->domain;
+      col->location = attrepr->location;
+      col->position = attrepr->position;
+      col->disk_size = tp_domain_disk_size (attrepr->domain);
+      col->type = (DB_TYPE) attrepr->type;
+
+      if (col->pr_type == NULL || col->disk_size <= 0)
+	{
+	  continue;
+	}
+
+      col->fast_ok = true;
+      /* a fixed non-string value read with copy == false never owns memory; CHAR is kept on the
+       * pr_clear_value path for its compressed-string bookkeeping */
+      col->skip_clear_ok = (attrepr->type != DB_TYPE_CHAR);
+      fd->any_fast = true;
+    }
+
+  return NO_ERROR;
+}
+
+/*
+ * heap_attrinfo_read_dbvalues_fast () - Per-record mixed fast/slow attribute decode
+ *   return: NO_ERROR or error code
+ *   recdes(in): Instance record descriptor (non-NULL data)
+ *   attr_info(in/out): The attribute information structure
+ *
+ * Note: Byte-equivalent to looping heap_attrvalue_read over all values: the
+ * per-attribute fast branch performs the same bound-bit test, the same
+ * data_readval call with the same arguments and the same NULL/default and
+ * error handling as heap_attrvalue_transform_to_dbvalue; only the redundant
+ * per-attribute header arithmetic and type re-resolution are hoisted.
+ */
+static int
+heap_attrinfo_read_dbvalues_fast (RECDES * recdes, HEAP_CACHE_ATTRINFO * attr_info)
+{
+  HEAP_ATTRINFO_FASTDECODE *fd = attr_info->fastdecode;
+  char *rec_data = recdes->data;
+  int repid_and_flag = OR_GET_MVCC_REPID_AND_FLAG (rec_data);
+  bool has_bound_bits = ((repid_and_flag & OR_BOUND_BIT_FLAG) != 0);
+  int offset_size = (((repid_and_flag & OR_OFFSET_SIZE_FLAG) == OR_OFFSET_SIZE_1BYTE)
+		     ? OR_BYTE_SIZE
+		     : (((repid_and_flag & OR_OFFSET_SIZE_FLAG) == OR_OFFSET_SIZE_2BYTE)
+			? OR_SHORT_SIZE : OR_INT_SIZE));
+  int mvcc_flags = (repid_and_flag >> OR_MVCC_FLAG_SHIFT_BITS) & OR_MVCC_FLAG_MASK;
+  int header_size = mvcc_header_size_lookup[mvcc_flags];
+  int n_variable = attr_info->read_classrepr->n_variable;
+  int fixed_length = attr_info->read_classrepr->fixed_length;
+  char *fixed_base = rec_data + header_size + OR_VAR_TABLE_SIZE_INTERNAL (n_variable, offset_size);
+  char *bound_bits = fixed_base + fixed_length;
+  HEAP_ATTRVALUE *value;
+  int i;
+  int ret = NO_ERROR;
+
+  /* hoisted bases must agree with the per-attribute macros used by the slow path */
+  assert (header_size == or_header_size (rec_data));
+  assert (offset_size == OR_GET_OFFSET_SIZE (rec_data));
+  assert (fixed_base == rec_data + OR_FIXED_ATTRIBUTES_OFFSET_BY_OBJ (rec_data, n_variable));
+  assert (!has_bound_bits || bound_bits == OR_GET_BOUND_BITS (rec_data, n_variable, fixed_length));
+  assert (attr_info->read_classrepr->id == or_rep_id (recdes));
+
+  for (i = 0; i < attr_info->num_values; i++)
+    {
+      HEAP_ATTRINFO_FASTDECODE_COL *col = &fd->cols[i];
+
+      value = &attr_info->values[i];
+
+      if (!col->fast_ok)
+	{
+	  /* shared/class/variable/default/deduplicate attribute: unchanged slow path */
+	  ret = heap_attrvalue_read (recdes, value, attr_info);
+	  if (ret != NO_ERROR)
+	    {
+	      return ret;
+	    }
+	  continue;
+	}
+
+      /* same bound-bit semantics as OR_FIXED_ATT_IS_UNBOUND with hoisted bases */
+      assert ((has_bound_bits && !OR_GET_BOUND_BIT (bound_bits, col->position))
+	      == (OR_FIXED_ATT_IS_UNBOUND (rec_data, n_variable, fixed_length, col->position) ? true : false));
+
+      /* clear/decache if old exists; skip only when the prior value is of this column's own
+       * non-string fixed type and owns no memory */
+      if (value->state != HEAP_UNINIT_ATTRVALUE
+	  && (!col->skip_clear_ok || value->dbvalue.need_clear
+	      || DB_VALUE_DOMAIN_TYPE (&value->dbvalue) != col->type))
+	{
+	  (void) pr_clear_value (&value->dbvalue);
+	}
+
+      if (has_bound_bits && !OR_GET_BOUND_BIT (bound_bits, col->position))
+	{
+	  /* unbound attribute, set it to null value */
+	  ret = db_value_domain_init (&value->dbvalue, col->type, col->domain->precision, col->domain->scale);
+	  if (ret != NO_ERROR)
+	    {
+	      return ret;
+	    }
+	  value->state = HEAP_READ_ATTRVALUE;
+	}
+      else
+	{
+	  OR_BUF buf;
+
+	  or_init (&buf, fixed_base + col->location, col->disk_size);
+	  ret = col->pr_type->data_readval (&buf, &value->dbvalue, col->domain, col->disk_size, false, NULL, 0);
+	  value->state = HEAP_READ_ATTRVALUE;
+	  if (ret != NO_ERROR)
+	    {
+	      (void) db_value_domain_init (&value->dbvalue, col->type, col->domain->precision, col->domain->scale);
+	      value->state = HEAP_UNINIT_ATTRVALUE;
+	      return ret;
+	    }
+	}
+    }
+
+  return ret;
+}
+
+/*
  * heap_midxkey_get_value () -
  *   return:
  *   recdes(in):
@@ -10673,13 +10962,24 @@ heap_attrinfo_read_dbvalues (THREAD_ENTRY * thread_p, const OID * inst_oid, RECD
    * Go over each attribute and read it
    */
 
-  for (i = 0; i < attr_info->num_values; i++)
+  if (inst_oid != NULL && recdes != NULL && recdes->data != NULL && heap_attrinfo_fastdecode_usable (attr_info))
     {
-      value = &attr_info->values[i];
-      ret = heap_attrvalue_read (recdes, value, attr_info);
+      ret = heap_attrinfo_read_dbvalues_fast (recdes, attr_info);
       if (ret != NO_ERROR)
 	{
 	  goto exit_on_error;
+	}
+    }
+  else
+    {
+      for (i = 0; i < attr_info->num_values; i++)
+	{
+	  value = &attr_info->values[i];
+	  ret = heap_attrvalue_read (recdes, value, attr_info);
+	  if (ret != NO_ERROR)
+	    {
+	      goto exit_on_error;
+	    }
 	}
     }
 
@@ -10736,13 +11036,24 @@ heap_attrinfo_read_dbvalues_without_oid (THREAD_ENTRY * thread_p, RECDES * recde
    * Go over each attribute and read it
    */
 
-  for (i = 0; i < attr_info->num_values; i++)
+  if (recdes != NULL && recdes->data != NULL && heap_attrinfo_fastdecode_usable (attr_info))
     {
-      value = &attr_info->values[i];
-      ret = heap_attrvalue_read (recdes, value, attr_info);
+      ret = heap_attrinfo_read_dbvalues_fast (recdes, attr_info);
       if (ret != NO_ERROR)
 	{
 	  goto exit_on_error;
+	}
+    }
+  else
+    {
+      for (i = 0; i < attr_info->num_values; i++)
+	{
+	  value = &attr_info->values[i];
+	  ret = heap_attrvalue_read (recdes, value, attr_info);
+	  if (ret != NO_ERROR)
+	    {
+	      goto exit_on_error;
+	    }
 	}
     }
 
@@ -12621,6 +12932,7 @@ heap_attrinfo_start_with_index (THREAD_ENTRY * thread_p, OID * class_oid, RECDES
       attr_info->read_classrepr = NULL;
       OID_SET_NULL (&attr_info->inst_oid);
       attr_info->inst_chn = NULL_CHN;
+      attr_info->fastdecode = NULL;
       attr_info->num_values = num_found_attrs;
 
       if (num_found_attrs <= 0)
@@ -25530,7 +25842,7 @@ heap_scan_get_visible_version (THREAD_ENTRY * thread_p, const OID * oid, OID * c
       assert (recdes != NULL);
       assert (peeked_recdes != NULL);
 
-      if (or_mvcc_get_header (peeked_recdes, &mvcc_header) != NO_ERROR)
+      if (heap_or_mvcc_get_header_gated (peeked_recdes, &mvcc_header) != NO_ERROR)
 	{
 	  /* Unexpected. */
 	  assert (false);

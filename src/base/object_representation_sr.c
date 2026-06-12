@@ -4247,6 +4247,96 @@ exit_on_error:
 }
 
 /*
+ * or_mvcc_get_header_fast () - Get mvcc record header from record data with a
+ *   single up-front length check and direct field reads.
+ *
+ * return		: NO_ERROR or error code.
+ * record (in)		: Record descriptor.
+ * mvcc_header (out)	: MVCC Record header.
+ *
+ * Note: Produces a header identical to or_mvcc_get_header (parity is
+ * assert-checked in debug builds): repid_and_flags (4B), chn (4B, always),
+ * insid (8B iff OR_MVCC_FLAG_VALID_INSID, else MVCCID_ALL_VISIBLE), delid
+ * (8B iff OR_MVCC_FLAG_VALID_DELID, else MVCCID_NULL), prev_version_lsa
+ * (iff OR_MVCC_FLAG_VALID_PREV_VERSION, else NULL LSA).  Only the OR_BUF
+ * bookkeeping and per-field helper calls are elided.
+ */
+int
+or_mvcc_get_header_fast (RECDES * record, MVCC_REC_HEADER * mvcc_header)
+{
+  char *p = record->data;
+  int repid_and_flag_bits;
+  int mvcc_flag;
+
+  assert (record != NULL && record->data != NULL && record->length >= OR_MVCC_REP_SIZE && mvcc_header != NULL);
+
+  repid_and_flag_bits = OR_GET_MVCC_REPID_AND_FLAG (p);
+  mvcc_flag = (repid_and_flag_bits >> OR_MVCC_FLAG_SHIFT_BITS) & OR_MVCC_FLAG_MASK;
+
+  if (record->length < mvcc_header_size_lookup[mvcc_flag])
+    {
+      /* malformed record; keep the slow helper's behavior */
+      assert (false);
+      return or_mvcc_get_header (record, mvcc_header);
+    }
+
+  mvcc_header->repid = repid_and_flag_bits & OR_MVCC_REPID_MASK;
+  mvcc_header->mvcc_flag = (char) mvcc_flag;
+
+  mvcc_header->chn = OR_GET_INT (p + OR_CHN_OFFSET);
+  p += OR_CHN_OFFSET + OR_CHN_SIZE;
+
+  if (mvcc_flag & OR_MVCC_FLAG_VALID_INSID)
+    {
+      OR_GET_BIGINT (p, &mvcc_header->mvcc_ins_id);
+      p += OR_MVCCID_SIZE;
+    }
+  else
+    {
+      mvcc_header->mvcc_ins_id = MVCCID_ALL_VISIBLE;
+    }
+
+  if (mvcc_flag & OR_MVCC_FLAG_VALID_DELID)
+    {
+      OR_GET_BIGINT (p, &mvcc_header->mvcc_del_id);
+      p += OR_MVCCID_SIZE;
+    }
+  else
+    {
+      mvcc_header->mvcc_del_id = MVCCID_NULL;
+    }
+
+  if (mvcc_flag & OR_MVCC_FLAG_VALID_PREV_VERSION)
+    {
+      mvcc_header->prev_version_lsa = *(LOG_LSA *) p;
+    }
+  else
+    {
+      LSA_SET_NULL (&mvcc_header->prev_version_lsa);
+    }
+
+#if !defined (NDEBUG)
+  {
+    /* parity: the fast parse must equal the slow helper field by field */
+    MVCC_REC_HEADER chk = MVCC_REC_HEADER_INITIALIZER;
+
+    if (or_mvcc_get_header (record, &chk) == NO_ERROR)
+      {
+	assert (chk.repid == mvcc_header->repid);
+	assert (chk.mvcc_flag == mvcc_header->mvcc_flag);
+	assert (chk.chn == mvcc_header->chn);
+	assert (chk.mvcc_ins_id == mvcc_header->mvcc_ins_id);
+	assert (chk.mvcc_del_id == mvcc_header->mvcc_del_id);
+	assert (chk.prev_version_lsa.pageid == mvcc_header->prev_version_lsa.pageid
+		&& chk.prev_version_lsa.offset == mvcc_header->prev_version_lsa.offset);
+      }
+  }
+#endif
+
+  return NO_ERROR;
+}
+
+/*
  * or_mvcc_set_header () - Updates record header
  *
  * return		: Void.

@@ -388,6 +388,12 @@ namespace parallel_scan
 	  {
 	    free_and_init (tl.writer_result_p->tpl_descr.f_valp);
 	  }
+	if (tl.writer_result_p != nullptr && tl.writer_result_p->tpl_descr.enc_cols != nullptr)
+	  {
+	    free_and_init (tl.writer_result_p->tpl_descr.enc_cols);
+	    tl.writer_result_p->tpl_descr.enc_key = nullptr;
+	    tl.writer_result_p->tpl_descr.enc_ncols = 0;
+	  }
 	tl.writer_result_p = nullptr;
 	if (tl.tpl_buf.tpl != nullptr)
 	  {

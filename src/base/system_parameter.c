@@ -264,6 +264,10 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_BTREE_PROBE_LEAF_MEMO "btree_probe_leaf_memo"
 
+#define PRM_NAME_HEAP_RECORD_DECODE_FAST "heap_record_decode_fast"
+
+#define PRM_NAME_QFILE_TUPLE_ENCODE_FAST "qfile_tuple_encode_fast"
+
 #define PRM_NAME_ENABLE_HISTO "communication_histogram"
 
 #define PRM_NAME_MUTEX_BUSY_WAITING_CNT "mutex_busy_waiting_cnt"
@@ -5452,6 +5456,28 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_BTREE_PROBE_LEAF_MEMO,
    PRM_NAME_BTREE_PROBE_LEAF_MEMO,
+   (PRM_USER_CHANGE | PRM_FOR_SERVER),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE, NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_HEAP_RECORD_DECODE_FAST,
+   PRM_NAME_HEAP_RECORD_DECODE_FAST,
+   (PRM_USER_CHANGE | PRM_FOR_SERVER),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE, NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_QFILE_TUPLE_ENCODE_FAST,
+   PRM_NAME_QFILE_TUPLE_ENCODE_FAST,
    (PRM_USER_CHANGE | PRM_FOR_SERVER),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,

@@ -127,6 +127,9 @@ cursor_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_l
     }
 
   dest_list_id_p->tpl_descr.f_valp = NULL;
+  dest_list_id_p->tpl_descr.enc_key = NULL;
+  dest_list_id_p->tpl_descr.enc_ncols = 0;
+  dest_list_id_p->tpl_descr.enc_cols = NULL;
   dest_list_id_p->sort_list = NULL;	/* never use sort_list in crs_ level */
 
   if (src_list_id_p->last_pgptr)
