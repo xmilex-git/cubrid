@@ -484,6 +484,10 @@ struct scan_stats
 
   /* hash list scan */
   struct timeval elapsed_hash_build;
+
+  /* index-NL heap lookup fast path (heap_index_lookup_fast); attempts counted only while the parameter is on */
+  UINT64 lookup_fast_attempts;
+  UINT64 lookup_fast_engaged;
 };
 
 typedef struct scan_id_struct SCAN_ID;
