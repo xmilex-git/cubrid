@@ -543,10 +543,12 @@ enum param_id
 
   PRM_ID_STREAMING_HASH_JOIN,
 
-  /* change PRM_LAST_ID when adding new system parameters */
   PRM_ID_HASH_JOIN_FUSED_PROBE,
 
-  PRM_LAST_ID = PRM_ID_HASH_JOIN_FUSED_PROBE
+  /* change PRM_LAST_ID when adding new system parameters */
+  PRM_ID_BTREE_PROBE_LEAF_MEMO,
+
+  PRM_LAST_ID = PRM_ID_BTREE_PROBE_LEAF_MEMO
 };
 typedef enum param_id PARAM_ID;
 
