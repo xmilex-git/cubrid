@@ -394,6 +394,14 @@ typedef struct hashjoin_proc_node
   bool stream_candidate;
   void *stream_pipeline;
   void *chase_state;
+
+  /* fused_state: HJOIN_FUSED_STATE ownership handle for the fused probe (probe
+   * pushdown into the parallel scan of the probe input).  Armed by this node's own
+   * mainblock aptr dispatch strictly before the probe input runs; consumed by
+   * qexec_hash_join (the join output was already produced by the fused scan) or
+   * freed by the mainblock teardown epilogue on error paths.  Runtime-only; never
+   * serialized; zeroed on unpack. */
+  void *fused_state;
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 } HASHJOIN_PROC_NODE;
 
@@ -537,6 +545,10 @@ struct cte_proc_node
 							 * probe-input chase (read-behind-writer); set client-side only
 							 * when the streamed edge is marked (param ON), re-vetted at
 							 * runtime on every execution */
+#define XASL_HJ_FUSED_PROBE_INPUT      (0x1 << 24)	/* hash-join probe-INPUT buildlist: candidate for the fused
+							 * probe (probe pushdown into the parallel scan); set
+							 * client-side only when hash_join_fused_probe is ON,
+							 * re-vetted at runtime on every execution */
 
 #define XASL_IS_FLAGED(x, f)        (((x)->flag & (int) (f)) != 0)
 #define IS_DBLINK_CURSOR_REWIND_XASL(x)     XASL_IS_FLAGED ((x), XASL_DBLINK_CURSOR_REWIND)
@@ -1221,6 +1233,10 @@ struct xasl_node
   void *chase_progress;		/* parallel_query::hjoin_chase * -- non-NULL ONLY while this
 				 * buildlist is the chased probe input of a streaming hash-join
 				 * (runtime-only; never serialized; zeroed on unpack) */
+  void *fused_probe;		/* HJOIN_FUSED_STATE * -- non-NULL ONLY while this buildlist
+				 * is the probe input of a fused hash-join probe and its scan
+				 * is in flight (runtime-only; never serialized; zeroed on
+				 * unpack) */
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 };
 

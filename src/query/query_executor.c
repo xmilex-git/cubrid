@@ -15425,6 +15425,176 @@ qexec_setup_fixed_scan (XASL_NODE * xasl, bool force_select_lock)
 
 #if SERVER_MODE && !WINDOWS
 /*
+ * qexec_hjoin_fused_dispatch () - Fused-probe dispatch of a HASHJOIN_PROC's input
+ *                                 pair, triggered at WHICHEVER of the two inputs the
+ *                                 aptr loop reaches first: run the build input
+ *                                 inline to completion, build the hash table
+ *                                 (qexec_hjoin_fused_prepare) and run the
+ *                                 client-marked probe input with the in-scan probe
+ *                                 hook published -- the probe gather output is then
+ *                                 the JOIN output and the probe-input temp list
+ *                                 never exists.  Consuming the pair at the first
+ *                                 slot guarantees neither input is ever dispatched
+ *                                 as a detached px subquery job, so the inline
+ *                                 build execution can never race one.
+ *   return: Error code (NO_ERROR if successful, error code otherwise).
+ *   thread_p(in): Thread entry (the mainblock driver).
+ *   xasl(in): The HASHJOIN_PROC node whose own mainblock is dispatching aptrs.
+ *   aptr(in): The input whose dispatch slot the loop is at (either merge side).
+ *   xasl_state(in): XASL state.
+ *   dispatched(out): True when this call consumed the aptr's dispatch slot; false
+ *                    keeps today's dispatch untouched.
+ *
+ * Note: Decided on EVERY execution from the execution-time parameter value plus the
+ *       client-marked candidate flag and runtime checks (plan-cache safety).  Every
+ *       refusal silently keeps the materialized path (pre-emit).
+ */
+static int
+qexec_hjoin_fused_dispatch (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_NODE * aptr, XASL_STATE * xasl_state,
+			    bool * dispatched)
+{
+  XASL_NODE *outer_xasl, *inner_xasl;
+  XASL_NODE *probe_xasl, *build_xasl;
+  void *fused_state = NULL;
+  bool outer_marked, inner_marked;
+  int error = NO_ERROR;
+
+  assert (xasl->type == HASHJOIN_PROC);
+  assert (IS_XASL_INITIAL_STATUS (aptr->status));
+
+  *dispatched = false;
+
+  if (!prm_get_bool_value (PRM_ID_HASH_JOIN_FUSED_PROBE))
+    {
+      return NO_ERROR;
+    }
+
+  /* driver/main thread only; v1 keeps trace runs on the fully-instrumented
+   * materialized path */
+  if (thread_p->private_heap_id == 0 || thread_is_on_trace (thread_p))
+    {
+      return NO_ERROR;
+    }
+
+  /* JOIN_INNER without extra during-join predicates only (v1: the predicate
+   * structures are not safely shareable across scan workers) */
+  if (xasl->proc.hashjoin.merge_info.join_type != JOIN_INNER || xasl->during_join_pred != NULL)
+    {
+      return NO_ERROR;
+    }
+
+  outer_xasl = xasl->proc.hashjoin.outer.xasl;
+  inner_xasl = xasl->proc.hashjoin.inner.xasl;
+  if (outer_xasl == NULL || inner_xasl == NULL || outer_xasl == inner_xasl
+      || (aptr != outer_xasl && aptr != inner_xasl))
+    {
+      return NO_ERROR;
+    }
+
+  /* the PROBE input is the client-marked, decisively larger side (exactly one) */
+  outer_marked = XASL_IS_FLAGED (outer_xasl, XASL_HJ_FUSED_PROBE_INPUT);
+  inner_marked = XASL_IS_FLAGED (inner_xasl, XASL_HJ_FUSED_PROBE_INPUT);
+  if (outer_marked == inner_marked)
+    {
+      return NO_ERROR;
+    }
+  probe_xasl = outer_marked ? outer_xasl : inner_xasl;
+  build_xasl = outer_marked ? inner_xasl : outer_xasl;
+
+  if (probe_xasl->type != BUILDLIST_PROC || !IS_XASL_INITIAL_STATUS (probe_xasl->status))
+    {
+      return NO_ERROR;
+    }
+
+  /* the probe input must start fresh and neither input may be result-cached or
+   * regu-linked */
+  if (probe_xasl->list_id == NULL || probe_xasl->list_id->type_list.type_cnt > 0
+      || QEXEC_IS_SUBQUERY_CACHE (probe_xasl) || XASL_IS_FLAGED (probe_xasl, XASL_LINK_TO_REGU_VARIABLE))
+    {
+      return NO_ERROR;
+    }
+  if (XASL_IS_FLAGED (build_xasl, XASL_LINK_TO_REGU_VARIABLE) || QEXEC_IS_SUBQUERY_CACHE (build_xasl))
+    {
+      return NO_ERROR;
+    }
+
+  /* the build input must be COMPLETE before the table can be built.  At the FIRST
+   * slot of the pair it is either still untouched (run it inline now -- with this
+   * pair consumed here it can never also be a detached px job) or already complete;
+   * anything else (in flight / failed) refuses. */
+  if (IS_XASL_INITIAL_STATUS (build_xasl->status))
+    {
+      error = qexec_execute_mainblock (thread_p, build_xasl, xasl_state, NULL);
+      if (error != NO_ERROR)
+	{
+	  return error;
+	}
+    }
+  else if (build_xasl->status != XASL_SUCCESS)
+    {
+      return NO_ERROR;
+    }
+
+  if (build_xasl->list_id == NULL || build_xasl->list_id->type_list.type_cnt == 0)
+    {
+      return NO_ERROR;
+    }
+
+  if (build_xasl->list_id->tuple_cnt == 0)
+    {
+      /* empty build side of an inner join: the materialized dispatch would skip the
+       * probe input entirely (the loop's own empty-input check does exactly that at
+       * the probe's slot) -- consume only THIS slot */
+      *dispatched = true;
+      return NO_ERROR;
+    }
+
+  error = qexec_hjoin_fused_prepare (thread_p, xasl, probe_xasl, &fused_state);
+  if (error != NO_ERROR)
+    {
+      return error;
+    }
+  if (fused_state == NULL)
+    {
+      /* structural/size/domain refusal: keep today's dispatch.  When this slot is
+       * the build's (already executed inline above), consume it; the probe then
+       * dispatches normally at its own slot. */
+      *dispatched = (aptr == build_xasl);
+      return NO_ERROR;
+    }
+
+  /* run the probe input with the in-scan probe hook published */
+  probe_xasl->fused_probe = fused_state;
+  error = qexec_execute_mainblock (thread_p, probe_xasl, xasl_state, NULL);
+  probe_xasl->fused_probe = NULL;
+
+  if (error != NO_ERROR)
+    {
+      qexec_hjoin_fused_abandon (thread_p, fused_state);
+      return error;
+    }
+
+  if (qexec_hjoin_fused_is_engaged (fused_state))
+    {
+      /* the gather output IS the join output; qexec_hash_join adopts it */
+      xasl->proc.hashjoin.fused_state = fused_state;
+
+      er_log_debug (ARG_FILE_LINE, "HJFUSED engaged: join %p probe aptr %p output rows %lld\n",
+		    (void *) xasl, (void *) probe_xasl, (long long) probe_xasl->list_id->tuple_cnt);
+    }
+  else
+    {
+      /* the scan ran without the hook (serial path / parallel-scan refusal): the
+       * probe produced a normal probe-input list -- drop the prepared table and let
+       * qexec_hash_join take today's path verbatim */
+      qexec_hjoin_fused_abandon (thread_p, fused_state);
+    }
+
+  *dispatched = true;
+  return NO_ERROR;
+}
+
+/*
  * qexec_stream_hjoin_check_candidate () - Per-execution server-side eligibility marking
  *                                         for the gated streaming hash-join edge.
  *   return: true when the aptr may stream this execution (candidate armed), else false.
@@ -15639,6 +15809,14 @@ qexec_stream_hjoin_teardown (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
       qexec_hjoin_chase_reap (thread_p, xasl);
     }
 
+  if (xasl->type == HASHJOIN_PROC && xasl->proc.hashjoin.fused_state != NULL)
+    {
+      /* fused probe armed but never consumed (an error between the arm and this
+       * block's own qexec_hash_join): drop the prepared hash table */
+      qexec_hjoin_fused_abandon (thread_p, xasl->proc.hashjoin.fused_state);
+      xasl->proc.hashjoin.fused_state = NULL;
+    }
+
   for (xptr = xasl; xptr != NULL; xptr = xptr->scan_ptr)
     {
       for (aptr = xptr->aptr_list; aptr != NULL; aptr = aptr->next)
@@ -15660,6 +15838,14 @@ qexec_stream_hjoin_teardown (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 
 	      aptr->proc.hashjoin.stream_pipeline = NULL;
 	      aptr->proc.hashjoin.stream_candidate = false;
+	    }
+
+	  if (aptr->proc.hashjoin.fused_state != NULL)
+	    {
+	      /* fused probe armed but never consumed (an error between the arm and
+	       * the aptr's qexec_hash_join): drop the prepared hash table */
+	      qexec_hjoin_fused_abandon (thread_p, aptr->proc.hashjoin.fused_state);
+	      aptr->proc.hashjoin.fused_state = NULL;
 	    }
 
 	  if (aptr->proc.hashjoin.chase_state != NULL)
@@ -16119,6 +16305,40 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 					    (void *) xasl, (void *) xptr2);
 			    }
 			}
+
+		      /* Fused probe: when this block IS a hash join and this aptr is its
+		       * client-marked probe input, build the hash table now (from the
+		       * complete build input) and run this aptr with the in-scan probe
+		       * hook -- its gather output is then the join output and the
+		       * probe-input temp list never exists.  Every refusal keeps today's
+		       * dispatch (pre-emit). */
+		      if (xasl->type == HASHJOIN_PROC
+		          && xasl->proc.hashjoin.outer.xasl != NULL && xasl->proc.hashjoin.inner.xasl != NULL
+		          && (xptr2 == xasl->proc.hashjoin.outer.xasl || xptr2 == xasl->proc.hashjoin.inner.xasl)
+		          && (XASL_IS_FLAGED (xasl->proc.hashjoin.outer.xasl, XASL_HJ_FUSED_PROBE_INPUT)
+		              || XASL_IS_FLAGED (xasl->proc.hashjoin.inner.xasl, XASL_HJ_FUSED_PROBE_INPUT))
+		          && xasl->proc.hashjoin.fused_state == NULL && xasl->proc.hashjoin.chase_state == NULL
+		          && !xasl->proc.hashjoin.stream_candidate)
+		        {
+		          bool fused_dispatched = false;
+
+		          if (qexec_hjoin_fused_dispatch (thread_p, xasl, xptr2, xasl_state, &fused_dispatched)
+		              != NO_ERROR)
+		            {
+		              if (tplrec.tpl)
+		                {
+		                  db_private_free_and_init (thread_p, tplrec.tpl);
+		                }
+		              qexec_failure_line (__LINE__, xasl_state);
+		              GOTO_EXIT_ON_ERROR;
+		            }
+
+		          if (fused_dispatched)
+		            {
+		              /* consumed (fused, silent fallback, or empty-build skip) */
+		              continue;
+		            }
+		        }
 
 		      /* Probe-input chase (D1): when this block IS the streaming-candidate
 		       * hash join and this aptr is its client-marked probe input, launch it

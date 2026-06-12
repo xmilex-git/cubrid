@@ -1244,6 +1244,157 @@ namespace parallel_scan
     (void) mark_stream_hashjoin_candidate_node (root, arg, candidates);
   }
 
+  /* Fused hash-join probe candidate marking (client side, gated on
+   * hash_join_fused_probe).
+   *
+   * Marks the OUTER (probe) input buildlist of an inner hash join with
+   * XASL_HJ_FUSED_PROBE_INPUT when the probe input is a plain single base-table
+   * sequential scan whose gather could instead probe the build hash table in-flight
+   * (probe pushdown into the parallel scan).  Only a CANDIDATE: the server re-vets
+   * eligibility on every execution (param value + post-build hash method + runtime
+   * shape), so plan-cache reuse across param flips stays correct.  Param OFF => the
+   * bit is never set => serialized XASL bytes are identical to the pre-feature
+   * engine.  JOIN_INNER picks the probe side by a decisive (>= 4x) estimated
+   * cardinality margin, exactly like the chase marking above: the runtime probe role
+   * is forced from this, so a non-decisive estimate marks nothing. */
+  static void
+  mark_fused_probe_candidate_node (XASL_NODE *hj)
+  {
+    if (hj == NULL || hj->type != HASHJOIN_PROC)
+      {
+	return;
+      }
+
+    HASHJOIN_PROC_NODE *hj_proc = &hj->proc.hashjoin;
+
+    if (hj_proc->merge_info.join_type != JOIN_INNER)
+      {
+	return;
+      }
+
+    /* v1: extra (non-equi) during-join predicates keep the materialized path; the
+     * predicate structures are not safely shareable across scan workers */
+    if (hj->during_join_pred != NULL)
+      {
+	return;
+      }
+
+    XASL_NODE *outer = hj_proc->outer.xasl;
+    XASL_NODE *inner = hj_proc->inner.xasl;
+    XASL_NODE *probe_input;
+
+    if (outer == NULL || inner == NULL || outer == inner)
+      {
+	return;
+      }
+
+    /* decisive probe side (either input): the probe input must be the clearly larger
+     * one so forcing the runtime probe role from this mark matches the counts-based
+     * role selection of the materialized path */
+    if (outer->cardinality >= inner->cardinality * 4.0 && outer->cardinality > 0.0)
+      {
+	probe_input = outer;
+      }
+    else if (inner->cardinality >= outer->cardinality * 4.0 && inner->cardinality > 0.0)
+      {
+	probe_input = inner;
+      }
+    else
+      {
+	return;
+      }
+
+    if (probe_input->type != BUILDLIST_PROC)
+      {
+	return;
+      }
+
+    /* plain single base-table sequential scan only */
+    ACCESS_SPEC_TYPE *spec = probe_input->spec_list;
+    if (spec == NULL || spec->next != NULL || spec->type != TARGET_CLASS
+	|| spec->access != ACCESS_METHOD_SEQUENTIAL || spec->single_fetch != QPROC_NO_SINGLE_INNER)
+      {
+	return;
+      }
+    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN)
+	|| ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_FOR_UPDATE))
+      {
+	return;
+      }
+
+    /* nothing may rewrite or post-process the gather output, and the sub-XASL must
+     * not drive further scans or subplans of its own */
+    if (probe_input->scan_ptr != NULL || probe_input->aptr_list != NULL || probe_input->dptr_list != NULL
+	|| probe_input->fptr_list != NULL || probe_input->bptr_list != NULL)
+      {
+	return;
+      }
+    if (probe_input->orderby_list != NULL || probe_input->after_iscan_list != NULL
+	|| probe_input->option == Q_DISTINCT)
+      {
+	return;
+      }
+    if (probe_input->proc.buildlist.groupby_list != NULL || probe_input->proc.buildlist.a_eval_list != NULL
+	|| probe_input->proc.buildlist.g_hash_eligible != 0)
+      {
+	return;
+      }
+    if (probe_input->selected_upd_list != NULL || probe_input->is_single_tuple || probe_input->merge_spec != NULL
+	|| probe_input->upd_del_class_cnt > 0)
+      {
+	return;
+      }
+    if (probe_input->instnum_pred != NULL || probe_input->instnum_val != NULL)
+      {
+	return;
+      }
+    if (XASL_IS_FLAGED (probe_input, XASL_LINK_TO_REGU_VARIABLE)
+	|| XASL_IS_FLAGED (probe_input, XASL_HAS_CONNECT_BY))
+      {
+	return;
+      }
+
+    XASL_SET_FLAG (probe_input, XASL_HJ_FUSED_PROBE_INPUT);
+  }
+
+  static void
+  mark_fused_probe_candidate_recursive (XASL_NODE *arg, std::unordered_set<XASL_NODE *> &visited)
+  {
+    if (arg == NULL || visited.find (arg) != visited.end ())
+      {
+	return;
+      }
+
+    for (XASL_NODE *xaslp = arg; xaslp != NULL; xaslp = xaslp->scan_ptr)
+      {
+	if (visited.find (xaslp) != visited.end ())
+	  {
+	    break;
+	  }
+	visited.insert (xaslp);
+
+	for (XASL_NODE *sub = xaslp->aptr_list; sub != NULL; sub = sub->next)
+	  {
+	    mark_fused_probe_candidate_recursive (sub, visited);
+	  }
+
+	mark_fused_probe_candidate_node (xaslp);
+      }
+  }
+
+  static void
+  mark_fused_probe_candidate (XASL_NODE *xasl)
+  {
+    if (!prm_get_bool_value (PRM_ID_HASH_JOIN_FUSED_PROBE))
+      {
+	return;
+      }
+
+    std::unordered_set<XASL_NODE *> visited;
+
+    mark_fused_probe_candidate_recursive (xasl, visited);
+  }
+
   static void
   mark_stream_hashjoin_candidate (XASL_NODE *xasl)
   {
@@ -1353,6 +1504,10 @@ scan_check_parallel_scan_possible (XASL_NODE *xasl)
   /* streaming hash-join candidate edge (gate 1): marked only after the parallel-scan
    * flags above are final, since the candidate shape requires them */
   parallel_scan::mark_stream_hashjoin_candidate (xasl);
+
+  /* fused hash-join probe candidate (gated): marked after the parallel-scan flags
+   * above are final, since the candidate shape requires them */
+  parallel_scan::mark_fused_probe_candidate (xasl);
 
   return NO_ERROR;
 }

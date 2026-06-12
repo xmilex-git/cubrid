@@ -259,6 +259,7 @@ stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool us
   xasl->memoize_storage = NULL;
   xasl->executed_parallelism = 0;
   xasl->chase_progress = NULL;
+  xasl->fused_probe = NULL;
 
   /* initialize the query in progress flag to FALSE.  Note that this flag is not packed/unpacked.  It is strictly a
    * server side flag. */
@@ -2374,6 +2375,7 @@ stx_build_xasl_node (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE * xasl)
   xasl->memoize_storage = NULL;
   xasl->executed_parallelism = 0;
   xasl->chase_progress = NULL;
+  xasl->fused_probe = NULL;
   return ptr;
 
 error:
@@ -3296,6 +3298,9 @@ stx_build_hashjoin_proc (THREAD_ENTRY * thread_p, char *ptr, HASHJOIN_PROC_NODE 
       node_p->domain_info.outer.value_indexes = node_p->merge_info.ls_outer_column;
       node_p->domain_info.inner.value_indexes = node_p->merge_info.ls_inner_column;
     }
+
+  /* runtime-only fused-probe handle (never serialized) */
+  node_p->fused_state = NULL;
 
   return ptr;
 

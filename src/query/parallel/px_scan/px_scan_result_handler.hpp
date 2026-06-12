@@ -124,7 +124,8 @@ namespace parallel_scan
 	  xasl (nullptr),
 	  val_list_domain_resolved (false),
 	  agg_hash_state (HS_NONE),
-	  g_agg_domains_resolved (TRUE) {}
+	  g_agg_domains_resolved (TRUE),
+	  fused_ctx (nullptr) {}
       ~mergeable_list_tls() = default;
       QFILE_LIST_ID *writer_result_p;
       QFILE_TUPLE_RECORD tpl_buf;
@@ -134,6 +135,9 @@ namespace parallel_scan
       bool val_list_domain_resolved;
       AGGREGATE_HASH_STATE agg_hash_state;
       int g_agg_domains_resolved;
+      /* fused hash-join probe: per-worker probe context (HJOIN_FUSED_WORKER *);
+       * non-NULL only while this worker probes a fused hash-join build table */
+      void *fused_ctx;
   };
 
   class xasl_snapshot_tls
