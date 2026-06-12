@@ -59,8 +59,10 @@ namespace parallel_query
       m_producer_count (0),
       m_producer_state (NULL),
       m_producer_state_free (NULL),
+      m_chase (),
       m_seq_counter (0),
       m_seq_producers_joined (0),
+      m_seq_chase_joined (0),
       m_seq_residue_drained (0),
       m_seq_workers_released (0),
       m_seq_state_freed (0),
@@ -236,6 +238,16 @@ namespace parallel_query
     return source_p;
   }
 
+  void
+  stream_pipeline::bind_chase (const chase_binding &binding)
+  {
+    /* DRIVER op, before launch_producers (): no concurrent reader yet */
+    assert (get_state () == pipe_state::BEGIN);
+    assert (m_chase.handle == NULL);
+
+    m_chase = binding;
+  }
+
   bool
   stream_pipeline::transition_to_consumer_closed ()
   {
@@ -282,6 +294,14 @@ namespace parallel_query
 	 * full channel no one will drain -- abort is the only correct wake (R11) */
 	m_channel_p->abort ();
       }
+
+    if (m_chase.request_stop != NULL)
+      {
+	/* R11 prompt stop for the chase WRITER too: it observes the request at its
+	 * per-tuple checkpoint and unwinds within one check interval; idempotent and
+	 * never an error.  Also wakes probe workers waiting on writer progress. */
+	m_chase.request_stop (m_chase.handle);
+      }
   }
 
   int
@@ -326,6 +346,17 @@ namespace parallel_query
       (void) advanced;
     }
     m_seq_producers_joined.store (next_seq (), std::memory_order_release);
+
+    /* 1b. join the chase writer (if bound): strictly AFTER the producers (its readers)
+     *     and strictly BEFORE the bundle free below destroys the input list it writes.
+     *     Prompt: the close-consumer step already requested its stop, and the writer
+     *     never waits on anything the pipeline owns (only forward pipeline -> writer
+     *     wait edges exist -- R5). */
+    if (m_chase.join != NULL)
+      {
+	m_chase.join (thread_p, m_chase.handle);
+	m_seq_chase_joined.store (next_seq (), std::memory_order_release);
+      }
 
     /* 2. drain channel residue: free every in-flight batch exactly once (INV-OWN).
      *    Safe without the pointer guard: only the runner ever frees the pointers, and
@@ -396,6 +427,9 @@ namespace parallel_query
 	m_source_p = NULL;
 	channel_p = m_channel_p;
 	m_channel_p = NULL;
+	/* the chase state outlives the pipeline but a post-teardown abort must not
+	 * touch it through us (it is reaped by the mainblock epilogue) */
+	m_chase = chase_binding ();
       }
 
       if (source_p != NULL)
@@ -466,7 +500,8 @@ namespace parallel_query
 		  "join_claim=%.1f join_done=%.1f | producer=[%.1f..%.1f] dur=%.1f | consumer=[%.1f..%.1f] dur=%.1f | "
 		  "overlap=%.1f (%.0f%% of producer) | push_block=%.1fms (%llu waits) pop_block=%.1fms (%llu waits) | "
 		  "batches=%llu bytes=%llu tuples=%llu | gather_tail(closed->join_claim)=%.1f teardown=%.1f | "
-		  "degree_p=%d degree_c=%d reserved=%d\n",
+		  "degree_p=%d degree_c=%d reserved=%d | chase=%d pages=%llu wait=%.1fms (%llu waits) "
+		  "writer_end=%.1f stop_req=%.1f stopped=%d\n",
 		  PX_REL_MS (m.t_launch_us.load (std::memory_order_relaxed)),
 		  PX_REL_MS (m.t_consumer_open_us.load (std::memory_order_relaxed)),
 		  PX_REL_MS (m.t_consumer_closed_us.load (std::memory_order_relaxed)),
@@ -491,7 +526,14 @@ namespace parallel_query
 		   > m.t_join_claim_us.load (std::memory_order_relaxed))
 		  ? (double) (m.t_join_done_us.load (std::memory_order_relaxed)
 			      - m.t_join_claim_us.load (std::memory_order_relaxed)) / 1000.0 : 0.0,
-		  m_producer_count, m_pool.consumer_degree, m_pool.reserved_workers);
+		  m_producer_count, m_pool.consumer_degree, m_pool.reserved_workers,
+		  m.chase_engaged.load (std::memory_order_relaxed),
+		  (unsigned long long) m.chase_pages.load (std::memory_order_relaxed),
+		  (double) m.chase_wait_us.load (std::memory_order_relaxed) / 1000.0,
+		  (unsigned long long) m.chase_wait_cnt.load (std::memory_order_relaxed),
+		  PX_REL_MS (m.chase_writer_end_us.load (std::memory_order_relaxed)),
+		  PX_REL_MS (m.chase_stop_request_us.load (std::memory_order_relaxed)),
+		  m.chase_stopped.load (std::memory_order_relaxed));
 
 #undef PX_REL_MS
   }
@@ -518,6 +560,13 @@ namespace parallel_query
     if (m_channel_p != NULL)
       {
 	m_channel_p->abort ();
+      }
+
+    if (m_chase.request_stop != NULL)
+      {
+	/* same prompt-stop edge on the error path: the writer unwinds, probe workers
+	 * waiting on writer progress wake (the chase wait predicate includes it) */
+	m_chase.request_stop (m_chase.handle);
       }
   }
 }

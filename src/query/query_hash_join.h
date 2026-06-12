@@ -316,11 +316,17 @@ typedef struct hashjoin_shared_probe_info
   // *INDENT-OFF*
   QFILE_LIST_SECTOR_SCAN_INFO sector_scan;
 
+  /* probe-input chase (D1): parallel_query::hjoin_chase *; non-NULL ONLY when the
+   * probe input is consumed read-behind-writer -- the probe page source is then the
+   * chase iterator instead of the sector scan */
+  void *chase;
+
   std::mutex stats_mutex;
   HASHJOIN_RANGE_STATS probe_range;
 
   hashjoin_shared_probe_info ()
     : sector_scan ()
+    , chase (nullptr)
     , stats_mutex ()
     , probe_range HASHJOIN_RANGE_STATS_INITIALIZER
   {
@@ -485,6 +491,12 @@ typedef struct hashjoin_manager
   bool stream_candidate;
   bool stream_detached;
   void *stream_pipeline;
+
+  /* Probe-input chase (D1): parallel_query::hjoin_chase * borrowed from the XASL node
+   * (owned there; reaped by the mainblock/teardown epilogue).  Non-NULL only while
+   * this execution may consume the probe input read-behind-writer; NULLed as soon as
+   * the chase is joined and today's (closed-list) path applies verbatim. */
+  void *chase;
 
 #if HASHJOIN_DUMP_HASH_TABLE
   pthread_mutex_t dump_hash_table_mutex;

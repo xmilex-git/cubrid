@@ -36,7 +36,8 @@
  *
  * Ordered teardown (OWN-3), executed by the SINGLE teardown runner inside join_all ():
  *
- *   close consumer -> join producers -> drain channel residue -> release workers once
+ *   close consumer -> join producers -> join chase writer (if bound) -> drain channel
+ *                  residue -> release workers once
  *                  -> free owned state (producer bundle, source, channel)
  *
  * join_all () MUST complete (state RELEASED) before qexec_clear_head_lists-time cleanup
@@ -137,6 +138,28 @@ namespace parallel_query
       /* frees the opaque producer-side state bundle exactly once, post-JOINED */
       typedef void (*producer_state_free_fn) (THREAD_ENTRY *thread_p, void *producer_state);
 
+      /* Probe-input chase binding (D1).  The chase WRITER sits OUTSIDE the atomic
+       * D_p + D_c grant (its dedicated worker is reserved before the pipeline exists
+       * and held for its lifetime), but its stop/join converge on THIS pipeline's
+       * ordered teardown:
+       *  - request_stop is fired by the close_consumer winner and by abort () (R11:
+       *    the writer stops within one check interval; a normal early close is NOT an
+       *    error);
+       *  - join runs inside join_all (), strictly AFTER the producers are joined and
+       *    strictly BEFORE the producer bundle is freed (the bundle free destroys the
+       *    input list the writer writes).
+       * The handle is non-owning: the chase state outlives the pipeline and is freed
+       * by the hash-join mainblock/teardown epilogue. */
+      struct chase_binding
+      {
+	void *handle = nullptr;
+	void (*request_stop) (void *handle) = nullptr;
+	void (*join) (THREAD_ENTRY *thread_p, void *handle) = nullptr;
+      };
+
+      /* DRIVER: bind the chase BEFORE launch_producers (); at most once */
+      void bind_chase (const chase_binding &binding);
+
       /* DRIVER: construct the owner in state BEGIN.  Takes ownership of pool
        * IMMEDIATELY: on any construction failure the reservation is released here
        * (never leaked, never partial) and NULL is returned -- the caller falls back
@@ -179,8 +202,8 @@ namespace parallel_query
       void close_consumer (THREAD_ENTRY *thread_p);
 
       /* DRIVER (TEARDOWN-RUNNER): the ordered teardown to RELEASED --
-       *   close consumer -> join producers -> drain residue -> release workers once ->
-       *   free owned state.
+       *   close consumer -> join producers -> join chase writer -> drain residue ->
+       *   release workers once -> free owned state.
        * Idempotent: the runner is elected by an atomic claim; a loser yield-spins until
        * RELEASED and returns without re-running any step.  MUST complete before
        * qexec_clear_head_lists-time cleanup. */
@@ -249,6 +272,10 @@ namespace parallel_query
       {
 	return m_seq_producers_joined.load (std::memory_order_acquire);
       }
+      std::uint64_t get_seq_chase_joined () const
+      {
+	return m_seq_chase_joined.load (std::memory_order_acquire);
+      }
       std::uint64_t get_seq_residue_drained () const
       {
 	return m_seq_residue_drained.load (std::memory_order_acquire);
@@ -314,12 +341,17 @@ namespace parallel_query
       void *m_producer_state;			/* opaque owned bundle (OWN-2) */
       producer_state_free_fn m_producer_state_free;
 
+      /* probe-input chase binding (non-owning; guarded by m_ptr_mtx for ANY-THREAD
+       * request_stop; cleared by the runner's free step) */
+      chase_binding m_chase;
+
       /* A7 overlap metrics (see px_stream_metrics.hpp; emitted in join_all) */
       stream_metrics m_metrics;
 
       /* instrumentation */
       std::atomic<std::uint64_t> m_seq_counter;
       std::atomic<std::uint64_t> m_seq_producers_joined;
+      std::atomic<std::uint64_t> m_seq_chase_joined;
       std::atomic<std::uint64_t> m_seq_residue_drained;
       std::atomic<std::uint64_t> m_seq_workers_released;
       std::atomic<std::uint64_t> m_seq_state_freed;

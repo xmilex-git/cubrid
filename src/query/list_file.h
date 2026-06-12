@@ -121,6 +121,8 @@ extern void qfile_finalize (void);
 extern void qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id);
 extern void qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id);
 extern int qfile_add_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, QFILE_TUPLE tpl);
+extern int qfile_append_page_copy (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_p, PAGE_PTR src_page_p,
+				   struct qmgr_temp_file *src_tfile_p);
 extern int qfile_add_tuple_get_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, QFILE_TUPLE tpl,
 					    QFILE_TUPLE_POSITION * tuple_pos);
 extern int qfile_add_overflow_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, PAGE_PTR ovfl_tpl_pg,

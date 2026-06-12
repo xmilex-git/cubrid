@@ -266,6 +266,13 @@ namespace parallel_query
       private:
 	void execute_inner (cubthread::entry &thread_ref);
 	void execute_outer (cubthread::entry &thread_ref);
+
+	/* probe page source seam: the sector iterator over the final list (default), or
+	 * the chase iterator strictly behind the still-running writer (D1; engaged when
+	 * m_shared_info->chase != NULL).  Same contract as sector_page_iterator:
+	 * NULL = end of input OR error (er_errid () set) OR stop (clean end). */
+	PAGE_PTR next_probe_page (cubthread::entry &thread_ref);
+	QMGR_TEMP_FILE *probe_tfile () const;
     };
 
 #if !defined (WINDOWS)

@@ -68,6 +68,13 @@ namespace parallel_scan
 
     private:
       void get_valid_read_spec ();
+
+      /* streaming hash-join probe-input chase (MERGEABLE_LIST only): incremental
+       * page-copy gather -- copies the per-worker lists' immutable page prefixes into
+       * dest as the workers publish their frontiers, instead of waiting for all
+       * workers and relinking pages once at the end.  Runs on the gather thread. */
+      SCAN_CODE chase_copy_gather (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest);
+
       int m_parallelism;
       std::mutex m_result_mutex;
       std::condition_variable m_result_cv;

@@ -3492,6 +3492,36 @@ qmgr_set_query_error (THREAD_ENTRY * thread_p, QUERY_ID query_id)
     }
 }
 
+/*
+ * qmgr_reset_query_error_interrupted () - clear a benign ER_INTERRUPTED parked on the
+ *   query entry.  Used ONLY by the streaming hash-join's probe-input chase (R11): a
+ *   REQUESTED writer stop unwinds through the normal error path, which parks
+ *   ER_INTERRUPTED here -- but a requested stop is not an error and the query must
+ *   return its correct result.  Any real failure re-parks its own error afterwards
+ *   through the failing block's exit path, so clearing the interrupt marker is safe.
+ *   return:
+ *   query_id(in)       :
+ */
+void
+qmgr_reset_query_error_interrupted (THREAD_ENTRY * thread_p, QUERY_ID query_id)
+{
+  QMGR_QUERY_ENTRY *query_p;
+
+  query_p = qmgr_get_query_entry (thread_p, query_id, NULL_TRAN_INDEX);
+  if (query_p != NULL && query_p->errid == ER_INTERRUPTED)
+    {
+      query_p->errid = NO_ERROR;
+#if defined (SERVER_MODE)
+      if (query_p->er_msg != NULL)
+	{
+	  free_and_init (query_p->er_msg);
+	}
+#else
+      query_p->er_msg = NULL;
+#endif
+    }
+}
+
 #if defined (SERVER_MODE)
 /*
  * qmgr_find_leaf () -

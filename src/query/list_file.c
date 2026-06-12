@@ -1668,6 +1668,104 @@ qfile_add_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFI
   return NO_ERROR;
 }
 
+/*
+ * qfile_append_page_copy () - Append one COMPLETE source data page's tuples to the end
+ *   of the destination list as one fresh page (page-level raw copy).
+ *   return: int (NO_ERROR or ER_FAILED)
+ *   dest_list_p(in): destination list (open, in append mode)
+ *   src_page_p(in): source data page (fixed by the caller; immutable)
+ *   src_tfile_p(in): temp file owning the source page (overflow chain access)
+ *
+ * Note: Built for the streaming hash-join probe-input chase: the gather copies the
+ *   per-worker scan lists' immutable pages into the final list incrementally instead
+ *   of one wholesale page-relink merge at the end.  The page's tuple bytes are
+ *   identical in the destination (same list tuple format); only the page chaining,
+ *   the first tuple's back-link and the list bookkeeping are rewritten.  A source
+ *   page carrying an overflow tuple takes the per-tuple path, deep-copying the
+ *   overflow chain into the destination's temp file.
+ */
+int
+qfile_append_page_copy (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_p, PAGE_PTR src_page_p,
+			struct qmgr_temp_file *src_tfile_p)
+{
+  PAGE_PTR new_page_p;
+  int tuple_cnt, last_offset, last_length, used_size;
+  char *first_tuple_p;
+  int error = NO_ERROR;
+
+  assert (dest_list_p != NULL && src_page_p != NULL);
+
+  tuple_cnt = QFILE_GET_TUPLE_COUNT (src_page_p);
+  if (tuple_cnt == 0)
+    {
+      /* empty page: nothing to append */
+      return NO_ERROR;
+    }
+
+  if (tuple_cnt == QFILE_OVERFLOW_TUPLE_COUNT_FLAG)
+    {
+      /* overflow CONTINUATION page: consumed through its start page; never copied */
+      assert (false);
+      return NO_ERROR;
+    }
+
+  if (QFILE_GET_OVERFLOW_PAGE_ID (src_page_p) != NULL_PAGEID)
+    {
+      /* overflow START page (single big tuple): assemble and re-add, which deep-copies
+       * the overflow chain into the destination's own temp file */
+      QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+
+      assert (tuple_cnt == 1);
+
+      error = qfile_assemble_overflow_tuple (thread_p, src_page_p, &tuple_record, src_tfile_p);
+      if (error == NO_ERROR)
+	{
+	  error = qfile_add_tuple_to_list (thread_p, dest_list_p, tuple_record.tpl);
+	}
+
+      if (tuple_record.tpl != NULL)
+	{
+	  db_private_free_and_init (thread_p, tuple_record.tpl);
+	}
+
+      return error;
+    }
+
+  last_offset = QFILE_GET_LAST_TUPLE_OFFSET (src_page_p);
+  assert (last_offset >= QFILE_PAGE_HEADER_SIZE && last_offset < DB_PAGESIZE);
+
+  last_length = QFILE_GET_TUPLE_LENGTH ((char *) src_page_p + last_offset);
+  used_size = last_offset + last_length;
+  assert (used_size > QFILE_PAGE_HEADER_SIZE && used_size <= DB_PAGESIZE);
+
+  /* fresh destination page chained after the current last page (also updates
+   * first/last vpid, page_cnt, last_pgptr, last_offset) */
+  new_page_p = qfile_allocate_new_page (thread_p, dest_list_p, dest_list_p->last_pgptr, false);
+  if (new_page_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  memcpy ((char *) new_page_p + QFILE_PAGE_HEADER_SIZE, (char *) src_page_p + QFILE_PAGE_HEADER_SIZE,
+	  used_size - QFILE_PAGE_HEADER_SIZE);
+
+  QFILE_PUT_TUPLE_COUNT (new_page_p, tuple_cnt);
+  QFILE_PUT_LAST_TUPLE_OFFSET (new_page_p, last_offset);
+
+  /* the copied first tuple's back-link now refers to the destination's previous tuple
+   * (backward scans); the rest of the page's back-links are intra-page and identical */
+  first_tuple_p = (char *) new_page_p + QFILE_PAGE_HEADER_SIZE;
+  QFILE_PUT_PREV_TUPLE_LENGTH (first_tuple_p, dest_list_p->lasttpl_len);
+
+  dest_list_p->tuple_cnt += tuple_cnt;
+  dest_list_p->lasttpl_len = last_length;
+  dest_list_p->last_offset = used_size;
+
+  qfile_set_dirty_page (thread_p, new_page_p, DONT_FREE, dest_list_p->tfile_vfid);
+
+  return NO_ERROR;
+}
+
 static int
 qfile_save_single_bound_item_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, char *page_p,
 				    int tuple_length)

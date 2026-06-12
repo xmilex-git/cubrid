@@ -84,6 +84,15 @@ namespace parallel_query
     std::atomic<std::uint64_t> bytes_pushed {0};
     std::atomic<std::uint64_t> tuples_pushed {0};
 
+    /* probe-input chase (D1) -- all zero unless a chase engaged */
+    std::atomic<int> chase_engaged {0};			/* 1 = probe consumed via the chase iterator */
+    std::atomic<int> chase_stopped {0};			/* 1 = writer ended on a requested stop (R11) */
+    std::atomic<std::uint64_t> chase_pages {0};		/* pages published at the last frontier update */
+    std::atomic<std::uint64_t> chase_wait_us {0};	/* probe time spent waiting on writer progress */
+    std::atomic<std::uint64_t> chase_wait_cnt {0};
+    std::atomic<std::uint64_t> chase_writer_end_us {0};	/* writer closed (epoch us) */
+    std::atomic<std::uint64_t> chase_stop_request_us {0};	/* first stop request (epoch us) */
+
     /* store-min (first writer of a nonzero value wins races conservatively) */
     void
     note_min (std::atomic<std::uint64_t> &slot, std::uint64_t value)

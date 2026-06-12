@@ -602,6 +602,18 @@ make_hashjoin_proc (QO_ENV * env, QO_PLAN * plan, XASL_NODE * outer_xasl, XASL_N
    * so the wire bytes and the server plan are identical with the feature ON or OFF. */
   xasl->cardinality = (plan->info != NULL) ? plan->info->cardinality : 0.0;
 
+  /* Also stamp the INPUT buildlists' estimated cardinalities (same client-side-only
+   * justification): the streaming hash-join chase marker (px_scan_checker.cpp) uses
+   * them to pick the probe-side input of a JOIN_INNER edge with a decisive margin. */
+  if (plan->plan_un.join.outer != NULL && plan->plan_un.join.outer->info != NULL)
+    {
+      outer_xasl->cardinality = plan->plan_un.join.outer->info->cardinality;
+    }
+  if (plan->plan_un.join.inner != NULL && plan->plan_un.join.inner->info != NULL)
+    {
+      inner_xasl->cardinality = plan->plan_un.join.inner->info->cardinality;
+    }
+
   proc = &xasl->proc.hashjoin;
 
   /* proc->outer.regu_list_pred */

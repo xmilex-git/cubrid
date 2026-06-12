@@ -35,6 +35,10 @@
 #include "query_aggregate.hpp"
 #include "xasl_aggregate.hpp"
 #include "object_domain.h"
+#include "query_manager.h"	/* qmgr_get_old_page, qmgr_free_old_page_and_init */
+#if !defined (WINDOWS)
+#include "px_stream_chase.hpp"	/* streaming hash-join probe-input chase */
+#endif /* !defined (WINDOWS) */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -329,6 +333,14 @@ namespace parallel_scan
 	  }
 	qfile_close_list (thread_p, tl.writer_result_p);
 
+#if !defined (WINDOWS)
+	if (m_.orig_xasl != nullptr && m_.orig_xasl->chase_progress != nullptr)
+	  {
+	    /* this worker's list is final: the chase gather may consume it to its end */
+	    qexec_hjoin_chase_src_close (m_.orig_xasl->chase_progress, tl.writer_result_p);
+	  }
+#endif /* !defined (WINDOWS) */
+
 	assert (tl.writer_result_p->last_pgptr == nullptr);
 	if (tl.writer_result_p != nullptr && tl.writer_result_p->tpl_descr.f_valp != nullptr)
 	  {
@@ -556,11 +568,289 @@ namespace parallel_scan
       }
   }
 
+  /*
+   * chase_copy_gather - streaming hash-join probe-input chase (MERGEABLE_LIST gather).
+   *
+   * Single consumer (the gather thread, i.e. the detached chase job).  For every
+   * worker list registered in the chase's source slots, copies the pages STRICTLY
+   * BEHIND that worker's published frontier (or through the real chain end once the
+   * worker closed) into dest -- page-level raw copies via qfile_append_page_copy --
+   * and publishes dest's own frontier after every page so the hash-join's probe
+   * workers can read dest behind THIS thread.  A fully-consumed source is destroyed
+   * immediately (bounds the transient extra temp space) and unhooked from
+   * writer_results so the normal finalize never double-frees it.
+   *
+   * Stop/error: the chase stop request and the scan interrupt both surface as S_ERROR
+   * here; the mainblock unwind then stops the scan workers (JOB_ENDED) and the chase
+   * task wrapper distinguishes a requested stop (R11: not an error) from a failure.
+   */
+  template <RESULT_TYPE result_type>
+  SCAN_CODE result_handler<result_type>::chase_copy_gather (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest)
+  {
+#if !defined (WINDOWS)
+    if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
+      {
+	void *chase_p = m_.orig_xasl->chase_progress;
+
+	struct src_cursor
+	{
+	  QFILE_LIST_ID *list;
+	  VPID next;
+	  bool started;
+	  bool done;
+	};
+	std::vector<src_cursor> cursors;
+	bool dest_domains_adopted = (dest->is_domain_resolved != false);
+
+	assert (chase_p != nullptr);
+	assert (dest != nullptr && dest->tuple_cnt == 0);
+
+	while (true)
+	  {
+	    bool progressed = false;
+	    int live_slots = 0;
+
+	    if (m_interrupt_p->get_code() != parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+	      {
+		return S_ERROR;
+	      }
+	    if (qexec_hjoin_chase_stop_requested (chase_p))
+	      {
+		/* R11: requested stop -- unwind promptly through the error path; the
+		 * chase task wrapper recognizes it as a benign stop */
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+		return S_ERROR;
+	      }
+
+	    int slot_cnt = qexec_hjoin_chase_src_count (chase_p);
+
+	    for (int i = 0; i < slot_cnt; i++)
+	      {
+		VPID frontier;
+		bool closed = false;
+		QFILE_LIST_ID *src = qexec_hjoin_chase_src_get (chase_p, i, &frontier, &closed);
+
+		if (src == nullptr)
+		  {
+		    continue;	/* free or already consumed slot */
+		  }
+		live_slots++;
+
+		/* find-or-create this source's local cursor */
+		src_cursor *cur = nullptr;
+		for (src_cursor &c : cursors)
+		  {
+		    if (c.list == src)
+		      {
+			cur = &c;
+			break;
+		      }
+		  }
+		if (cur == nullptr)
+		  {
+		    src_cursor fresh;
+
+		    fresh.list = src;
+		    VPID_SET_NULL (&fresh.next);
+		    fresh.started = false;
+		    fresh.done = false;
+		    cursors.push_back (fresh);
+		    cur = &cursors.back ();
+		  }
+
+		if (!dest_domains_adopted && src->is_domain_resolved)
+		  {
+		    /* adopt the source's final domains (workers resolve VARIABLE
+		     * domains from real values; dest was opened from the raw outptr
+		     * list).  Single dest writer = this thread. */
+		    assert (dest->type_list.type_cnt == src->type_list.type_cnt);
+		    for (int k = 0; k < dest->type_list.type_cnt; k++)
+		      {
+			dest->type_list.domp[k] = src->type_list.domp[k];
+		      }
+		    dest->is_domain_resolved = true;
+		    dest_domains_adopted = true;
+
+		    /* dest's type list is now final: the hash-join may consume it */
+		    qexec_hjoin_chase_writer_open (chase_p, dest);
+		  }
+
+		/* consume everything strictly behind this worker's frontier (or
+		 * through the real chain end once it closed) */
+		while (true)
+		  {
+		    if (!cur->started)
+		      {
+			VPID first_vpid = src->first_vpid;
+
+			if (VPID_ISNULL (&first_vpid))
+			  {
+			    if (closed)
+			      {
+				cur->done = true;	/* empty source */
+			      }
+			    break;
+			  }
+			cur->next = first_vpid;
+			cur->started = true;
+		      }
+
+		    if (cur->next.pageid == NULL_PAGEID || cur->next.pageid == NULL_PAGEID_IN_PROGRESS)
+		      {
+			if (closed)
+			  {
+			    cur->done = true;	/* real chain end */
+			  }
+			break;
+		      }
+
+		    if (!closed && VPID_EQ (&cur->next, &frontier))
+		      {
+			/* the frontier page is the worker's still-mutable last page */
+			break;
+		      }
+
+		    VPID fix_vpid = cur->next;
+		    PAGE_PTR page = qmgr_get_old_page (thread_p, &fix_vpid, src->tfile_vfid);
+
+		    if (page == nullptr)
+		      {
+			m_err_messages_p->move_top_error_message_to_this();
+			m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_MAIN_THREAD);
+			return S_ERROR;
+		      }
+
+		    int err_code = qfile_append_page_copy (thread_p, dest, page, src->tfile_vfid);
+
+		    QFILE_GET_NEXT_VPID (&cur->next, page);
+		    qmgr_free_old_page_and_init (thread_p, page, src->tfile_vfid);
+
+		    if (err_code == NO_ERROR)
+		      {
+			/* publish dest's new frontier for the probe readers; also the
+			 * R11 stop checkpoint */
+			err_code = qexec_hjoin_chase_writer_on_tuple (thread_p, chase_p, dest);
+		      }
+		    if (err_code != NO_ERROR)
+		      {
+			m_err_messages_p->move_top_error_message_to_this();
+			m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_MAIN_THREAD);
+			return S_ERROR;
+		      }
+
+		    progressed = true;
+		  }
+
+		if (cur->done)
+		  {
+		    /* fully consumed: destroy the source NOW and unhook it everywhere
+		     * (slot, writer_results, local cursor) */
+		    qexec_hjoin_chase_src_consume (chase_p, i);
+		    {
+		      std::lock_guard<std::mutex> lock (m_.writer_results_mutex);
+		      for (size_t w = 0; w < m_.writer_results.size (); w++)
+			{
+			  if (m_.writer_results[w] == src)
+			    {
+			      m_.writer_results.erase (m_.writer_results.begin () + w);
+			      break;
+			    }
+			}
+		    }
+		    for (size_t c = 0; c < cursors.size (); c++)
+		      {
+			if (cursors[c].list == src)
+			  {
+			    cursors.erase (cursors.begin () + c);
+			    break;
+			  }
+		      }
+		    qfile_destroy_list (thread_p, src);
+		    QFILE_FREE_AND_INIT_LIST_ID (src);
+		    live_slots--;
+		    progressed = true;
+		  }
+	      }
+
+	    if (progressed)
+	      {
+		continue;
+	      }
+
+	    bool workers_done;
+	    {
+	      std::unique_lock<std::mutex> lock (m_result_mutex);
+	      workers_done = (m_.active_results == 0);
+	    }
+
+	    if (workers_done && live_slots == 0)
+	      {
+		/* every worker finalized (so every list was registered+closed) and
+		 * every registered source consumed.  Defensive: destroy any leftover
+		 * never-registered empty list exactly like the merge would. */
+		bool leftovers = false;
+		{
+		  std::lock_guard<std::mutex> lock (m_.writer_results_mutex);
+		  for (QFILE_LIST_ID *&leftover : m_.writer_results)
+		    {
+		      if (leftover != nullptr && leftover->tuple_cnt == 0)
+			{
+			  qfile_destroy_list (thread_p, leftover);
+			  QFILE_FREE_AND_INIT_LIST_ID (leftover);
+			}
+		      else if (leftover != nullptr)
+			{
+			  leftovers = true;	/* registered between checks: loop again */
+			}
+		    }
+		  if (!leftovers)
+		    {
+		      m_.writer_results.clear ();
+		    }
+		}
+		if (!leftovers)
+		  {
+		    break;
+		  }
+	      }
+	    else
+	      {
+		qexec_hjoin_chase_copy_wait (chase_p);
+	      }
+	  }
+
+	return S_END;
+      }
+    else
+      {
+	(void) thread_p;
+	(void) dest;
+	assert (false);
+	return S_ERROR;
+      }
+#else /* !defined (WINDOWS) */
+    (void) thread_p;
+    (void) dest;
+    assert (false);
+    return S_ERROR;
+#endif /* !defined (WINDOWS) */
+  }
+
   template <RESULT_TYPE result_type>
   SCAN_CODE result_handler<result_type>::read (THREAD_ENTRY *thread_p, read_dest_type *dest)
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
       {
+#if !defined (WINDOWS)
+	if (m_.orig_xasl != nullptr && m_.orig_xasl->chase_progress != nullptr && !m_.g_hash_eligible)
+	  {
+	    /* streaming hash-join probe-input chase: copy worker pages into dest as
+	     * the workers publish them (read-behind each worker) and publish dest's
+	     * own frontier for the probe readers -- replaces wait-for-all-workers +
+	     * one wholesale page-relink merge, which has no chaseable frontier */
+	    return chase_copy_gather (thread_p, dest);
+	  }
+#endif /* !defined (WINDOWS) */
 	{
 	  std::unique_lock<std::mutex> lock (m_result_mutex);
 	  if (m_.active_results != 0)
@@ -737,6 +1027,30 @@ namespace parallel_scan
 
 	OUTPTR_LIST *input = (OUTPTR_LIST *)src;
 
+#if !defined (WINDOWS)
+	/* streaming hash-join probe-input chase: this worker list's pages strictly
+	 * before its last page are immutable -- publish that frontier per page
+	 * boundary so the chase gather can copy them while the scan still runs */
+	void *chase_p = (m_.orig_xasl != nullptr) ? m_.orig_xasl->chase_progress : nullptr;
+	VPID chase_old_last_vpid;
+
+	VPID_SET_NULL (&chase_old_last_vpid);
+	if (chase_p != nullptr)
+	  {
+	    if (qexec_hjoin_chase_stop_requested (chase_p))
+	      {
+		/* R11 prompt stop: stop producing; unwinds as a standard worker error
+		 * (the chase task wrapper recognizes the requested stop, so no spurious
+		 * error ever reaches the client) */
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+		m_err_messages_p->move_top_error_message_to_this();
+		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		return false;
+	      }
+	    chase_old_last_vpid = tl.writer_result_p->last_vpid;
+	  }
+#endif /* !defined (WINDOWS) */
+
 	prefetch (tl.writer_result_p, PREFETCH_WRITE, PREFETCH_CACHE_L1);
 
 	status = qdata_generate_tuple_desc_for_valptr_list (thread_p, input, tl.vd, & (tl.writer_result_p->tpl_descr));
@@ -831,6 +1145,14 @@ namespace parallel_scan
 		return false;
 	      }
 	  }
+
+#if !defined (WINDOWS)
+	if (chase_p != nullptr && !VPID_EQ (&chase_old_last_vpid, &tl.writer_result_p->last_vpid))
+	  {
+	    /* page boundary crossed: publish this worker's new read frontier */
+	    qexec_hjoin_chase_src_publish (chase_p, tl.writer_result_p);
+	  }
+#endif /* !defined (WINDOWS) */
 	return true;
       }
     else if constexpr (result_type == RESULT_TYPE::XASL_SNAPSHOT)

@@ -387,9 +387,13 @@ typedef struct hashjoin_proc_node
    * mode may apply to this join's output edge; cleared/re-decided on every execution.
    * stream_pipeline: parallel_query::stream_pipeline ownership handle, non-NULL only
    * while a streamed execution of this node is in flight; the mainblock driver runs
-   * join_all () + destroy () strictly before head-list cleanup of the same query. */
+   * join_all () + destroy () strictly before head-list cleanup of the same query.
+   * chase_state: parallel_query::hjoin_chase ownership handle for the probe-input
+   * chase (D1), armed by this node's own mainblock aptr dispatch; joined+freed by
+   * qexec_hjoin_chase_reap on the mainblock/teardown epilogue. */
   bool stream_candidate;
   void *stream_pipeline;
+  void *chase_state;
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 } HASHJOIN_PROC_NODE;
 
@@ -529,6 +533,10 @@ struct cte_proc_node
 #define XASL_ANALYTIC_USES_LIMIT_OPT (0x1 << 20)	/* analytic uses limit optimization */
 #define XASL_ANALYTIC_SKIP_SORT (0x1 << 21)	/* analytic skip sort optimization */
 #define XASL_DBLINK_CURSOR_REWIND	(0x1 << 22)	/* correlated DBLink subquery: rewind CCI cursor instead of re-issuing cci_execute per outer row */
+#define XASL_HJ_CHASE_INPUT	       (0x1 << 23)	/* streaming hash-join probe-INPUT buildlist: candidate for the
+							 * probe-input chase (read-behind-writer); set client-side only
+							 * when the streamed edge is marked (param ON), re-vetted at
+							 * runtime on every execution */
 
 #define XASL_IS_FLAGED(x, f)        (((x)->flag & (int) (f)) != 0)
 #define IS_DBLINK_CURSOR_REWIND_XASL(x)     XASL_IS_FLAGED ((x), XASL_DBLINK_CURSOR_REWIND)
@@ -1210,6 +1218,9 @@ struct xasl_node
   int executed_parallelism;	/* parallelism of the query */
   memoize::storage *memoize_storage;
   // *INDENT-ON*
+  void *chase_progress;		/* parallel_query::hjoin_chase * -- non-NULL ONLY while this
+				 * buildlist is the chased probe input of a streaming hash-join
+				 * (runtime-only; never serialized; zeroed on unpack) */
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 };
 

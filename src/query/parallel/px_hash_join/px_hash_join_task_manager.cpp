@@ -33,6 +33,9 @@
 #include "query_hash_join.h"
 #include "query_hash_scan.h"
 #include "query_manager.h"		/* qmgr_get_old_page, qmgr_free_old_page_and_init, ... */
+#if !defined (WINDOWS)
+#include "px_stream_chase.hpp"		/* parallel_query::hjoin_chase (probe-input chase) */
+#endif /* !defined (WINDOWS) */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -1043,6 +1046,35 @@ cleanup:
       thread_ref.m_uses_px_stats = false;
     }
 
+    /*
+     * probe page source seam: sector iterator over the final list, or the chase
+     * iterator strictly behind the still-running writer (D1)
+     */
+
+    PAGE_PTR
+    probe_task::next_probe_page (cubthread::entry &thread_ref)
+    {
+#if !defined (WINDOWS)
+      if (m_shared_info->chase != nullptr)
+	{
+	  return ((parallel_query::hjoin_chase *) m_shared_info->chase)->reader_next_page (thread_ref);
+	}
+#endif /* !defined (WINDOWS) */
+      return m_page_iter.get_next_page (thread_ref, m_shared_info->sector_scan);
+    }
+
+    QMGR_TEMP_FILE *
+    probe_task::probe_tfile () const
+    {
+#if !defined (WINDOWS)
+      if (m_shared_info->chase != nullptr)
+	{
+	  return ((parallel_query::hjoin_chase *) m_shared_info->chase)->reader_tfile ();
+	}
+#endif /* !defined (WINDOWS) */
+      return m_page_iter.get_current_tfile ();
+    }
+
     void
     probe_task::execute_inner (cubthread::entry &thread_ref)
     {
@@ -1112,7 +1144,7 @@ cleanup:
 	      break;		/* error_exit */
 	    }
 
-	  page = m_page_iter.get_next_page (thread_ref, m_shared_info->sector_scan);
+	  page = next_probe_page (thread_ref);
 	  if (page == nullptr)
 	    {
 	      if (er_errid () != NO_ERROR)
@@ -1129,7 +1161,7 @@ cleanup:
 	  if (tuple_cnt == 0)
 	    {
 	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_free_old_page_and_init (&thread_ref, page, probe_tfile ());
 	      continue;
 	    }
 	  tuple_index = -1;
@@ -1142,7 +1174,7 @@ cleanup:
 	    {
 	      assert (tuple_cnt == 1);
 
-	      error = qfile_assemble_overflow_tuple (&thread_ref, page, &overflow_record, m_page_iter.get_current_tfile ());
+	      error = qfile_assemble_overflow_tuple (&thread_ref, page, &overflow_record, probe_tfile ());
 	      if (error != NO_ERROR)
 		{
 		  m_task_manager.handle_error (thread_ref);
@@ -1274,7 +1306,7 @@ cleanup:
 
 	  if (page != nullptr)
 	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_free_old_page_and_init (&thread_ref, page, probe_tfile ());
 	    }
 
 	  if (has_error)
@@ -1286,7 +1318,7 @@ cleanup:
 
       if (page != nullptr)
 	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	  qmgr_free_old_page_and_init (&thread_ref, page, probe_tfile ());
 	}
 
       if (thread_is_on_trace (&thread_ref))
@@ -1375,7 +1407,7 @@ cleanup:
 	      break;		/* error_exit */
 	    }
 
-	  page = m_page_iter.get_next_page (thread_ref, m_shared_info->sector_scan);
+	  page = next_probe_page (thread_ref);
 	  if (page == nullptr)
 	    {
 	      if (er_errid () != NO_ERROR)
@@ -1392,7 +1424,7 @@ cleanup:
 	  if (tuple_cnt == 0)
 	    {
 	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_free_old_page_and_init (&thread_ref, page, probe_tfile ());
 	      continue;
 	    }
 	  tuple_index = -1;
@@ -1405,7 +1437,7 @@ cleanup:
 	    {
 	      assert (tuple_cnt == 1);
 
-	      error = qfile_assemble_overflow_tuple (&thread_ref, page, &overflow_record, m_page_iter.get_current_tfile ());
+	      error = qfile_assemble_overflow_tuple (&thread_ref, page, &overflow_record, probe_tfile ());
 	      if (error != NO_ERROR)
 		{
 		  m_task_manager.handle_error (thread_ref);
@@ -1623,7 +1655,7 @@ cleanup:
 
 	  if (page != nullptr)
 	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_free_old_page_and_init (&thread_ref, page, probe_tfile ());
 	    }
 
 	  if (has_error)
@@ -1635,7 +1667,7 @@ cleanup:
 
       if (page != nullptr)
 	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	  qmgr_free_old_page_and_init (&thread_ref, page, probe_tfile ());
 	}
 
       if (thread_is_on_trace (&thread_ref))

@@ -258,6 +258,7 @@ stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool us
   xasl->px_executor = NULL;
   xasl->memoize_storage = NULL;
   xasl->executed_parallelism = 0;
+  xasl->chase_progress = NULL;
 
   /* initialize the query in progress flag to FALSE.  Note that this flag is not packed/unpacked.  It is strictly a
    * server side flag. */
@@ -2372,6 +2373,7 @@ stx_build_xasl_node (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE * xasl)
   xasl->px_executor = NULL;
   xasl->memoize_storage = NULL;
   xasl->executed_parallelism = 0;
+  xasl->chase_progress = NULL;
   return ptr;
 
 error:

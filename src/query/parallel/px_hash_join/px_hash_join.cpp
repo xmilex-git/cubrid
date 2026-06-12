@@ -22,6 +22,9 @@
 
 #include "px_hash_join.hpp"
 #include "px_hash_join_task_manager.hpp"
+#if !defined (WINDOWS)
+#include "px_stream_chase.hpp"		/* parallel_query::hjoin_chase (probe-input chase) */
+#endif /* !defined (WINDOWS) */
 
 #include "error_manager.h"		/* assert_release_error, er_errid, NO_ERROR, ... */
 #include "list_file.h"			/* qfile_open_list, qfile_open_list_scan, qfile_close_scan, ... */
@@ -678,14 +681,26 @@ error_exit:
 	}
       state->sink_states = sink_states;
 
-      /* collect data page sectors for the (already final) probe INPUT relation */
-      error = qfile_open_list_sector_scan (&thread_ref, manager->single_context.probe->list_id,
-					   &state->shared_info.sector_scan);
-      if (error != NO_ERROR)
+      if (manager->chase != nullptr)
 	{
-	  goto error_exit;
+	  /* D1 probe-input chase: the input list is still being written -- the probe
+	   * tasks read it page-by-page strictly behind the writer's published frontier
+	   * through the chase iterator; no sector scan exists (it would read the live
+	   * list-id struct).  Works unchanged if the writer finished meanwhile (the
+	   * iterator then just walks the closed chain). */
+	  state->shared_info.chase = manager->chase;
 	}
-      sector_scan_opened = true;
+      else
+	{
+	  /* collect data page sectors for the (already final) probe INPUT relation */
+	  error = qfile_open_list_sector_scan (&thread_ref, manager->single_context.probe->list_id,
+					       &state->shared_info.sector_scan);
+	  if (error != NO_ERROR)
+	    {
+	      goto error_exit;
+	    }
+	  sector_scan_opened = true;
+	}
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{

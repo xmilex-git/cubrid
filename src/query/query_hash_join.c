@@ -35,6 +35,7 @@
 #if defined (SERVER_MODE) && !defined (WINDOWS)
 #include "px_stream_channel.hpp"	/* parallel_query::stream_channel, row_batch */
 #include "px_stream_pipeline.hpp"	/* parallel_query::stream_pipeline */
+#include "px_stream_chase.hpp"	/* parallel_query::hjoin_chase (probe-input chase) */
 #include "px_stream_policy.hpp"	/* stream_policy_try_begin, stream_policy_release_pool_handle */
 #endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 #include "query_list.h"		/* JOIN_TYPE */
@@ -136,6 +137,12 @@ static void hjoin_destroy_qlist (THREAD_ENTRY * thread_p, HASHJOIN_CONTEXT * con
 /* Hash Join Processing */
 static HASHJOIN_STATUS hjoin_check_empty_inputs (HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
 
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+/* Probe-Input Chase (D1) */
+static bool hjoin_chase_outer_is_chased (HASHJOIN_MANAGER * manager);
+static int hjoin_chase_check_or_join (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager);
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
 /* Build Phase */
 static int hjoin_build (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
 static int hjoin_build_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan,
@@ -215,6 +222,36 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 	  manager_is_heap = true;
 	}
     }
+
+  /* Probe-input chase (D1): the chased input may still be materializing.  Before the
+   * manager reads the input lists' metadata, wait until the OPEN list is usable (type
+   * list published) or the writer ended; when this execution cannot stream after all,
+   * the materialized path needs the COMPLETE list -- join the writer naturally. */
+  void *chase_state = xasl->proc.hashjoin.chase_state;
+
+  if (chase_state != NULL)
+    {
+      if (!stream_candidate)
+	{
+	  error = qexec_hjoin_chase_join_for_data (thread_p, chase_state);
+	  chase_state = NULL;	/* today's path verbatim (state reaped by the epilogue) */
+	}
+      else
+	{
+	  error = qexec_hjoin_chase_wait_input_usable (thread_p, chase_state);
+	}
+
+      if (error != NO_ERROR)
+	{
+	  /* pre-init failure: the manager is not initialized yet -- bail directly */
+	  if (manager_is_heap)
+	    {
+	      db_private_free_and_init (thread_p, manager);
+	    }
+	  assert_release_error (er_errid () != NO_ERROR);
+	  return er_errid ();
+	}
+    }
 #endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
   error = hjoin_init_manager (thread_p, manager, xasl, query_id, val_descr);
@@ -225,6 +262,16 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 
   manager->stream_candidate = stream_candidate;
 
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+  manager->chase = chase_state;
+  if (chase_state != NULL)
+    {
+      /* the open input's metadata (type list / domains) is consumed: the writer's
+       * end-of-job clear may now run without racing the reads above */
+      qexec_hjoin_chase_release_meta (chase_state);
+    }
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
   single_context = &manager->single_context;
 
   status = hjoin_check_empty_inputs (manager, single_context);
@@ -232,10 +279,35 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
   switch (status)
     {
     case HASHJOIN_STATUS_FILL_NULL_VALUES:
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+      if (manager->chase != NULL)
+	{
+	  /* the NULL-fill scans the (chased) probe side in full: join the writer */
+	  error = qexec_hjoin_chase_join_for_data (thread_p, manager->chase);
+	  manager->chase = NULL;
+	  if (error != NO_ERROR)
+	    {
+	      goto error_exit;
+	    }
+	}
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
       error = hjoin_outer_fill_null_values (thread_p, manager, single_context);
       break;
 
     case HASHJOIN_STATUS_TRY:
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+      if (manager->chase != NULL)
+	{
+	  /* chase decision pre-partition: keep the chase only when the complete (build)
+	   * side alone guarantees the single in-memory strategy; otherwise join the
+	   * writer naturally and decide exactly as today on final counts */
+	  error = hjoin_chase_check_or_join (thread_p, manager);
+	  if (error != NO_ERROR)
+	    {
+	      goto error_exit;
+	    }
+	}
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
       part_status = hjoin_try_partition (thread_p, manager, single_context);
       single_context->status = part_status;
       switch (part_status)
@@ -374,6 +446,17 @@ cleanup:
 
       manager->stream_pipeline = NULL;
       manager->px_worker_manager = NULL;
+    }
+
+  if (manager->chase != NULL && !manager->stream_detached)
+    {
+      /* every non-detached exit reaches here: the writer is either already joined (the
+       * materialized path consumed the closed list -- both calls are no-ops) or its
+       * output is no longer needed (END short-circuit / error) -- stop it promptly and
+       * join BEFORE hjoin_clear_manager destroys the input list files below (R11). */
+      qexec_hjoin_chase_request_stop (manager->chase);
+      qexec_hjoin_chase_join (thread_p, manager->chase);
+      manager->chase = NULL;
     }
 #endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
@@ -735,10 +818,17 @@ hjoin_execute_internal (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HAS
       goto error_exit;
     }
 
-  error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id);
-  if (error != NO_ERROR)
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+  if (manager->chase == NULL)
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
     {
-      goto error_exit;
+      /* with an active chase the probe input is OPEN: the streamed probe reads it only
+       * through the chase iterator (header + immutable pages); no list scan is opened */
+      error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id);
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
     }
 
   error = hjoin_probe (thread_p, manager, context);
@@ -2194,14 +2284,37 @@ hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * man
       return HASHJOIN_STATUS_NONE;
     }
 
-  /* I2: producer degree from the already-final probe-INPUT page count (the output size
-   * is unknown and never needed) */
+  /* I2: producer degree from the probe-INPUT page count -- the pages PUBLISHED so far
+   * when the input is still being chased (D1), the final count otherwise (the output
+   * size is unknown and never needed) */
+  UINT64 input_pages;
+
+  if (manager->chase != NULL)
+    {
+      input_pages = (UINT64) MAX (qexec_hjoin_chase_pages_published (manager->chase), 0);
+    }
+  else
+    {
+      input_pages = single_context->probe->list_id->page_cnt;
+    }
+
   UINT32 degree = parallel_query::compute_parallel_degree (parallel_query::parallel_type::HASH_JOIN,
-							   single_context->probe->list_id->page_cnt,
-							   manager->num_parallel_threads);
+							   input_pages, manager->num_parallel_threads);
   if (degree < 2)
     {
       return HASHJOIN_STATUS_NONE;
+    }
+
+  if (manager->chase != NULL)
+    {
+      /* the published frontier is a strict LOWER BOUND on the final input (the writer
+       * is still running; arming at build-ready typically sees a fraction of it) --
+       * give the auto-computation headroom so a growing input is not under-granted;
+       * the parallelism/core caps inside still bound the result */
+      UINT32 degree_growing = parallel_query::compute_parallel_degree (parallel_query::parallel_type::HASH_JOIN,
+								       input_pages * 8,
+								       manager->num_parallel_threads);
+      degree = MAX (degree, degree_growing);
     }
 
   /* D2: asymmetric degrees -- the consumer (downstream scan over the streamed output) is
@@ -2240,13 +2353,33 @@ hjoin_try_stream_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * man
   manager->px_worker_manager = decision.pool;	/* NON-OWNING: task dispatch only */
   manager->stream_pipeline = (void *) pipe;
 
+  // *INDENT-OFF*
+  if (manager->chase != NULL)
+    {
+      /* D1: converge the chase writer's stop/join on THIS pipeline's ordered teardown
+       * (close consumer -> join producers -> JOIN CHASE -> drain -> release -> free) */
+      parallel_query::stream_pipeline::chase_binding chase_binding;
+
+      chase_binding.handle = manager->chase;
+      chase_binding.request_stop = parallel_query::hjoin_chase::pipeline_request_stop;
+      chase_binding.join = parallel_query::hjoin_chase::pipeline_join;
+      pipe->bind_chase (chase_binding);
+
+      ((parallel_query::hjoin_chase *) manager->chase)->set_metrics (pipe->get_metrics ());
+      pipe->get_metrics ()->chase_engaged.store (1, std::memory_order_relaxed);
+    }
+  // *INDENT-ON*
+
   /* A7 diagnostics: which edge streamed, with what per-side degrees, from what input
-   * sizes (gated by the er_log_debug system parameter; streamed path only) */
+   * sizes (gated by the er_log_debug system parameter; streamed path only).  With an
+   * active chase the probe-input fields are the PUBLISHED frontier, not final counts
+   * (-1 tuples: unknowable while the writer runs). */
   er_log_debug (ARG_FILE_LINE,
-		"HJSTREAM arm: degree_p=%d degree_c=%d pipeline_workers=%d probe_pages=%d probe_tuples=%lld "
-		"build_pages=%d build_tuples=%lld channel_capacity=%d batch_bytes=%d\n",
-		degree_p, degree_c, decision.pipeline_workers,
-		single_context->probe->list_id->page_cnt, (long long) single_context->probe->list_id->tuple_cnt,
+		"HJSTREAM arm: degree_p=%d degree_c=%d pipeline_workers=%d chase=%d probe_pages=%lld "
+		"probe_tuples=%lld build_pages=%d build_tuples=%lld channel_capacity=%d batch_bytes=%d\n",
+		degree_p, degree_c, decision.pipeline_workers, (manager->chase != NULL) ? 1 : 0,
+		(long long) input_pages,
+		(manager->chase != NULL) ? -1LL : (long long) single_context->probe->list_id->tuple_cnt,
 		single_context->build->list_id->page_cnt, (long long) single_context->build->list_id->tuple_cnt,
 		HJOIN_STREAM_CHANNEL_CAPACITY, HJOIN_STREAM_BATCH_BYTES);
 
@@ -2615,12 +2748,62 @@ hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
 
   outer = &context->outer;
   inner = &context->inner;
+
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+  bool chase_active = false;
+
+  if (manager->chase != NULL && context == &manager->single_context)
+    {
+      if (qexec_hjoin_chase_is_closed (manager->chase))
+	{
+	  /* fast input (refusal ladder step 3): join the chase context (instant) and
+	   * take today's path verbatim -- counts-based selection, sector scan */
+	  error = qexec_hjoin_chase_join_for_data (thread_p, manager->chase);
+	  manager->chase = NULL;
+	  if (error != NO_ERROR)
+	    {
+	      goto error_exit;
+	    }
+	}
+      else
+	{
+	  chase_active = true;
+	}
+    }
+
+  if (!chase_active)
+    {
+      assert (outer->list_id != NULL && outer->list_id->tuple_cnt > 0);
+      assert (inner->list_id != NULL && inner->list_id->tuple_cnt > 0);
+    }
+#else /* defined (SERVER_MODE) && !defined (WINDOWS) */
   assert (outer->list_id != NULL && outer->list_id->tuple_cnt > 0);
   assert (inner->list_id != NULL && inner->list_id->tuple_cnt > 0);
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
   switch (manager->join_type)
     {
     case JOIN_INNER:
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+      if (chase_active)
+	{
+	  /* forced roles: probe = the (still materializing) chased side, build = the
+	   * complete side.  The client marks the chase input only with a decisive
+	   * (>= 4x) estimated-cardinality margin, so this matches the counts-based
+	   * choice; on a misestimate the worst case is today's performance. */
+	  if (hjoin_chase_outer_is_chased (manager))
+	    {
+	      context->build = inner;
+	      context->probe = outer;
+	    }
+	  else
+	    {
+	      context->build = outer;
+	      context->probe = inner;
+	    }
+	  break;
+	}
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
       if (outer->list_id->tuple_cnt < inner->list_id->tuple_cnt)
 	{
 	  context->build = outer;
@@ -2719,6 +2902,21 @@ hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
 	  assert_release_error (false);
 	  goto error_exit;
 	}
+
+#if !defined (WINDOWS)
+      if (manager->chase != NULL && manager->stream_pipeline == NULL)
+	{
+	  /* streamed-arm refusal (non-IN_MEM build, degree < 2, reservation shortfall):
+	   * the materialized probe reads the COMPLETE list -- join the writer naturally
+	   * (refusal ladder step 4), then everything downstream is today's path */
+	  error = qexec_hjoin_chase_join_for_data (thread_p, manager->chase);
+	  manager->chase = NULL;
+	  if (error != NO_ERROR)
+	    {
+	      goto error_exit;
+	    }
+	}
+#endif /* !defined (WINDOWS) */
     }
 #endif /* defined (SERVER_MODE) */
 
@@ -2986,6 +3184,70 @@ hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan)
   hash_scan->hash_list_scan_type = HASH_METH_NOT_USE;
 }
 
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+/*
+ * hjoin_chase_outer_is_chased() - True when the OUTER input is the chased one.
+ *   return: bool.
+ *   manager(in): Hash join manager containing shared state.
+ */
+static bool
+hjoin_chase_outer_is_chased (HASHJOIN_MANAGER * manager)
+{
+  assert (manager->chase != NULL);
+
+  return manager->outer->xasl != NULL && manager->outer->xasl->chase_progress != NULL;
+}
+
+/*
+ * hjoin_chase_check_or_join() - Pre-partition chase decision (refusal ladder).
+ *   return: Error code (NO_ERROR if successful, error code otherwise).
+ *   thread_p(in): Thread entry.
+ *   manager(in): Hash join manager containing shared state.
+ *
+ * Note: Keeps the chase only when (a) the input is genuinely still open and (b) the
+ *       COMPLETE (build) side alone fits the single in-memory strategy -- then today's
+ *       hjoin_check_partition can only answer SINGLE (min (complete, growing) <=
+ *       complete).  Otherwise the writer is joined to natural completion and
+ *       manager->chase is NULLed, making every downstream step today's path verbatim
+ *       on the closed list.
+ */
+static int
+hjoin_chase_check_or_join (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager)
+{
+  QFILE_LIST_ID *complete_list_id;
+  UINT64 mem_limit;
+  UINT32 part_cnt;
+  int error = NO_ERROR;
+
+  assert (manager->chase != NULL);
+
+  if (!qexec_hjoin_chase_is_closed (manager->chase))
+    {
+      complete_list_id =
+	hjoin_chase_outer_is_chased (manager) ? manager->inner->xasl->list_id : manager->outer->xasl->list_id;
+
+      mem_limit = prm_get_bigint_value (PRM_ID_MAX_HASH_LIST_SCAN_SIZE);
+      assert (mem_limit > 0);
+
+      part_cnt =
+	CEIL_PTVDIV ((sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) * complete_list_id->tuple_cnt,
+		     mem_limit * PARTITION_FILL_FACTOR);
+      if (part_cnt <= 1)
+	{
+	  /* the build side fits in memory: the chase may proceed (forced roles) */
+	  return NO_ERROR;
+	}
+    }
+
+  /* closed already, or the build side would partition: the materialized decision needs
+   * the COMPLETE list -- join the writer naturally and take today's path verbatim */
+  error = qexec_hjoin_chase_join_for_data (thread_p, manager->chase);
+  manager->chase = NULL;
+
+  return error;
+}
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
 /*
  * hjoin_check_empty_inputs() -
  *   return: One of the following HASHJOIN_STATUS values:
@@ -3019,6 +3281,24 @@ hjoin_check_empty_inputs (HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context
 
   outer_tuple_cnt = outer->list_id->tuple_cnt;
   inner_tuple_cnt = inner->list_id->tuple_cnt;
+
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+  if (manager->chase != NULL && context == &manager->single_context
+      && !qexec_hjoin_chase_is_closed (manager->chase))
+    {
+      /* the chased input is still materializing: its count is unknowable here -- treat
+       * it as non-empty (the build side is complete and checked exactly; a finally
+       * empty chased input ends up as an empty probe, which is correct) */
+      if (hjoin_chase_outer_is_chased (manager))
+	{
+	  outer_tuple_cnt = 1;
+	}
+      else
+	{
+	  inner_tuple_cnt = 1;
+	}
+    }
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
   /* HASHJOIN_STATUS_END must be checked first. */
 

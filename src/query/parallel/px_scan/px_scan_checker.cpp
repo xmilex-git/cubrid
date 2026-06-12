@@ -1289,6 +1289,53 @@ namespace parallel_scan
       }
 
     ACCESS_SPEC_SET_FLAG (best->spec, ACCESS_SPEC_FLAG_STREAM_HASHJOIN);
+
+    /* D1 probe-input chase: additionally mark the PROBE-side input buildlist of the
+     * winning edge so its materialization can be overlapped (read-behind-writer).
+     * JOIN_LEFT/RIGHT fix the probe side statically; JOIN_INNER picks the input with
+     * the decisively larger estimated cardinality (>= 4x -- the runtime build/probe
+     * roles are forced from this, so a non-decisive estimate marks nothing and the
+     * counts-based selection of today applies).  The bit is set only when the marking
+     * pass runs (param ON), so OFF-serialized bytes are unchanged (R2); the server
+     * re-vets eligibility on every execution (plan-cache safety). */
+    {
+      HASHJOIN_PROC_NODE *hj_proc = &best->producer->proc.hashjoin;
+      XASL_NODE *probe_input = NULL;
+
+      switch (hj_proc->merge_info.join_type)
+	{
+	case JOIN_LEFT:
+	  probe_input = hj_proc->outer.xasl;
+	  break;
+	case JOIN_RIGHT:
+	  probe_input = hj_proc->inner.xasl;
+	  break;
+	case JOIN_INNER:
+	  if (hj_proc->outer.xasl != NULL && hj_proc->inner.xasl != NULL)
+	    {
+	      double outer_card = hj_proc->outer.xasl->cardinality;
+	      double inner_card = hj_proc->inner.xasl->cardinality;
+
+	      if (outer_card >= inner_card * 4.0 && outer_card > 0.0)
+		{
+		  probe_input = hj_proc->outer.xasl;
+		}
+	      else if (inner_card >= outer_card * 4.0 && inner_card > 0.0)
+		{
+		  probe_input = hj_proc->inner.xasl;
+		}
+	    }
+	  break;
+	default:
+	  break;
+	}
+
+      if (probe_input != NULL && probe_input->type == BUILDLIST_PROC
+	  && !XASL_IS_FLAGED (probe_input, XASL_LINK_TO_REGU_VARIABLE))
+	{
+	  XASL_SET_FLAG (probe_input, XASL_HJ_CHASE_INPUT);
+	}
+    }
   }
 }
 

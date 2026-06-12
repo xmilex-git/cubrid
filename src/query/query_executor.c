@@ -90,6 +90,7 @@
 #include "px_scan_trace_handler.hpp"
 #include "px_scan.hpp"
 #include "px_stream_pipeline.hpp"	/* parallel_query::stream_pipeline (streaming hash join) */
+#include "px_stream_chase.hpp"	/* probe-input chase (streaming hash join D1) */
 #endif /* SERVER_MODE && !WINDOWS */
 #include "px_query_executor.hpp"
 #include <vector>
@@ -1269,6 +1270,15 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
 		  GOTO_EXIT_ON_ERROR;
 		}
 	    }
+
+#if SERVER_MODE && !WINDOWS
+	  if (xasl->chase_progress != NULL
+	      && qexec_hjoin_chase_writer_on_tuple (thread_p, xasl->chase_progress, xasl->list_id) != NO_ERROR)
+	    {
+	      /* requested stop (R11): unwind promptly; never an error to the client */
+	      GOTO_EXIT_ON_ERROR;
+	    }
+#endif /* SERVER_MODE && !WINDOWS */
 	  break;
 
 	case QPROC_TPLDESCR_RETRY_SET_TYPE:
@@ -1294,6 +1304,14 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
 	    {
 	      GOTO_EXIT_ON_ERROR;
 	    }
+
+#if SERVER_MODE && !WINDOWS
+	  if (xasl->chase_progress != NULL
+	      && qexec_hjoin_chase_writer_on_tuple (thread_p, xasl->chase_progress, xasl->list_id) != NO_ERROR)
+	    {
+	      GOTO_EXIT_ON_ERROR;
+	    }
+#endif /* SERVER_MODE && !WINDOWS */
 	  break;
 
 	default:
@@ -14625,6 +14643,17 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
 		QFILE_SET_FLAG (ls_flag, QFILE_FLAG_RESULT_FILE);
 	      }
 
+#if SERVER_MODE && !WINDOWS
+	    if (xasl->chase_progress != NULL)
+	      {
+		/* chased probe input (streaming hash-join D1): probe workers read this
+		 * list cross-thread behind the writer -- membuf pages are per-list
+		 * memory that may move on growth, so force real temp-file pages
+		 * (precedent: the MERGEABLE_LIST writer lists) */
+		QFILE_SET_FLAG (ls_flag, QFILE_NOT_USE_MEMBUF);
+	      }
+#endif /* SERVER_MODE && !WINDOWS */
+
 	    xasl->list_id =
 	      qfile_open_list (thread_p, &type_list, xasl->after_iscan_list, xasl_state->query_id, ls_flag,
 			       xasl->list_id);
@@ -14640,6 +14669,14 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
 	      {
 		db_private_free_and_init (thread_p, type_list.domp);
 	      }
+
+#if SERVER_MODE && !WINDOWS
+	    if (xasl->chase_progress != NULL)
+	      {
+		/* the hash-join may now read the open list's type list (once final) */
+		qexec_hjoin_chase_writer_open (xasl->chase_progress, xasl->list_id);
+	      }
+#endif /* SERVER_MODE && !WINDOWS */
 
 	    if (xasl->orderby_list != NULL)
 	      {
@@ -15496,6 +15533,85 @@ qexec_stream_hjoin_check_candidate (THREAD_ENTRY * thread_p, XASL_NODE * xasl, X
 }
 
 /*
+ * qexec_stream_hjoin_chase_eligible () - Runtime eligibility of an aptr as the CHASED
+ *                                        probe input of this hash join (D1).
+ *   return: true when the aptr's list may be consumed read-behind-writer.
+ *   xasl(in): The HASHJOIN_PROC node whose own mainblock is dispatching aptrs.
+ *   aptr(in): The client-marked (XASL_HJ_CHASE_INPUT) input under consideration.
+ *
+ * Note: Refuses every shape that rewrites/replaces the list after the main insert loop
+ *       (sort, distinct, group-by, analytics, top-n) or that the single-writer
+ *       publication model cannot serve.  Every refusal silently keeps today's
+ *       dispatch (pre-emit; refusal ladder step 2).
+ */
+static bool
+qexec_stream_hjoin_chase_eligible (XASL_NODE * xasl, XASL_NODE * aptr)
+{
+  assert (xasl->type == HASHJOIN_PROC);
+
+  if (aptr->type != BUILDLIST_PROC)
+    {
+      return false;
+    }
+
+  /* the aptr must be one of THIS hash join's two inputs */
+  if (aptr != xasl->proc.hashjoin.outer.xasl && aptr != xasl->proc.hashjoin.inner.xasl)
+    {
+      return false;
+    }
+
+  /* static probe side by join type must match the marked input */
+  switch (xasl->proc.hashjoin.merge_info.join_type)
+    {
+    case JOIN_INNER:
+      break;
+    case JOIN_LEFT:
+      if (aptr != xasl->proc.hashjoin.outer.xasl)
+	{
+	  return false;
+	}
+      break;
+    case JOIN_RIGHT:
+      if (aptr != xasl->proc.hashjoin.inner.xasl)
+	{
+	  return false;
+	}
+      break;
+    default:
+      return false;
+    }
+
+  /* anything that rewrites the list after the main loop breaks the single-writer
+   * append-only publication model: refuse */
+  if (aptr->orderby_list != NULL || aptr->after_iscan_list != NULL || aptr->option == Q_DISTINCT
+      || aptr->topn_items != NULL)
+    {
+      return false;
+    }
+  if (aptr->proc.buildlist.groupby_list != NULL || aptr->proc.buildlist.a_eval_list != NULL)
+    {
+      return false;
+    }
+  if (aptr->selected_upd_list != NULL || aptr->is_single_tuple || aptr->merge_spec != NULL
+      || aptr->upd_del_class_cnt > 0)
+    {
+      return false;
+    }
+  if (XASL_IS_FLAGED (aptr, XASL_HAS_CONNECT_BY) || XASL_IS_FLAGED (aptr, XASL_LINK_TO_REGU_VARIABLE))
+    {
+      return false;
+    }
+
+  /* the list must start fresh so its open can force QFILE_NOT_USE_MEMBUF */
+  if (aptr->list_id == NULL || aptr->list_id->type_list.type_cnt > 0)
+    {
+      return false;
+    }
+
+  return true;
+}
+
+/*
  * qexec_stream_hjoin_teardown () - Join and destroy every streaming hash-join pipeline
  *                                  owned by this mainblock's aptrs.
  *   return: None.
@@ -15514,11 +15630,25 @@ qexec_stream_hjoin_teardown (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 {
   XASL_NODE *xptr, *aptr;
 
+  /* this block IS a hash join: reap its own probe-input chase, but ONLY when no
+   * pipeline is in flight (detached streaming: the chase is joined inside the
+   * pipeline's ordered teardown and reaped by the consumer-side driver below) */
+  if (xasl->type == HASHJOIN_PROC && xasl->proc.hashjoin.chase_state != NULL
+      && xasl->proc.hashjoin.stream_pipeline == NULL)
+    {
+      qexec_hjoin_chase_reap (thread_p, xasl);
+    }
+
   for (xptr = xasl; xptr != NULL; xptr = xptr->scan_ptr)
     {
       for (aptr = xptr->aptr_list; aptr != NULL; aptr = aptr->next)
 	{
-	  if (aptr->type == HASHJOIN_PROC && aptr->proc.hashjoin.stream_pipeline != NULL)
+	  if (aptr->type != HASHJOIN_PROC)
+	    {
+	      continue;
+	    }
+
+	  if (aptr->proc.hashjoin.stream_pipeline != NULL)
 	    {
 	      // *INDENT-OFF*
 	      parallel_query::stream_pipeline *pipe =
@@ -15530,6 +15660,14 @@ qexec_stream_hjoin_teardown (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 
 	      aptr->proc.hashjoin.stream_pipeline = NULL;
 	      aptr->proc.hashjoin.stream_candidate = false;
+	    }
+
+	  if (aptr->proc.hashjoin.chase_state != NULL)
+	    {
+	      /* detached path: join_all above already joined the writer (ordered
+	       * teardown step 1b); the reap is then an instant join + free.  Also
+	       * covers a chase left behind by an error between arm and hjoin. */
+	      qexec_hjoin_chase_reap (thread_p, aptr);
 	    }
 	}
     }
@@ -15909,7 +16047,13 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 
 	  for (xptr2 = xptr->aptr_list; xptr2; xptr2 = xptr2->next)
 	    {
-	      if (merge_infop && !xasl->px_executor)
+	      if (merge_infop && !xasl->px_executor
+#if defined (SERVER_MODE) || defined (SA_MODE)
+		  /* a chase-dispatched input is still materializing: its transient
+		   * counts must never drive the empty-input skip (D1) */
+		  && !(xasl->type == HASHJOIN_PROC && xasl->proc.hashjoin.chase_state != NULL)
+#endif /* defined (SERVER_MODE) || defined (SA_MODE) */
+		  )
 		{
 		  if (merge_infop->join_type == JOIN_INNER || merge_infop->join_type == JOIN_LEFT)
 		    {
@@ -15975,6 +16119,22 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 					    (void *) xasl, (void *) xptr2);
 			    }
 			}
+
+		      /* Probe-input chase (D1): when this block IS the streaming-candidate
+		       * hash join and this aptr is its client-marked probe input, launch it
+		       * as a detached chase job on a dedicated reserved worker instead of
+		       * add_job/inline -- run_jobs () below then joins the BUILD-side inputs
+		       * only, and the hash join starts as soon as the build input is ready
+		       * (probe workers read the chased list strictly behind its writer). */
+		      if (xptr2->type == BUILDLIST_PROC && xasl->type == HASHJOIN_PROC
+		          && xasl->proc.hashjoin.stream_candidate && xasl->proc.hashjoin.chase_state == NULL
+		          && XASL_IS_FLAGED (xptr2, XASL_HJ_CHASE_INPUT)
+		          && qexec_stream_hjoin_chase_eligible (xasl, xptr2)
+		          && qexec_hjoin_chase_try_arm (thread_p, xasl, xptr2, xasl_state))
+		        {
+		          /* dispatched detached; never part of the px job set */
+		          continue;
+		        }
 
 		      if (!XASL_IS_FLAGED (xasl, XASL_NO_PARALLEL_SUBQUERY) && XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL)
 			  && xasl->px_executor == nullptr)
