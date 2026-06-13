@@ -54,6 +54,10 @@ struct heap_attrvalue
   DB_VALUE dbvalue;		/* DB values of the attribute in memory */
 };
 
+/* Opaque per-attrinfo record-decode fast-path cache (heap_record_decode_fast).
+ * Built and consumed by heap_file.c only. */
+typedef struct heap_attrinfo_fastdecode HEAP_ATTRINFO_FASTDECODE;
+
 typedef struct heap_cache_attrinfo HEAP_CACHE_ATTRINFO;
 struct heap_cache_attrinfo
 {
@@ -68,6 +72,7 @@ struct heap_cache_attrinfo
   int inst_chn;			/* Current chn of instance object */
   int num_values;		/* Number of desired attribute values */
   HEAP_ATTRVALUE *values;	/* Value for the attributes */
+  HEAP_ATTRINFO_FASTDECODE *fastdecode;	/* Decode fast-path cache; NULL unless heap_record_decode_fast is enabled */
 };
 
 #else /* !defined (SERVER_MODE) && !defined (SA_MODE) */
