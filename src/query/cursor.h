@@ -93,6 +93,9 @@ extern int cursor_copy_list_id (QFILE_LIST_ID * dest_list_id, const QFILE_LIST_I
             if (list_id_p->tpl_descr.f_valp) { \
               free_and_init (list_id_p->tpl_descr.f_valp); \
             } \
+            if (list_id_p->tpl_descr.enc_cols) { \
+              free_and_init (list_id_p->tpl_descr.enc_cols); \
+            } \
             if (list_id_p->sort_list) { \
               free_and_init (list_id_p->sort_list); \
             } \

@@ -450,6 +450,9 @@ qfile_modify_type_list (QFILE_TUPLE_VALUE_TYPE_LIST * type_list_p, QFILE_LIST_ID
     }
 
   list_id_p->tpl_descr.f_valp = NULL;
+  list_id_p->tpl_descr.enc_key = NULL;
+  list_id_p->tpl_descr.enc_ncols = 0;
+  list_id_p->tpl_descr.enc_cols = NULL;
   return NO_ERROR;
 }
 
@@ -590,6 +593,12 @@ qfile_clear_list_id (QFILE_LIST_ID * list_id_p)
     {
       free_and_init (list_id_p->tpl_descr.f_valp);
     }
+  if (list_id_p->tpl_descr.enc_cols)
+    {
+      free_and_init (list_id_p->tpl_descr.enc_cols);
+    }
+  list_id_p->tpl_descr.enc_key = NULL;
+  list_id_p->tpl_descr.enc_ncols = 0;
 
   if (list_id_p->sort_list)
     {
@@ -1359,6 +1368,7 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 
 	  qmgr_free_old_page_and_init (thread_p, list_id_p->last_pgptr, list_id_p->tfile_vfid);
 	}
+      list_id_p->last_pgptr_dirtied = false;
     }
 }
 
@@ -1422,6 +1432,7 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
     }
 
   list_id_p->last_pgptr = last_page_ptr;
+  list_id_p->last_pgptr_dirtied = false;
 
   return NO_ERROR;
 }
@@ -1517,6 +1528,7 @@ qfile_allocate_new_page (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, PAG
     }
   QFILE_COPY_VPID (&list_id_p->last_vpid, &new_vpid);
   list_id_p->last_pgptr = new_page_p;
+  list_id_p->last_pgptr_dirtied = false;
   list_id_p->last_offset = QFILE_PAGE_HEADER_SIZE;
 
   return new_page_p;
@@ -1696,14 +1708,34 @@ qfile_save_normal_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, 
 {
   int i, tuple_value_size;
   int total_tuple_value_size = 0;
-  for (i = 0; i < tuple_descr_p->f_cnt; i++)
+  QFILE_ENC_COL *enc_cols = tuple_descr_p->enc_cols;
+
+  if (enc_cols != NULL && tuple_descr_p->f_cnt <= tuple_descr_p->enc_ncols)
     {
-      if (qdata_copy_db_value_to_tuple_value (tuple_descr_p->f_valp[i], tuple_p, &tuple_value_size) != NO_ERROR)
+      /* qfile_tuple_encode_fast: per-column cached writers; each column falls back to the
+       * generic encode whenever its value does not match the cached type */
+      for (i = 0; i < tuple_descr_p->f_cnt; i++)
 	{
-	  return ER_FAILED;
+	  if (qdata_copy_db_value_to_tuple_value_enc (tuple_descr_p->f_valp[i], &enc_cols[i], tuple_p,
+						      &tuple_value_size) != NO_ERROR)
+	    {
+	      return ER_FAILED;
+	    }
+	  total_tuple_value_size += tuple_value_size;
+	  tuple_p += tuple_value_size;
 	}
-      total_tuple_value_size += tuple_value_size;
-      tuple_p += tuple_value_size;
+    }
+  else
+    {
+      for (i = 0; i < tuple_descr_p->f_cnt; i++)
+	{
+	  if (qdata_copy_db_value_to_tuple_value (tuple_descr_p->f_valp[i], tuple_p, &tuple_value_size) != NO_ERROR)
+	    {
+	      return ER_FAILED;
+	    }
+	  total_tuple_value_size += tuple_value_size;
+	  tuple_p += tuple_value_size;
+	}
     }
 
   assert_release (total_tuple_value_size <= tuple_length);
@@ -1887,7 +1919,20 @@ qfile_generate_tuple_into_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id
 
   qfile_add_tuple_to_list_id (list_id_p, page_p, tuple_length, tuple_length);
 
-  qfile_set_dirty_page (thread_p, cur_page_p, DONT_FREE, list_id_p->tfile_vfid);
+  if (prm_get_bool_value (PRM_ID_QFILE_TUPLE_ENCODE_FAST))
+    {
+      /* batch the append-writer dirty mark: once per page while it stays fixed; the
+       * page-switch (FREE) and close paths mark pages dirty exactly as before */
+      if (!list_id_p->last_pgptr_dirtied)
+	{
+	  qfile_set_dirty_page (thread_p, cur_page_p, DONT_FREE, list_id_p->tfile_vfid);
+	  list_id_p->last_pgptr_dirtied = true;
+	}
+    }
+  else
+    {
+      qfile_set_dirty_page (thread_p, cur_page_p, DONT_FREE, list_id_p->tfile_vfid);
+    }
   return NO_ERROR;
 }
 
@@ -2245,6 +2290,7 @@ qfile_get_first_page (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
   QFILE_COPY_VPID (&list_id_p->last_vpid, &new_vpid);
 
   list_id_p->last_pgptr = new_page_p;
+  list_id_p->last_pgptr_dirtied = false;
   list_id_p->last_offset = QFILE_PAGE_HEADER_SIZE;
   QFILE_PUT_OVERFLOW_VPID_NULL (new_page_p);
 
@@ -3225,6 +3271,7 @@ qfile_truncate_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id)
   list_id->last_vpid.pageid = NULL_PAGEID;
   list_id->last_vpid.volid = NULL_VOLID;
   list_id->last_pgptr = NULL;
+  list_id->last_pgptr_dirtied = false;
   list_id->last_offset = QFILE_NULL_PAGE_OFFSET;
   list_id->lasttpl_len = 0;
   if (tfile_vfid_p != NULL)

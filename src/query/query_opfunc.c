@@ -408,6 +408,65 @@ qdata_copy_db_value_to_tuple_value (DB_VALUE * dbval_p, char *tuple_val_p, int *
 }
 
 /*
+ * qdata_copy_db_value_to_tuple_value_enc () -
+ *   return: int (NO_ERROR on success, ER_FAILED on failure)
+ *   dbval(in)   : Source dbval node
+ *   enc_col(in) : Per-column encode cache entry (qfile_tuple_encode_fast)
+ *   tvalp(in)   : Tuple value
+ *   tval_size(out) : Set to the tuple value size
+ *
+ * Note: Writes the value with the cached writer when the value's type (and
+ * precision, for NUMERIC) matches the cache, producing bytes identical to
+ * qdata_copy_db_value_to_tuple_value; any mismatch falls back to it.
+ */
+int
+qdata_copy_db_value_to_tuple_value_enc (DB_VALUE * dbval_p, const QFILE_ENC_COL * enc_col, char *tuple_val_p,
+					int *tuple_val_size)
+{
+  if (enc_col->pr_type != NULL && DB_VALUE_DOMAIN_TYPE (dbval_p) == enc_col->type
+      && (enc_col->type != DB_TYPE_NUMERIC || DB_VALUE_PRECISION (dbval_p) == enc_col->precision))
+    {
+      OR_BUF buf;
+      int rc, align;
+
+      if (DB_IS_NULL (dbval_p))
+	{
+	  QFILE_PUT_TUPLE_VALUE_FLAG (tuple_val_p, V_UNBOUND);
+	  QFILE_PUT_TUPLE_VALUE_LENGTH (tuple_val_p, 0);
+	  *tuple_val_size = QFILE_TUPLE_VALUE_HEADER_SIZE;
+	  return NO_ERROR;
+	}
+
+      /* exact disk-size preservation: the cached size must match the per-value one */
+      assert (enc_col->disk_size == pr_data_writeval_disk_size (dbval_p));
+
+      QFILE_PUT_TUPLE_VALUE_FLAG (tuple_val_p, V_BOUND);
+      or_init (&buf, tuple_val_p + QFILE_TUPLE_VALUE_HEADER_SIZE, enc_col->disk_size);
+      rc = enc_col->pr_type->data_writeval (&buf, dbval_p);
+
+      if (buf.ptr > buf.endptr || rc != NO_ERROR)
+	{
+	  /* This should not happen */
+	  assert_release (false);
+	  return ER_FAILED;
+	}
+
+      align = enc_col->bound_size - QFILE_TUPLE_VALUE_HEADER_SIZE;
+      QFILE_PUT_TUPLE_VALUE_LENGTH (tuple_val_p, align);
+
+#if !defined(NDEBUG)
+      /* suppress valgrind UMW error */
+      memset (tuple_val_p + QFILE_TUPLE_VALUE_HEADER_SIZE + enc_col->disk_size, 0, align - enc_col->disk_size);
+#endif
+      *tuple_val_size = enc_col->bound_size;
+
+      return NO_ERROR;
+    }
+
+  return qdata_copy_db_value_to_tuple_value (dbval_p, tuple_val_p, tuple_val_size);
+}
+
+/*
  * qdata_copy_valptr_list_to_tuple () -
  *   return: NO_ERROR, or ER_code
  *   valptr_list(in)    : Value pointer list
@@ -609,6 +668,33 @@ qdata_tuple_to_val_list (THREAD_ENTRY * thread_p, qfile_tuple_value_type_list * 
 }
 
 /*
+ * qdata_enc_col_type_is_invariant () - Does a tuple value of this type always
+ *   occupy the same disk size (given equal precision, for NUMERIC)?
+ *   return: true for fixed-size types cacheable by qfile_tuple_encode_fast
+ *   type(in): DB type of a bound value
+ */
+static bool
+qdata_enc_col_type_is_invariant (DB_TYPE type)
+{
+  switch (type)
+    {
+    case DB_TYPE_INTEGER:
+    case DB_TYPE_BIGINT:
+    case DB_TYPE_SHORT:
+    case DB_TYPE_FLOAT:
+    case DB_TYPE_DOUBLE:
+    case DB_TYPE_DATE:
+    case DB_TYPE_TIME:
+    case DB_TYPE_TIMESTAMP:
+    case DB_TYPE_DATETIME:
+    case DB_TYPE_NUMERIC:
+      return true;
+    default:
+      return false;
+    }
+}
+
+/*
  * qdata_generate_tuple_desc_for_valptr_list () -
  *   return: QPROC_TPLDESCR_SUCCESS on success or
  *           QP_TPLDESCR_RETRY_xxx,
@@ -627,11 +713,30 @@ qdata_generate_tuple_desc_for_valptr_list (THREAD_ENTRY * thread_p, valptr_list_
 {
   REGU_VARIABLE_LIST reg_var_p;
   REGU_VARIABLE *regu_var_p;
+  DB_VALUE *dbval_p;
   int i;
   int value_size;
   int flags;
   QPROC_TPLDESCR_STATUS status = QPROC_TPLDESCR_SUCCESS;
   DB_TYPE dbval_type;
+  QFILE_ENC_COL *enc_cols = NULL;
+
+  /* qfile_tuple_encode_fast: per-column constant size cache, built lazily for
+   * the first valptr list this descriptor is generated from */
+  if (tuple_desc_p->enc_key == (void *) valptr_list_p)
+    {
+      enc_cols = tuple_desc_p->enc_cols;
+    }
+  else if (tuple_desc_p->enc_key == NULL)
+    {
+      if (prm_get_bool_value (PRM_ID_QFILE_TUPLE_ENCODE_FAST) && valptr_list_p->valptr_cnt > 0)
+	{
+	  tuple_desc_p->enc_cols = (QFILE_ENC_COL *) calloc (valptr_list_p->valptr_cnt, sizeof (QFILE_ENC_COL));
+	  enc_cols = tuple_desc_p->enc_cols;
+	}
+      tuple_desc_p->enc_ncols = (enc_cols != NULL) ? valptr_list_p->valptr_cnt : -1;
+      tuple_desc_p->enc_key = (void *) valptr_list_p;
+    }
 
   tuple_desc_p->tpl_size = QFILE_TUPLE_LENGTH_SIZE;	/* set tuple size as header size */
   tuple_desc_p->f_cnt = 0;
@@ -646,16 +751,30 @@ qdata_generate_tuple_desc_for_valptr_list (THREAD_ENTRY * thread_p, valptr_list_
 	{
 	  continue;
 	}
-      tuple_desc_p->f_valp[tuple_desc_p->f_cnt] =
-	qdata_get_dbval_from_constant_regu_variable (thread_p, regu_var_p, val_desc_p);
+      dbval_p = qdata_get_dbval_from_constant_regu_variable (thread_p, regu_var_p, val_desc_p);
+      tuple_desc_p->f_valp[tuple_desc_p->f_cnt] = dbval_p;
 
-      if (tuple_desc_p->f_valp[tuple_desc_p->f_cnt] == NULL)
+      if (dbval_p == NULL)
 	{
 	  status = QPROC_TPLDESCR_FAILURE;
 	  goto exit_with_status;
 	}
 
-      dbval_type = DB_VALUE_DOMAIN_TYPE (tuple_desc_p->f_valp[tuple_desc_p->f_cnt]);
+      dbval_type = DB_VALUE_DOMAIN_TYPE (dbval_p);
+
+      if (enc_cols != NULL)
+	{
+	  QFILE_ENC_COL *ec = &enc_cols[tuple_desc_p->f_cnt];
+
+	  if (ec->pr_type != NULL && dbval_type == ec->type
+	      && (ec->type != DB_TYPE_NUMERIC || DB_VALUE_PRECISION (dbval_p) == ec->precision))
+	    {
+	      /* invariant fixed-size column: tuple value size known without re-resolution */
+	      tuple_desc_p->tpl_size += (DB_IS_NULL (dbval_p) ? QFILE_TUPLE_VALUE_HEADER_SIZE : ec->bound_size);
+	      tuple_desc_p->f_cnt += 1;
+	      continue;
+	    }
+	}
 
       /* SET data-type cannot use tuple descriptor */
       if (unlikely (pr_is_set_type (dbval_type)))
@@ -665,11 +784,32 @@ qdata_generate_tuple_desc_for_valptr_list (THREAD_ENTRY * thread_p, valptr_list_
 	}
 
       /* add aligned field size to tuple size */
-      value_size = qdata_get_tuple_value_size_from_dbval (tuple_desc_p->f_valp[tuple_desc_p->f_cnt]);
+      value_size = qdata_get_tuple_value_size_from_dbval (dbval_p);
       if (value_size == ER_FAILED)
 	{
 	  status = QPROC_TPLDESCR_FAILURE;
 	  goto exit_with_status;
+	}
+
+      if (enc_cols != NULL && !DB_IS_NULL (dbval_p))
+	{
+	  QFILE_ENC_COL *ec = &enc_cols[tuple_desc_p->f_cnt];
+
+	  if (ec->pr_type == NULL && qdata_enc_col_type_is_invariant (dbval_type))
+	    {
+	      /* first bound value of an invariant fixed-size column: cache its writer and sizes */
+	      const PR_TYPE *pr_type = pr_type_from_id (dbval_type);
+
+	      if (pr_type != NULL)
+		{
+		  ec->disk_size = pr_type->get_disk_size_of_value (dbval_p);
+		  ec->bound_size = value_size;
+		  ec->type = dbval_type;
+		  ec->precision = DB_VALUE_PRECISION (dbval_p);
+		  ec->pr_type = pr_type;
+		  assert (ec->bound_size == QFILE_TUPLE_VALUE_HEADER_SIZE + DB_ALIGN (ec->disk_size, MAX_ALIGNMENT));
+		}
+	    }
 	}
 
       /* The compressed string will be deallocated later, after copying db_value into tuple. */

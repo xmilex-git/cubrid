@@ -362,6 +362,20 @@ typedef enum
   T_MERGE			/* called by xs_add_mergetuple() */
 } QFILE_TUPLE_TYPE;
 
+/* Per-column cache for the fixed-tuple encode fast path (qfile_tuple_encode_fast
+ * system parameter).  A column with a non-NULL pr_type may be written with the
+ * cached writer whenever the row value's type (and precision, for NUMERIC)
+ * matches the cached one; any mismatch falls back to the generic encode. */
+typedef struct qfile_enc_col QFILE_ENC_COL;
+struct qfile_enc_col
+{
+  const struct pr_type *pr_type;	/* cached writer; NULL = always use the generic path */
+  int bound_size;		/* tuple value size (header + aligned data) when bound */
+  int disk_size;		/* unaligned disk data size */
+  DB_TYPE type;			/* DB type the cache was built for */
+  int precision;		/* DB value precision (NUMERIC exact-size guard) */
+};
+
 /* tuple descriptor */
 typedef struct qfile_tuple_descriptor QFILE_TUPLE_DESCRIPTOR;
 struct qfile_tuple_descriptor
@@ -383,6 +397,11 @@ struct qfile_tuple_descriptor
   QFILE_TUPLE_RECORD *tplrec1;	/* first tuple */
   QFILE_TUPLE_RECORD *tplrec2;	/* second tuple */
   QFILE_LIST_MERGE_INFO *merge_info;	/* tuple merge info */
+
+  /* qfile_tuple_encode_fast (server side only) */
+  void *enc_key;		/* valptr list the encode cache was built for; NULL = not built */
+  int enc_ncols;		/* number of cached columns; -1 = disabled for this descriptor */
+  QFILE_ENC_COL *enc_cols;	/* cached per-column writers; NULL unless built */
 };
 
 /*
@@ -444,6 +463,7 @@ struct qfile_list_id
   QFILE_TUPLE_DESCRIPTOR tpl_descr;	/* tuple descriptor */
   bool is_domain_resolved;	/* domains for host var is resolved or not */
   bool is_result_cached;	/* for subquery result cache */
+  bool last_pgptr_dirtied;	/* qfile_tuple_encode_fast: last_pgptr already marked dirty during its current fix */
   QFILE_LIST_ID *dependent_list_id;	/* Linked as dependent by qfile_connect_list; cleared together. */
 };
 
@@ -476,8 +496,12 @@ struct qfile_list_id
       (list_id)->tpl_descr.tplrec1 = NULL; \
       (list_id)->tpl_descr.tplrec2 = NULL; \
       (list_id)->tpl_descr.merge_info = NULL; \
+      (list_id)->tpl_descr.enc_key = NULL; \
+      (list_id)->tpl_descr.enc_ncols = 0; \
+      (list_id)->tpl_descr.enc_cols = NULL; \
       (list_id)->is_domain_resolved = false; \
       (list_id)->is_result_cached = false; \
+      (list_id)->last_pgptr_dirtied = false; \
       (list_id)->dependent_list_id = NULL; \
     } \
   while (0)
