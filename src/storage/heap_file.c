@@ -25825,6 +25825,119 @@ heap_get_visible_version (THREAD_ENTRY * thread_p, const OID * oid, OID * class_
 }
 
 /*
+ * heap_get_visible_version_lookup_fast () - Same-page REC_HOME fast entry for the per-row heap lookup of an inner
+ *					     index-NL scan (heap_index_lookup_fast system parameter).
+ *
+ *   return: SCAN_CODE; meaningful only when *handled is set to true:
+ *	     - S_SUCCESS: visible record obtained (PEEK), recdes set.
+ *	     - S_SNAPSHOT_NOT_SATISFIED: record is too old for the snapshot.
+ *   thread_p (in)  : Thread entry.
+ *   oid (in)	    : Object to be obtained.
+ *   next_oid (in)  : Next OID the caller will look up, or NULL; used only for a semantically inert software prefetch
+ *		      of its record bytes when it resides on the same page.
+ *   recdes (out)   : Record descriptor (PEEK).
+ *   scan_cache (in): Heap scan cache; its page_watcher must keep the home page fixed for the fast path to engage.
+ *   handled (out)  : Set to true only when the fast path fully resolved the lookup. When false, nothing was changed
+ *		      and the caller MUST fall through to heap_get_visible_version () for the byte-identical legacy
+ *		      behavior (page change, non-REC_HOME record, unknown slot, TOO_NEW version, header parse failure).
+ *
+ *  Note: The fast path acquires no latches and transfers no page watchers: the home page stays read-latched by
+ *	  scan_cache->page_watcher exactly as the legacy path leaves it between consecutive calls when
+ *	  cache_last_fix_page is set. It replicates heap_get_visible_version_internal () for the narrow gate below
+ *	  (PEEK, old_chn == NULL_CHN, no class_oid output, MVCC-enabled class with a snapshot): one slot access,
+ *	  MVCC header parse, snapshot check, then the PEEKed record. Any deviation falls back with zero side effects
+ *	  (a TOO_NEW fallback re-runs snapshot_fnc in the legacy path; the check is pure, only perfmon MVCC snapshot
+ *	  counters may count that row twice).
+ */
+SCAN_CODE
+heap_get_visible_version_lookup_fast (THREAD_ENTRY * thread_p, const OID * oid, const OID * next_oid, RECDES * recdes,
+				      HEAP_SCANCACHE * scan_cache, bool * handled)
+{
+  PAGE_PTR pgptr;
+  SPAGE_SLOT *slot_p;
+  VPID oid_vpid;
+  RECDES peek_recdes;
+  MVCC_REC_HEADER mvcc_header = MVCC_REC_HEADER_INITIALIZER;
+  MVCC_SATISFIES_SNAPSHOT_RESULT snapshot_res;
+
+  assert (handled != NULL && *handled == false);
+  assert (oid != NULL && recdes != NULL);
+  assert (prm_get_bool_value (PRM_ID_HEAP_INDEX_LOOKUP_FAST));
+
+  /* Engage conditions; on any miss return with *handled == false and zero side effects. */
+  if (scan_cache == NULL || !scan_cache->cache_last_fix_page || scan_cache->page_watcher.pgptr == NULL)
+    {
+      return S_SUCCESS;
+    }
+  if (scan_cache->mvcc_snapshot == NULL || scan_cache->mvcc_snapshot->snapshot_fnc == NULL
+      || scan_cache->mvcc_disabled_class || OID_ISNULL (&scan_cache->node.class_oid))
+    {
+      return S_SUCCESS;
+    }
+
+  pgptr = scan_cache->page_watcher.pgptr;
+  VPID_GET_FROM_OID (&oid_vpid, oid);
+  if (!VPID_EQ (pgbuf_get_vpid_ptr (pgptr), &oid_vpid))
+    {
+      return S_SUCCESS;
+    }
+
+  slot_p = spage_get_slot (pgptr, oid->slotid);
+  if (slot_p == NULL || slot_p->record_type != REC_HOME || slot_p->offset_to_record == 0 /* SPAGE_EMPTY_OFFSET */ )
+    {
+      /* Unknown slot or record-type drift (UPDATE -> REC_RELOCATION/REC_BIGONE, DELETE); legacy path only. */
+      return S_SUCCESS;
+    }
+
+  /* Build the PEEK recdes directly from the slot; same fields spage_get_record () would set. */
+  peek_recdes.area_size = -1;
+  peek_recdes.data = (char *) pgptr + slot_p->offset_to_record;
+  peek_recdes.length = slot_p->record_length;
+  peek_recdes.type = slot_p->record_type;
+
+  /* Software prefetch of the next OID's record bytes when it sits on the same, already-latched page; hides the
+   * first-touch cacheline stall of its MVCC header behind the current row's filter/decode work. */
+  if (next_oid != NULL && next_oid->pageid == oid->pageid && next_oid->volid == oid->volid)
+    {
+      SPAGE_SLOT *next_slot_p = spage_get_slot (pgptr, next_oid->slotid);
+
+      if (next_slot_p != NULL && next_slot_p->offset_to_record != 0 /* SPAGE_EMPTY_OFFSET */ )
+	{
+	  const char *prefetch_p = (const char *) pgptr + next_slot_p->offset_to_record;
+
+	  __builtin_prefetch (prefetch_p, 0, 3);
+	  __builtin_prefetch (prefetch_p + 64, 0, 3);
+	}
+    }
+
+  if (heap_or_mvcc_get_header_gated (&peek_recdes, &mvcc_header) != NO_ERROR)
+    {
+      /* Unexpected; let the legacy path retry and report it. */
+      return S_SUCCESS;
+    }
+
+  snapshot_res = scan_cache->mvcc_snapshot->snapshot_fnc (thread_p, &mvcc_header, scan_cache->mvcc_snapshot);
+  if (snapshot_res == TOO_NEW_FOR_SNAPSHOT)
+    {
+      /* Current version not visible; the legacy path must run heap_get_visible_version_from_log (). */
+      return S_SUCCESS;
+    }
+  else if (snapshot_res == TOO_OLD_FOR_SNAPSHOT)
+    {
+      *handled = true;
+      return S_SNAPSHOT_NOT_SATISFIED;
+    }
+
+  assert (snapshot_res == SNAPSHOT_SATISFIED);
+
+  /* old_chn is NULL_CHN by gate, so MVCC_IS_CHN_UPTODATE () is always false; get the record data (PEEK). */
+  *recdes = peek_recdes;
+
+  *handled = true;
+  return S_SUCCESS;
+}
+
+/*
 * heap_scan_get_visible_version () - get visible version, mvcc style when snapshot provided, otherwise directly from heap
 *
 *   return: SCAN_CODE. Posible values:
@@ -25944,6 +26057,16 @@ heap_get_visible_version_internal (THREAD_ENTRY * thread_p, HEAP_GET_CONTEXT * c
     {
       /* we need class_oid to check if the class is mvcc enabled */
       context->class_oid_p = &class_oid_local;
+
+      if (prm_get_bool_value (PRM_ID_HEAP_INDEX_LOOKUP_FAST) && context->scan_cache != NULL
+	  && !OID_ISNULL (&context->scan_cache->node.class_oid))
+	{
+	  /* heap_index_lookup_fast: seed the local class OID from the scan cache so that
+	   * heap_prepare_get_context () skips the per-row page-header read; the OIDs fetched through a class scan
+	   * cache belong to the scan's class, and the value only feeds the mvcc-disabled check below, which already
+	   * trusts scan_cache->node.class_oid / scan_cache->mvcc_disabled_class for that class. */
+	  COPY_OID (&class_oid_local, &context->scan_cache->node.class_oid);
+	}
     }
 
   if (context->scan_cache && context->ispeeking == COPY && context->recdes_p != NULL)

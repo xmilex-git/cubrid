@@ -535,10 +535,12 @@ enum param_id
 
   PRM_ID_UPDATE_STATISTICS_UPDATE_HISTOGRAM,
 
-  /* change PRM_LAST_ID when adding new system parameters */
   PRM_ID_HEAP_RECORD_DECODE_FAST,
 
-  PRM_LAST_ID = PRM_ID_HEAP_RECORD_DECODE_FAST
+  /* change PRM_LAST_ID when adding new system parameters */
+  PRM_ID_HEAP_INDEX_LOOKUP_FAST,
+
+  PRM_LAST_ID = PRM_ID_HEAP_INDEX_LOOKUP_FAST
 };
 typedef enum param_id PARAM_ID;
 

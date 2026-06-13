@@ -5393,6 +5393,16 @@ scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
     case S_INDX_SCAN:
       isidp = &scan_id->s.isid;
 
+      if (scan_id->scan_stats.lookup_fast_attempts > 0)
+	{
+	  /* heap_index_lookup_fast engage-rate report; attempts are counted only while the parameter is on */
+	  er_log_debug (ARG_FILE_LINE, "HEAPFAST: index lookup fast-path engaged %llu/%llu (%.1f%%)\n",
+			(unsigned long long) scan_id->scan_stats.lookup_fast_engaged,
+			(unsigned long long) scan_id->scan_stats.lookup_fast_attempts,
+			100.0 * (double) scan_id->scan_stats.lookup_fast_engaged
+			/ (double) scan_id->scan_stats.lookup_fast_attempts);
+	}
+
 #if SERVER_MODE && !WINDOWS
       /* drop pending capture if start_scan never ran (open-then-abort path). */
       if (isidp->parallel_pending != NULL)
@@ -6811,8 +6821,42 @@ scan_next_index_lookup_heap (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SC
       recdes.data = NULL;
     }
 
-  sp_scan = heap_get_visible_version (thread_p, isidp->curr_oidp, NULL, &recdes, &isidp->scan_cache, scan_id->fixed,
-				      NULL_CHN);
+  if (prm_get_bool_value (PRM_ID_HEAP_INDEX_LOOKUP_FAST))
+    {
+      /* Same-page REC_HOME fast entry; on any deviation it sets nothing and we fall through to the legacy call. */
+      bool fast_handled = false;
+      const OID *next_oidp = NULL;
+
+      if (!isidp->multi_range_opt.use && isidp->oid_list != NULL && isidp->curr_oidno + 1 < isidp->oids_count)
+	{
+	  /* next OID of the already-drained OID batch; used only for software prefetch */
+	  next_oidp = GET_NTH_OID (isidp->oid_list->oidp, isidp->curr_oidno + 1);
+	}
+
+      scan_id->scan_stats.lookup_fast_attempts++;
+
+      if (scan_id->fixed != false)
+	{
+	  /* PEEK only */
+	  sp_scan = heap_get_visible_version_lookup_fast (thread_p, isidp->curr_oidp, next_oidp, &recdes,
+							  &isidp->scan_cache, &fast_handled);
+	}
+
+      if (fast_handled)
+	{
+	  scan_id->scan_stats.lookup_fast_engaged++;
+	}
+      else
+	{
+	  sp_scan = heap_get_visible_version (thread_p, isidp->curr_oidp, NULL, &recdes, &isidp->scan_cache,
+					      scan_id->fixed, NULL_CHN);
+	}
+    }
+  else
+    {
+      sp_scan = heap_get_visible_version (thread_p, isidp->curr_oidp, NULL, &recdes, &isidp->scan_cache,
+					  scan_id->fixed, NULL_CHN);
+    }
   if (sp_scan == S_SNAPSHOT_NOT_SATISFIED)
     {
       if (SCAN_IS_INDEX_COVERED (isidp))
