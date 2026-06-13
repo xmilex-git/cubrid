@@ -3363,6 +3363,27 @@ qo_nljoin_cost (QO_PLAN * planp)
   if (qo_is_iscan (inner))
     {
       inner_io_cost = guessed_result_cardinality * inner->variable_io_cost * (1 - ISCAN_IO_HIT_RATIO);
+
+      /* Honest per-driving-row random-descent IO for an index-NL inner.
+       *
+       * inner->variable_io_cost is object_IO, which collapses to ~0 (MAX'd to 1) for an FK equi-probe whose
+       * selectivity is ~1/keys, so the stock model charges a multi-million-row index-NL inner near nothing and
+       * wrongly prefers it over seq-scan + hash. In reality each driving row does one random B-tree root-to-leaf
+       * descent (index height pages) plus, unless the index covers the probe, one random heap-page fetch for the
+       * matched object. That random IO is what makes a deep serial index-NL chain expensive; we add it here so the
+       * cost scales continuously with the inner's index height and grows with the number of driving rows.
+       */
+      {
+	double index_height, heap_fetch_pages;
+
+	index_height = (double) inner->plan_un.scan.index->cum_stats.height - 1.0;
+	if (index_height < 0.0)
+	  {
+	    index_height = 0.0;
+	  }
+	heap_fetch_pages = qo_is_index_covering_scan (inner) ? 0.0 : 1.0;
+	inner_io_cost += guessed_result_cardinality * (index_height + heap_fetch_pages) * (1 - ISCAN_IO_HIT_RATIO);
+      }
     }
   else
     {
@@ -3526,6 +3547,8 @@ qo_hjoin_cost (QO_PLAN * plan_p)
   double inner_cardinality, outer_cardinality;
   double inner_build_cpu_cost, outer_build_cpu_cost;
   double inner_build_io_cost, outer_build_io_cost;
+  int hj_degree;
+  double outer_var_cpu, inner_var_cpu, outer_var_io, inner_var_io;
 
   inner_plan_p = plan_p->plan_un.join.inner;
 
@@ -3550,27 +3573,69 @@ qo_hjoin_cost (QO_PLAN * plan_p)
   inner_cardinality = inner_plan_p->info->cardinality;
   outer_cardinality = outer_plan_p->info->cardinality;
 
+  /* Parallel-degree divisor for the genuinely-parallel work of a parallel-eligible hash join.
+   *
+   * A hash join that qo_check_hjoin_for_parallel_opt() marked PLAN_PARALLEL_OPT_CAN_USE / _USE runs its build and
+   * probe across PRM_ID_PARALLELISM workers, and its immediate base-table scan inputs are read in parallel as well.
+   * The stock model sums the child costs and prices build/probe as if the join ran serially, so it never reflects
+   * that wall-clock parallel speed-up and a parallel hash plan loses to a serial all-NL plan hintlessly.
+   *
+   * We divide ONLY the genuinely-parallel work by degree: the per-row build/probe CPU (STEP 2/STEP 3 below) and,
+   * for any child that is a base-table SCAN leaf, that child's inherited variable_cpu + variable_io (the parallel
+   * base scan). A child that is itself a JOIN subtree passes through undivided -- it already received whatever
+   * parallel credit it deserved at its own level, so dividing it again would collapse cumulatively. Fixed costs
+   * are never divided (they model one-time per-plan setup, not per-row parallel work). parallel_opt_use is set in
+   * qo_check_hjoin_for_parallel_opt() before qo_plan_compute_cost() runs, so it is populated here.
+   *
+   * With degree == 1 (parallelism <= 1 or the join is not parallel-eligible) every divisor is 1, so the result is
+   * byte-identical to the de-gated serial cost.
+   */
+  hj_degree = 1;
+  if (plan_p->parallel_opt_use == PLAN_PARALLEL_OPT_CAN_USE || plan_p->parallel_opt_use == PLAN_PARALLEL_OPT_USE)
+    {
+      hj_degree = prm_get_integer_value (PRM_ID_PARALLELISM);
+      if (hj_degree < 1)
+	{
+	  hj_degree = 1;
+	}
+    }
+
   /**
    * STEP 1: Sum up the fixed and variable costs from both the outer and inner.
    */
   plan_p->fixed_cpu_cost = outer_plan_p->fixed_cpu_cost + inner_plan_p->fixed_cpu_cost;
   plan_p->fixed_io_cost = outer_plan_p->fixed_io_cost + inner_plan_p->fixed_io_cost;
 
-  plan_p->variable_cpu_cost = outer_plan_p->variable_cpu_cost + inner_plan_p->variable_cpu_cost;
-  plan_p->variable_io_cost = outer_plan_p->variable_io_cost + inner_plan_p->variable_io_cost;
+  /* A base-table SCAN leaf input is read in parallel; divide its inherited variable cost by degree. A JOIN
+   * subtree input passes through undivided (credited at its own level). */
+  outer_var_cpu = (outer_plan_p->plan_type == QO_PLANTYPE_SCAN)
+    ? outer_plan_p->variable_cpu_cost / hj_degree : outer_plan_p->variable_cpu_cost;
+  inner_var_cpu = (inner_plan_p->plan_type == QO_PLANTYPE_SCAN)
+    ? inner_plan_p->variable_cpu_cost / hj_degree : inner_plan_p->variable_cpu_cost;
+  outer_var_io = (outer_plan_p->plan_type == QO_PLANTYPE_SCAN)
+    ? outer_plan_p->variable_io_cost / hj_degree : outer_plan_p->variable_io_cost;
+  inner_var_io = (inner_plan_p->plan_type == QO_PLANTYPE_SCAN)
+    ? inner_plan_p->variable_io_cost / hj_degree : inner_plan_p->variable_io_cost;
+
+  plan_p->variable_cpu_cost = outer_var_cpu + inner_var_cpu;
+  plan_p->variable_io_cost = outer_var_io + inner_var_io;
 
   /**
    * STEP 2: Calculate the cost when inner is used as build input.
+   * The per-row build/probe CPU is parallel work, so it is divided across the degree workers.
    */
   inner_build_cpu_cost = (inner_cardinality * QO_CPU_WEIGHT * HJ_BUILD_CPU_OVERHEAD_FACTOR);
   inner_build_cpu_cost += (outer_cardinality * QO_CPU_WEIGHT * HJ_PROBE_CPU_OVERHEAD_FACTOR);
+  inner_build_cpu_cost /= hj_degree;
   inner_build_io_cost = 0.0;
 
   /**
    * STEP 3: Calculate the cost when outer is used as build input.
+   * The per-row build/probe CPU is parallel work, so it is divided across the degree workers.
    */
   outer_build_cpu_cost = (inner_cardinality * QO_CPU_WEIGHT * HJ_PROBE_CPU_OVERHEAD_FACTOR);
   outer_build_cpu_cost += (outer_cardinality * QO_CPU_WEIGHT * HJ_BUILD_CPU_OVERHEAD_FACTOR);
+  outer_build_cpu_cost /= hj_degree;
   outer_build_io_cost = 0.0;
 
 #if 0
@@ -6611,9 +6676,14 @@ qo_examine_hash_join (QO_INFO * info, JOIN_TYPE join_type, QO_INFO * outer, QO_I
       /* join hint: force nl-join, idx-join, m-join; skip hash-join */
       goto exit;
     }
+  else if (prm_get_bool_value (PRM_ID_OPTIMIZER_ENABLE_HASH_JOIN))
+    {
+      /* kill-switch ON (default): enumerate hash-join and let the cost model accept or reject it. */
+      /* fall through */
+    }
   else
     {
-      /* default: disable hash-join */
+      /* kill-switch OFF: legacy gated behavior -- hash-join is never enumerated hintlessly. */
 #if TEST_HASH_JOIN_ENABLE
       /* fall through */
 #else /* TEST_HASH_JOIN_ENABLE */
