@@ -260,6 +260,25 @@ struct btree_scan
   LOG_LSA cur_leaf_lsa;		/* page LSA of current leaf page */
   LOCK lock_mode;		/* Lock mode - S_LOCK or X_LOCK. */
 
+  /* Probe leaf memo. Most-recently-used list of the last leaf pages visited by previous range scans over this
+   * structure, with the page LSA observed while each was fixed. The next scan start may skip the root-to-leaf descent
+   * when a memoized page is unchanged (same LSA) and the new lower key provably belongs to its key range. Multiple
+   * entries cover probe streams that alternate between several ascending runs (e.g. a nested loop driven by a list
+   * merged from parallel producers). Survives BTREE_RESET_SCAN (the per-key-range reset) on purpose; cleared by
+   * BTREE_INIT_SCAN.
+   *
+   * The memo is a pure hint with no correctness gate: a hit is taken only when the page re-fixes with the exact
+   * memoized LSA AND the lower key provably falls inside that leaf's fence range; every other outcome (and every
+   * descending scan) falls back to a full root-to-leaf descent. memo_miss_streak / memo_probe_seq drive an adaptive
+   * self-disable on dead-memo (write-heavy) workloads: the only state they change is whether a probe is attempted at
+   * all; a miss always does the full descent, entries are never deleted on miss, and positioning never depends on
+   * hit/miss. */
+#define BTREE_PROBE_LEAF_MEMO_SIZE 4
+  VPID memo_vpid[BTREE_PROBE_LEAF_MEMO_SIZE];	/* vpid of memoized leaf page; NULL vpid = empty entry; [0] = MRU */
+  LOG_LSA memo_lsa[BTREE_PROBE_LEAF_MEMO_SIZE];	/* page LSA of memoized leaf page when it was last fixed */
+  int memo_miss_streak;		/* consecutive dead-memo misses; drives the adaptive self-disable */
+  unsigned int memo_probe_seq;	/* per-scan-start probe sequence; throttles re-probing while self-disabled */
+
   RECDES key_record;
 
   bool need_to_check_null;
@@ -320,6 +339,16 @@ struct btree_scan
     (bts)->key_range_max_value_equal = false;		\
     LSA_SET_NULL (&(bts)->cur_leaf_lsa);		\
     (bts)->lock_mode = NULL_LOCK;			\
+    {							\
+      int memo_i_;					\
+      for (memo_i_ = 0; memo_i_ < BTREE_PROBE_LEAF_MEMO_SIZE; memo_i_++)	\
+	{						\
+	  VPID_SET_NULL (&(bts)->memo_vpid[memo_i_]);	\
+	  LSA_SET_NULL (&(bts)->memo_lsa[memo_i_]);	\
+	}						\
+    }							\
+    (bts)->memo_miss_streak = 0;			\
+    (bts)->memo_probe_seq = 0;				\
     (bts)->key_record.data = NULL;			\
     (bts)->offset = 0;					\
     (bts)->need_to_check_null = false;			\
