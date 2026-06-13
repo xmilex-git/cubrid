@@ -482,6 +482,31 @@ int hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
 				  QFILE_TUPLE_RECORD * outer_record, QFILE_TUPLE_RECORD * inner_record,
 				  QFILE_LIST_MERGE_INFO * merge_info, QFILE_TUPLE_RECORD * overflow_record);
 
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+/* Fused hash-join probe (hidden kill-switch hash_join_fused_probe, default ON):
+ * probe pushdown into the parallel scan of the probe input.  The mainblock
+ * dispatcher of a HASHJOIN_PROC arms the state (qexec_hjoin_fused_prepare builds the
+ * hash table from the complete build input), publishes it on the probe-input
+ * buildlist (xasl->fused_probe) and runs that aptr; the parallel-scan workers then
+ * probe the shared read-only table on every in-flight row and emit already-merged
+ * join tuples directly to their per-worker gather lists, so the probe-input temp list
+ * never exists.  qexec_hash_join later just adopts the gather output.  Every refusal
+ * (prepare returns a NULL state, or the scan never engages) silently keeps today's
+ * materialized path; correctness never depends on the kill-switch. */
+int qexec_hjoin_fused_prepare (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_NODE * probe_aptr,
+			       void **fused_state_out);
+void qexec_hjoin_fused_abandon (THREAD_ENTRY * thread_p, void *fused_state);
+bool qexec_hjoin_fused_is_engaged (void *fused_state);
+int qexec_hjoin_fused_adopt_result (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
+
+/* scan-worker seam (called from the parallel-scan MERGEABLE_LIST result handler) */
+QFILE_TUPLE_VALUE_TYPE_LIST *qexec_hjoin_fused_output_type_list (void *fused_state);
+void *qexec_hjoin_fused_worker_open (THREAD_ENTRY * thread_p, void *fused_state, OUTPTR_LIST * outptr_list,
+				     QFILE_LIST_ID * output_list_id);
+int qexec_hjoin_fused_worker_row (THREAD_ENTRY * thread_p, void *worker_ctx, VAL_DESCR * val_descr);
+void qexec_hjoin_fused_worker_close (THREAD_ENTRY * thread_p, void *worker_ctx);
+#endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
+
 void hjoin_trace_start (THREAD_ENTRY * thread_p, HASHJOIN_START_STATS * start_stats);
 void hjoin_trace_end (THREAD_ENTRY * thread_p, HASHJOIN_INPUT_STATS * stats, HASHJOIN_START_STATS * start_stats);
 void hjoin_trace_merge_stats (HASHJOIN_STATS * stats, HASHJOIN_STATS * context_stats, HASHJOIN_STATUS status);

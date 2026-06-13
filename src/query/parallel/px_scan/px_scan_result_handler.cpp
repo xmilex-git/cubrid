@@ -35,6 +35,9 @@
 #include "query_aggregate.hpp"
 #include "xasl_aggregate.hpp"
 #include "object_domain.h"
+#if !defined (WINDOWS)
+#include "query_hash_join.h"	/* fused hash-join probe worker seam */
+#endif /* !defined (WINDOWS) */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -215,17 +218,35 @@ namespace parallel_scan
       {
 	int size;
 	tl.vd = vd;
+	void *fused_state_p = nullptr;
+#if !defined (WINDOWS)
+	if (m_.orig_xasl != nullptr && m_.orig_xasl->fused_probe != nullptr && !m_.g_hash_eligible)
+	  {
+	    /* fused hash-join probe: this worker's gather list holds JOIN-OUTPUT
+	     * tuples (probe pushdown); its type list is the join's output type list */
+	    fused_state_p = m_.orig_xasl->fused_probe;
+	  }
+#endif /* !defined (WINDOWS) */
 	{
 	  std::lock_guard<std::mutex> lock (m_.writer_results_mutex);
 	  qfile_tuple_value_type_list type_list;
 	  int err_code = NO_ERROR;
 	  QFILE_LIST_ID *list_id;
-	  err_code = qdata_get_valptr_type_list (thread_p, outptr_list, &type_list);
-	  if (err_code != NO_ERROR)
+#if !defined (WINDOWS)
+	  if (fused_state_p != nullptr)
 	    {
-	      m_err_messages_p->move_top_error_message_to_this();
-	      m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-	      return;
+	      type_list = *qexec_hjoin_fused_output_type_list (fused_state_p);
+	    }
+	  else
+#endif /* !defined (WINDOWS) */
+	    {
+	      err_code = qdata_get_valptr_type_list (thread_p, outptr_list, &type_list);
+	      if (err_code != NO_ERROR)
+		{
+		  m_err_messages_p->move_top_error_message_to_this();
+		  m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		  return;
+		}
 	    }
 	  list_id = qfile_open_list (thread_p, &type_list, NULL, m_query_id, QFILE_FLAG_ALL|QFILE_NOT_USE_MEMBUF, NULL );
 	  if (!list_id)
@@ -236,7 +257,7 @@ namespace parallel_scan
 	    }
 	  m_.writer_results.push_back (list_id);
 	  tl.writer_result_p = list_id;
-	  if (type_list.domp != nullptr)
+	  if (fused_state_p == nullptr && type_list.domp != nullptr)
 	    {
 	      db_private_free_and_init (thread_p, type_list.domp);
 	    }
@@ -273,6 +294,19 @@ namespace parallel_scan
 	tl.xasl = curr_xasl;
 	tl.agg_hash_state = HS_NONE;
 	tl.g_agg_domains_resolved = TRUE;
+#if !defined (WINDOWS)
+	tl.fused_ctx = nullptr;
+	if (fused_state_p != nullptr)
+	  {
+	    tl.fused_ctx = qexec_hjoin_fused_worker_open (thread_p, fused_state_p, outptr_list, tl.writer_result_p);
+	    if (tl.fused_ctx == nullptr)
+	      {
+		m_err_messages_p->move_top_error_message_to_this();
+		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		return;
+	      }
+	  }
+#endif /* !defined (WINDOWS) */
 	if (m_.g_hash_eligible)
 	  {
 	    if (qexec_alloc_agg_hash_context_buildlist_xasl (thread_p, curr_xasl, vd->xasl_state, true) != NO_ERROR)
@@ -310,6 +344,15 @@ namespace parallel_scan
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
       {
+#if !defined (WINDOWS)
+	if (tl.fused_ctx != nullptr)
+	  {
+	    /* fused hash-join probe: release this worker's probe context (build-list
+	     * scan, keys, buffers) before its gather list is closed below */
+	    qexec_hjoin_fused_worker_close (thread_p, tl.fused_ctx);
+	    tl.fused_ctx = nullptr;
+	  }
+#endif /* !defined (WINDOWS) */
 	AGGREGATE_HASH_CONTEXT *context = tl.xasl->proc.buildlist.agg_hash_context;
 	bool hash_aggregate_append = m_.g_hash_eligible;
 	if (hash_aggregate_append)
@@ -736,6 +779,22 @@ namespace parallel_scan
 	QPROC_TPLDESCR_STATUS status;
 
 	OUTPTR_LIST *input = (OUTPTR_LIST *)src;
+
+#if !defined (WINDOWS)
+	if (tl.fused_ctx != nullptr)
+	  {
+	    /* fused hash-join probe: probe the shared build table on the in-flight row
+	     * and emit only joined tuples to this worker's gather list; the probe row
+	     * is never qfile-encoded unless its key has a hash-bucket candidate */
+	    if (qexec_hjoin_fused_worker_row (thread_p, tl.fused_ctx, tl.vd) != NO_ERROR)
+	      {
+		m_err_messages_p->move_top_error_message_to_this();
+		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		return false;
+	      }
+	    return true;
+	  }
+#endif /* !defined (WINDOWS) */
 
 	prefetch (tl.writer_result_p, PREFETCH_WRITE, PREFETCH_CACHE_L1);
 

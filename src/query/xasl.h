@@ -381,6 +381,14 @@ typedef struct hashjoin_proc_node
 #if defined (SERVER_MODE) || defined (SA_MODE)
   HASHJOIN_DOMAIN_INFO domain_info;
   HASHJOIN_STATS_GROUP stats_group;
+
+  /* fused_state: HJOIN_FUSED_STATE ownership handle for the fused probe (probe
+   * pushdown into the parallel scan of the probe input).  Armed by this node's own
+   * mainblock aptr dispatch strictly before the probe input runs; consumed by
+   * qexec_hash_join (the join output was already produced by the fused scan) or
+   * freed by the teardown reclamation path on error paths.  Runtime-only; never
+   * serialized; zeroed on unpack. */
+  void *fused_state;
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 } HASHJOIN_PROC_NODE;
 
@@ -520,6 +528,10 @@ struct cte_proc_node
 #define XASL_ANALYTIC_USES_LIMIT_OPT (0x1 << 20)	/* analytic uses limit optimization */
 #define XASL_ANALYTIC_SKIP_SORT (0x1 << 21)	/* analytic skip sort optimization */
 #define XASL_DBLINK_CURSOR_REWIND	(0x1 << 22)	/* correlated DBLink subquery: rewind CCI cursor instead of re-issuing cci_execute per outer row */
+#define XASL_HJ_FUSED_PROBE_INPUT      (0x1 << 24)	/* hash-join probe-INPUT buildlist: candidate for the fused
+							 * probe (probe pushdown into the parallel scan); set
+							 * client-side only when hash_join_fused_probe is ON,
+							 * re-vetted at runtime on every execution */
 
 #define XASL_IS_FLAGED(x, f)        (((x)->flag & (int) (f)) != 0)
 #define IS_DBLINK_CURSOR_REWIND_XASL(x)     XASL_IS_FLAGED ((x), XASL_DBLINK_CURSOR_REWIND)
@@ -1195,6 +1207,10 @@ struct xasl_node
   int executed_parallelism;	/* parallelism of the query */
   memoize::storage *memoize_storage;
   // *INDENT-ON*
+  void *fused_probe;		/* HJOIN_FUSED_STATE * -- non-NULL ONLY while this buildlist
+				 * is the probe input of a fused hash-join probe and its scan
+				 * is in flight (runtime-only; never serialized; zeroed on
+				 * unpack) */
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 };
 

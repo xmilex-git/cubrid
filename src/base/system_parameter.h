@@ -533,10 +533,12 @@ enum param_id
 
   PRM_ID_ENABLE_HEAP_FIXED_SCAN,
 
-  /* change PRM_LAST_ID when adding new system parameters */
   PRM_ID_UPDATE_STATISTICS_UPDATE_HISTOGRAM,
 
-  PRM_LAST_ID = PRM_ID_UPDATE_STATISTICS_UPDATE_HISTOGRAM
+  /* change PRM_LAST_ID when adding new system parameters */
+  PRM_ID_HASH_JOIN_FUSED_PROBE,
+
+  PRM_LAST_ID = PRM_ID_HASH_JOIN_FUSED_PROBE
 };
 typedef enum param_id PARAM_ID;
 
