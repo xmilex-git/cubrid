@@ -2986,6 +2986,7 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
   tfile_vfid_p->membuf_npages = num_buffer_pages;
   tfile_vfid_p->membuf_type = membuf_type;
   tfile_vfid_p->preserved = false;
+  tfile_vfid_p->detached = false;
   tfile_vfid_p->tde_encrypted = false;
   tfile_vfid_p->membuf_last = -1;
 
@@ -3092,6 +3093,7 @@ qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id)
   tfile_vfid_p->membuf_npages = 0;
   tfile_vfid_p->membuf_type = TEMP_FILE_MEMBUF_NONE;
   tfile_vfid_p->preserved = false;
+  tfile_vfid_p->detached = false;
   tfile_vfid_p->tde_encrypted = false;
 
   /* Find the query entry and chain the created temp file to the entry */
@@ -3309,6 +3311,36 @@ qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_
   QMGR_TRAN_ENTRY *tran_entry_p;
   int tran_index, rc;
 
+  /* Detached temp files have already been unlinked from the per-query ring (see
+   * qmgr_detach_temp_file_from_query). They are retired by pointer here, without any query-entry
+   * lookup or ring surgery, so a still-referenced page can no longer be retired/reused by another
+   * concurrent query. This branch MUST be first. */
+  if (tfile_vfid_p != NULL && tfile_vfid_p->detached)
+    {
+      int rc_detached = NO_ERROR;
+      if (!VFID_ISNULL (&tfile_vfid_p->temp_vfid))
+	{
+	  if (tfile_vfid_p->preserved)
+	    {
+	      rc_detached = file_temp_retire_preserved (thread_p, &tfile_vfid_p->temp_vfid);
+	    }
+	  else
+	    {
+	      rc_detached = file_temp_retire (thread_p, &tfile_vfid_p->temp_vfid);
+	    }
+	  VFID_SET_NULL (&tfile_vfid_p->temp_vfid);
+	}
+      if (tfile_vfid_p->temp_file_type != FILE_QUERY_AREA)
+	{
+	  qmgr_put_temp_file_into_list (tfile_vfid_p);
+	}
+      else
+	{
+	  free_and_init (tfile_vfid_p);
+	}
+      return rc_detached;
+    }
+
   tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
   tran_entry_p = &qmgr_Query_table.tran_entries_p[tran_index];
 
@@ -3376,6 +3408,74 @@ qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_
 	  free_and_init (tfile_vfid_p);
 	}
     }
+  return NO_ERROR;
+}
+
+/*
+ * qmgr_detach_temp_file_from_query () - unlink a temp file wrapper from the per-query temp ring
+ *                                       without retiring it
+ *   return: NO_ERROR, or ER_QPROC_UNKNOWN_QUERYID if the query entry is gone
+ *   query_id(in)     : query that currently owns the temp file
+ *   tfile_vfid_p(in) : temp file wrapper to detach
+ *
+ * Note: Used by the parallel partial-hash-aggregate merge. A source list file whose pages are
+ * relinked (via qfile_connect_list) into the merged list must not be retired while still
+ * referenced. Detaching it from the per-query ring transfers ownership to the consuming list; the
+ * wrapper is later retired exactly once, by pointer, through qmgr_free_list_temp_file's detached
+ * branch (when qfile_destroy_list walks the dependent chain). Retires nothing here.
+ */
+int
+qmgr_detach_temp_file_from_query (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  QMGR_QUERY_ENTRY *query_p;
+  QMGR_TRAN_ENTRY *tran_entry_p;
+  int tran_index;
+
+  assert (tfile_vfid_p != NULL);
+
+  tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+  tran_entry_p = &qmgr_Query_table.tran_entries_p[tran_index];
+
+  pthread_mutex_lock (&tran_entry_p->mutex);
+
+  if (qmgr_Query_table.tran_entries_p != NULL)
+    {
+      query_p = qmgr_find_query_entry (tran_entry_p->query_entry_list_p, query_id);
+    }
+  else
+    {
+      query_p = NULL;
+    }
+
+  if (query_p == NULL)
+    {
+      pthread_mutex_unlock (&tran_entry_p->mutex);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_QUERYID, 1, query_id);
+      return ER_QPROC_UNKNOWN_QUERYID;
+    }
+
+  /* unlink tfile_vfid_p from the circular ring (same surgery as qmgr_free_list_temp_file) */
+  if (tfile_vfid_p->next == tfile_vfid_p)
+    {
+      /* self-linked single node */
+      query_p->temp_vfid = NULL;
+    }
+  else
+    {
+      tfile_vfid_p->next->prev = tfile_vfid_p->prev;
+      tfile_vfid_p->prev->next = tfile_vfid_p->next;
+      if (query_p->temp_vfid == tfile_vfid_p)
+	{
+	  query_p->temp_vfid = tfile_vfid_p->next;
+	}
+    }
+  query_p->num_tmp--;
+
+  tfile_vfid_p->detached = true;
+  tfile_vfid_p->next = tfile_vfid_p->prev = NULL;
+
+  pthread_mutex_unlock (&tran_entry_p->mutex);
+
   return NO_ERROR;
 }
 
@@ -3624,6 +3724,7 @@ qmgr_get_temp_file_from_list (QMGR_TEMP_FILE_LIST * temp_file_list_p)
       temp_file_p = temp_file_list_p->list;
       temp_file_list_p->list = temp_file_p->next;
       temp_file_p->prev = temp_file_p->next = NULL;
+      temp_file_p->detached = false;
       temp_file_list_p->count--;
     }
 
@@ -3650,6 +3751,7 @@ qmgr_put_temp_file_into_list (QMGR_TEMP_FILE * temp_file_p)
     }
 
   temp_file_p->membuf_last = -1;
+  temp_file_p->detached = false;
 
   if (QMGR_IS_VALID_MEMBUF_TYPE (temp_file_p->membuf_type))
     {

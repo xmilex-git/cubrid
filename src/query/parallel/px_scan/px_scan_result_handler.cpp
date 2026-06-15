@@ -35,6 +35,7 @@
 #include "query_aggregate.hpp"
 #include "xasl_aggregate.hpp"
 #include "object_domain.h"
+#include "query_manager.h"
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -508,52 +509,103 @@ namespace parallel_scan
       }
   }
 
-  void merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists)
+  // Merge the worker source list files into dest using zero-copy qfile_connect_list (page relink,
+  // no per-tuple copy). Each consumed source temp file is detached from the qmgr per-query ring so
+  // it is retired exactly once, by pointer, when dest is later destroyed. Returns NO_ERROR or an
+  // error code; on error every still-owned list is destroyed and lists is cleared (no leak, no
+  // double free).
+  static int
+  merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists)
   {
-    QFILE_LIST_ID *tmp_merged_list = nullptr;
-    for (QFILE_LIST_ID *list_id : lists)
+    QFILE_LIST_ID *tmp = nullptr;
+    int error = NO_ERROR;
+    const QUERY_ID qid = dest->query_id;	/* same main query_id shared by workers */
+    size_t n = lists.size ();
+    for (size_t i = 0; i < n; i++)
       {
-	assert (list_id != nullptr);
-	assert (list_id->last_pgptr == nullptr);
-	if (list_id->tuple_cnt > 0)
+	QFILE_LIST_ID *src = lists[i];
+	if (src->tuple_cnt == 0)
 	  {
-	    if (tmp_merged_list == nullptr)
-	      {
-		tmp_merged_list = list_id;
-	      }
-	    else
-	      {
-		qfile_connect_list (thread_p, tmp_merged_list, list_id);
-	      }
+	    qfile_destroy_list (thread_p, src);
+	    QFILE_FREE_AND_INIT_LIST_ID (src);
+	    lists[i] = nullptr;
+	    continue;
 	  }
-	else
+	if (tmp == nullptr)
 	  {
-	    qfile_destroy_list (thread_p, list_id);
-	    QFILE_FREE_AND_INIT_LIST_ID (list_id);
+	    tmp = src;
+	    lists[i] = nullptr;
+	    continue;
 	  }
-	list_id = nullptr;
-      }
-    lists.clear();
-    if (tmp_merged_list != nullptr)
-      {
-	if (dest->tuple_cnt > 0)
+	if (qfile_connect_list (thread_p, tmp, src) != NO_ERROR)	/* src NOT linked on failure */
 	  {
-	    if (dest->last_pgptr != nullptr)
-	      {
-		qfile_close_list (thread_p, dest);
-	      }
-	    qfile_connect_list (thread_p, dest, tmp_merged_list);
+	    error = ER_FAILED;
+	    goto cleanup;
 	  }
-	else
+	lists[i] = nullptr;	/* src now a dependent of tmp */
+	if (qmgr_detach_temp_file_from_query (thread_p, qid, src->tfile_vfid) != NO_ERROR)
 	  {
-	    if (dest->type_list.type_cnt > 0)
-	      {
-		qfile_destroy_list (thread_p, dest);
-	      }
-	    qfile_copy_list_id (dest, tmp_merged_list, true, QFILE_MOVE_DEPENDENT);
-	    QFILE_FREE_AND_INIT_LIST_ID (tmp_merged_list);
+	    error = ER_FAILED;
+	    goto cleanup;
 	  }
       }
+    if (tmp == nullptr)
+      {
+	lists.clear ();
+	return NO_ERROR;
+      }
+    if (qmgr_detach_temp_file_from_query (thread_p, qid, tmp->tfile_vfid) != NO_ERROR)
+      {
+	error = ER_FAILED;
+	goto cleanup;
+      }
+    if (dest->tuple_cnt > 0)
+      {
+	if (dest->last_pgptr != nullptr)
+	  {
+	    qfile_close_list (thread_p, dest);
+	  }
+	if (qfile_connect_list (thread_p, dest, tmp) != NO_ERROR)
+	  {
+	    error = ER_FAILED;
+	    goto cleanup;
+	  }
+	tmp = nullptr;		/* ownership handed to dest */
+      }
+    else
+      {
+	QFILE_LIST_ID scratch;
+	if (qfile_copy_list_id (&scratch, tmp, true, QFILE_MOVE_DEPENDENT) != NO_ERROR)
+	  {
+	    error = ER_FAILED;	/* dest untouched; tmp still owns chain */
+	    goto cleanup;
+	  }
+	if (dest->type_list.type_cnt > 0)
+	  {
+	    qfile_destroy_list (thread_p, dest);
+	  }
+	*dest = scratch;	/* commit; do NOT clear scratch */
+	QFILE_FREE_AND_INIT_LIST_ID (tmp);	/* tmp identity moved into dest */
+      }
+    lists.clear ();
+    return NO_ERROR;
+
+  cleanup:
+    if (tmp != nullptr)
+      {
+	qfile_destroy_list (thread_p, tmp);
+	QFILE_FREE_AND_INIT_LIST_ID (tmp);
+      }
+    for (size_t i = 0; i < n; i++)
+      {
+	if (lists[i] != nullptr)
+	  {
+	    qfile_destroy_list (thread_p, lists[i]);
+	    QFILE_FREE_AND_INIT_LIST_ID (lists[i]);
+	  }
+      }
+    lists.clear ();
+    return error;
   }
 
   template <RESULT_TYPE result_type>
@@ -581,12 +633,18 @@ namespace parallel_scan
 	    return S_ERROR;
 	  }
 
-	merge_list_ids (thread_p, dest, m_.writer_results);
+	if (merge_list_ids (thread_p, dest, m_.writer_results) != NO_ERROR)
+	  {
+	    return S_ERROR;
+	  }
 
 	if (m_.g_hash_eligible)
 	  {
 	    BUILDLIST_PROC_NODE *buildlist_proc = &m_.orig_xasl->proc.buildlist;
-	    merge_list_ids (thread_p, buildlist_proc->agg_hash_context->part_list_id, m_.hgby_results);
+	    if (merge_list_ids (thread_p, buildlist_proc->agg_hash_context->part_list_id, m_.hgby_results) != NO_ERROR)
+	      {
+		return S_ERROR;
+	      }
 	    /* HS_REJECT_ALL forces 'hash: partial' trace for hgby with part list IDs (cf. qdump_print_stats_text). */
 	    m_.orig_xasl->groupby_stats.groupby_hash = HS_REJECT_ALL;
 	  }

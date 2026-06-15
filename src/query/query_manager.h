@@ -93,6 +93,7 @@ struct qmgr_temp_file
   int membuf_npages;
   QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type;
   bool preserved;		/* if temp file is preserved */
+  bool detached;		/* if temp file was detached from the per-query ring (retired by pointer) */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };
 
@@ -173,6 +174,8 @@ extern QMGR_TEMP_FILE *qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY
 						  QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type);
 extern QMGR_TEMP_FILE *qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id);
 extern int qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_FILE * tfile_vfidp);
+extern int qmgr_detach_temp_file_from_query (THREAD_ENTRY * thread_p, QUERY_ID query_id,
+					     QMGR_TEMP_FILE * tfile_vfid_p);
 extern int qmgr_free_temp_file_list (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfidp, QUERY_ID query_id,
 				     bool is_error);
 
