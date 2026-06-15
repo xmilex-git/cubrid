@@ -36,6 +36,13 @@
 #include "xasl_aggregate.hpp"
 #include "object_domain.h"
 
+#if !defined(NDEBUG)
+/* CBRD-26927 V-RESID part 2: debug-only live-chain VFID enumeration (no-op in release).
+ * query_manager.h completes struct qmgr_temp_file so tfile_vfid->temp_vfid is readable. */
+#include "query_manager.h"
+#include "vresid2_log.h"
+#endif
+
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -577,6 +584,45 @@ namespace parallel_scan
     return error;
   }
 
+#if !defined(NDEBUG)
+  /*
+   * vresid2_snapshot_chain () - CBRD-26927 V-RESID part 2 (debug-only).
+   *   Walk a consumed list's dependent_list_id chain (the chain qfile_connect_list
+   *   builds) and emit, for each node, its backing temp-file VFID(s):
+   *     - list_id->temp_vfid                 (duplicated id), and
+   *     - list_id->tfile_vfid->temp_vfid     (the authoritative descriptor id).
+   *   All nodes of one snapshot share the same ts so the snapshot can be ordered
+   *   against the VRESID2_RETIRE: lines (snapshot ts <= retire ts < chain destroy
+   *   => alias while live). chain = "hgby" or "writer". Bounded walk so a stale
+   *   cyclic pointer can never wedge the instrumentation.
+   */
+  static void
+  vresid2_snapshot_chain (const char *chain, QFILE_LIST_ID *head)
+  {
+    long long ts = vresid2_now_ns ();
+    long tid = vresid2_tid ();
+    long long qid = (head != nullptr) ? (long long) head->query_id : -1;
+    int depth = 0;
+
+    if (head == nullptr)
+      {
+	vresid2_logf ("VRESID2_CHAIN: ts=%lld tid=%ld qid=%lld chain=%s node=-1 lvfid=NULL tvfid=NULL nodes=0\n",
+		      ts, tid, qid, chain);
+	return;
+      }
+
+    for (QFILE_LIST_ID *node = head; node != nullptr && depth < 100000; node = node->dependent_list_id, ++depth)
+      {
+	int lvolid = (int) node->temp_vfid.volid;
+	int lfileid = (int) node->temp_vfid.fileid;
+	int tvolid = (node->tfile_vfid != nullptr) ? (int) node->tfile_vfid->temp_vfid.volid : -1;
+	int tfileid = (node->tfile_vfid != nullptr) ? (int) node->tfile_vfid->temp_vfid.fileid : -1;
+	vresid2_logf ("VRESID2_CHAIN: ts=%lld tid=%ld qid=%lld chain=%s node=%d lvfid=%d:%d tvfid=%d:%d tuples=%lld\n",
+		      ts, tid, qid, chain, depth, lvolid, lfileid, tvolid, tfileid, (long long) node->tuple_cnt);
+      }
+  }
+#endif /* !NDEBUG */
+
   void merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists)
   {
     QFILE_LIST_ID *tmp_merged_list = nullptr;
@@ -652,6 +698,13 @@ namespace parallel_scan
 
 	merge_list_ids (thread_p, dest, m_.writer_results);
 
+#if !defined(NDEBUG)
+	/* CBRD-26927 V-RESID part 2: snapshot the writer_results relink target (the
+	 * qfile_connect_list dependent_list_id chain deliberately left unchanged by
+	 * the fix) the instant the merge completes, while it is still live. */
+	vresid2_snapshot_chain ("writer", dest);
+#endif
+
 	if (m_.g_hash_eligible)
 	  {
 	    BUILDLIST_PROC_NODE *buildlist_proc = &m_.orig_xasl->proc.buildlist;
@@ -660,6 +713,12 @@ namespace parallel_scan
 	      {
 		return S_ERROR;
 	      }
+#if !defined(NDEBUG)
+	    /* CBRD-26927 V-RESID part 2: snapshot the main query's part_list (the hgby
+	     * chain, now populated by the shipped copy fix) right after the copy, while
+	     * it is live. Post-fix this set must stay disjoint from the retired VFIDs. */
+	    vresid2_snapshot_chain ("hgby", buildlist_proc->agg_hash_context->part_list_id);
+#endif
 	    /* HS_REJECT_ALL forces 'hash: partial' trace for hgby with part list IDs (cf. qdump_print_stats_text). */
 	    m_.orig_xasl->groupby_stats.groupby_hash = HS_REJECT_ALL;
 	  }

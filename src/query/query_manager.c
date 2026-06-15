@@ -47,6 +47,12 @@
 #include "thread_entry.hpp"
 #include "xasl_cache.h"
 #include "xasl_unpack_info.hpp"
+
+#if !defined(NDEBUG)
+/* CBRD-26927 V-RESID part 2: debug-only retire-VFID logger (no-op in release). */
+#include "vresid2_log.h"
+#endif
+
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -3190,6 +3196,15 @@ qmgr_free_temp_file_list (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p
       fd_ret = NO_ERROR;
       if ((tfile_vfid_p->temp_file_type != FILE_QUERY_AREA || is_error) && !VFID_ISNULL (&tfile_vfid_p->temp_vfid))
 	{
+#if !defined(NDEBUG)
+	  /* CBRD-26927 V-RESID part 2: bulk query-teardown retire path. Logged with the
+	   * same prefix/seq so cross-query retire-vs-live-chain aliasing is detectable. */
+	  vresid2_logf ("VRESID2_RETIRE: ts=%lld tid=%ld qid=%lld vfid=%d:%d kind=%s preserved=%d\n",
+			vresid2_now_ns (), vresid2_tid (), (long long) query_id,
+			(int) tfile_vfid_p->temp_vfid.volid, (int) tfile_vfid_p->temp_vfid.fileid,
+			tfile_vfid_p->preserved ? "list_retire_preserved" : "list_retire",
+			tfile_vfid_p->preserved ? 1 : 0);
+#endif
 	  if (tfile_vfid_p->preserved)
 	    {
 	      fd_ret = file_temp_retire_preserved (thread_p, &tfile_vfid_p->temp_vfid);
@@ -3335,6 +3350,16 @@ qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_
     {
       if (!VFID_ISNULL (&tfile_vfid_p->temp_vfid))
 	{
+#if !defined(NDEBUG)
+	  /* CBRD-26927 V-RESID part 2: log every temp-file VFID this query retires,
+	   * with a monotonic-clock seq so the retire can be ordered against the
+	   * live-chain snapshots emitted in px_scan_result_handler.cpp. */
+	  vresid2_logf ("VRESID2_RETIRE: ts=%lld tid=%ld qid=%lld vfid=%d:%d kind=%s preserved=%d\n",
+			vresid2_now_ns (), vresid2_tid (), (long long) query_id,
+			(int) tfile_vfid_p->temp_vfid.volid, (int) tfile_vfid_p->temp_vfid.fileid,
+			tfile_vfid_p->preserved ? "retire_preserved" : "retire",
+			tfile_vfid_p->preserved ? 1 : 0);
+#endif
 	  if (tfile_vfid_p->preserved)
 	    {
 	      if (file_temp_retire_preserved (thread_p, &tfile_vfid_p->temp_vfid) != NO_ERROR)
