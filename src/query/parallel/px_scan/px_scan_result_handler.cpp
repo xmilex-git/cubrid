@@ -508,6 +508,75 @@ namespace parallel_scan
       }
   }
 
+  /*
+   * copy_hgby_results_into_part_list () - CBRD-26927. Deep-copy every worker's
+   *   partial-aggregate tuples into the main query's own part_list (dest), then
+   *   destroy each worker temp file. Unlike the qfile_connect_list page-relink,
+   *   this makes dest own all of its pages, so it never references a worker-origin
+   *   temp page that another concurrent query could retire and reuse (the
+   *   corruption source). Worker lists are tiny (≈ one row per group), so the
+   *   copy cost is negligible.
+   *   return: NO_ERROR, or ER_FAILED (caller returns S_ERROR). On any error the
+   *           remaining worker lists are still drained+freed so nothing leaks.
+   */
+  static int
+  copy_hgby_results_into_part_list (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest,
+				    std::vector<QFILE_LIST_ID *> &lists)
+  {
+    int error = NO_ERROR;
+
+    for (QFILE_LIST_ID *list_id : lists)
+      {
+	assert (list_id != nullptr);
+	assert (list_id->last_pgptr == nullptr);	/* worker closed its list in write_finalize */
+
+	if (error == NO_ERROR && list_id->tuple_cnt > 0)
+	  {
+	    QFILE_LIST_SCAN_ID scan_id;
+
+	    if (qfile_open_list_scan (list_id, &scan_id) == NO_ERROR)
+	      {
+		QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+		SCAN_CODE qp_scan;
+
+		while ((qp_scan = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK)) == S_SUCCESS)
+		  {
+		    if (qfile_add_tuple_to_list (thread_p, dest, tuple_record.tpl) != NO_ERROR)
+		      {
+			error = ER_FAILED;
+			break;
+		      }
+		  }
+		qfile_close_scan (thread_p, &scan_id);
+		if (error == NO_ERROR && qp_scan != S_END)
+		  {
+		    error = ER_FAILED;
+		  }
+	      }
+	    else
+	      {
+		error = ER_FAILED;
+	      }
+	  }
+
+	/* Destroy the worker temp file now (we own a copy in dest). Done even on
+	 * error so nothing leaks; dest is torn down at groupby teardown. */
+	qfile_destroy_list (thread_p, list_id);
+	QFILE_FREE_AND_INIT_LIST_ID (list_id);
+      }
+    lists.clear ();
+
+    /* qfile_add_tuple_to_list leaves dest's last page held (last_pgptr != NULL);
+     * close it so the downstream qexec_groupby scan/sort sees a closed list (the
+     * relink path also hands downstream a closed list). Safe when dest stayed
+     * empty: qfile_close_list frees last_pgptr only when non-NULL. */
+    if (dest->last_pgptr != nullptr)
+      {
+	qfile_close_list (thread_p, dest);
+      }
+    return error;
+  }
+
   void merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists)
   {
     QFILE_LIST_ID *tmp_merged_list = nullptr;
@@ -586,7 +655,11 @@ namespace parallel_scan
 	if (m_.g_hash_eligible)
 	  {
 	    BUILDLIST_PROC_NODE *buildlist_proc = &m_.orig_xasl->proc.buildlist;
-	    merge_list_ids (thread_p, buildlist_proc->agg_hash_context->part_list_id, m_.hgby_results);
+	    if (copy_hgby_results_into_part_list (thread_p, buildlist_proc->agg_hash_context->part_list_id,
+						  m_.hgby_results) != NO_ERROR)
+	      {
+		return S_ERROR;
+	      }
 	    /* HS_REJECT_ALL forces 'hash: partial' trace for hgby with part list IDs (cf. qdump_print_stats_text). */
 	    m_.orig_xasl->groupby_stats.groupby_hash = HS_REJECT_ALL;
 	  }
