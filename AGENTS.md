@@ -214,3 +214,22 @@ PR title must match `^\[[A-Z]+-\d+\]\s.+` (e.g. `[CBRD-12345] Fix buffer overflo
 - `src/object/schema_system_catalog_constants.h` — Catalog table name constants
 - `docs/install_build_requirements.md` — Build dependency installation
 
+## Agent skills
+
+### Issue tracker
+
+Issues/PRDs live in the **`xmilex-git/cubrid`** fork's GitHub Issues (NOT origin/`CUBRID`).
+Always pass `--repo xmilex-git/cubrid` to `gh`. Issue bodies are written in Korean.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles map 1:1 to label strings
+(`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`).
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Multi-context: `CONTEXT-MAP.md` at root points to per-module `CONTEXT.md` files.
+See `docs/agents/domain.md`.
+
