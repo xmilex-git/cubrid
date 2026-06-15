@@ -1,0 +1,35 @@
+# colocate.tsv — order-sensitivity registry for ctp-parallel.
+#
+# Each non-comment line is ONE group of outermost `cases/` directories (paths are
+# scenario-relative, i.e. relative to <testcases>/sql, and end in `/cases`).
+# Whitespace- or TAB-separated.
+#
+#   * 1 dir on a line  -> KEEP WHOLE: this dir is never split per-`.sql`, in ANY
+#                         mode (this is the default in `dir` mode, but the registry
+#                         ALSO enforces it under `--by-case`, where everything else
+#                         splits to single cases).
+#   * 2+ dirs on a line -> KEEP WHOLE *and* CO-LOCATE: all listed dirs are placed on
+#                         the SAME shard (use only when a dependency crosses dirs).
+#
+# Loaded by default if this file is present; override with `--colocate <file>` or
+# disable with `--no-colocate`. Unknown/typo'd dirs are warned about, not fatal.
+#
+# Seed = the 4 cases that the ctp-parallel report (.claude/review/ctp-parallel-report.md,
+# section P7) proved are SPLIT-INDUCED false failures: they pass when their cases/
+# dir runs whole, fail when per-`.sql` splitting scatters them across shards. The
+# report's --shards 1 re-run showed the dependency is INTRA-directory, so each is a
+# keep-whole singleton (NOT forced onto one shared shard — they are unrelated
+# features, and co-locating all four would just create a hot shard for no proven
+# benefit). If a cross-dir dependency is ever found, put those dirs on one line.
+
+# [report #1] PL/CSQL local-function arg-length error (04_04_01-02_error_arg_len_big)
+_05_plcsql/_01_testspec/_04_expression/_04_function_call/_01_local_function/cases
+
+# [report #2] PL/CSQL builtin string-function bit_length (04_04_03_01_bfn_string_bit_length)
+_05_plcsql/_01_testspec/_04_expression/_04_function_call/_03_builtin_function/_01_string_function/cases
+
+# [report #4] function-based index + last_insert_id() session state
+_23_apricot_qa/_02_performance/_02_function_based_index/cases
+
+# [report #6] fig_cake cbrd_24702
+_35_fig_cake/cbrd_24044/cbrd_24702/cases

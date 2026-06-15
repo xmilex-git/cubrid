@@ -1,0 +1,4 @@
+# Runtime / test artifacts — never committed.
+test/.scratch/
+ctp-parallel-out/
+*.log

@@ -1,0 +1,53 @@
+# Containerfile — per-shard CTP SQL runner image (host-matched runtime).
+#
+# Unlike the CI build image (cubridci/cubridci:develop, CentOS 6 / glibc 2.12),
+# this is a RUNTIME image whose glibc matches a modern host build (Rocky Linux 8 /
+# glibc 2.28), so a CUBRID built on the host runs unchanged when mounted in.
+# The heavy state (build, scenario, CTP-conf, CUBRID_DATABASES) is mounted writable
+# at run time by ctp_parallel.sh — NOT baked in — so one image serves all shards.
+#
+# Build:  podman build -t ctp-parallel:local -f Containerfile .
+# Override base: podman build --build-arg BASE_IMAGE=<ref> ...
+#
+# Copyright (c) 2024 CUBRID test-infra. Apache-2.0.
+
+ARG BASE_IMAGE=docker.io/library/rockylinux:8
+FROM ${BASE_IMAGE}
+
+# Runtime deps:
+#   java-1.8.0-openjdk-devel : Java stored procedure (java_stored_procedure=yes) + CTP (Java)
+#   gcc gcc-c++ make         : make_locale (need_make_locale=yes) compiles the locale .so
+#   glibc-langpack-en        : the en_US locale CTP runs under (LC_ALL=en_US)
+#   libstdc++                : C++17 runtime for the CUBRID engine
+#   ncurses-compat-libs      : libncurses.so.5 for csql
+#   diffutils                : CTP compares .answer vs .result with diff
+#   which procps-ng util-linux findutils sed gawk grep tar gzip hostname : CUBRID/CTP shell glue
+#   tzdata                   : Asia/Seoul zoneinfo (the SQL answer files assume KST)
+RUN dnf -y install \
+        java-1.8.0-openjdk-devel \
+        gcc gcc-c++ make \
+        glibc-langpack-en \
+        libstdc++ \
+        ncurses-compat-libs \
+        diffutils findutils which procps-ng util-linux file \
+        sed gawk grep tar gzip hostname \
+        tzdata \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# Match the host the QA answers were generated on: CUBRID derives its default
+# timezone from /etc/localtime (NOT $TZ), and the base image ships it as UTC.
+# Leaving it UTC shifts every TIMESTAMP/DATETIME result by the KST offset and
+# fails hundreds of datetime/timezone cases that are otherwise correct.
+RUN ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime && echo "Asia/Seoul" > /etc/timezone
+
+ENV JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk \
+    TZ=Asia/Seoul \
+    LC_ALL=en_US
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Mount targets (created so the bind mounts have stable parents).
+RUN mkdir -p /home/CUBRID /home/CTP /home/CUBRID_DB /home/cubrid-testcases/sql
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<!--
+  GANTT TIMELINE TEMPLATE  (single self-contained file — no external deps)
+  ────────────────────────────────────────────────────────────────────────
+  How to use:
+  1. Replace header (kicker/h1/.sub) and the 4 summary cards with project facts.
+  2. The grid is 5 week columns. Each .row is a workstream: an .rlab (label + the
+     exact issue ids in .tag) and a .lane holding 5 .cellguide spans + the .bar(s).
+  3. Position bars with inline style="left:%;width:%" — 0% = start of W1,
+     100% = end of W5. Bar width = the review/merge FLOW, not keyboard days.
+  4. PUT THE CRITICAL PATH ROW FIRST (class critrow, bar b-crit). The reader
+     should see what governs the end date before anything else.
+  5. Recurring events (weekly sync) = small .dot on a .ghost bar. Milestone = .milestone diamond.
+  6. Keep only the legend swatches you use. Run ../scripts/verify_html.sh before delivering.
+
+  Bar buckets: b-dev b-refactor b-regress b-test b-sync b-buffer b-crit
+  (semantics in references/design-system.md §3)
+-->
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PROJECT — Gantt 일정</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel2:#1d212c; --line:#2a2f3d;
+    --ink:#e7eaf0; --muted:#9aa3b2; --faint:#6b7488;
+    --dev:#4f8cff; --refactor:#a978ff; --regress:#ff7a59;
+    --test:#2dd4a7; --sync:#f5b94d; --merge:#34d399; --buffer:#5b6478;
+    --crit:#ff5277;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:radial-gradient(1200px 600px at 70% -10%,#1b2030 0%,var(--bg) 55%);
+    color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",
+    "Apple SD Gothic Neo","Noto Sans KR",Pretendard,Roboto,sans-serif;
+    padding:40px 32px 64px;line-height:1.5;-webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1120px;margin:0 auto}
+  header{margin-bottom:28px}
+  .kicker{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);font-weight:600}
+  h1{font-size:30px;font-weight:800;margin:6px 0 4px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:14px}
+  .sub b{color:var(--ink);font-weight:600}
+
+  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:26px 0 30px}
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+    border-radius:14px;padding:16px 18px;position:relative;overflow:hidden}
+  .card .lab{font-size:11.5px;color:var(--muted);font-weight:600;letter-spacing:.04em}
+  .card .val{font-size:22px;font-weight:800;margin-top:6px;letter-spacing:-.01em}
+  .card .note{font-size:11.5px;color:var(--faint);margin-top:4px}
+  .card.accent{border-color:#2f5fd0} .card.accent .val{color:#7fa9ff}
+  .card.crit{border-color:#6e2740} .card.crit .val{color:#ff7a98}
+  .card .glow{position:absolute;right:-30px;top:-30px;width:90px;height:90px;border-radius:50%;
+    filter:blur(30px);opacity:.5}
+
+  .gantt{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:8px 0 4px;overflow:hidden}
+  .gantt-head{display:grid;grid-template-columns:230px repeat(5,1fr);border-bottom:1px solid var(--line)}
+  .gantt-head .corner{padding:14px 18px;font-size:12px;color:var(--muted);font-weight:700}
+  .wk{padding:12px 10px;text-align:center;border-left:1px solid var(--line)}
+  .wk .w{font-size:13px;font-weight:800}
+  .wk .d{font-size:11px;color:var(--muted);margin-top:2px}
+  .wk.buf{background:repeating-linear-gradient(45deg,transparent,transparent 6px,#ffffff05 6px,#ffffff05 12px)}
+
+  .row{display:grid;grid-template-columns:230px repeat(5,1fr);align-items:center;min-height:46px;
+    border-bottom:1px solid #20242f}
+  .row:last-child{border-bottom:none}
+  .row:hover{background:#ffffff04}
+  .rlab{padding:8px 16px;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .rlab .tag{font-size:10px;color:var(--faint);font-weight:500}
+  .lane{position:relative;grid-column:2 / span 5;height:100%;display:grid;
+    grid-template-columns:repeat(5,1fr);align-items:center;pointer-events:none}
+  .cellguide{border-left:1px solid #20242f;height:100%}
+  .bar{position:absolute;height:24px;border-radius:7px;display:flex;align-items:center;
+    padding:0 10px;font-size:11.5px;font-weight:700;color:#0c0e14;white-space:nowrap;
+    box-shadow:0 2px 6px #0006;top:50%;transform:translateY(-50%)}
+  .bar.ghost{color:var(--ink);background:transparent;box-shadow:none;font-weight:600}
+  .dot{position:absolute;top:50%;transform:translate(-50%,-50%);width:11px;height:11px;border-radius:50%;
+    border:2px solid var(--bg)}
+  .milestone{position:absolute;top:50%;width:16px;height:16px;transform:translate(-50%,-50%) rotate(45deg);
+    border:2px solid var(--bg);box-shadow:0 0 0 3px #34d39933}
+
+  .b-dev{background:linear-gradient(90deg,#4f8cff,#6ea2ff)}
+  .b-refactor{background:linear-gradient(90deg,#a978ff,#c19bff)}
+  .b-regress{background:linear-gradient(90deg,#ff7a59,#ff9b7e)}
+  .b-test{background:linear-gradient(90deg,#2dd4a7,#5fe5c0)}
+  .b-sync{background:linear-gradient(90deg,#f5b94d,#ffd277)}
+  .b-buffer{background:repeating-linear-gradient(45deg,#5b6478,#5b6478 6px,#6b7488 6px,#6b7488 12px);color:#dfe3ec}
+  .b-crit{background:linear-gradient(90deg,#ff5277,#ff7a98)}
+
+  .critrow{background:linear-gradient(90deg,#ff527711,transparent)}
+  .critrow .rlab{color:#ff97ad}
+
+  .grid2{display:grid;grid-template-columns:1.3fr 1fr;gap:18px;margin-top:24px}
+  .panelbox{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+  .panelbox h3{font-size:13px;letter-spacing:.04em;color:var(--muted);text-transform:uppercase;margin-bottom:14px}
+  .legend{display:flex;flex-wrap:wrap;gap:10px 16px}
+  .lg{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink)}
+  .sw{width:14px;height:14px;border-radius:4px}
+  ul.notes{list-style:none;display:flex;flex-direction:column;gap:11px}
+  ul.notes li{font-size:13px;color:var(--ink);padding-left:20px;position:relative}
+  ul.notes li::before{content:"";position:absolute;left:2px;top:7px;width:7px;height:7px;border-radius:50%;background:var(--dev)}
+  ul.notes li.risk::before{background:var(--crit)}
+  ul.notes li.win::before{background:var(--merge)}
+  ul.notes li b{color:#fff}
+
+  .quote{margin-top:24px;background:linear-gradient(180deg,#13243a,#101725);border:1px solid #234063;
+    border-left:3px solid var(--dev);border-radius:12px;padding:18px 22px}
+  .quote .q{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#7fa9ff;font-weight:700;margin-bottom:8px}
+  .quote p{font-size:14.5px;color:#dde6f4;line-height:1.7}
+  .quote b{color:#fff}
+  footer{margin-top:26px;text-align:center;color:var(--faint);font-size:11.5px}
+  .pill{display:inline-block;background:#ffffff10;border:1px solid var(--line);border-radius:999px;
+    padding:2px 10px;font-size:11px;color:var(--muted);margin-left:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="kicker">PROJECT · branch / context</div>
+    <h1>PROJECT 일정 <span class="pill">YYYY-MM-DD 기준</span></h1>
+    <div class="sub">게이트: <b>DEFINITION OF DONE</b> · 인력/속도 · 임계경로: <b>…</b></div>
+  </header>
+
+  <section class="cards">
+    <div class="card accent"><div class="glow" style="background:#4f8cff"></div>
+      <div class="lab">목표</div><div class="val">~6/17</div><div class="note">…</div></div>
+    <div class="card"><div class="glow" style="background:#34d399"></div>
+      <div class="lab">버퍼 한계</div><div class="val">~6/19</div><div class="note">…</div></div>
+    <div class="card"><div class="glow" style="background:#a978ff"></div>
+      <div class="lab">직접 작업</div><div class="val">N일</div><div class="note">비임계 / 겹침</div></div>
+    <div class="card crit"><div class="glow" style="background:#ff5277"></div>
+      <div class="lab">슬립 리스크</div><div class="val">…</div><div class="note">유일 변수</div></div>
+  </section>
+
+  <section class="gantt">
+    <div class="gantt-head">
+      <div class="corner">작업 / 버킷</div>
+      <div class="wk"><div class="w">W1</div><div class="d">6/1–6/5</div></div>
+      <div class="wk"><div class="w">W2</div><div class="d">6/8–6/12</div></div>
+      <div class="wk"><div class="w">W3</div><div class="d">6/15–6/19</div></div>
+      <div class="wk"><div class="w">W4</div><div class="d">6/22–6/26</div></div>
+      <div class="wk buf"><div class="w">버퍼</div><div class="d">6/29–7/3</div></div>
+    </div>
+
+    <!-- CRITICAL PATH — always first -->
+    <div class="row critrow">
+      <div class="rlab">🔴 임계경로<span class="tag">무엇이 끝점을 지배하는가</span></div>
+      <div class="lane">
+        <span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span>
+        <div class="bar b-crit" style="left:1%;width:78%">…</div>
+      </div>
+    </div>
+
+    <!-- recurring event row (e.g. weekly sync) — dots on a ghost bar -->
+    <div class="row">
+      <div class="rlab">🟡 주간 sync<span class="tag">매주</span></div>
+      <div class="lane">
+        <span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span>
+        <div class="bar ghost" style="left:0;width:100%">
+          <span class="dot" style="background:var(--sync);left:10%"></span>
+          <span class="dot" style="background:var(--sync);left:30%"></span>
+          <span class="dot" style="background:var(--sync);left:50%"></span>
+          <span class="dot" style="background:var(--sync);left:70%"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- workstream rows -->
+    <div class="row">
+      <div class="rlab">🔵 개발<span class="tag">TICKET-101·102</span></div>
+      <div class="lane">
+        <span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span>
+        <div class="bar b-dev" style="left:1%;width:37%">마무리 → 리뷰 → 머지</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="rlab">🟣 리팩터링<span class="tag">TICKET-103</span></div>
+      <div class="lane">
+        <span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span>
+        <div class="bar b-refactor" style="left:21%;width:37%">리뷰 → 머지</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="rlab">🟢 테스트/CI<span class="tag">매뉴얼·회귀</span></div>
+      <div class="lane">
+        <span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span>
+        <div class="bar b-test" style="left:55%;width:19%">CI green + 매뉴얼</div>
+      </div>
+    </div>
+
+    <!-- milestone + buffer -->
+    <div class="row">
+      <div class="rlab">💎 병합 + 버퍼<span class="tag">milestone</span></div>
+      <div class="lane">
+        <span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span><span class="cellguide"></span>
+        <div class="milestone" style="left:78%;background:var(--merge)"></div>
+        <div class="bar b-buffer" style="left:80%;width:19%">버퍼</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="grid2">
+    <div class="panelbox">
+      <h3>레전드</h3>
+      <div class="legend">
+        <div class="lg"><span class="sw b-crit"></span>임계경로</div>
+        <div class="lg"><span class="sw b-dev"></span>개발</div>
+        <div class="lg"><span class="sw b-refactor"></span>리팩터링</div>
+        <div class="lg"><span class="sw b-regress"></span>회귀/버그</div>
+        <div class="lg"><span class="sw b-test"></span>테스트/CI</div>
+        <div class="lg"><span class="sw b-sync"></span>sync</div>
+        <div class="lg"><span class="sw b-buffer"></span>버퍼</div>
+        <div class="lg"><span class="sw" style="background:var(--merge);transform:rotate(45deg)"></span>마일스톤</div>
+      </div>
+      <div style="margin-top:18px;font-size:12.5px;color:var(--muted);line-height:1.7">
+        막대 길이는 <b>리뷰·머지 흐름 기준</b>이며 직접 작업 시간은 그 안에서 병렬로 소화됩니다.
+        제외 항목(범위 밖)은 캘린더 버전의 이슈 사전에 정리.
+      </div>
+    </div>
+
+    <div class="panelbox">
+      <h3>핵심 메모</h3>
+      <ul class="notes">
+        <li class="win"><b>가장 중요한 한 줄</b> — 무엇이 빨리 끝나는가</li>
+        <li class="risk"><b>슬립 변수</b> — 일정 방어의 핵심</li>
+        <li><b>우선순위</b> — 분산 큰 항목 먼저</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="quote">
+    <div class="q">요약</div>
+    <p>이해관계자에게 보낼 <b>한 문단 요약</b>. 임계경로·목표일·버퍼·유일한 리스크를 평문으로.</p>
+  </div>
+
+  <footer>PROJECT · Gantt · generated YYYY-MM-DD</footer>
+</div>
+</body>
+</html>
