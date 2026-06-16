@@ -737,20 +737,25 @@ namespace parallel_scan
 
 	OUTPTR_LIST *input = (OUTPTR_LIST *)src;
 
-	prefetch (tl.writer_result_p, PREFETCH_WRITE, PREFETCH_CACHE_L1);
+	/* Hoist the thread_local accessor once per call: collapses the per-access TLS
+	   lazy-init guard (__tls_init) + dynamic resolution (__tls_get_addr) from N to 1.
+	   `t` is a reference to the same object, so behavior is unchanged. (#34 D1) */
+	auto &t = tl;
 
-	status = qdata_generate_tuple_desc_for_valptr_list (thread_p, input, tl.vd, & (tl.writer_result_p->tpl_descr));
+	prefetch (t.writer_result_p, PREFETCH_WRITE, PREFETCH_CACHE_L1);
+
+	status = qdata_generate_tuple_desc_for_valptr_list (thread_p, input, t.vd, & (t.writer_result_p->tpl_descr));
 
 	if (unlikely (!m_.is_list_id_domain_resolved))
 	  {
-	    qfile_update_domains_on_type_list (thread_p, tl.writer_result_p, input);
-	    m_.is_list_id_domain_resolved = tl.writer_result_p->is_domain_resolved;
+	    qfile_update_domains_on_type_list (thread_p, t.writer_result_p, input);
+	    m_.is_list_id_domain_resolved = t.writer_result_p->is_domain_resolved;
 	  }
-	if (unlikely (!tl.val_list_domain_resolved))
+	if (unlikely (!t.val_list_domain_resolved))
 	  {
-	    XASL_NODE *xptr = tl.xasl;
+	    XASL_NODE *xptr = t.xasl;
 	    int i = 0;
-	    tl.val_list_domain_resolved = true;
+	    t.val_list_domain_resolved = true;
 
 	    for (; xptr != nullptr; xptr = xptr->scan_ptr)
 	      {
@@ -758,15 +763,15 @@ namespace parallel_scan
 		int end = i + xptr->val_list->val_cnt;
 		for (; i < end; i++)
 		  {
-		    if (tl.dbvals_for_domain_resolve[i].domain.general_info.is_null)
+		    if (t.dbvals_for_domain_resolve[i].domain.general_info.is_null)
 		      {
 			if (!valp->val->domain.general_info.is_null)
 			  {
-			    pr_clone_value (valp->val, &tl.dbvals_for_domain_resolve[i]);
+			    pr_clone_value (valp->val, &t.dbvals_for_domain_resolve[i]);
 			  }
 			else
 			  {
-			    tl.val_list_domain_resolved = false;
+			    t.val_list_domain_resolved = false;
 			  }
 		      }
 		    valp = valp->next;
@@ -777,30 +782,30 @@ namespace parallel_scan
 	if (likely (status == QPROC_TPLDESCR_SUCCESS))
 	  {
 	    bool output_tuple = true;
-	    if (tl.agg_hash_state == HS_ACCEPT_ALL)
+	    if (t.agg_hash_state == HS_ACCEPT_ALL)
 	      {
-		if (unlikely (!tl.g_agg_domains_resolved))
+		if (unlikely (!t.g_agg_domains_resolved))
 		  {
-		    if (qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg (thread_p, tl.xasl, tl.vd,
-			&tl.g_agg_domains_resolved) != NO_ERROR)
+		    if (qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg (thread_p, t.xasl, t.vd,
+			&t.g_agg_domains_resolved) != NO_ERROR)
 		      {
 			m_err_messages_p->move_top_error_message_to_this();
 			m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
 			return false;
 		      }
 		  }
-		if (qexec_hash_gby_agg_tuple_public (thread_p, tl.xasl, tl.vd->xasl_state, &tl.tpl_buf,
-						     & (tl.writer_result_p->tpl_descr), tl.writer_result_p, &output_tuple) != NO_ERROR)
+		if (qexec_hash_gby_agg_tuple_public (thread_p, t.xasl, t.vd->xasl_state, &t.tpl_buf,
+						     & (t.writer_result_p->tpl_descr), t.writer_result_p, &output_tuple) != NO_ERROR)
 		  {
 		    m_err_messages_p->move_top_error_message_to_this();
 		    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
 		    return false;
 		  }
-		tl.agg_hash_state = tl.xasl->proc.buildlist.agg_hash_context->state;
+		t.agg_hash_state = t.xasl->proc.buildlist.agg_hash_context->state;
 	      }
 	    if (output_tuple)
 	      {
-		if (unlikely (qfile_generate_tuple_into_list (thread_p, tl.writer_result_p, T_NORMAL) != NO_ERROR))
+		if (unlikely (qfile_generate_tuple_into_list (thread_p, t.writer_result_p, T_NORMAL) != NO_ERROR))
 		  {
 		    m_err_messages_p->move_top_error_message_to_this();
 		    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
@@ -816,14 +821,14 @@ namespace parallel_scan
 	  }
 	else if (unlikely (status == QPROC_TPLDESCR_RETRY_SET_TYPE || status == QPROC_TPLDESCR_RETRY_BIG_REC))
 	  {
-	    err_code = qdata_copy_valptr_list_to_tuple (thread_p, input, tl.vd, &tl.tpl_buf);
+	    err_code = qdata_copy_valptr_list_to_tuple (thread_p, input, t.vd, &t.tpl_buf);
 	    if (err_code != NO_ERROR)
 	      {
 		m_err_messages_p->move_top_error_message_to_this();
 		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
 		return false;
 	      }
-	    err_code = qfile_add_tuple_to_list (thread_p, tl.writer_result_p, tl.tpl_buf.tpl);
+	    err_code = qfile_add_tuple_to_list (thread_p, t.writer_result_p, t.tpl_buf.tpl);
 	    if (err_code != NO_ERROR)
 	      {
 		m_err_messages_p->move_top_error_message_to_this();
