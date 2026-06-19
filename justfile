@@ -20,6 +20,7 @@
 #   just install-locale [dest]             copy prebuilt locale files (lib+bin); auto-run by build/rebuild
 #   just deploy [mode] [version]           stop server (if any) -> build -> conf
 #   just ctest [mode]                      ctest against the build tree
+#   just shell-debug <TEST_DIR>            run one CTP shell test (or subtree) via ~/cubrid-testtools/CTP
 #
 # Campaign: debug install for D1/D2/D3, release install for D4 — switch via `just use <mode>`.
 
@@ -116,3 +117,53 @@ deploy mode="debug" version=ver:
 # ctest (unit + sql-level) against a build tree.
 ctest mode="debug":
     ctest --test-dir "build_preset_{{mode}}" --output-on-failure
+
+# Run one or a limited range of CTP shell tests against the local build.
+# Powers the `cubrid-shell-run` skill. CTP's stock shell_ci.conf runs *everything*
+# under scenario=; this copies it, repoints scenario= at one directory, and disables
+# the testcase git auto-update so a debug run never mutates ~/cubrid-testcases-private-ex.
+# CTP runs against the install on PATH (not the build tree) — rebuild/reinstall first
+# if you changed src/.
+#
+# The rewritten conf goes under .not_git_tracking/scratch (NOT /tmp — host /tmp is tmpfs).
+#
+# ARG SHAPE
+#   TEST_DIR must be the directory that *contains* `cases/<name>.sh`, NOT the .sh itself.
+#   Pass any ancestor directory to run a wider subtree (CTP recurses).
+#
+# Usage:
+#   just shell-debug ~/cubrid-testcases-private-ex/shell/_06_issues/_10_1h/bug_1638
+shell-debug TEST_DIR:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # CTP requires these in the environment (vimkim's .envrc exports the same two).
+    # `just` recipes run in a non-login shell that does not source the profile, so
+    # set them here to keep the recipe self-contained.
+    export CTP_HOME=~/cubrid-testtools/CTP
+    export init_path="$CTP_HOME/shell/init_path"
+    SRC="$CTP_HOME/conf/shell_ci.conf"
+    [ -f "$SRC" ] || { echo "ERROR: CTP conf not found: $SRC (is CTP installed?)" >&2; exit 1; }
+    SCRATCH="{{justfile_directory()}}/.not_git_tracking/scratch"
+    mkdir -p "$SCRATCH"
+    CONF=$(mktemp "$SCRATCH/shell_single.XXXXXX.conf")
+    cp "$SRC" "$CONF"
+    sed -i "s|^scenario=.*|scenario={{TEST_DIR}}|"              "$CONF"
+    sed -i "s|^testcase_update_yn=.*|testcase_update_yn=false|" "$CONF"
+    sed -i "s|^testcase_exclude_from_file=.*|#&|"               "$CONF"
+    echo "[shell-debug] scenario={{TEST_DIR}}"
+    echo "[shell-debug] conf=$CONF"
+    # Wrap in script(1) for a pseudo-TTY: avoids the known pipe-hang when `cubrid
+    # server start/stop` output is captured by a non-TTY (CI, agent shells).
+    # -q quiet, -e return the child's exit code, -f flush, -c run the command.
+    script -qefc "$CTP_HOME/bin/ctp.sh shell -c $CONF" /dev/null
+
+# Semantic alias for shell-debug — signals "run a whole bucket" at the call site.
+shell-debug-many SUBTREE: (shell-debug SUBTREE)
+
+# Interactive picker against the UNMODIFIED conf (testcase_update_yn=true still git-pulls).
+shell-debug-interactive:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CTP_HOME=~/cubrid-testtools/CTP
+    export init_path="$CTP_HOME/shell/init_path"
+    "$CTP_HOME/bin/ctp.sh" shell --interactive -c "$CTP_HOME/conf/shell_ci.conf"
