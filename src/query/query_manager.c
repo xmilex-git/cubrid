@@ -31,6 +31,8 @@
 #include "query_manager.h"
 
 #include "file_manager.h"
+#include "file_io.h"		/* P2-B: file_io-direct private-spill routing */
+#include "tde.h"		/* P2-B: TDE-aware private-spill encrypt/decrypt */
 #include "compile_context.h"
 #include "log_append.hpp"
 #include "object_primitive.h"
@@ -2506,6 +2508,235 @@ qmgr_add_modified_class (THREAD_ENTRY * thread_p, const OID * class_oid_p)
  *       	     PAGE ALLOCATION/DEALLOCATION ROUTINES
  */
 
+/* ---- P2-B private-spill (Axis B): file_io-direct copy buffers, ZERO page-buffer fix ----
+ * A QMGR_TEMP_FILE flagged private_spill is provably single-owner (plan-wide non-parallel,
+ * non-result, non-preserved, non-holdable -- see qfile_open_list / the executor gate). Its disk
+ * pages never reside in the page buffer: each is handed to the caller as a malloc'd copy buffer
+ * whose 16-byte-aligned header (kept just before the DB_PAGESIZE payload the caller sees) records
+ * the on-disk VPID and whether the buffer is writable (flush on free). The membuf(NULL_VOLID) tier
+ * is unchanged. Writes are deferred to the page's eventual release (writeback FREE or a writable
+ * read-only-free), which is correct because a private list is built (sequential append, one
+ * last_pgptr held at a time) and only read back AFTER it is closed -- so a held page is never
+ * re-fetched by VPID while dirty. The architect's sector-scan guard (qfile_open_list_sector_scan)
+ * asserts no private list is ever wired into a cross-thread px input. */
+
+#define QMGR_SPILL_MAGIC ((INT64) 0x515350494c4cLL)	/* "QSPILL" */
+#define QMGR_SPILL_HDR_SIZE (DB_ALIGN (sizeof (QMGR_SPILL_PAGE), MAX_ALIGNMENT))
+
+typedef struct qmgr_spill_page QMGR_SPILL_PAGE;
+struct qmgr_spill_page
+{
+  INT64 magic;			/* QMGR_SPILL_MAGIC sentinel (defense against mis-dispatch) */
+  VPID vpid;			/* on-disk location of this page */
+  bool writable;		/* true: flush to disk on release; false: discard (pure read) */
+};
+
+static QMGR_SPILL_PAGE *
+qmgr_spill_hdr (PAGE_PTR page_p)
+{
+  QMGR_SPILL_PAGE *hdr = (QMGR_SPILL_PAGE *) ((char *) page_p - QMGR_SPILL_HDR_SIZE);
+  assert (hdr->magic == QMGR_SPILL_MAGIC);
+  return hdr;
+}
+
+/* Allocate a copy buffer for one private-spill disk page. Returns the DB_PAGESIZE payload pointer
+ * (the header sits just before it), or NULL on OOM. */
+static PAGE_PTR
+qmgr_spill_alloc_buffer (const VPID * vpid_p, bool writable)
+{
+  char *base;
+  QMGR_SPILL_PAGE *hdr;
+
+  base = (char *) malloc (QMGR_SPILL_HDR_SIZE + DB_PAGESIZE);
+  if (base == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+	      (size_t) (QMGR_SPILL_HDR_SIZE + DB_PAGESIZE));
+      return NULL;
+    }
+  hdr = (QMGR_SPILL_PAGE *) base;
+  hdr->magic = QMGR_SPILL_MAGIC;
+  hdr->vpid = *vpid_p;
+  hdr->writable = writable;
+  return (PAGE_PTR) (base + QMGR_SPILL_HDR_SIZE);
+}
+
+static void
+qmgr_spill_free_buffer (PAGE_PTR page_p)
+{
+  free ((char *) page_p - QMGR_SPILL_HDR_SIZE);
+}
+
+/* Write one private-spill page's payload to disk via file_io (no page-buffer fix). Mirrors the
+ * P2-A external_sort TDE/file_io wiring: temp-file algorithm, is_temp nonce, no WAL. */
+static int
+qmgr_spill_io_write (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p, const VPID * vpid_p, const char *payload)
+{
+  FILEIO_PAGE *io_page = NULL, *cipher_page = NULL, *to_write;
+  TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
+  int vol_fd;
+  int ret = NO_ERROR;
+
+  if (tfile_vfid_p->tde_encrypted)
+    {
+      ret = file_get_tde_algorithm (thread_p, &tfile_vfid_p->temp_vfid, PGBUF_UNCONDITIONAL_LATCH, &tde_algo);
+      if (ret != NO_ERROR)
+	{
+	  return ret;
+	}
+    }
+
+  io_page = (FILEIO_PAGE *) malloc (IO_PAGESIZE);
+  if (io_page == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  if (tde_algo != TDE_ALGORITHM_NONE)
+    {
+      cipher_page = (FILEIO_PAGE *) malloc (IO_PAGESIZE);
+      if (cipher_page == NULL)
+	{
+	  free (io_page);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+    }
+
+  fileio_initialize_res (thread_p, io_page, IO_PAGESIZE);
+  io_page->prv.ptype = PAGE_QRESULT;
+  io_page->prv.volid = vpid_p->volid;
+  io_page->prv.pageid = vpid_p->pageid;
+  memcpy (io_page->page, payload, DB_PAGESIZE);
+  to_write = io_page;
+
+  if (tde_algo != TDE_ALGORITHM_NONE)
+    {
+      io_page->prv.pflag &= ~FILEIO_PAGE_FLAG_ENCRYPTED_MASK;
+      io_page->prv.pflag |=
+	(tde_algo == TDE_ALGORITHM_AES) ? FILEIO_PAGE_FLAG_ENCRYPTED_AES : FILEIO_PAGE_FLAG_ENCRYPTED_ARIA;
+      ret = tde_encrypt_data_page (io_page, tde_algo, true, cipher_page);
+      if (ret != NO_ERROR)
+	{
+	  ASSERT_ERROR ();
+	  goto end;
+	}
+      to_write = cipher_page;
+    }
+
+  vol_fd = fileio_get_volume_descriptor (vpid_p->volid);
+  if (fileio_write (thread_p, vol_fd, to_write, vpid_p->pageid, IO_PAGESIZE, FILEIO_WRITE_DEFAULT_WRITE) == NULL)
+    {
+      ASSERT_ERROR_AND_SET (ret);
+    }
+
+end:
+  free (io_page);
+  if (cipher_page != NULL)
+    {
+      free (cipher_page);
+    }
+  return ret;
+}
+
+/* Read one private-spill page from disk via file_io into payload (no page-buffer fix). */
+static int
+qmgr_spill_io_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p, const VPID * vpid_p, char *payload)
+{
+  FILEIO_PAGE *io_page = NULL, *cipher_page = NULL, *read_into;
+  TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
+  int vol_fd;
+  int ret = NO_ERROR;
+
+  if (tfile_vfid_p->tde_encrypted)
+    {
+      ret = file_get_tde_algorithm (thread_p, &tfile_vfid_p->temp_vfid, PGBUF_UNCONDITIONAL_LATCH, &tde_algo);
+      if (ret != NO_ERROR)
+	{
+	  return ret;
+	}
+    }
+
+  io_page = (FILEIO_PAGE *) malloc (IO_PAGESIZE);
+  if (io_page == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  if (tde_algo != TDE_ALGORITHM_NONE)
+    {
+      cipher_page = (FILEIO_PAGE *) malloc (IO_PAGESIZE);
+      if (cipher_page == NULL)
+	{
+	  free (io_page);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+    }
+
+  read_into = (tde_algo != TDE_ALGORITHM_NONE) ? cipher_page : io_page;
+  vol_fd = fileio_get_volume_descriptor (vpid_p->volid);
+  if (fileio_read (thread_p, vol_fd, read_into, vpid_p->pageid, IO_PAGESIZE) == NULL)
+    {
+      ASSERT_ERROR_AND_SET (ret);
+      goto end;
+    }
+
+  if (tde_algo != TDE_ALGORITHM_NONE)
+    {
+      ret = tde_decrypt_data_page (cipher_page, tde_algo, true, io_page);
+      if (ret != NO_ERROR)
+	{
+	  ASSERT_ERROR ();
+	  goto end;
+	}
+    }
+
+  memcpy (payload, io_page->page, DB_PAGESIZE);
+
+end:
+  free (io_page);
+  if (cipher_page != NULL)
+    {
+      free (cipher_page);
+    }
+  return ret;
+}
+
+/* Read an existing private-spill disk page into a fresh copy buffer (no page-buffer fix). */
+static PAGE_PTR
+qmgr_spill_read_page (THREAD_ENTRY * thread_p, const VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p, bool writable)
+{
+  PAGE_PTR page_p;
+
+  page_p = qmgr_spill_alloc_buffer (vpid_p, writable);
+  if (page_p == NULL)
+    {
+      return NULL;
+    }
+  if (qmgr_spill_io_read (thread_p, tfile_vfid_p, vpid_p, (char *) page_p) != NO_ERROR)
+    {
+      qmgr_spill_free_buffer (page_p);
+      return NULL;
+    }
+  return page_p;
+}
+
+/* Release a private-spill copy buffer: a writable buffer is flushed to disk first (this captures
+ * post-writeback modifications such as the close-time NEXT_VPID_NULL on the last page), a read-only
+ * buffer is simply discarded. */
+static void
+qmgr_spill_release_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  QMGR_SPILL_PAGE *hdr = qmgr_spill_hdr (page_p);
+
+  if (hdr->writable)
+    {
+      (void) qmgr_spill_io_write (thread_p, tfile_vfid_p, &hdr->vpid, (const char *) page_p);
+    }
+  qmgr_spill_free_buffer (page_p);
+}
+
 /*
  * qmgr_temp_page_get_readonly () - read-only temp-page accessor (Phase 1, Axis A).
  *   return: pinned PAGE_PTR (Phase 1: identical to the legacy pgbuf fix)
@@ -2561,6 +2792,13 @@ qmgr_temp_page_get_readonly (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_F
     }
   else
     {
+      /* P2-B: a provably single-owner private list reads its disk pages via file_io into a
+       * read-only copy buffer (ZERO page-buffer fix). */
+      if (tfile_vfid_p->private_spill)
+	{
+	  return qmgr_spill_read_page (thread_p, vpid_p, tfile_vfid_p, false /* writable */ );
+	}
+
       /* return temp file page; preserve the original per-call-site fix mode */
       switch (fix_mode)
 	{
@@ -2629,8 +2867,17 @@ qmgr_temp_page_free_readonly (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEM
 
   if (page_type == QMGR_TEMP_FILE_PAGE)
     {
-      /* The list files came from list file cache have no tfile_vfid_p. */
-      pgbuf_unfix (thread_p, page_p);
+      /* P2-B: a private-spill disk page is a file_io copy buffer, not a pgbuf-fixed page; release
+       * it through the copy-buffer path (a writable buffer is flushed to disk first). */
+      if (tfile_vfid_p->private_spill)
+	{
+	  qmgr_spill_release_page (thread_p, page_p, tfile_vfid_p);
+	}
+      else
+	{
+	  /* The list files came from list file cache have no tfile_vfid_p. */
+	  pgbuf_unfix (thread_p, page_p);
+	}
     }
 #if defined (SERVER_MODE)
   else
@@ -2670,8 +2917,16 @@ qmgr_temp_page_free_readonly_simple (THREAD_ENTRY * thread_p, PAGE_PTR page_p, Q
 
   if (page_type == QMGR_TEMP_FILE_PAGE)
     {
-      /* The list files came from list file cache have no tfile_vfid_p. */
-      pgbuf_simple_unfix (thread_p, page_p);
+      /* P2-B: a private-spill disk page is a file_io copy buffer, not a pgbuf-fixed page. */
+      if (tfile_vfid_p->private_spill)
+	{
+	  qmgr_spill_release_page (thread_p, page_p, tfile_vfid_p);
+	}
+      else
+	{
+	  /* The list files came from list file cache have no tfile_vfid_p. */
+	  pgbuf_simple_unfix (thread_p, page_p);
+	}
     }
 #if defined (SERVER_MODE)
   else
@@ -2693,6 +2948,14 @@ QMGR_TEMP_WPAGE
 qmgr_temp_page_get_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
 {
   QMGR_TEMP_WPAGE wpage;
+
+  /* P2-B: an EXISTING private-spill disk page is fetched into a writable copy buffer (flushed to
+   * disk when released). The membuf(NULL_VOLID) tier and the non-private pgbuf path are unchanged. */
+  if (tfile_vfid_p != NULL && tfile_vfid_p->private_spill && vpid_p->volid != NULL_VOLID)
+    {
+      wpage.page_p = qmgr_spill_read_page (thread_p, vpid_p, tfile_vfid_p, true /* writable */ );
+      return wpage;
+    }
 
   wpage.page_p = qmgr_temp_page_get_readonly (thread_p, vpid_p, tfile_vfid_p, QMGR_TEMP_FIX_WRITE_LATCH);
   return wpage;
@@ -2731,7 +2994,13 @@ qmgr_temp_page_get_new_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TE
   if (VFID_ISNULL (&tfile_vfid_p->temp_vfid))
     {
       TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
-      if (file_create_temp (thread_p, 1, &tfile_vfid_p->temp_vfid) != NO_ERROR)
+      /* P2-B: a private-spill file is created numerable so its pages can be allocated/located by
+       * ordinal (file_numerable_find_nth) and written via file_io with ZERO page-buffer fix. The
+       * VFID still flows through file_create_temp* -> per-txn temp registry, so query-end / abort /
+       * crash-restart cleanup is unchanged. */
+      if ((tfile_vfid_p->private_spill
+	   ? file_create_temp_numerable (thread_p, 1, &tfile_vfid_p->temp_vfid)
+	   : file_create_temp (thread_p, 1, &tfile_vfid_p->temp_vfid)) != NO_ERROR)
 	{
 	  ASSERT_ERROR ();
 	  return wpage;
@@ -2750,6 +3019,44 @@ qmgr_temp_page_get_new_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TE
 	      return wpage;
 	    }
 	}
+    }
+
+  /* P2-B: allocate a NEW private-spill page from the numerable temp file by ordinal (auto-extend)
+   * and hand back an initialized writable copy buffer -- ZERO page-buffer fix. The on-disk content
+   * is written when the buffer is released (writeback FREE / writable read-only-free). */
+  if (tfile_vfid_p->private_spill)
+    {
+      QFILE_PAGE_HEADER pgheader = QFILE_PAGE_HEADER_INITIALIZER;
+      int ret;
+
+      VPID_SET_NULL (vpid_p);
+      ret = file_numerable_find_nth (thread_p, &tfile_vfid_p->temp_vfid, tfile_vfid_p->spill_npages, true /* auto_alloc */ ,
+				     NULL, NULL, vpid_p);
+      if (ret != NO_ERROR || VPID_ISNULL (vpid_p))
+	{
+	  ASSERT_ERROR ();
+	  vpid_p->pageid = NULL_PAGEID;
+	  if (er_errid () == ER_FILE_NOT_ENOUGH_PAGES_IN_VOLUME)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	    }
+	  return wpage;
+	}
+
+      page_p = qmgr_spill_alloc_buffer (vpid_p, true /* writable */ );
+      if (page_p == NULL)
+	{
+	  vpid_p->pageid = NULL_PAGEID;
+	  return wpage;
+	}
+      tfile_vfid_p->spill_npages++;
+      /* mirror qmgr_init_external_file_page: a clean QFILE page header (on-disk ptype stays
+       * PAGE_QRESULT, written by the file_io path). */
+      memset ((char *) page_p, 0, DB_PAGESIZE);
+      qmgr_put_page_header (page_p, &pgheader);
+
+      wpage.page_p = page_p;
+      return wpage;
     }
 
   /* try to get pages from an external temp file */
@@ -2790,8 +3097,23 @@ qmgr_temp_page_writeback (THREAD_ENTRY * thread_p, QMGR_TEMP_WPAGE * wpage, int 
 
   if (page_type == QMGR_TEMP_FILE_PAGE)
     {
-      log_skip_logging (thread_p, addr_p);
-      pgbuf_set_dirty (thread_p, wpage->page_p, free_page);
+      if (tfile_vfid_p->private_spill)
+	{
+	  /* P2-B: no temp WAL (file_io path writes no log). A FREE write-back flushes the copy
+	   * buffer to disk now and releases it; a DONT_FREE write-back keeps the held buffer (it is
+	   * flushed on its eventual release -- the build path holds one last_pgptr at a time and the
+	   * list is read back only after close, so a held page is never re-fetched while dirty). */
+	  if (free_page == (int) FREE)
+	    {
+	      qmgr_spill_release_page (thread_p, wpage->page_p, tfile_vfid_p);
+	      wpage->page_p = NULL;
+	    }
+	}
+      else
+	{
+	  log_skip_logging (thread_p, addr_p);
+	  pgbuf_set_dirty (thread_p, wpage->page_p, free_page);
+	}
     }
 #if defined (SERVER_MODE)
   else if (free_page == (int) FREE)
@@ -3023,6 +3345,8 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
   tfile_vfid_p->membuf_type = membuf_type;
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
+  tfile_vfid_p->private_spill = false;	/* P2-B: opt-in; set later only at proven-private call sites */
+  tfile_vfid_p->spill_npages = 0;
   tfile_vfid_p->membuf_last = -1;
 
   page_p = (PAGE_PTR) ((PAGE_PTR) tfile_vfid_p->membuf
@@ -3129,6 +3453,8 @@ qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id)
   tfile_vfid_p->membuf_type = TEMP_FILE_MEMBUF_NONE;
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
+  tfile_vfid_p->private_spill = false;	/* P2-B: result/cache files are never private (forbidden track 4/7) */
+  tfile_vfid_p->spill_npages = 0;
 
   /* Find the query entry and chain the created temp file to the entry */
 
@@ -3445,6 +3771,40 @@ qmgr_is_query_interrupted (THREAD_ENTRY * thread_p, QUERY_ID query_id)
   return (logtb_get_check_interrupt (thread_p) && logtb_is_interrupted_tran (thread_p, true, &dummy, tran_index));
 }
 #endif /* SERVER_MODE */
+
+/*
+ * qmgr_is_query_holdable () - P2-B: is this query a holdable cursor (track 7)?
+ *   return: true if holdable, OR if the entry cannot be confirmed non-holdable (conservative)
+ *   query_id(in): query identifier
+ *
+ * Note: side-effect-free (does NOT load from the session like qmgr_get_query_entry); used by the
+ *   private-spill gate so a result that outlives the producing statement is never routed private.
+ */
+bool
+qmgr_is_query_holdable (THREAD_ENTRY * thread_p, QUERY_ID query_id)
+{
+  QMGR_QUERY_ENTRY *query_p;
+  QMGR_TRAN_ENTRY *tran_entry_p;
+  int tran_index;
+  bool holdable;
+
+  if (qmgr_Query_table.tran_entries_p == NULL)
+    {
+      /* cannot confirm non-holdable */
+      return true;
+    }
+
+  tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+  tran_entry_p = &qmgr_Query_table.tran_entries_p[tran_index];
+
+  pthread_mutex_lock (&tran_entry_p->mutex);
+  query_p = qmgr_find_query_entry (tran_entry_p->query_entry_list_p, query_id);
+  /* entry absent => cannot confirm non-holdable => conservative true */
+  holdable = (query_p == NULL) ? true : query_p->is_holdable;
+  pthread_mutex_unlock (&tran_entry_p->mutex);
+
+  return holdable;
+}
 
 #if defined (ENABLE_UNUSED_FUNCTION)
 /*

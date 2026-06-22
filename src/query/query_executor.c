@@ -4039,6 +4039,44 @@ qexec_fill_sort_limit (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * x
 }
 
 /*
+ * qexec_is_plan_private_spill_safe () - P2-B: is this list provably single-owner, so its disk
+ *   pages may be routed to file_io (zero page-buffer fix)?
+ *   return: true only when ALL of the following hold; false (conservative) otherwise.
+ *
+ * The decisive PLAN-WIDE non-parallel clause is the server parallel worker pool being EMPTY:
+ *   PRM_ID_MAX_PARALLEL_WORKERS < 2 -> worker_manager_global::init() creates no pool (capacity 0),
+ *   so worker_manager::try_reserve_workers() can never reserve a worker for ANY operator in ANY
+ *   plan (px subquery gather / parallel scan / hash join / sort). max_parallel_workers is a
+ *   boot-fixed server parameter (not client-changeable) and is the same value the pool was sized
+ *   with, so this cannot diverge from the runtime pool state (unlike the call_once-cached
+ *   PRM_ID_PARALLELISM inside compute_parallel_degree). It is the plan-wide form of
+ *   "xasl->parallelism implies single-thread": every node's effective parallel degree is clamped to
+ *   this budget. We additionally require the node-local xasl->parallelism <= 1 (defense in depth),
+ *   the list is NOT a holdable cursor result (track 7), and the caller has confirmed it is not a
+ *   RESULT_FILE (the RESULT_FILE / preserved cache cases are forbidden tracks 4/7).
+ */
+static bool
+qexec_is_plan_private_spill_safe (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
+{
+  /* (a) plan-wide non-parallel: empty server worker pool -> no px worker anywhere. */
+  if (prm_get_integer_value (PRM_ID_MAX_PARALLEL_WORKERS) >= 2)
+    {
+      return false;
+    }
+  /* (b) node-local non-parallel intent (redundant when (a) holds, kept as defense in depth). */
+  if (xasl->parallelism > 1)
+    {
+      return false;
+    }
+  /* (c) not a holdable cursor: the result must not outlive the producing statement. */
+  if (qmgr_is_query_holdable (thread_p, xasl_state->query_id))
+    {
+      return false;
+    }
+  return true;
+}
+
+/*
  * qexec_orderby_distinct () -
  *   return: NO_ERROR, or ER_code
  *   xasl(in)   :
@@ -4287,6 +4325,14 @@ qexec_orderby_distinct_by_sorting (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QU
       if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL) && XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED))
 	{
 	  QFILE_SET_FLAG (ls_flag, QFILE_FLAG_RESULT_FILE);
+	}
+      /* P2-B: the ORDER BY sorted-output list is provably single-owner when the plan runs with no
+       * parallel workers and is not a holdable result. Tag it private-spill so its disk pages are
+       * routed to file_io (zero page-buffer fix). Only on the non-RESULT_FILE path (RESULT_FILE is
+       * the list-cache/holdable forbidden tracks 4/7). */
+      else if (qexec_is_plan_private_spill_safe (thread_p, xasl, xasl_state))
+	{
+	  QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
 	}
 
       limit = NO_SORT_LIMIT;

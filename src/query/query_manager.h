@@ -98,6 +98,11 @@ struct qmgr_temp_file
   QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type;
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
+  /* P2-B: provably single-owner (plan-wide non-parallel, non-result, non-preserved, non-holdable)
+   * list. When true, the disk pages of this temp file are routed through file_io as per-call copy
+   * buffers with ZERO page-buffer fixes; the membuf(NULL_VOLID) tier is unchanged. Default false. */
+  bool private_spill;
+  int spill_npages;		/* number of file_io-direct disk pages allocated (numerable nth cursor) */
 };
 
 /*
@@ -225,6 +230,9 @@ extern bool qmgr_is_query_interrupted (THREAD_ENTRY * thread_p, QUERY_ID query_i
 extern void qmgr_set_query_error (THREAD_ENTRY * thread_p, QUERY_ID query_id);
 extern void qmgr_setup_empty_list_file (char *page_buf);
 extern int qmgr_get_temp_file_membuf_pages (QMGR_TEMP_FILE * temp_file_p);
+/* P2-B: true iff the query is a holdable cursor (track 7); side-effect-free lookup used by the
+ * private-spill gate to exclude results that outlive the producing statement. */
+extern bool qmgr_is_query_holdable (THREAD_ENTRY * thread_p, QUERY_ID query_id);
 extern int qmgr_get_sql_id (THREAD_ENTRY * thread_p, char **sql_id_buf, char *query, size_t sql_len);
 extern struct drand48_data *qmgr_get_rand_buf (THREAD_ENTRY * thread_p);
 extern QUERY_ID qmgr_get_current_query_id (THREAD_ENTRY * thread_p);

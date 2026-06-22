@@ -524,7 +524,11 @@ enum
   QFILE_FLAG_ALL = 0x0100,
   QFILE_FLAG_DISTINCT = 0x0200,
   QFILE_FLAG_USE_KEY_BUFFER = 0x0400,
-  QFILE_NOT_USE_MEMBUF = 0x0800
+  QFILE_NOT_USE_MEMBUF = 0x0800,
+  /* P2-B: route this list's disk pages through file_io (zero page-buffer fix). Set ONLY when the
+   * list is provably single-owner: plan-wide non-parallel + not RESULT_FILE + not preserved + not
+   * holdable. qfile_open_list forwards it onto QMGR_TEMP_FILE.private_spill. */
+  QFILE_FLAG_PRIVATE_SPILL = 0x1000
 };
 
 #define QFILE_SET_FLAG(var, flag)          ((var) |= (flag))

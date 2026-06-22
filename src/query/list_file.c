@@ -1239,6 +1239,13 @@ qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALUE_TYPE_LIST * type_lis
   else
     {
       list_id_p->tfile_vfid = qmgr_create_new_temp_file (thread_p, query_id, TEMP_FILE_MEMBUF_NORMAL);
+      /* P2-B: tag the temp file private-spill ONLY on the NORMAL (non-RESULT, non-KEY_BUFFER) path.
+       * The caller (the ORDER BY sorted-output site, gated plan-wide non-parallel + not holdable)
+       * passes QFILE_FLAG_PRIVATE_SPILL; result/cache files (track 4/7) never reach this branch. */
+      if (list_id_p->tfile_vfid != NULL && QFILE_IS_FLAG_SET (flag, QFILE_FLAG_PRIVATE_SPILL))
+	{
+	  list_id_p->tfile_vfid->private_spill = true;
+	}
     }
 
   if (list_id_p->tfile_vfid == NULL)
@@ -1408,15 +1415,20 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
   else
     {
       assert_release (!VPID_ISNULL (&list_id_p->last_vpid));
-      last_page_ptr =
-	pgbuf_fix (thread_p, &list_id_p->last_vpid, OLD_PAGE, PGBUF_LATCH_WRITE, PGBUF_UNCONDITIONAL_LATCH);
+      /* P2-B: route through the write-back accessor so a private-spill last page is fetched into a
+       * writable file_io copy buffer (ZERO page-buffer fix); non-private lists keep the legacy
+       * WRITE-latch pgbuf fix. The ptype check applies only to the pgbuf-backed (non-private) page. */
+      last_page_ptr = qmgr_temp_page_get_writable (thread_p, &list_id_p->last_vpid, temp_file_p).page_p;
       if (last_page_ptr == NULL)
 	{
 	  return ER_FAILED;
 	}
 
 #if !defined (NDEBUG)
-      (void) pgbuf_check_page_ptype (thread_p, last_page_ptr, PAGE_QRESULT);
+      if (!temp_file_p->private_spill)
+	{
+	  (void) pgbuf_check_page_ptype (thread_p, last_page_ptr, PAGE_QRESULT);
+	}
 #endif /* !NDEBUG */
 
     }
@@ -7251,6 +7263,11 @@ qfile_open_list_sector_scan (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
   assert (thread_p != NULL);
   assert (list_id != NULL);
   assert (sector_scan != NULL);
+  /* P2-B safety guard (architect rec #4): a private-spill list is provably single-owner and its
+   * pages live in per-call file_io copy buffers, NOT in the page buffer. A sector scan is the
+   * cross-thread parallel-page reader; a private list must never be wired into one. If this fires,
+   * a plan change routed a private list into a px input -- the private tag is then unsafe. */
+  assert (list_id->tfile_vfid == NULL || !list_id->tfile_vfid->private_spill);
 
   error = qfile_collect_list_sector_info (thread_p, list_id, &sector_scan->sector_info);
   if (error != NO_ERROR)
