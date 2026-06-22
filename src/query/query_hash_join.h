@@ -468,6 +468,13 @@ int hjoin_init_shared_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * ma
 void hjoin_clear_shared_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
 				    HASHJOIN_SHARED_SPLIT_INFO * shared_info);
 
+/* P4 fix: promote a membuf-only worker STAGING list into an EMPTY partition accumulator slot while
+ * preserving the accumulator's shared_spill tag across the raw qfile_copy_list_id struct memcpy.
+ * Used by both the parallel split (px_hash_join_task_manager.cpp) and the serial twin
+ * (hjoin_split_qlist). The caller still frees the staging list_id afterward (as before). */
+void hjoin_promote_staging_to_empty_accumulator (THREAD_ENTRY * thread_p, QFILE_LIST_ID * accum_list_id,
+						 QFILE_LIST_ID * staging_list_id);
+
 /* Hash List Scan */
 int hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cnt, QFILE_LIST_ID * list_id);
 void hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan);

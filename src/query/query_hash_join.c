@@ -1610,6 +1610,56 @@ error_exit:
 }
 
 /*
+ * hjoin_promote_staging_to_empty_accumulator () - P4 fix.
+ *   thread_p(in): Thread entry.
+ *   accum_list_id(in/out): the EMPTY (tuple_cnt==0) partition accumulator slot.
+ *   staging_list_id(in): the membuf-only per-worker staging list being adopted.
+ *
+ * When an empty accumulator adopts a staging list, qfile_copy_list_id is a raw struct memcpy that
+ * overwrites accum_list_id->tfile_vfid with the staging list's tfile_vfid -- which is shared_spill=
+ * false. Without this helper the accumulator would silently revert to the legacy pgbuf backing
+ * instead of the P4 file_io path. Here we capture the accumulator's spill tag BEFORE it is destroyed
+ * and re-stamp it onto the adopted (membuf-only, not-yet-allocated) tfile_vfid BEFORE any disk
+ * allocation, so the first spill creates a NUMERABLE file_io file. The caller still owns the staging
+ * list_id and frees it afterward (the shared tfile_vfid is owned by the query-entry chain, not freed
+ * by qfile_free_list_id). part_mutexes locking is the caller's responsibility and is unchanged.
+ */
+void
+hjoin_promote_staging_to_empty_accumulator (THREAD_ENTRY * thread_p, QFILE_LIST_ID * accum_list_id,
+					    QFILE_LIST_ID * staging_list_id)
+{
+  bool make_shared;
+
+  assert (accum_list_id != NULL);
+  assert (staging_list_id != NULL);
+  assert (staging_list_id->tfile_vfid != NULL);
+
+  /* the staging source is a per-worker membuf-only list: it must own NO disk VFID yet and must never
+   * be private_spill, so re-tagging its tfile_vfid shared_spill before any disk allocation is sound. */
+  assert (VFID_ISNULL (&staging_list_id->tfile_vfid->temp_vfid));
+  assert (!staging_list_id->tfile_vfid->private_spill);
+
+  /* capture the EMPTY accumulator's shared_spill tag BEFORE qfile_destroy_list frees its tfile_vfid. */
+  make_shared = (accum_list_id->tfile_vfid != NULL && accum_list_id->tfile_vfid->shared_spill);
+
+  qfile_destroy_list (thread_p, accum_list_id);
+  /* raw struct memcpy: accum_list_id now owns the staging tfile_vfid pointer. */
+  (void) qfile_copy_list_id (accum_list_id, staging_list_id, false, QFILE_PROHIBIT_DEPENDENT);
+
+  /* re-stamp the spill tag on the adopted tfile_vfid BEFORE any disk allocation. NEVER set
+   * shared_spill on an already-created non-numerable disk VFID -- the membuf-only assert above
+   * guarantees the adopted temp_vfid is still NULL here. */
+  accum_list_id->tfile_vfid->shared_spill = make_shared;
+  accum_list_id->tfile_vfid->private_spill = false;
+  accum_list_id->tfile_vfid->spill_npages = 0;
+
+  /* a parallel-intended accumulator MUST retain shared_spill==true; a serial/non-parallel accumulator
+   * keeps it false. private_spill stays false either way. */
+  assert (accum_list_id->tfile_vfid != NULL && accum_list_id->tfile_vfid->shared_spill == make_shared
+	  && !accum_list_id->tfile_vfid->private_spill);
+}
+
+/*
  * hjoin_split_qlist() -
  *   return: Error code (NO_ERROR if successful, error code otherwise)
  *   thread_p(in): Thread entry.
@@ -1739,8 +1789,8 @@ hjoin_split_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 	    }
 	  else
 	    {
-	      qfile_destroy_list (thread_p, part_list_id[part_id]);
-	      qfile_copy_list_id (part_list_id[part_id], temp_part_list_id[part_id], false, QFILE_PROHIBIT_DEPENDENT);
+	      /* P4 fix: preserve shared_spill across the empty-accumulator staging promotion. */
+	      hjoin_promote_staging_to_empty_accumulator (thread_p, part_list_id[part_id], temp_part_list_id[part_id]);
 	      QFILE_FREE_AND_INIT_LIST_ID (temp_part_list_id[part_id]);
 	    }
 	}
@@ -1790,9 +1840,9 @@ hjoin_split_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 		}
 	      else
 		{
-		  qfile_destroy_list (thread_p, part_list_id[part_index]);
-		  qfile_copy_list_id (part_list_id[part_index], temp_part_list_id[part_index], false,
-				      QFILE_PROHIBIT_DEPENDENT);
+		  /* P4 fix: preserve shared_spill across the empty-accumulator staging promotion. */
+		  hjoin_promote_staging_to_empty_accumulator (thread_p, part_list_id[part_index],
+							      temp_part_list_id[part_index]);
 		}
 	    }
 	  else

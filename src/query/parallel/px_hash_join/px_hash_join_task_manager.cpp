@@ -531,8 +531,9 @@ namespace parallel_query
 		      }
 		    else
 		      {
-			qfile_destroy_list (&thread_ref, part_list_id[part_id]);
-			qfile_copy_list_id (part_list_id[part_id], temp_part_list_id[part_id], false, QFILE_PROHIBIT_DEPENDENT);
+			/* P4 fix: preserve shared_spill across the empty-accumulator staging promotion. */
+			hjoin_promote_staging_to_empty_accumulator (&thread_ref, part_list_id[part_id],
+								    temp_part_list_id[part_id]);
 			QFILE_FREE_AND_INIT_LIST_ID (temp_part_list_id[part_id]);
 		      }
 		  }
@@ -617,8 +618,9 @@ namespace parallel_query
 		    }
 		  else
 		    {
-		      qfile_destroy_list (&thread_ref, part_list_id[part_index]);
-		      qfile_copy_list_id (part_list_id[part_index], temp_part_list_id[part_index], false, QFILE_PROHIBIT_DEPENDENT);
+		      /* P4 fix: preserve shared_spill across the empty-accumulator staging promotion. */
+		      hjoin_promote_staging_to_empty_accumulator (&thread_ref, part_list_id[part_index],
+								  temp_part_list_id[part_index]);
 		    }
 		}
 	      else
