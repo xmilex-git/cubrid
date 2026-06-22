@@ -228,6 +228,7 @@ typedef enum
   PERF_PAGE_BTREE_OVF,		/* b+tree overflow index page */
   PERF_PAGE_BTREE_LEAF,		/* b+tree leaf index page */
   PERF_PAGE_BTREE_NONLEAF,	/* b+tree nonleaf index page */
+  PERF_PAGE_TEMP,		/* temp/spill query page (perf-only; on-disk ptype stays PAGE_QRESULT) */
   PERF_PAGE_CNT
 } PERF_PAGE_TYPE;
 
@@ -374,6 +375,7 @@ typedef enum
 
   PSTAT_QM_NUM_OBJFETCHES,
   PSTAT_QM_NUM_HOLDABLE_CURSORS,
+  PSTAT_QM_TEMP_MEM_CAP_DEGRADES,
 
   /* Execution statistics for external sort */
   PSTAT_SORT_NUM_IO_PAGES,

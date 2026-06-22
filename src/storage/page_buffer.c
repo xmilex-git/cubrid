@@ -14558,6 +14558,12 @@ pgbuf_get_page_type_for_stat (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
     {
       perf_page_type = btree_get_perf_btree_page_type (thread_p, pgptr);
     }
+  else if (io_pgptr->prv.ptype == PAGE_QRESULT)
+    {
+      /* Temp/spill query-result pages: reclassify for perfmon only. The on-disk ptype stays PAGE_QRESULT;
+       * only the perf bucket is separated so temp page-buffer activity is measurable (P0 measurement infra). */
+      perf_page_type = PERF_PAGE_TEMP;
+    }
   else
     {
       perf_page_type = (PERF_PAGE_TYPE) io_pgptr->prv.ptype;

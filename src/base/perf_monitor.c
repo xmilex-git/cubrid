@@ -298,6 +298,7 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_QM_NUM_HASHJOINS_PARALLEL, "Num_query_hashjoins_parallel"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_QM_NUM_OBJFETCHES, "Num_query_objfetches"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QM_NUM_HOLDABLE_CURSORS, "Num_query_holdable_cursors"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_QM_TEMP_MEM_CAP_DEGRADES, "Num_temp_query_mem_cap_degrades"),
 
   /* Execution statistics for external sort */
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_SORT_NUM_IO_PAGES, "Num_sort_io_pages"),
@@ -2115,6 +2116,8 @@ perfmon_stat_page_type_name (const int page_type)
       return "PAGE_BTREE_L";
     case PERF_PAGE_BTREE_NONLEAF:
       return "PAGE_BTREE_N";
+    case PERF_PAGE_TEMP:
+      return "PAGE_TEMP";
     default:
       break;
     }

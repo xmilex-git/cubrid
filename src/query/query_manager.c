@@ -2887,6 +2887,9 @@ qmgr_init_external_file_page (THREAD_ENTRY * thread_p, PAGE_PTR page, void *args
 {
   QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
 
+  /* Disk page type stays PAGE_QRESULT. Perfmon reclassifies these temp/spill pages as
+   * PERF_PAGE_TEMP in pgbuf_get_page_type_for_stat so temp page-buffer activity is measured
+   * separately, without changing the on-disk ptype (P0 measurement infra). */
   pgbuf_set_page_ptype (thread_p, page, PAGE_QRESULT);
   qmgr_put_page_header (page, &page_header);
   pgbuf_set_dirty (thread_p, page, DONT_FREE);
