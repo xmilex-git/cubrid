@@ -3837,6 +3837,9 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 	      vpid.pageid = key->s.original.pageid;
 	      vpid.volid = key->s.original.volid;
 
+/* Phase 1 (Axis A) grep-gate exclusion: the legacy 2-arg qmgr_get_old_page / qmgr_free_old_page_and_init
+ * calls in this #if 0 SortCache block are DEAD (do not compile). The exclusion is valid ONLY while the
+ * block stays disabled; if reactivated they MUST be migrated to the qmgr_temp_page_* accessors. */
 #if 0				/* SortCache */
 	      /* check if page is already fixed */
 	      if (VPID_EQ (&(info->fixed_vpid), &vpid))
@@ -3865,7 +3868,7 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 		  info->fixed_page = page;
 		}		/* else */
 #else
-	      page = qmgr_get_old_page (thread_p, &vpid, list_idp->tfile_vfid);
+	      page = qmgr_temp_page_get_readonly (thread_p, &vpid, list_idp->tfile_vfid, QMGR_TEMP_FIX_WRITE_LATCH);
 	      if (page == NULL)
 		{
 		  assert (er_errid () != NO_ERROR);
@@ -3918,7 +3921,7 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 		    }
 		}
 #if 1				/* SortCache */
-	      qmgr_free_old_page_and_init (thread_p, page, list_idp->tfile_vfid);
+	      qmgr_temp_page_free_readonly_and_init (thread_p, page, list_idp->tfile_vfid);
 #endif
 	    }
 	  else
@@ -4547,6 +4550,9 @@ qexec_clear_groupby_state (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate)
    * managed by the listfile manager (via input_scan), and it's not
    * ours to free.
    */
+/* Phase 1 (Axis A) grep-gate exclusion: the legacy 2-arg qmgr_get_old_page / qmgr_free_old_page_and_init
+ * calls in this #if 0 SortCache block are DEAD (do not compile). The exclusion is valid ONLY while the
+ * block stays disabled; if reactivated they MUST be migrated to the qmgr_temp_page_* accessors. */
 #if 0				/* SortCache */
   list_idp = &(gbstate->input_scan->list_id);
   /* free currently fixed page */
@@ -4924,7 +4930,7 @@ qexec_hash_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 	  vpid.pageid = key->s.original.pageid;
 	  vpid.volid = key->s.original.volid;
 
-	  page = qmgr_get_old_page (thread_p, &vpid, list_idp->tfile_vfid);
+	  page = qmgr_temp_page_get_readonly (thread_p, &vpid, list_idp->tfile_vfid, QMGR_TEMP_FIX_WRITE_LATCH);
 	  if (page == NULL)
 	    {
 	      return ER_FAILED;
@@ -4954,7 +4960,7 @@ qexec_hash_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 		}
 	      if (status != NO_ERROR)
 		{
-		  qmgr_free_old_page_and_init (thread_p, page, list_idp->tfile_vfid);
+		  qmgr_temp_page_free_readonly_and_init (thread_p, page, list_idp->tfile_vfid);
 		  return ER_FAILED;
 		}
 
@@ -4963,7 +4969,7 @@ qexec_hash_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 	  else
 	    {
 	    }
-	  qmgr_free_old_page_and_init (thread_p, page, list_idp->tfile_vfid);
+	  qmgr_temp_page_free_readonly_and_init (thread_p, page, list_idp->tfile_vfid);
 	}
       else
 	{
@@ -5101,6 +5107,9 @@ qexec_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 	  vpid.pageid = key->s.original.pageid;
 	  vpid.volid = key->s.original.volid;
 
+/* Phase 1 (Axis A) grep-gate exclusion: the legacy 2-arg qmgr_get_old_page / qmgr_free_old_page_and_init
+ * calls in this #if 0 SortCache block are DEAD (do not compile). The exclusion is valid ONLY while the
+ * block stays disabled; if reactivated they MUST be migrated to the qmgr_temp_page_* accessors. */
 #if 0				/* SortCache */
 	  /* check if page is already fixed */
 	  if (VPID_EQ (&(info->fixed_vpid), &vpid))
@@ -5128,7 +5137,7 @@ qexec_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 	      info->fixed_page = page;
 	    }			/* else */
 #else
-	  page = qmgr_get_old_page (thread_p, &vpid, list_idp->tfile_vfid);
+	  page = qmgr_temp_page_get_readonly (thread_p, &vpid, list_idp->tfile_vfid, QMGR_TEMP_FIX_WRITE_LATCH);
 	  if (page == NULL)
 	    {
 	      goto exit_on_error;
@@ -5322,7 +5331,7 @@ qexec_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 #if 1				/* SortCache */
       if (page)
 	{
-	  qmgr_free_old_page_and_init (thread_p, page, list_idp->tfile_vfid);
+	  qmgr_temp_page_free_readonly_and_init (thread_p, page, list_idp->tfile_vfid);
 	}
 #endif
 
@@ -5332,7 +5341,7 @@ wrapup:
 #if 1				/* SortCache */
   if (page)
     {
-      qmgr_free_old_page_and_init (thread_p, page, list_idp->tfile_vfid);
+      qmgr_temp_page_free_readonly_and_init (thread_p, page, list_idp->tfile_vfid);
     }
 #endif
 
@@ -5673,6 +5682,9 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 
   /* close output file */
   qfile_close_list (thread_p, gbstate.output_file);
+/* Phase 1 (Axis A) grep-gate exclusion: the legacy 2-arg qmgr_free_old_page_and_init
+ * call in this #if 0 SortCache block is DEAD (does not compile). The exclusion is valid ONLY while the
+ * block stays disabled; if reactivated it MUST be migrated to the qmgr_temp_page_* accessors. */
 #if 0				/* SortCache */
   /* free currently fixed page */
   if (gbstate.fixed_page != NULL)
@@ -17699,7 +17711,7 @@ exit_on_error:
 	{
 	  if (lfscan_id.curr_pgptr != NULL)
 	    {
-	      qmgr_free_old_page_and_init (thread_p, lfscan_id.curr_pgptr, lfscan_id.list_id.tfile_vfid);
+	      qmgr_temp_page_free_readonly_and_init (thread_p, lfscan_id.curr_pgptr, lfscan_id.list_id.tfile_vfid);
 	    }
 
 	  lfscan_id.list_id.tfile_vfid = NULL;
@@ -17716,7 +17728,7 @@ exit_on_error:
 	{
 	  if (lfscan_id.curr_pgptr != NULL)
 	    {
-	      qmgr_free_old_page_and_init (thread_p, lfscan_id.curr_pgptr, lfscan_id.list_id.tfile_vfid);
+	      qmgr_temp_page_free_readonly_and_init (thread_p, lfscan_id.curr_pgptr, lfscan_id.list_id.tfile_vfid);
 	    }
 
 	  lfscan_id.list_id.tfile_vfid = NULL;
@@ -21552,7 +21564,7 @@ wrapup:
       /* clear current input: sort items and input scan */
       if (analytic_state.curr_sort_page.page_p != NULL)
 	{
-	  qmgr_free_old_page_and_init (thread_p, analytic_state.curr_sort_page.page_p,
+	  qmgr_temp_page_free_readonly_and_init (thread_p, analytic_state.curr_sort_page.page_p,
 				       analytic_state.input_scan->list_id.tfile_vfid);
 	  analytic_state.curr_sort_page.vpid.pageid = NULL_PAGEID;
 	  analytic_state.curr_sort_page.vpid.volid = NULL_VOLID;
@@ -22078,10 +22090,10 @@ qexec_analytic_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 	{
 	  if (analytic_state->curr_sort_page.page_p != NULL)
 	    {
-	      qmgr_free_old_page_and_init (thread_p, analytic_state->curr_sort_page.page_p, list_idp->tfile_vfid);
+	      qmgr_temp_page_free_readonly_and_init (thread_p, analytic_state->curr_sort_page.page_p, list_idp->tfile_vfid);
 	    }
 
-	  analytic_state->curr_sort_page.page_p = qmgr_get_old_page (thread_p, &vpid, list_idp->tfile_vfid);
+	  analytic_state->curr_sort_page.page_p = qmgr_temp_page_get_readonly (thread_p, &vpid, list_idp->tfile_vfid, QMGR_TEMP_FIX_WRITE_LATCH);
 	  if (analytic_state->curr_sort_page.page_p == NULL)
 	    {
 	      goto exit_on_error;
@@ -22581,7 +22593,7 @@ qexec_clear_analytic_state (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_s
 
   if (analytic_state->curr_sort_page.page_p != NULL)
     {
-      qmgr_free_old_page_and_init (thread_p, analytic_state->curr_sort_page.page_p,
+      qmgr_temp_page_free_readonly_and_init (thread_p, analytic_state->curr_sort_page.page_p,
 				   analytic_state->input_scan->list_id.tfile_vfid);
       analytic_state->curr_sort_page.vpid.pageid = NULL_PAGEID;
       analytic_state->curr_sort_page.vpid.volid = NULL_VOLID;

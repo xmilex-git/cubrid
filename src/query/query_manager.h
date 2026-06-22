@@ -39,18 +39,22 @@
 // forward definitions
 struct xasl_cache_ent;
 
-#define qmgr_free_old_page_and_init(thread_p, page_p, tfile_vfidp) \
+/* Phase 1 temp-page accessor split (Axis A). Replaces the legacy
+ * qmgr_free_old_page_and_init / qmgr_free_old_page_simple_fix_and_init macros.
+ * Free is backing-dispatch (Phase 1: pgbuf_unfix for every QMGR_TEMP_FILE backing). */
+#define qmgr_temp_page_free_readonly_and_init(thread_p, page_p, tfile_vfidp) \
   do \
     { \
-      qmgr_free_old_page ((thread_p), (page_p), (tfile_vfidp)); \
+      qmgr_temp_page_free_readonly ((thread_p), (page_p), (tfile_vfidp)); \
       (page_p) = NULL; \
     } \
   while (0)
 
-#define qmgr_free_old_page_simple_fix_and_init(thread_p, page_p, tfile_vfidp) \
+/* Latchless (pgbuf_simple_fix) read-only temp-page release. */
+#define qmgr_temp_page_free_readonly_simple_and_init(thread_p, page_p, tfile_vfidp) \
   do \
     { \
-      qmgr_free_old_page_simple_fix ((thread_p), (page_p), (tfile_vfidp)); \
+      qmgr_temp_page_free_readonly_simple ((thread_p), (page_p), (tfile_vfidp)); \
       (page_p) = NULL; \
     } \
   while (0)
@@ -169,6 +173,44 @@ extern void qmgr_free_old_page_simple_fix (THREAD_ENTRY * thread_p, PAGE_PTR pag
 extern void qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_ptr, int free_page, LOG_DATA_ADDR * addrp,
 				 QMGR_TEMP_FILE * tfile_vfidp);
 extern PAGE_PTR qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpidp, QMGR_TEMP_FILE * tfile_vfidp);
+
+/* ---- Phase 1 temp-page accessor split (Axis A: read-only vs write-back) ----
+ * The legacy qmgr_get_old_page / _read_only / _simple_fix / qmgr_free_old_page /
+ * _simple_fix / qmgr_get_new_page / qmgr_set_dirty_page symbols above are kept as
+ * thin shims (retire after Phase 6); all call sites route through the families below.
+ * Behavior is preserved: Phase 1 still uses pgbuf and leaves the membuf branch intact. */
+
+/* QMGR_TEMP_FIX_MODE preserves each read-only call site's ORIGINAL fix mode so a
+ * WRITE-latch reader is never silently downgraded to a READ-latch (the PERF_PAGE_TEMP
+ * zero-delta gate cannot detect a latch downgrade; only per-site classification can). */
+typedef enum
+{
+  QMGR_TEMP_FIX_WRITE_LATCH = 0,	/* legacy qmgr_get_old_page: pgbuf_fix PGBUF_LATCH_WRITE */
+  QMGR_TEMP_FIX_READ_LATCH,	/* legacy qmgr_get_old_page_read_only: pgbuf_fix PGBUF_LATCH_READ */
+  QMGR_TEMP_FIX_SIMPLE		/* legacy qmgr_get_old_page_simple_fix: pgbuf_simple_fix (latchless) */
+} QMGR_TEMP_FIX_MODE;
+
+/* Type-distinct write-back handle: the compile-time guard that only write-back callers
+ * (page mutation + writeback) can mark a temp page dirty. Read-only callers receive a
+ * bare PAGE_PTR and therefore cannot reach qmgr_temp_page_writeback. */
+typedef struct qmgr_temp_wpage QMGR_TEMP_WPAGE;
+struct qmgr_temp_wpage
+{
+  PAGE_PTR page_p;		/* writable temp page; NULL when unavailable */
+};
+
+extern PAGE_PTR qmgr_temp_page_get_readonly (THREAD_ENTRY * thread_p, VPID * vpidp, QMGR_TEMP_FILE * tfile_vfidp,
+					     QMGR_TEMP_FIX_MODE fix_mode);
+extern void qmgr_temp_page_free_readonly (THREAD_ENTRY * thread_p, PAGE_PTR page_ptr, QMGR_TEMP_FILE * tfile_vfidp);
+extern void qmgr_temp_page_free_readonly_simple (THREAD_ENTRY * thread_p, PAGE_PTR page_ptr,
+						 QMGR_TEMP_FILE * tfile_vfidp);
+extern QMGR_TEMP_WPAGE qmgr_temp_page_get_writable (THREAD_ENTRY * thread_p, VPID * vpidp, QMGR_TEMP_FILE * tfile_vfidp);
+extern QMGR_TEMP_WPAGE qmgr_temp_page_get_new_writable (THREAD_ENTRY * thread_p, VPID * vpidp,
+							QMGR_TEMP_FILE * tfile_vfidp);
+extern void qmgr_temp_page_writeback (THREAD_ENTRY * thread_p, QMGR_TEMP_WPAGE * wpage, int free_page,
+				      LOG_DATA_ADDR * addrp, QMGR_TEMP_FILE * tfile_vfidp);
+extern void qmgr_temp_page_free_writable (THREAD_ENTRY * thread_p, QMGR_TEMP_WPAGE * wpage,
+					  QMGR_TEMP_FILE * tfile_vfidp);
 extern QMGR_TEMP_FILE *qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id,
 						  QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type);
 extern QMGR_TEMP_FILE *qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id);

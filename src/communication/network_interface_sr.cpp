@@ -5614,7 +5614,7 @@ null_list:
 	}
       else
 	{
-	  page_ptr = qmgr_get_old_page (thread_p, & (list_id->first_vpid), list_id->tfile_vfid);
+	  page_ptr = qmgr_temp_page_get_readonly (thread_p, & (list_id->first_vpid), list_id->tfile_vfid, QMGR_TEMP_FIX_WRITE_LATCH);
 
 	  if (page_ptr != NULL)
 	    {
@@ -5632,7 +5632,7 @@ null_list:
 
 	      aligned_page_buf = (char *) malloc (page_size);
 	      memcpy (aligned_page_buf, page_ptr, page_size);
-	      qmgr_free_old_page_and_init (thread_p, page_ptr, list_id->tfile_vfid);
+	      qmgr_temp_page_free_readonly_and_init (thread_p, page_ptr, list_id->tfile_vfid);
 	      page_ptr = aligned_page_buf;
 
 	      /* for now, allow end query if there is only one page and more ... */
@@ -6121,7 +6121,7 @@ sqmgr_prepare_and_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char 
 	}
       else
 	{
-	  page_ptr = qmgr_get_old_page (thread_p, &q_result->first_vpid, q_result->tfile_vfid);
+	  page_ptr = qmgr_temp_page_get_readonly (thread_p, &q_result->first_vpid, q_result->tfile_vfid, QMGR_TEMP_FIX_WRITE_LATCH);
 	}
 
       if (page_ptr)
@@ -6140,7 +6140,7 @@ sqmgr_prepare_and_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char 
 	  /* to free page_ptr early */
 	  aligned_page_buf = (char *) malloc (page_size);
 	  memcpy (aligned_page_buf, page_ptr, page_size);
-	  qmgr_free_old_page_and_init (thread_p, page_ptr, q_result->tfile_vfid);
+	  qmgr_temp_page_free_readonly_and_init (thread_p, page_ptr, q_result->tfile_vfid);
 	}
       else
 	{

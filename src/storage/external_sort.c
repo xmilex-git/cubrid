@@ -4462,6 +4462,7 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
   int i = 0, j = 0, splitted_num_page;
   bool is_first_vpid = false;
   PAGE_PTR page_p;
+  QMGR_TEMP_WPAGE wpage = { NULL };
   VPID next_vpid, prev_vpid, first_vpid[SORT_MAX_PARALLEL], last_vpid[SORT_MAX_PARALLEL];
   SORT_INFO *sort_info_p, *org_sort_info_p;
 
@@ -4485,7 +4486,8 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
   /* TO_DO : dont fix all pages to split. Consider using a numerable temporary file */
   while (true)
     {
-      page_p = qmgr_get_old_page (thread_p, &prev_vpid, sort_info_p->input_file->tfile_vfid);
+      wpage = qmgr_temp_page_get_writable (thread_p, &prev_vpid, sort_info_p->input_file->tfile_vfid);
+      page_p = wpage.page_p;
       if (page_p == NULL)
 	{
 	  return ER_FAILED;
@@ -4493,19 +4495,19 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
       if (is_first_vpid)
 	{
 	  QFILE_PUT_PREV_VPID_NULL (page_p);
-	  qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
+	  qmgr_temp_page_writeback (thread_p, &wpage, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
 	  is_first_vpid = false;
 	}
       QFILE_GET_NEXT_VPID (&next_vpid, page_p);
       if (VPID_ISNULL (&next_vpid))
 	{
-	  qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+	  qmgr_temp_page_free_writable (thread_p, &wpage, sort_info_p->input_file->tfile_vfid);
 	  break;
 	}
       else if (++j >= splitted_num_page)
 	{
 	  QFILE_PUT_NEXT_VPID_NULL (page_p);
-	  qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
+	  qmgr_temp_page_writeback (thread_p, &wpage, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
 	  is_first_vpid = true;
 	  first_vpid[i] = next_vpid;
 	  last_vpid[i] = prev_vpid;
@@ -4517,22 +4519,23 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
 	    }
 	  else
 	    {
-	      qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+	      qmgr_temp_page_free_writable (thread_p, &wpage, sort_info_p->input_file->tfile_vfid);
 
 	      /* init prev page id */
-	      page_p = qmgr_get_old_page (thread_p, &next_vpid, sort_info_p->input_file->tfile_vfid);
+	      wpage = qmgr_temp_page_get_writable (thread_p, &next_vpid, sort_info_p->input_file->tfile_vfid);
+	      page_p = wpage.page_p;
 	      if (page_p == NULL)
 		{
 		  return ER_FAILED;
 		}
 	      QFILE_PUT_PREV_VPID_NULL (page_p);
-	      qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
-	      qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+	      qmgr_temp_page_writeback (thread_p, &wpage, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
+	      qmgr_temp_page_free_writable (thread_p, &wpage, sort_info_p->input_file->tfile_vfid);
 	      break;
 	    }
 	}
       prev_vpid = next_vpid;
-      qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+      qmgr_temp_page_free_writable (thread_p, &wpage, sort_info_p->input_file->tfile_vfid);
     }
 
   /* add splitted file info */

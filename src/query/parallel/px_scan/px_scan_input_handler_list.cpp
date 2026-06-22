@@ -134,7 +134,7 @@ namespace parallel_scan
 	  }
 
 	/* Single READ-latch fix; transfer ownership to caller on S_SUCCESS. */
-	PAGE_PTR page_p = qmgr_get_old_page_read_only (thread_p, &vpid, m_tl_current_tfile);
+	PAGE_PTR page_p = qmgr_temp_page_get_readonly(thread_p, &vpid, m_tl_current_tfile, QMGR_TEMP_FIX_READ_LATCH);
 	if (page_p == nullptr)
 	  {
 	    assert_release_error (er_errid () != NO_ERROR);
@@ -144,7 +144,7 @@ namespace parallel_scan
 	/* Overflow continuations: the start-page owner walks the chain via qfile_assemble_overflow_tuple. */
 	if (QFILE_GET_TUPLE_COUNT (page_p) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG)
 	  {
-	    qmgr_free_old_page (thread_p, page_p, m_tl_current_tfile);
+	    qmgr_temp_page_free_readonly(thread_p, page_p, m_tl_current_tfile);
 	    continue;
 	  }
 

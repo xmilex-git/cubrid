@@ -2507,323 +2507,215 @@ qmgr_add_modified_class (THREAD_ENTRY * thread_p, const OID * class_oid_p)
  */
 
 /*
- * qmgr_get_old_page () -
- *   return:
- *   vpidp(in)  :
- *   tfile_vfidp(in)    :
- */
-PAGE_PTR
-qmgr_get_old_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
-{
-  int tran_index;
-  PAGE_PTR page_p;
-#if defined(SERVER_MODE)
-  bool dummy;
-#endif /* SERVER_MODE */
-
-  if (vpid_p->volid == NULL_VOLID && tfile_vfid_p == NULL)
-    {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
-      return NULL;
-    }
-
-  if (vpid_p->volid == NULL_VOLID)
-    {
-      /* return memory buffer */
-      tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
-
-      if (vpid_p->pageid >= 0 && vpid_p->pageid <= tfile_vfid_p->membuf_last)
-	{
-	  page_p = tfile_vfid_p->membuf[vpid_p->pageid];
-
-	  /* interrupt check */
-#if defined (SERVER_MODE)
-	  if (logtb_get_check_interrupt (thread_p) == true
-	      && logtb_is_interrupted_tran (thread_p, true, &dummy, tran_index) == true)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
-	      page_p = NULL;
-	    }
-#endif
-	}
-      else
-	{
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, tran_index);
-	  page_p = NULL;
-	}
-    }
-  else
-    {
-      /* return temp file page */
-      page_p = pgbuf_fix (thread_p, vpid_p, OLD_PAGE, PGBUF_LATCH_WRITE, PGBUF_UNCONDITIONAL_LATCH);
-
-      if (page_p != NULL)
-	{
-#if !defined (NDEBUG)
-	  (void) pgbuf_check_page_ptype (thread_p, page_p, PAGE_QRESULT);
-#endif /* !NDEBUG */
-	}
-    }
-
-  return page_p;
-}
-
-/*
- * qmgr_free_old_page () -
- *   return:
- *   page_ptr(in)       :
- *   tfile_vfidp(in)    :
- */
-void
-qmgr_free_old_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * tfile_vfid_p)
-{
-  QMGR_PAGE_TYPE page_type;
-
-  if (page_p == NULL)
-    {
-      assert (0);
-      return;
-    }
-  if (tfile_vfid_p == NULL)
-    {
-      pgbuf_unfix (thread_p, page_p);
-      return;
-    }
-
-  page_type = qmgr_get_page_type (page_p, tfile_vfid_p);
-  if (page_type == QMGR_UNKNOWN_PAGE)
-    {
-      assert (false);
-      return;
-    }
-
-  if (page_type == QMGR_TEMP_FILE_PAGE)
-    {
-      /* The list files came from list file cache have no tfile_vfid_p. */
-      pgbuf_unfix (thread_p, page_p);
-    }
-#if defined (SERVER_MODE)
-  else
-    {
-      assert (page_type == QMGR_MEMBUF_PAGE);
-    }
-#endif
-}
-
-PAGE_PTR
-qmgr_get_old_page_read_only (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
-{
-  int tran_index;
-  PAGE_PTR page_p;
-#if defined(SERVER_MODE)
-  bool dummy;
-#endif /* SERVER_MODE */
-
-  if (vpid_p->volid == NULL_VOLID && tfile_vfid_p == NULL)
-    {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
-      return NULL;
-    }
-
-  if (vpid_p->volid == NULL_VOLID)
-    {
-      /* return memory buffer */
-      tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
-
-      if (vpid_p->pageid >= 0 && vpid_p->pageid <= tfile_vfid_p->membuf_last)
-	{
-	  page_p = tfile_vfid_p->membuf[vpid_p->pageid];
-
-	  /* interrupt check */
-#if defined (SERVER_MODE)
-	  if (logtb_get_check_interrupt (thread_p) == true
-	      && logtb_is_interrupted_tran (thread_p, true, &dummy, tran_index) == true)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
-	      page_p = NULL;
-	    }
-#endif
-	}
-      else
-	{
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, tran_index);
-	  page_p = NULL;
-	}
-    }
-  else
-    {
-      /* return temp file page */
-      page_p = pgbuf_fix (thread_p, vpid_p, OLD_PAGE, PGBUF_LATCH_READ, PGBUF_UNCONDITIONAL_LATCH);
-
-      if (page_p != NULL)
-	{
-#if !defined (NDEBUG)
-	  (void) pgbuf_check_page_ptype (thread_p, page_p, PAGE_QRESULT);
-#endif /* !NDEBUG */
-	}
-    }
-
-  return page_p;
-}
-
-/*
- * qmgr_get_old_page_simple_fix () -
- *   return:
- *   vpidp(in)  :
- *   tfile_vfidp(in)    :
- */
-PAGE_PTR
-qmgr_get_old_page_simple_fix (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
-{
-  int tran_index;
-  PAGE_PTR page_p;
-#if defined(SERVER_MODE)
-  bool dummy;
-#endif /* SERVER_MODE */
-
-  if (vpid_p->volid == NULL_VOLID && tfile_vfid_p == NULL)
-    {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
-      return NULL;
-    }
-
-  if (vpid_p->volid == NULL_VOLID)
-    {
-      /* return memory buffer */
-      tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
-
-      if (vpid_p->pageid >= 0 && vpid_p->pageid <= tfile_vfid_p->membuf_last)
-	{
-	  page_p = tfile_vfid_p->membuf[vpid_p->pageid];
-
-	  /* interrupt check */
-#if defined (SERVER_MODE)
-	  if (logtb_get_check_interrupt (thread_p) == true
-	      && logtb_is_interrupted_tran (thread_p, true, &dummy, tran_index) == true)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
-	      page_p = NULL;
-	    }
-#endif
-	}
-      else
-	{
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, tran_index);
-	  page_p = NULL;
-	}
-    }
-  else
-    {
-      /* latchless read only fix */
-      page_p = pgbuf_simple_fix (thread_p, vpid_p, true);
-
-      if (page_p != NULL)
-	{
-#if !defined (NDEBUG)
-	  (void) pgbuf_check_page_ptype (thread_p, page_p, PAGE_QRESULT);
-#endif /* !NDEBUG */
-	}
-    }
-
-  return page_p;
-}
-
-/*
- * qmgr_free_old_page_simple_fix () -
- *   return:
- *   page_ptr(in)       :
- *   tfile_vfidp(in)    :
- */
-void
-qmgr_free_old_page_simple_fix (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * tfile_vfid_p)
-{
-  QMGR_PAGE_TYPE page_type;
-
-  if (page_p == NULL)
-    {
-      assert (0);
-      return;
-    }
-  if (tfile_vfid_p == NULL)
-    {
-      pgbuf_simple_unfix (thread_p, page_p);
-      return;
-    }
-
-  page_type = qmgr_get_page_type (page_p, tfile_vfid_p);
-  if (page_type == QMGR_UNKNOWN_PAGE)
-    {
-      assert (false);
-      return;
-    }
-
-  if (page_type == QMGR_TEMP_FILE_PAGE)
-    {
-      /* The list files came from list file cache have no tfile_vfid_p. */
-      pgbuf_simple_unfix (thread_p, page_p);
-    }
-#if defined (SERVER_MODE)
-  else
-    {
-      assert (page_type == QMGR_MEMBUF_PAGE);
-    }
-#endif
-}
-
-/*
- * qmgr_set_dirty_page () -
- *   return:
- *   page_ptr(in)       :
- *   free_page(in)      :
- *   addrp(in)  :
- *   tfile_vfidp(in)    :
- */
-void
-qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LOG_DATA_ADDR * addr_p,
-		     QMGR_TEMP_FILE * tfile_vfid_p)
-{
-  QMGR_PAGE_TYPE page_type;
-
-  page_type = qmgr_get_page_type (page_p, tfile_vfid_p);
-  if (page_type == QMGR_UNKNOWN_PAGE)
-    {
-      assert (false);
-      return;
-    }
-
-  if (page_type == QMGR_TEMP_FILE_PAGE)
-    {
-      log_skip_logging (thread_p, addr_p);
-      pgbuf_set_dirty (thread_p, page_p, free_page);
-    }
-#if defined (SERVER_MODE)
-  else if (free_page == (int) FREE)
-    {
-      assert (page_type == QMGR_MEMBUF_PAGE);
-    }
-#endif
-}
-
-/*
- * qmgr_get_new_page () -
- *   return: PAGE_PTR
- *   vpidp(in)  : Set to the allocated real page identifier
- *   tfile_vfidp(in)    : Query Associated with the XASL tree
+ * qmgr_temp_page_get_readonly () - read-only temp-page accessor (Phase 1, Axis A).
+ *   return: pinned PAGE_PTR (Phase 1: identical to the legacy pgbuf fix)
+ *   vpid_p (in)       : page identifier
+ *   tfile_vfid_p (in) : temp file
+ *   fix_mode (in)     : the call site's ORIGINAL fix mode, preserved verbatim
  *
- * Note: A new query file page is allocated and returned. The page fetched and returned, is not locked.
- * This routine is called succesively to allocate pages for the query result files (list files) or XASL tree files.
- * If an error occurs, NULL pointer is returned.
+ * Note: Phase 1 is behavior-preserving routing only. The in-memory buffer
+ *   (NULL_VOLID) branch is left unchanged (shared by both accessor families).
+ *   fix_mode MUST match the legacy call site so a WRITE-latch reader is never
+ *   silently downgraded to a READ-latch [POLISH 1].
  */
 PAGE_PTR
-qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
+qmgr_temp_page_get_readonly (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p,
+			    QMGR_TEMP_FIX_MODE fix_mode)
 {
+  int tran_index;
   PAGE_PTR page_p;
-  QMGR_QUERY_ENTRY *query_p = NULL;
+#if defined(SERVER_MODE)
+  bool dummy;
+#endif /* SERVER_MODE */
+
+  if (vpid_p->volid == NULL_VOLID && tfile_vfid_p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return NULL;
+    }
+
+  if (vpid_p->volid == NULL_VOLID)
+    {
+      /* return memory buffer (membuf branch unchanged in both families) */
+      tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+
+      if (vpid_p->pageid >= 0 && vpid_p->pageid <= tfile_vfid_p->membuf_last)
+	{
+	  page_p = tfile_vfid_p->membuf[vpid_p->pageid];
+
+	  /* interrupt check */
+#if defined (SERVER_MODE)
+	  if (logtb_get_check_interrupt (thread_p) == true
+	      && logtb_is_interrupted_tran (thread_p, true, &dummy, tran_index) == true)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+	      page_p = NULL;
+	    }
+#endif
+	}
+      else
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, tran_index);
+	  page_p = NULL;
+	}
+    }
+  else
+    {
+      /* return temp file page; preserve the original per-call-site fix mode */
+      switch (fix_mode)
+	{
+	case QMGR_TEMP_FIX_WRITE_LATCH:
+	  page_p = pgbuf_fix (thread_p, vpid_p, OLD_PAGE, PGBUF_LATCH_WRITE, PGBUF_UNCONDITIONAL_LATCH);
+	  break;
+	case QMGR_TEMP_FIX_READ_LATCH:
+	  page_p = pgbuf_fix (thread_p, vpid_p, OLD_PAGE, PGBUF_LATCH_READ, PGBUF_UNCONDITIONAL_LATCH);
+	  break;
+	case QMGR_TEMP_FIX_SIMPLE:
+	  /* latchless read only fix */
+	  page_p = pgbuf_simple_fix (thread_p, vpid_p, true);
+	  break;
+	default:
+	  assert (false);
+	  page_p = NULL;
+	  break;
+	}
+
+      if (page_p != NULL)
+	{
+#if !defined (NDEBUG)
+	  (void) pgbuf_check_page_ptype (thread_p, page_p, PAGE_QRESULT);
+#endif /* !NDEBUG */
+	}
+    }
+
+  return page_p;
+}
+
+/*
+ * qmgr_temp_page_free_readonly () - release a read-only temp page (Phase 1, Axis A).
+ *   page_p (in)       : pinned page (or copy buffer in P2/P4)
+ *   tfile_vfid_p (in) : temp file backing
+ *
+ * Note: Free dispatches on the QMGR_TEMP_FILE backing [POLISH 3]. Phase 1 every
+ *   backing is still a pgbuf-fixed page:
+ *     1) pinned-cache page (track 4)           -> pgbuf_unfix
+ *     2) pinned-temp page (P1 private/shared)  -> pgbuf_unfix
+ *     3) private-spill copy buffer (P2 onward) -> free()  [not present in P1]
+ *     4) shared-spill copy buffer (P4 onward)  -> free()  [not present in P1]
+ *   Free is read-only/write-back agnostic: it only releases the pin/buffer.
+ */
+void
+qmgr_temp_page_free_readonly (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  QMGR_PAGE_TYPE page_type;
+
+  if (page_p == NULL)
+    {
+      assert (0);
+      return;
+    }
+  if (tfile_vfid_p == NULL)
+    {
+      pgbuf_unfix (thread_p, page_p);
+      return;
+    }
+
+  page_type = qmgr_get_page_type (page_p, tfile_vfid_p);
+  if (page_type == QMGR_UNKNOWN_PAGE)
+    {
+      assert (false);
+      return;
+    }
+
+  if (page_type == QMGR_TEMP_FILE_PAGE)
+    {
+      /* The list files came from list file cache have no tfile_vfid_p. */
+      pgbuf_unfix (thread_p, page_p);
+    }
+#if defined (SERVER_MODE)
+  else
+    {
+      assert (page_type == QMGR_MEMBUF_PAGE);
+    }
+#endif
+}
+
+/*
+ * qmgr_temp_page_free_readonly_simple () - release a latchless (pgbuf_simple_fix)
+ *   read-only temp page. Mirrors qmgr_temp_page_free_readonly but uses
+ *   pgbuf_simple_unfix. (No live callers in Phase 1; provided for the simple-fix mode.)
+ */
+void
+qmgr_temp_page_free_readonly_simple (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  QMGR_PAGE_TYPE page_type;
+
+  if (page_p == NULL)
+    {
+      assert (0);
+      return;
+    }
+  if (tfile_vfid_p == NULL)
+    {
+      pgbuf_simple_unfix (thread_p, page_p);
+      return;
+    }
+
+  page_type = qmgr_get_page_type (page_p, tfile_vfid_p);
+  if (page_type == QMGR_UNKNOWN_PAGE)
+    {
+      assert (false);
+      return;
+    }
+
+  if (page_type == QMGR_TEMP_FILE_PAGE)
+    {
+      /* The list files came from list file cache have no tfile_vfid_p. */
+      pgbuf_simple_unfix (thread_p, page_p);
+    }
+#if defined (SERVER_MODE)
+  else
+    {
+      assert (page_type == QMGR_MEMBUF_PAGE);
+    }
+#endif
+}
+
+/*
+ * qmgr_temp_page_get_writable () - write-back temp-page accessor (Phase 1, Axis A).
+ *   return: type-distinct writable handle (page_p NULL when unavailable)
+ *
+ * Note: Phase 1 == legacy WRITE-latch qmgr_get_old_page (reuses the read-only
+ *   getter so the membuf branch stays identical in both families). Only write-back
+ *   callers (page mutation + qmgr_temp_page_writeback) obtain this handle.
+ */
+QMGR_TEMP_WPAGE
+qmgr_temp_page_get_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  QMGR_TEMP_WPAGE wpage;
+
+  wpage.page_p = qmgr_temp_page_get_readonly (thread_p, vpid_p, tfile_vfid_p, QMGR_TEMP_FIX_WRITE_LATCH);
+  return wpage;
+}
+
+/*
+ * qmgr_temp_page_get_new_writable () - allocate a NEW write-back temp page (Phase 1, Axis A).
+ *   return: type-distinct writable handle
+ *
+ * Note: Phase 1 == legacy qmgr_get_new_page (membuf alloc branch + external temp file).
+ */
+QMGR_TEMP_WPAGE
+qmgr_temp_page_get_new_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  QMGR_TEMP_WPAGE wpage;
+  PAGE_PTR page_p;
+
+  wpage.page_p = NULL;
 
   if (tfile_vfid_p == NULL)
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
-      return NULL;
+      return wpage;
     }
 
   /* first page, return memory buffer instead real temp file page */
@@ -2831,7 +2723,8 @@ qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfil
     {
       vpid_p->volid = NULL_VOLID;
       vpid_p->pageid = ++(tfile_vfid_p->membuf_last);
-      return tfile_vfid_p->membuf[tfile_vfid_p->membuf_last];
+      wpage.page_p = tfile_vfid_p->membuf[tfile_vfid_p->membuf_last];
+      return wpage;
     }
 
   /* memory buffer is exhausted; create temp file */
@@ -2841,7 +2734,7 @@ qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfil
       if (file_create_temp (thread_p, 1, &tfile_vfid_p->temp_vfid) != NO_ERROR)
 	{
 	  ASSERT_ERROR ();
-	  return NULL;
+	  return wpage;
 	}
       tfile_vfid_p->temp_file_type = FILE_TEMP;
 
@@ -2854,7 +2747,7 @@ qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfil
 	      ASSERT_ERROR ();
 	      file_temp_retire (thread_p, &tfile_vfid_p->temp_vfid);
 	      VFID_SET_NULL (&tfile_vfid_p->temp_vfid);
-	      return NULL;
+	      return wpage;
 	    }
 	}
     }
@@ -2871,7 +2764,147 @@ qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfil
 	}
     }
 
-  return page_p;
+  wpage.page_p = page_p;
+  return wpage;
+}
+
+/*
+ * qmgr_temp_page_writeback () - write back a write-back temp page (Phase 1, Axis A).
+ *   wpage (in)     : type-distinct writable handle
+ *   free_page (in) : FREE / DONT_FREE
+ *
+ * Note: Phase 1 == legacy qmgr_set_dirty_page semantics (backing dispatch).
+ */
+void
+qmgr_temp_page_writeback (THREAD_ENTRY * thread_p, QMGR_TEMP_WPAGE * wpage, int free_page, LOG_DATA_ADDR * addr_p,
+			 QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  QMGR_PAGE_TYPE page_type;
+
+  page_type = qmgr_get_page_type (wpage->page_p, tfile_vfid_p);
+  if (page_type == QMGR_UNKNOWN_PAGE)
+    {
+      assert (false);
+      return;
+    }
+
+  if (page_type == QMGR_TEMP_FILE_PAGE)
+    {
+      log_skip_logging (thread_p, addr_p);
+      pgbuf_set_dirty (thread_p, wpage->page_p, free_page);
+    }
+#if defined (SERVER_MODE)
+  else if (free_page == (int) FREE)
+    {
+      assert (page_type == QMGR_MEMBUF_PAGE);
+    }
+#endif
+}
+
+/*
+ * qmgr_temp_page_free_writable () - release a write-back temp page (Phase 1, Axis A).
+ *   Free is backing-dispatch identical to the read-only release in Phase 1.
+ */
+void
+qmgr_temp_page_free_writable (THREAD_ENTRY * thread_p, QMGR_TEMP_WPAGE * wpage, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  qmgr_temp_page_free_readonly (thread_p, wpage->page_p, tfile_vfid_p);
+  wpage->page_p = NULL;
+}
+
+/*
+ * qmgr_get_old_page () -
+ *   return:
+ *   vpidp(in)  :
+ *   tfile_vfidp(in)    :
+ */
+PAGE_PTR
+qmgr_get_old_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  /* legacy shim — retire after Phase 6. Routes to the read-only WRITE-latch accessor. */
+  return qmgr_temp_page_get_readonly (thread_p, vpid_p, tfile_vfid_p, QMGR_TEMP_FIX_WRITE_LATCH);
+}
+
+/*
+ * qmgr_free_old_page () -
+ *   return:
+ *   page_ptr(in)       :
+ *   tfile_vfidp(in)    :
+ */
+void
+qmgr_free_old_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  /* legacy shim — retire after Phase 6. */
+  qmgr_temp_page_free_readonly (thread_p, page_p, tfile_vfid_p);
+}
+
+PAGE_PTR
+qmgr_get_old_page_read_only (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  /* legacy shim — retire after Phase 6. */
+  return qmgr_temp_page_get_readonly (thread_p, vpid_p, tfile_vfid_p, QMGR_TEMP_FIX_READ_LATCH);
+}
+
+/*
+ * qmgr_get_old_page_simple_fix () -
+ *   return:
+ *   vpidp(in)  :
+ *   tfile_vfidp(in)    :
+ */
+PAGE_PTR
+qmgr_get_old_page_simple_fix (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  /* legacy shim — retire after Phase 6. */
+  return qmgr_temp_page_get_readonly (thread_p, vpid_p, tfile_vfid_p, QMGR_TEMP_FIX_SIMPLE);
+}
+
+/*
+ * qmgr_free_old_page_simple_fix () -
+ *   return:
+ *   page_ptr(in)       :
+ *   tfile_vfidp(in)    :
+ */
+void
+qmgr_free_old_page_simple_fix (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  /* legacy shim — retire after Phase 6. */
+  qmgr_temp_page_free_readonly_simple (thread_p, page_p, tfile_vfid_p);
+}
+
+/*
+ * qmgr_set_dirty_page () -
+ *   return:
+ *   page_ptr(in)       :
+ *   free_page(in)      :
+ *   addrp(in)  :
+ *   tfile_vfidp(in)    :
+ */
+void
+qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LOG_DATA_ADDR * addr_p,
+		     QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  /* legacy shim — retire after Phase 6. */
+  QMGR_TEMP_WPAGE wpage;
+
+  wpage.page_p = page_p;
+  qmgr_temp_page_writeback (thread_p, &wpage, free_page, addr_p, tfile_vfid_p);
+}
+
+/*
+ * qmgr_get_new_page () -
+ *   return: PAGE_PTR
+ *   vpidp(in)  : Set to the allocated real page identifier
+ *   tfile_vfidp(in)    : Query Associated with the XASL tree
+ *
+ * Note: A new query file page is allocated and returned. The page fetched and returned, is not locked.
+ * This routine is called succesively to allocate pages for the query result files (list files) or XASL tree files.
+ * If an error occurs, NULL pointer is returned.
+ */
+PAGE_PTR
+qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  /* legacy shim — retire after Phase 6. */
+  return qmgr_temp_page_get_new_writable (thread_p, vpid_p, tfile_vfid_p).page_p;
 }
 
 /*

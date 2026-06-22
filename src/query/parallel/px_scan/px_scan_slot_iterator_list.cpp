@@ -80,7 +80,7 @@ namespace parallel_scan
   {
     if (m_curr_pgptr != nullptr)
       {
-	qmgr_free_old_page (thread_p, m_curr_pgptr, m_curr_tfile);
+	qmgr_temp_page_free_readonly (thread_p, m_curr_pgptr, m_curr_tfile);
 	m_curr_pgptr = nullptr;
       }
     if (m_tplrec.tpl != nullptr)
@@ -97,7 +97,7 @@ namespace parallel_scan
     /* Free previous page with its own tfile, then adopt the new fix. */
     if (m_curr_pgptr != nullptr)
       {
-	qmgr_free_old_page (thread_p, m_curr_pgptr, m_curr_tfile);
+	qmgr_temp_page_free_readonly (thread_p, m_curr_pgptr, m_curr_tfile);
 	m_curr_pgptr = nullptr;
       }
 

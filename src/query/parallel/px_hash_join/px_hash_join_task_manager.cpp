@@ -32,7 +32,7 @@
 #include "query_evaluator.h"		/* eval_pred, V_ERROR, V_TRUE */
 #include "query_hash_join.h"
 #include "query_hash_scan.h"
-#include "query_manager.h"		/* qmgr_get_old_page, qmgr_free_old_page_and_init, ... */
+#include "query_manager.h"		/* qmgr_temp_page_get_readonly, qmgr_temp_page_free_readonly_and_init, ... */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -193,7 +193,7 @@ namespace parallel_query
 		  vpid.volid = NULL_VOLID;
 		  vpid.pageid = m_membuf_index++;
 
-		  PAGE_PTR page = qmgr_get_old_page (&thread_ref, &vpid, sector_info->membuf_tfile);
+		  PAGE_PTR page = qmgr_temp_page_get_readonly(&thread_ref, &vpid, sector_info->membuf_tfile, QMGR_TEMP_FIX_WRITE_LATCH);
 		  if (page == nullptr)
 		    {
 		      assert_release_error (er_errid () != NO_ERROR);
@@ -203,7 +203,7 @@ namespace parallel_query
 		  /* skip overflow continuation pages */
 		  if (QFILE_GET_TUPLE_COUNT (page) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG)
 		    {
-		      qmgr_free_old_page_and_init (&thread_ref, page, sector_info->membuf_tfile);
+		      qmgr_temp_page_free_readonly_and_init(&thread_ref, page, sector_info->membuf_tfile);
 		      continue;
 		    }
 
@@ -248,7 +248,7 @@ namespace parallel_query
 	      QMGR_TEMP_FILE *tfile = (QMGR_TEMP_FILE *) tfiles[m_sector_index];
 	      assert (tfile != nullptr);
 
-	      PAGE_PTR page = qmgr_get_old_page (&thread_ref, &vpid, tfile);
+	      PAGE_PTR page = qmgr_temp_page_get_readonly(&thread_ref, &vpid, tfile, QMGR_TEMP_FIX_WRITE_LATCH);
 	      if (page == nullptr)
 		{
 		  assert_release_error (er_errid () != NO_ERROR);
@@ -259,7 +259,7 @@ namespace parallel_query
 	       * by the worker that owns the overflow start page */
 	      if (QFILE_GET_TUPLE_COUNT (page) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG)
 		{
-		  qmgr_free_old_page_and_init (&thread_ref, page, tfile);
+		  qmgr_temp_page_free_readonly_and_init(&thread_ref, page, tfile);
 		  continue;
 		}
 
@@ -386,7 +386,7 @@ namespace parallel_query
 	  if (tuple_cnt == 0)
 	    {
 	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	      continue;
 	    }
 
@@ -559,7 +559,7 @@ namespace parallel_query
 
 	  if (page != nullptr)
 	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	    }
 
 	  if (has_error)
@@ -571,7 +571,7 @@ namespace parallel_query
 
       if (page != nullptr)
 	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	  qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	}
 
       assert (temp_part_list_id != nullptr);
@@ -1093,7 +1093,7 @@ cleanup:
 	  if (tuple_cnt == 0)
 	    {
 	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	      continue;
 	    }
 	  tuple_index = -1;
@@ -1238,7 +1238,7 @@ cleanup:
 
 	  if (page != nullptr)
 	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	    }
 
 	  if (has_error)
@@ -1250,7 +1250,7 @@ cleanup:
 
       if (page != nullptr)
 	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	  qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	}
 
       if (thread_is_on_trace (&thread_ref))
@@ -1356,7 +1356,7 @@ cleanup:
 	  if (tuple_cnt == 0)
 	    {
 	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	      continue;
 	    }
 	  tuple_index = -1;
@@ -1587,7 +1587,7 @@ cleanup:
 
 	  if (page != nullptr)
 	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	      qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	    }
 
 	  if (has_error)
@@ -1599,7 +1599,7 @@ cleanup:
 
       if (page != nullptr)
 	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
+	  qmgr_temp_page_free_readonly_and_init(&thread_ref, page, m_page_iter.get_current_tfile ());
 	}
 
       if (thread_is_on_trace (&thread_ref))
