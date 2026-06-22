@@ -27,12 +27,33 @@
 #include "system.h"		/* UINT32, UINT64 */
 #include "system_parameter.h"	/* sysprm_get_range, PRM_ID_PARALLELISM */
 #include "thread_manager.hpp"	/* cubthread::system_core_count */
+#include "query_manager.h"	/* qmgr_admission_apply_mem_cap (P3 temp_query_mem_cap admission gate) */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
 namespace parallel_query
 {
+  /* P3: temp_query_mem_cap admission gate. Clamp the just-decided parallel degree to the
+   * per-query temp in-memory budget BEFORE worker acquisition and barrier init, so the worker
+   * count is immutable for the rest of execution (Pre-mortem c: no mid-execution parallel
+   * shrink). No-op when temp_query_mem_cap == 0 (default): the degree is returned unchanged. */
+  static UINT32
+  px_apply_temp_mem_cap (UINT32 degree) noexcept
+  {
+    if (degree < 2)
+      {
+	/* serial / parallel-disabled: no parallel-degree lever to degrade. */
+	return degree;
+      }
+
+    int workers = (int) degree;
+    THREAD_ENTRY *thread_p = thread_get_thread_entry_info ();
+    (void) qmgr_admission_apply_mem_cap (thread_p, NULL, &workers);
+    assert (workers >= 1 && workers <= (int) degree);
+    return (UINT32) workers;
+  }
+
   UINT32 compute_parallel_degree (parallel_type type, UINT64 num_pages, int hint_degree) noexcept
   {
     static std::once_flag once;
@@ -133,11 +154,11 @@ namespace parallel_query
 	/* hint first, ignore the parallelism parameter */
 	if (num_pages < (UINT64) hint_degree)
 	  {
-	    return num_pages;
+	    return px_apply_temp_mem_cap ((UINT32) num_pages);
 	  }
 	else
 	  {
-	    return hint_degree;
+	    return px_apply_temp_mem_cap ((UINT32) hint_degree);
 	  }
       }
     else
@@ -167,6 +188,6 @@ namespace parallel_query
 #endif
     // *INDENT-ON*
 
-    return MIN (auto_degree, (UINT32) parallelism);
+    return px_apply_temp_mem_cap (MIN (auto_degree, (UINT32) parallelism));
   }
 }				/* namespace parallel_query */

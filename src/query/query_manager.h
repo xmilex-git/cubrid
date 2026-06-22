@@ -244,4 +244,21 @@ extern int qmgr_dblink_add_conn_handle (THREAD_ENTRY * thread_p, int conn_handle
 					char *password, bool set_participant);
 extern DBLINK_CONN_ENTRY *qmgr_dblink_get_conn_entry (THREAD_ENTRY * thread_p);
 extern void qmgr_dblink_clear_conn_entry (THREAD_ENTRY * thread_p);
+
+/* ---- Phase 3: temp_query_mem_cap admission-time enforcement (Principle P2: admission-only) ----
+ * Per-query temp in-memory budget computed by the admission gate below. */
+typedef struct qmgr_temp_mem_budget QMGR_TEMP_MEM_BUDGET;
+struct qmgr_temp_mem_budget
+{
+  UINT64 per_worker_bytes;	/* membuf + sort + hash in-memory budget for one parallel participant */
+  UINT64 total_bytes;		/* per_worker_bytes * admitted worker count */
+};
+
+/* qmgr_admission_apply_mem_cap () - clamp a query's parallel degree to temp_query_mem_cap at
+ * ADMISSION time (before worker acquisition and barrier init). Returns true and increments
+ * PSTAT_QM_TEMP_MEM_CAP_DEGRADES iff the parallel degree was lowered. No-op (returns false and
+ * leaves *parallel_workers_inout unchanged) when temp_query_mem_cap == 0 (default) or the
+ * requested degree is already serial. budget_out is optional (may be NULL). */
+extern bool qmgr_admission_apply_mem_cap (THREAD_ENTRY * thread_p, QMGR_TEMP_MEM_BUDGET * budget_out,
+					  int *parallel_workers_inout);
 #endif /* _QUERY_MANAGER_H_ */

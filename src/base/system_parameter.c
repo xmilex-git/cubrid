@@ -252,6 +252,8 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_UPDATE_STATISTICS_UPDATE_HISTOGRAM "update_statistics_update_histogram"
 
+#define PRM_NAME_TEMP_QUERY_MEM_CAP "temp_query_mem_cap"
+
 #define PRM_NAME_ENABLE_HISTO "communication_histogram"
 
 #define PRM_NAME_MUTEX_BUSY_WAITING_CNT "mutex_busy_waiting_cnt"
@@ -5367,6 +5369,18 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.b = false}},
    NULL_SYSPRM_PARAM_VALUE,
    NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_TEMP_QUERY_MEM_CAP,
+   PRM_NAME_TEMP_QUERY_MEM_CAP,
+   (PRM_FOR_SERVER | PRM_USER_CHANGE | PRM_SIZE_UNIT),
+   PRM_BIGINT,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.bi = 0}},
+   {false, {.bi = 0}},
+   NULL_SYSPRM_PARAM_VALUE,
+   {false, {.bi = 0}},
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL}

@@ -4087,6 +4087,101 @@ qmgr_get_temp_file_membuf_pages (QMGR_TEMP_FILE * temp_file_p)
   return temp_file_p->membuf_npages;
 }
 
+/*
+ * qmgr_admission_apply_mem_cap () - P3: admission-time temp_query_mem_cap enforcement.
+ *   return            : true iff the parallel degree was degraded (counter incremented).
+ *   thread_p (in)     : thread entry (used for the degrade perfmon counter).
+ *   budget_out (out)  : optional; receives the per-participant and total in-memory temp budget.
+ *   parallel_workers_inout (in/out) : requested parallel degree; lowered in place on degrade.
+ *
+ * Invoked ONCE per parallel-operator admission, from the central parallel-decision site
+ * (parallel_query::compute_parallel_degree), BEFORE worker_manager::try_reserve_workers () and
+ * BEFORE the fixed-count barrier (px_sort.h) is initialized. Because the (possibly lowered)
+ * degree returned here feeds BOTH the worker acquire AND the barrier, the worker count is fixed
+ * before execution and stays immutable for the rest of the query -- there is no mid-execution
+ * parallel shrink (Pre-mortem c: a fixed-count barrier must never wait on a worker that was
+ * never spawned).
+ *
+ * Resource-acquisition order (fixed): (1) compute the per-query temp in-memory budget and clamp
+ * to temp_query_mem_cap here; (2) the returned degree is MIN (requested, what the cap allows);
+ * (3) the caller acquires that many workers via try_reserve_workers; (4) the caller initializes
+ * the fixed-count barrier with that same count.
+ *
+ * The only admission-safe degrade lever is the parallel degree: membuf / sort / hash sizes and
+ * the file_io spill paths are intentionally left untouched. When temp_query_mem_cap == 0
+ * (default) this is a byte-for-byte no-op and the counter stays 0.
+ */
+bool
+qmgr_admission_apply_mem_cap (THREAD_ENTRY * thread_p, QMGR_TEMP_MEM_BUDGET * budget_out, int *parallel_workers_inout)
+{
+  UINT64 cap_bytes;
+  UINT64 per_worker_bytes;
+  UINT64 allowed_workers;
+  int requested;
+  int admitted;
+
+  assert (parallel_workers_inout != NULL);
+
+  cap_bytes = prm_get_bigint_value (PRM_ID_TEMP_QUERY_MEM_CAP);
+  if (cap_bytes == 0)
+    {
+      /* disabled (default): no admission control, behavior unchanged, counter stays 0. */
+      return false;
+    }
+
+  requested = *parallel_workers_inout;
+  if (requested < 2)
+    {
+      /* already serial: the parallel-degree lever is exhausted and membuf/file_io budgets are
+       * intentionally preserved, so there is nothing left to degrade at admission. */
+      return false;
+    }
+
+  /* Per parallel participant in-memory temp budget (conservative upper bound): private membuf
+   * + shared sort buffer + hash in-memory budget. */
+  per_worker_bytes =
+    (UINT64) prm_get_integer_value (PRM_ID_TEMP_MEM_BUFFER_PAGES) * (UINT64) DB_PAGESIZE
+    + (UINT64) prm_get_integer_value (PRM_ID_SR_NBUFFERS) * (UINT64) DB_PAGESIZE
+    + prm_get_bigint_value (PRM_ID_MAX_HASH_LIST_SCAN_SIZE);
+
+  if (per_worker_bytes == 0)
+    {
+      /* nothing measurable to bound. */
+      return false;
+    }
+
+  /* Maximum worker count whose total in-memory budget fits under the cap. */
+  allowed_workers = cap_bytes / per_worker_bytes;
+  if (allowed_workers < 1)
+    {
+      allowed_workers = 1;	/* always admit at least a single (serial) participant. */
+    }
+
+  if (allowed_workers >= (UINT64) requested)
+    {
+      /* fits within the cap: admit as requested, no degrade. */
+      if (budget_out != NULL)
+	{
+	  budget_out->per_worker_bytes = per_worker_bytes;
+	  budget_out->total_bytes = per_worker_bytes * (UINT64) requested;
+	}
+      return false;
+    }
+
+  /* Degrade AT ADMISSION ONLY: lower the parallel degree (down to serial if necessary). */
+  admitted = (int) allowed_workers;
+  *parallel_workers_inout = admitted;
+  if (budget_out != NULL)
+    {
+      budget_out->per_worker_bytes = per_worker_bytes;
+      budget_out->total_bytes = per_worker_bytes * (UINT64) admitted;
+    }
+
+  perfmon_inc_stat (thread_p, PSTAT_QM_TEMP_MEM_CAP_DEGRADES);
+
+  return true;
+}
+
 #if defined (SERVER_MODE)
 /*
  * qmgr_set_query_exec_info_to_tdes () - calculate timeout and set to transaction
