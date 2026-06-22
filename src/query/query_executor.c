@@ -5491,6 +5491,18 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       {
 	QFILE_SET_FLAG (ls_flag, QFILE_FLAG_RESULT_FILE);
       }
+    /* P5 (cursor track 7): a top-most group-by output with no analytic / order-by / distinct
+     * downstream reader is the final cursor result.  When the if above did not cache it and it is
+     * provably single-owner (plan-wide non-parallel and not a holdable cursor --
+     * qexec_is_plan_private_spill_safe) tag it private-spill so its disk pages route through file_io
+     * with zero page-buffer fix, reusing the P2-B private path.  Holdable or cached cursor results
+     * stay pgbuf-backed (track 7-holdable / track 4 list cache). */
+    else if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL) && buildlist->a_eval_list == NULL
+	     && (xasl->orderby_list == NULL || XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST))
+	     && xasl->option != Q_DISTINCT && qexec_is_plan_private_spill_safe (thread_p, xasl, xasl_state))
+      {
+	QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
+      }
 
     output_list_id =
       qfile_open_list (thread_p, &output_type_list, buildlist->after_groupby_list, xasl_state->query_id, ls_flag, NULL);
@@ -14705,6 +14717,20 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
 	      {
 		QFILE_SET_FLAG (ls_flag, QFILE_FLAG_RESULT_FILE);
 	      }
+	    /* P5 (cursor track 7): the if above did not fire, so this top-most BUILDLIST result is NOT
+	     * cached.  With no group-by / analytic / order-by / distinct downstream reader it is the final
+	     * cursor result; when it is also provably single-owner (plan-wide non-parallel and not a
+	     * holdable cursor -- qexec_is_plan_private_spill_safe) tag it private-spill so its disk pages
+	     * route through file_io with zero page-buffer fix, reusing the P2-B private path.  Holdable or
+	     * cached cursor results stay pgbuf-backed (track 7-holdable / track 4 list cache). */
+	    else if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL)
+		     && buildlist->groupby_list == NULL && buildlist->a_eval_list == NULL
+		     && (xasl->orderby_list == NULL || XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST))
+		     && xasl->option != Q_DISTINCT
+		     && qexec_is_plan_private_spill_safe (thread_p, xasl, xasl_state))
+	      {
+		QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
+	      }
 
 	    xasl->list_id =
 	      qfile_open_list (thread_p, &type_list, xasl->after_iscan_list, xasl_state->query_id, ls_flag,
@@ -21436,6 +21462,17 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
 	    && xasl->option != Q_DISTINCT)
 	  {
 	    QFILE_SET_FLAG (ls_flag, QFILE_FLAG_RESULT_FILE);
+	  }
+	/* P5 (cursor track 7): the last-iteration analytic output with no order-by / distinct downstream
+	 * reader is the final cursor result.  When the if above did not cache it and it is provably
+	 * single-owner (plan-wide non-parallel and not a holdable cursor -- qexec_is_plan_private_spill_safe)
+	 * tag it private-spill so its disk pages route through file_io with zero page-buffer fix, reusing
+	 * the P2-B private path.  Holdable or cached cursor results stay pgbuf-backed (track 7-holdable / 4). */
+	else if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL)
+		 && (xasl->orderby_list == NULL || XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST))
+		 && xasl->option != Q_DISTINCT && qexec_is_plan_private_spill_safe (thread_p, xasl, xasl_state))
+	  {
+	    QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
 	  }
       }
 
