@@ -275,6 +275,7 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/query_aggregate.cpp
   ${QUERY_DIR}/query_hash_scan.c
   ${QUERY_DIR}/query_hash_join.c
+  ${QUERY_DIR}/query_hash_join_fused.c
   ${QUERY_DIR}/query_analytic.cpp
   ${QUERY_DIR}/query_dump.c
   ${QUERY_DIR}/query_evaluator.c

@@ -36,6 +36,12 @@
 #include <type_traits>
 #include <vector>
 
+/* fused hash-join probe: opaque handles, bodies in query_hash_join_fused.c (forward
+ * declared here so the result handler can hold typed pointers without depending on the
+ * hash-join interface header, which is only included on non-WINDOWS server builds) */
+struct hjoin_fused_state;
+struct hjoin_fused_worker;
+
 namespace parallel_scan
 {
   class list_id_header;
@@ -130,7 +136,7 @@ namespace parallel_scan
       int g_agg_domains_resolved;
       /* fused hash-join probe: per-worker probe context (HJOIN_FUSED_WORKER *);
        * non-NULL only while this worker probes a fused hash-join build table */
-      void *fused_ctx;
+      hjoin_fused_worker *fused_ctx;
   };
 
   class xasl_snapshot_tls

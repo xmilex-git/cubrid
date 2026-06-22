@@ -15428,7 +15428,7 @@ qexec_hjoin_fused_dispatch (THREAD_ENTRY * thread_p, XASL_NODE * hj_xasl, XASL_N
 {
   XASL_NODE *outer_xasl, *inner_xasl;
   XASL_NODE *probe_xasl, *build_xasl;
-  void *fused_state = NULL;
+  HJOIN_FUSED_STATE *fused_state = NULL;
   bool outer_marked, inner_marked;
   int error = NO_ERROR;
 

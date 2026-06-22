@@ -388,7 +388,7 @@ typedef struct hashjoin_proc_node
    * qexec_hash_join (the join output was already produced by the fused scan) or
    * freed by the teardown reclamation path on error paths.  Runtime-only; never
    * serialized; zeroed on unpack. */
-  void *fused_state;
+  struct hjoin_fused_state *fused_state;
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 } HASHJOIN_PROC_NODE;
 
@@ -1207,7 +1207,7 @@ struct xasl_node
   int executed_parallelism;	/* parallelism of the query */
   memoize::storage *memoize_storage;
   // *INDENT-ON*
-  void *fused_probe;		/* HJOIN_FUSED_STATE * -- non-NULL ONLY while this buildlist
+  struct hjoin_fused_state *fused_probe;	/* HJOIN_FUSED_STATE * -- non-NULL ONLY while this buildlist
 				 * is the probe input of a fused hash-join probe and its scan
 				 * is in flight (runtime-only; never serialized; zeroed on
 				 * unpack) */

@@ -44,6 +44,10 @@
 #define HASHJOIN_DUMP_BUILD 0
 #define HASHJOIN_DUMP_PROBE 0
 
+/* hash-list partition fill factor (single-partition sizing); shared by the
+ * materialized path (query_hash_join.c) and the fused probe (query_hash_join_fused.c) */
+#define PARTITION_FILL_FACTOR 0.8
+
 /*
  * Forward Declarations
  */
@@ -478,6 +482,8 @@ int hjoin_fetch_key (THREAD_ENTRY * thread_p, HASHJOIN_FETCH_INFO * fetch_info, 
 void hjoin_update_tuple_hash_key (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * tuple_record, UINT32 hash_key);
 int hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST_SCAN_ID * list_scan_id,
 		     QFILE_TUPLE_RECORD * tuple_record);
+int hjoin_build_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST_SCAN_ID * list_scan_id,
+		     QFILE_TUPLE_RECORD * tuple_record);
 int hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
 				  QFILE_TUPLE_RECORD * outer_record, QFILE_TUPLE_RECORD * inner_record,
 				  QFILE_LIST_MERGE_INFO * merge_info, QFILE_TUPLE_RECORD * overflow_record);
@@ -492,19 +498,25 @@ int hjoin_merge_tuple_to_list_id (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
  * join tuples directly to their per-worker gather lists, so the probe-input temp list
  * never exists.  qexec_hash_join later just adopts the gather output.  Every refusal
  * (prepare returns a NULL state, or the scan never engages) silently keeps today's
- * materialized path; correctness never depends on the kill-switch. */
+ * materialized path; correctness never depends on the kill-switch.
+ *
+ * HJOIN_FUSED_STATE / HJOIN_FUSED_WORKER are opaque handles whose struct bodies are
+ * private to query_hash_join_fused.c; callers hold only these typed pointers. */
+typedef struct hjoin_fused_state HJOIN_FUSED_STATE;
+typedef struct hjoin_fused_worker HJOIN_FUSED_WORKER;
+
 int qexec_hjoin_fused_prepare (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_NODE * probe_aptr,
-			       void **fused_state_out);
-void qexec_hjoin_fused_abandon (THREAD_ENTRY * thread_p, void *fused_state);
-bool qexec_hjoin_fused_is_engaged (void *fused_state);
+			       HJOIN_FUSED_STATE ** fused_state_out);
+void qexec_hjoin_fused_abandon (THREAD_ENTRY * thread_p, HJOIN_FUSED_STATE * fused_state);
+bool qexec_hjoin_fused_is_engaged (HJOIN_FUSED_STATE * fused_state);
 int qexec_hjoin_fused_adopt_result (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 
 /* scan-worker seam (called from the parallel-scan MERGEABLE_LIST result handler) */
-QFILE_TUPLE_VALUE_TYPE_LIST *qexec_hjoin_fused_output_type_list (void *fused_state);
-void *qexec_hjoin_fused_worker_open (THREAD_ENTRY * thread_p, void *fused_state, OUTPTR_LIST * outptr_list,
-				     QFILE_LIST_ID * output_list_id);
-int qexec_hjoin_fused_worker_row (THREAD_ENTRY * thread_p, void *worker_ctx, VAL_DESCR * val_descr);
-void qexec_hjoin_fused_worker_close (THREAD_ENTRY * thread_p, void *worker_ctx);
+QFILE_TUPLE_VALUE_TYPE_LIST *qexec_hjoin_fused_output_type_list (HJOIN_FUSED_STATE * fused_state);
+HJOIN_FUSED_WORKER *qexec_hjoin_fused_worker_open (THREAD_ENTRY * thread_p, HJOIN_FUSED_STATE * fused_state,
+						   OUTPTR_LIST * outptr_list, QFILE_LIST_ID * output_list_id);
+int qexec_hjoin_fused_worker_row (THREAD_ENTRY * thread_p, HJOIN_FUSED_WORKER * worker_ctx, VAL_DESCR * val_descr);
+void qexec_hjoin_fused_worker_close (THREAD_ENTRY * thread_p, HJOIN_FUSED_WORKER * worker_ctx);
 #endif /* defined (SERVER_MODE) && !defined (WINDOWS) */
 
 void hjoin_trace_start (THREAD_ENTRY * thread_p, HASHJOIN_START_STATS * start_stats);

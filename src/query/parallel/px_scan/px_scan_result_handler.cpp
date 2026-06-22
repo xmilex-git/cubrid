@@ -218,7 +218,7 @@ namespace parallel_scan
       {
 	int size;
 	tl.vd = vd;
-	void *fused_state_p = nullptr;
+	hjoin_fused_state *fused_state_p = nullptr;
 #if !defined (WINDOWS)
 	if (m_.orig_xasl != nullptr && m_.orig_xasl->fused_probe != nullptr && !m_.g_hash_eligible)
 	  {
