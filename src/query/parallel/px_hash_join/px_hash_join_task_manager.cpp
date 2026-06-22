@@ -471,6 +471,10 @@ namespace parallel_query
 	      /* overflow page */
 	      if (QFILE_GET_OVERFLOW_PAGE_ID (page) != NULL_PAGEID)
 		{
+		  /* P4 (track 6): part_list_id[part_id] is a shared_spill list; its disk pages now use
+		   * file_io (copy buffers, ZERO page-buffer fix). This lock makes that file_io safe -- the
+		   * reopen/append/close below (and its lazy temp_vfid create + page writes) all run UNDER
+		   * part_mutexes[part_id], so no two workers ever touch the shared handle concurrently. */
 		  std::unique_lock lock (m_shared_info->part_mutexes[part_id]);
 
 		  assert (part_list_id[part_id]->last_pgptr == nullptr);
@@ -499,6 +503,8 @@ namespace parallel_query
 		  qfile_close_list (&thread_ref, temp_part_list_id[part_id]);	/* may be meaningless since only memory buffer is used */
 
 		  {
+		    /* P4 (track 6): shared_spill file_io for part_list_id[part_id] runs UNDER this lock
+		     * (qfile_append_list allocates/writes its disk pages via the copy-buffer path here). */
 		    std::unique_lock lock (m_shared_info->part_mutexes[part_id]);
 
 		    assert (part_list_id[part_id]->last_pgptr == nullptr);
@@ -590,6 +596,8 @@ namespace parallel_query
 
 	      if (temp_part_list_id[part_index]->tuple_cnt > 0)
 		{
+		  /* P4 (track 6): final flush of the shared_spill accumulator -- the qfile_append_list disk
+		   * page writes run UNDER part_mutexes[part_index], so the file_io is never concurrent. */
 		  std::unique_lock lock (m_shared_info->part_mutexes[part_index]);
 
 		  assert (part_list_id[part_index]->last_pgptr == nullptr);

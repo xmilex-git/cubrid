@@ -1246,6 +1246,15 @@ qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALUE_TYPE_LIST * type_lis
 	{
 	  list_id_p->tfile_vfid->private_spill = true;
 	}
+      /* P4 (track 6): the parallel hash-join shared partition accumulator (opened QFILE_FLAG_ALL by
+       * the coordinator in hjoin_prepare_partition, tagged shared by hjoin_init_shared_split_info)
+       * routes its disk pages through the SAME copy-buffer file_io path -- safe because all writes
+       * run under part_mutexes and reads happen post-barrier. Distinct flag so the sector-scan guard
+       * still rejects private lists but permits this shared one. */
+      else if (list_id_p->tfile_vfid != NULL && QFILE_IS_FLAG_SET (flag, QFILE_FLAG_SHARED_SPILL))
+	{
+	  list_id_p->tfile_vfid->shared_spill = true;
+	}
     }
 
   if (list_id_p->tfile_vfid == NULL)
@@ -1415,9 +1424,10 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
   else
     {
       assert_release (!VPID_ISNULL (&list_id_p->last_vpid));
-      /* P2-B: route through the write-back accessor so a private-spill last page is fetched into a
-       * writable file_io copy buffer (ZERO page-buffer fix); non-private lists keep the legacy
-       * WRITE-latch pgbuf fix. The ptype check applies only to the pgbuf-backed (non-private) page. */
+      /* P2-B/P4: route through the write-back accessor so a private_spill / shared_spill last page is
+       * fetched into a writable file_io copy buffer (ZERO page-buffer fix); non-spill lists keep the
+       * legacy WRITE-latch pgbuf fix. The ptype check applies only to the pgbuf-backed page -- a spill
+       * copy buffer is not a pgbuf page, so skip it for both spill tags. */
       last_page_ptr = qmgr_temp_page_get_writable (thread_p, &list_id_p->last_vpid, temp_file_p).page_p;
       if (last_page_ptr == NULL)
 	{
@@ -1425,7 +1435,7 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
 	}
 
 #if !defined (NDEBUG)
-      if (!temp_file_p->private_spill)
+      if (!temp_file_p->private_spill && !temp_file_p->shared_spill)
 	{
 	  (void) pgbuf_check_page_ptype (thread_p, last_page_ptr, PAGE_QRESULT);
 	}
@@ -7263,10 +7273,14 @@ qfile_open_list_sector_scan (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
   assert (thread_p != NULL);
   assert (list_id != NULL);
   assert (sector_scan != NULL);
-  /* P2-B safety guard (architect rec #4): a private-spill list is provably single-owner and its
+  /* P2-B safety guard (architect rec #4): a private_spill list is provably single-owner and its
    * pages live in per-call file_io copy buffers, NOT in the page buffer. A sector scan is the
-   * cross-thread parallel-page reader; a private list must never be wired into one. If this fires,
-   * a plan change routed a private list into a px input -- the private tag is then unsafe. */
+   * cross-thread parallel-page reader; a PRIVATE list must never be wired into one. If this fires,
+   * a plan change routed a private list into a px input -- the private tag is then unsafe.
+   * P4 note: shared_spill (track 6) is DELIBERATELY NOT asserted here -- a shared HJ accumulator IS
+   * meant to be sector-scanned at the next recursion level. That is safe because each sector reader
+   * acquires the page via qmgr_temp_page_get_readonly -> its own read-only file_io copy buffer
+   * (atomic pread, no shared mutable state), and the scan runs only after the split barrier. */
   assert (list_id->tfile_vfid == NULL || !list_id->tfile_vfid->private_spill);
 
   error = qfile_collect_list_sector_info (thread_p, list_id, &sector_scan->sector_info);

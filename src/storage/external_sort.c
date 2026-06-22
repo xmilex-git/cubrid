@@ -5521,10 +5521,18 @@ sort_write_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num
 	  return ret;
 	}
     }
-  /* Phase 2 (Axis B): a NON-PARALLEL sort owns its run files single-threaded, so write the run
-   * pages straight to disk via file_io (zero page-buffer fix). Parallel sorts keep the pgbuf
-   * path here (deferred: worker result files are read cross-thread by the coordinator merge). */
-  bool direct_io = (sort_param != NULL && sort_param->px_parallel_num <= 1);
+  /* Phase 2 (Axis B) + P4 (track 5): write the run pages straight to disk via file_io (ZERO
+   * page-buffer fix). This now covers PARALLEL sorts too. Each px worker (px_sort_param[i]) owns its
+   * own sort run files (sort_param->temp[]) single-threaded during the run phase; the coordinator and
+   * the merge workers read/rewrite them only AFTER the run/merge barrier (SORT_WAIT_PARALLEL /
+   * wait_workers in sort_listfile / sort_merge_run_for_parallel). The barrier supplies happens-before,
+   * so a run page written by one worker is fully on disk before any other thread reads it, and the
+   * final-run readers in sort_put_result_for_parallel read DISJOINT page ranges with their own
+   * file_io buffers (atomic pread). There is never unlocked concurrent read+write or write+write on
+   * one run file, so no page-buffer residency and no extra lock are needed. (The SHARED input split
+   * file is NOT touched here -- it is written via the P1 accessors and read via qfile scan, and stays
+   * pgbuf-backed; see sort_split_input_temp_file.) */
+  bool direct_io = (sort_param != NULL);
 
   /* initializations */
   page_no = first_page;
@@ -5621,9 +5629,13 @@ sort_read_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num_
   int i;
   int ret = NO_ERROR;
   TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
-  /* Phase 2 (Axis B): mirror sort_write_area — a NON-PARALLEL sort reads its own run pages
-   * directly via file_io (zero page-buffer fix). Parallel sorts keep the pgbuf path. */
-  bool direct_io = (sort_param != NULL && sort_param->px_parallel_num <= 1);
+  /* Phase 2 (Axis B) + P4 (track 5): mirror sort_write_area -- read run pages directly via file_io
+   * (ZERO page-buffer fix), now for PARALLEL sorts too. The matching write used the same gate, so a
+   * given run file is always file_io for both write and read (never mixed). All cross-thread reads
+   * are barrier-separated from the writes; concurrent readers of the same final run (disjoint ranges
+   * in sort_put_result_for_parallel) each use their own file_io buffer with atomic pread, so no lock
+   * is needed. */
+  bool direct_io = (sort_param != NULL);
 
   vpid.volid = vfid->volid;
   page_no = first_page;

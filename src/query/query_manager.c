@@ -2508,17 +2508,29 @@ qmgr_add_modified_class (THREAD_ENTRY * thread_p, const OID * class_oid_p)
  *       	     PAGE ALLOCATION/DEALLOCATION ROUTINES
  */
 
-/* ---- P2-B private-spill (Axis B): file_io-direct copy buffers, ZERO page-buffer fix ----
- * A QMGR_TEMP_FILE flagged private_spill is provably single-owner (plan-wide non-parallel,
- * non-result, non-preserved, non-holdable -- see qfile_open_list / the executor gate). Its disk
- * pages never reside in the page buffer: each is handed to the caller as a malloc'd copy buffer
- * whose 16-byte-aligned header (kept just before the DB_PAGESIZE payload the caller sees) records
- * the on-disk VPID and whether the buffer is writable (flush on free). The membuf(NULL_VOLID) tier
- * is unchanged. Writes are deferred to the page's eventual release (writeback FREE or a writable
- * read-only-free), which is correct because a private list is built (sequential append, one
- * last_pgptr held at a time) and only read back AFTER it is closed -- so a held page is never
- * re-fetched by VPID while dirty. The architect's sector-scan guard (qfile_open_list_sector_scan)
- * asserts no private list is ever wired into a cross-thread px input. */
+/* ---- P2-B/P4 file_io-direct spill (Axis B): copy buffers, ZERO page-buffer fix ----
+ * A QMGR_TEMP_FILE flagged private_spill OR shared_spill has its disk pages routed through file_io:
+ * each page is handed to the caller as a malloc'd copy buffer whose 16-byte-aligned header (kept
+ * just before the DB_PAGESIZE payload the caller sees) records the on-disk VPID and whether the
+ * buffer is writable (flush on free). The two tags share this SAME copy-buffer machinery and differ
+ * ONLY in what makes the file_io safe:
+ *   - private_spill (P2-B, tracks 1/2/3): the list is provably single-owner (plan-wide non-parallel,
+ *     non-result, non-preserved, non-holdable). No concurrency, so no lock is needed. Built by
+ *     sequential append (one last_pgptr held at a time) and read back only after close, so a held
+ *     page is never re-fetched by VPID while dirty. The sector-scan guard
+ *     (qfile_open_list_sector_scan) asserts a private list is NEVER wired into a cross-thread px input.
+ *   - shared_spill (P4, track 6): a SHARED parallel hash-join partition accumulator written by many
+ *     px workers. The copy-buffer reads/writes are made safe EXTERNALLY by the caller:
+ *       * WRITES (qfile_reopen_list_as_append_mode / qfile_add_tuple_to_list / qfile_append_list /
+ *         qfile_close_list) always run under HASHJOIN_SHARED_SPLIT_INFO::part_mutexes[part_id]
+ *         (px_hash_join_task_manager.cpp:474/502/593). Each append reopens->appends->closes (which
+ *         flushes the last page) entirely under the lock, so on lock release every page is on disk
+ *         and last_pgptr==NULL; the next lock-holder re-reads the flushed last page from disk.
+ *       * READS happen only AFTER the split barrier (task_manager::join + wait_workers), so they
+ *         never overlap writes; each consumer (single per partition, or a concurrent sector scan at
+ *         the next recursion level) allocates its OWN copy buffer and uses an atomic positioned
+ *         pread, so concurrent reads need no lock. shared_spill IS permitted into a sector scan
+ *         (unlike private_spill). The membuf(NULL_VOLID) tier is unchanged for both tags. */
 
 #define QMGR_SPILL_MAGIC ((INT64) 0x515350494c4cLL)	/* "QSPILL" */
 #define QMGR_SPILL_HDR_SIZE (DB_ALIGN (sizeof (QMGR_SPILL_PAGE), MAX_ALIGNMENT))
@@ -2565,6 +2577,15 @@ static void
 qmgr_spill_free_buffer (PAGE_PTR page_p)
 {
   free ((char *) page_p - QMGR_SPILL_HDR_SIZE);
+}
+
+/* True iff this temp file routes its disk pages through the file_io copy-buffer path (P2-B
+ * private_spill OR P4 track-6 shared_spill). The dispatch is identical for both tags; they differ
+ * only in the external serialization (see the section comment above). NULL-safe. */
+static inline bool
+qmgr_temp_file_is_spill (const QMGR_TEMP_FILE * tfile_vfid_p)
+{
+  return tfile_vfid_p != NULL && (tfile_vfid_p->private_spill || tfile_vfid_p->shared_spill);
 }
 
 /* Write one private-spill page's payload to disk via file_io (no page-buffer fix). Mirrors the
@@ -2792,9 +2813,11 @@ qmgr_temp_page_get_readonly (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_F
     }
   else
     {
-      /* P2-B: a provably single-owner private list reads its disk pages via file_io into a
-       * read-only copy buffer (ZERO page-buffer fix). */
-      if (tfile_vfid_p->private_spill)
+      /* P2-B/P4: a private_spill (single-owner) OR shared_spill (parallel HJ accumulator, read here
+       * only after the split barrier) list reads its disk pages via file_io into a read-only copy
+       * buffer (ZERO page-buffer fix). Each reader gets its own buffer, so concurrent shared reads
+       * need no lock. */
+      if (qmgr_temp_file_is_spill (tfile_vfid_p))
 	{
 	  return qmgr_spill_read_page (thread_p, vpid_p, tfile_vfid_p, false /* writable */ );
 	}
@@ -2867,9 +2890,9 @@ qmgr_temp_page_free_readonly (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEM
 
   if (page_type == QMGR_TEMP_FILE_PAGE)
     {
-      /* P2-B: a private-spill disk page is a file_io copy buffer, not a pgbuf-fixed page; release
-       * it through the copy-buffer path (a writable buffer is flushed to disk first). */
-      if (tfile_vfid_p->private_spill)
+      /* P2-B/P4: a private_spill/shared_spill disk page is a file_io copy buffer, not a pgbuf-fixed
+       * page; release it through the copy-buffer path (a writable buffer is flushed to disk first). */
+      if (qmgr_temp_file_is_spill (tfile_vfid_p))
 	{
 	  qmgr_spill_release_page (thread_p, page_p, tfile_vfid_p);
 	}
@@ -2917,8 +2940,8 @@ qmgr_temp_page_free_readonly_simple (THREAD_ENTRY * thread_p, PAGE_PTR page_p, Q
 
   if (page_type == QMGR_TEMP_FILE_PAGE)
     {
-      /* P2-B: a private-spill disk page is a file_io copy buffer, not a pgbuf-fixed page. */
-      if (tfile_vfid_p->private_spill)
+      /* P2-B/P4: a private_spill/shared_spill disk page is a file_io copy buffer, not a pgbuf page. */
+      if (qmgr_temp_file_is_spill (tfile_vfid_p))
 	{
 	  qmgr_spill_release_page (thread_p, page_p, tfile_vfid_p);
 	}
@@ -2949,9 +2972,11 @@ qmgr_temp_page_get_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_F
 {
   QMGR_TEMP_WPAGE wpage;
 
-  /* P2-B: an EXISTING private-spill disk page is fetched into a writable copy buffer (flushed to
-   * disk when released). The membuf(NULL_VOLID) tier and the non-private pgbuf path are unchanged. */
-  if (tfile_vfid_p != NULL && tfile_vfid_p->private_spill && vpid_p->volid != NULL_VOLID)
+  /* P2-B/P4: an EXISTING private_spill/shared_spill disk page is fetched into a writable copy buffer
+   * (flushed to disk when released). For shared_spill this runs under the caller's part_mutexes (it
+   * is reached only from qfile_*append* under that lock). The membuf(NULL_VOLID) tier and the
+   * non-spill pgbuf path are unchanged. */
+  if (qmgr_temp_file_is_spill (tfile_vfid_p) && vpid_p->volid != NULL_VOLID)
     {
       wpage.page_p = qmgr_spill_read_page (thread_p, vpid_p, tfile_vfid_p, true /* writable */ );
       return wpage;
@@ -2994,11 +3019,12 @@ qmgr_temp_page_get_new_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TE
   if (VFID_ISNULL (&tfile_vfid_p->temp_vfid))
     {
       TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
-      /* P2-B: a private-spill file is created numerable so its pages can be allocated/located by
-       * ordinal (file_numerable_find_nth) and written via file_io with ZERO page-buffer fix. The
-       * VFID still flows through file_create_temp* -> per-txn temp registry, so query-end / abort /
-       * crash-restart cleanup is unchanged. */
-      if ((tfile_vfid_p->private_spill
+      /* P2-B/P4: a spill (private or shared) file is created numerable so its pages can be allocated/
+       * located by ordinal (file_numerable_find_nth) and written via file_io with ZERO page-buffer
+       * fix. The VFID still flows through file_create_temp* -> per-txn temp registry, so query-end /
+       * abort / crash-restart cleanup is unchanged. For shared_spill this lazy create runs under the
+       * caller's part_mutexes (first worker to spill), so the temp_vfid alloc is serialized. */
+      if ((qmgr_temp_file_is_spill (tfile_vfid_p)
 	   ? file_create_temp_numerable (thread_p, 1, &tfile_vfid_p->temp_vfid)
 	   : file_create_temp (thread_p, 1, &tfile_vfid_p->temp_vfid)) != NO_ERROR)
 	{
@@ -3021,10 +3047,12 @@ qmgr_temp_page_get_new_writable (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TE
 	}
     }
 
-  /* P2-B: allocate a NEW private-spill page from the numerable temp file by ordinal (auto-extend)
-   * and hand back an initialized writable copy buffer -- ZERO page-buffer fix. The on-disk content
-   * is written when the buffer is released (writeback FREE / writable read-only-free). */
-  if (tfile_vfid_p->private_spill)
+  /* P2-B/P4: allocate a NEW spill page from the numerable temp file by ordinal (auto-extend) and
+   * hand back an initialized writable copy buffer -- ZERO page-buffer fix. The on-disk content is
+   * written when the buffer is released (writeback FREE / writable read-only-free). For shared_spill
+   * the ordinal cursor (spill_npages) bump and the file_alloc are serialized by the caller's
+   * part_mutexes, so concurrent workers never race the numerable allocation. */
+  if (qmgr_temp_file_is_spill (tfile_vfid_p))
     {
       QFILE_PAGE_HEADER pgheader = QFILE_PAGE_HEADER_INITIALIZER;
       int ret;
@@ -3097,12 +3125,14 @@ qmgr_temp_page_writeback (THREAD_ENTRY * thread_p, QMGR_TEMP_WPAGE * wpage, int 
 
   if (page_type == QMGR_TEMP_FILE_PAGE)
     {
-      if (tfile_vfid_p->private_spill)
+      if (qmgr_temp_file_is_spill (tfile_vfid_p))
 	{
-	  /* P2-B: no temp WAL (file_io path writes no log). A FREE write-back flushes the copy
+	  /* P2-B/P4: no temp WAL (file_io path writes no log). A FREE write-back flushes the copy
 	   * buffer to disk now and releases it; a DONT_FREE write-back keeps the held buffer (it is
-	   * flushed on its eventual release -- the build path holds one last_pgptr at a time and the
-	   * list is read back only after close, so a held page is never re-fetched while dirty). */
+	   * flushed on its eventual release). private_spill builds sequentially (one last_pgptr at a
+	   * time, read back only after close). shared_spill performs this write-back under the caller's
+	   * part_mutexes, and each append closes (flushes the last page) before releasing the lock, so a
+	   * held page is never re-fetched by another worker while dirty. */
 	  if (free_page == (int) FREE)
 	    {
 	      qmgr_spill_release_page (thread_p, wpage->page_p, tfile_vfid_p);
@@ -3346,6 +3376,7 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
   tfile_vfid_p->private_spill = false;	/* P2-B: opt-in; set later only at proven-private call sites */
+  tfile_vfid_p->shared_spill = false;	/* P4: opt-in; set only on the parallel HJ shared accumulator */
   tfile_vfid_p->spill_npages = 0;
   tfile_vfid_p->membuf_last = -1;
 
@@ -3454,6 +3485,7 @@ qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id)
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
   tfile_vfid_p->private_spill = false;	/* P2-B: result/cache files are never private (forbidden track 4/7) */
+  tfile_vfid_p->shared_spill = false;	/* P4: result/cache files are never a shared HJ accumulator */
   tfile_vfid_p->spill_npages = 0;
 
   /* Find the query entry and chain the created temp file to the entry */

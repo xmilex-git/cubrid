@@ -528,7 +528,16 @@ enum
   /* P2-B: route this list's disk pages through file_io (zero page-buffer fix). Set ONLY when the
    * list is provably single-owner: plan-wide non-parallel + not RESULT_FILE + not preserved + not
    * holdable. qfile_open_list forwards it onto QMGR_TEMP_FILE.private_spill. */
-  QFILE_FLAG_PRIVATE_SPILL = 0x1000
+  QFILE_FLAG_PRIVATE_SPILL = 0x1000,
+  /* P4 (track 6): route this list's disk pages through file_io (zero page-buffer fix) like
+   * QFILE_FLAG_PRIVATE_SPILL, but for a SHARED parallel hash-join partition accumulator. The list
+   * is NOT single-owner: multiple px workers append to it. file_io safety is supplied EXTERNALLY by
+   * the caller's HASHJOIN_SHARED_SPLIT_INFO::part_mutexes[part_id] (every append/write runs under
+   * that lock) and the split barrier (reads happen only after wait, each consumer with its own copy
+   * buffer). Distinct from PRIVATE_SPILL so the sector-scan guard (qfile_open_list_sector_scan)
+   * keeps rejecting PRIVATE lists while ALLOWING shared ones to be sector-scanned. Forwarded onto
+   * QMGR_TEMP_FILE.shared_spill by qfile_open_list. */
+  QFILE_FLAG_SHARED_SPILL = 0x2000
 };
 
 #define QFILE_SET_FLAG(var, flag)          ((var) |= (flag))

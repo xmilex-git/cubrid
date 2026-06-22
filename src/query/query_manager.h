@@ -102,6 +102,13 @@ struct qmgr_temp_file
    * list. When true, the disk pages of this temp file are routed through file_io as per-call copy
    * buffers with ZERO page-buffer fixes; the membuf(NULL_VOLID) tier is unchanged. Default false. */
   bool private_spill;
+  /* P4 (track 6): SHARED parallel hash-join partition accumulator. Routes disk pages through the
+   * SAME file_io copy-buffer path as private_spill (ZERO page-buffer fix), but the list is written
+   * concurrently by px workers -- file_io is safe ONLY because every disk read/write happens under
+   * the owner's HASHJOIN_SHARED_SPLIT_INFO::part_mutexes[part_id] (writes, during the split phase)
+   * or after the split barrier (reads, each consumer allocates its own copy buffer). Kept DISTINCT
+   * from private_spill so the sector-scan guard rejects private but permits shared. Default false. */
+  bool shared_spill;
   int spill_npages;		/* number of file_io-direct disk pages allocated (numerable nth cursor) */
 };
 

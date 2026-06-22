@@ -1360,6 +1360,10 @@ hjoin_prepare_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HA
 
   int error = NO_ERROR;
 
+  /* P4 (track 6): see the gated assignment below. Declared here (before the error_exit gotos) so its
+   * initialization is not jumped over. */
+  int part_flag = QFILE_FLAG_ALL;
+
   assert (thread_p != NULL);
   assert (manager != NULL);
   assert (split_info != NULL);
@@ -1391,19 +1395,34 @@ hjoin_prepare_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HA
     }
   memset (contexts, 0, part_cnt * sizeof (HASHJOIN_CONTEXT));
 
+#if defined (SERVER_MODE)
+  /* P4 (track 6): when the plan intends parallel hash join (>1 worker), these partition lists become
+   * SHARED accumulators written concurrently by px workers (parallel_query::hash_join::build_partitions
+   * -> split_task, every append under HASHJOIN_SHARED_SPLIT_INFO::part_mutexes[part_id]) and read only
+   * after the split barrier. Tag them shared_spill so their disk spill uses the mutex-guarded file_io
+   * copy-buffer path (ZERO page-buffer fix) instead of the page buffer. If parallelism later degrades
+   * to serial (worker reservation fails -> HASHJOIN_STATUS_PARTITION), the single thread owns the
+   * lists outright, so file_io stays safe. A genuinely non-parallel plan (<=1 worker) is NOT tagged
+   * and keeps the legacy pgbuf backing -- serial hash join behavior is unchanged. */
+  if (manager->num_parallel_threads > 1)
+    {
+      part_flag |= QFILE_FLAG_SHARED_SPILL;
+    }
+#endif /* SERVER_MODE */
+
   for (part_index = 0; part_index < part_cnt; part_index++)
     {
       current_context = &contexts[part_index];
 
       outer_part_list_id[part_index] =
-	qfile_open_list (thread_p, &outer_list_id->type_list, NULL, outer_list_id->query_id, QFILE_FLAG_ALL, NULL);
+	qfile_open_list (thread_p, &outer_list_id->type_list, NULL, outer_list_id->query_id, part_flag, NULL);
       if (outer_part_list_id[part_index] == NULL)
 	{
 	  goto error_exit;
 	}
 
       inner_part_list_id[part_index] =
-	qfile_open_list (thread_p, &inner_list_id->type_list, NULL, inner_list_id->query_id, QFILE_FLAG_ALL, NULL);
+	qfile_open_list (thread_p, &inner_list_id->type_list, NULL, inner_list_id->query_id, part_flag, NULL);
       if (inner_part_list_id[part_index] == NULL)
 	{
 	  goto error_exit;
