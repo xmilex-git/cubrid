@@ -482,17 +482,155 @@ struct qfile_list_id
     } \
   while (0)
 
+/* Tuple position coordinate type */
+enum qfile_tuple_position_coordinate_type
+{
+  QFILE_TUPLE_POSITION_COORD_VPID = 0,
+  QFILE_TUPLE_POSITION_COORD_RAW_FD = 1
+};
+typedef enum qfile_tuple_position_coordinate_type QFILE_TUPLE_POSITION_COORDINATE_TYPE;
+
 /* Tuple position structure */
 typedef struct qfile_tuple_position QFILE_TUPLE_POSITION;
 struct qfile_tuple_position
 {
   SCAN_STATUS status;		/* Scan status */
   SCAN_POSITION position;	/* Scan position */
-  VPID vpid;			/* Real tuple page identifier */
-  int offset;			/* Tuple offset inside the page */
+  QFILE_TUPLE_POSITION_COORDINATE_TYPE coord_type;	/* Coordinate discriminator */
+  union
+  {
+    struct
+    {
+      VPID vpid;		/* Real tuple page identifier */
+      int offset;		/* Tuple offset inside the page */
+      int vpid_reserved;	/* Keep coordinate width fixed */
+    };
+    struct
+    {
+      UINT32 raw_fd_segment_id;	/* Raw-fd segment identifier */
+      INT32 page_index;		/* Page index inside the raw-fd segment */
+      INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
+      INT32 raw_fd_reserved;	/* Keep coordinate width fixed */
+    };
+  };
   QFILE_TUPLE tpl;		/* Tuple pointer inside the page */
   int tplno;			/* Tuple number inside the page */
 };
+typedef struct qfile_tuple_position_db QFILE_TUPLE_POSITION_DB;
+struct qfile_tuple_position_db
+{
+  SCAN_STATUS status;		/* Scan status */
+  SCAN_POSITION position;	/* Scan position */
+  QFILE_TUPLE_POSITION_COORDINATE_TYPE coord_type;	/* Coordinate discriminator */
+  union
+  {
+    struct
+    {
+      VPID vpid;		/* Real tuple page identifier */
+      int offset;		/* Tuple offset inside the page */
+      int vpid_reserved;	/* Keep coordinate width fixed */
+    };
+    struct
+    {
+      UINT32 raw_fd_segment_id;	/* Raw-fd segment identifier */
+      INT32 page_index;		/* Page index inside the raw-fd segment */
+      INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
+      INT32 raw_fd_reserved;	/* Keep coordinate width fixed */
+    };
+  };
+  int tplno;			/* Tuple number inside the page */
+};
+
+
+#define QFILE_TUPLE_POSITION_DB_BIT_SIZE (sizeof (QFILE_TUPLE_POSITION_DB) * 8)
+
+static inline bool
+qfile_tuple_position_is_raw_fd (const QFILE_TUPLE_POSITION * tuple_position_p)
+{
+  return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
+}
+
+static inline void
+qfile_tuple_position_set_vpid (QFILE_TUPLE_POSITION * tuple_position_p, const VPID * vpid_p, int offset)
+{
+  tuple_position_p->coord_type = QFILE_TUPLE_POSITION_COORD_VPID;
+  tuple_position_p->vpid = *vpid_p;
+  tuple_position_p->offset = offset;
+  tuple_position_p->vpid_reserved = 0;
+}
+
+static inline void
+qfile_tuple_position_set_raw_fd (QFILE_TUPLE_POSITION * tuple_position_p, UINT32 raw_fd_segment_id, INT32 page_index,
+				 INT32 tuple_offset)
+{
+  tuple_position_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
+  tuple_position_p->raw_fd_segment_id = raw_fd_segment_id;
+  tuple_position_p->page_index = page_index;
+  tuple_position_p->tuple_offset = tuple_offset;
+  tuple_position_p->raw_fd_reserved = 0;
+}
+
+static inline void
+qfile_tuple_position_copy_coord (QFILE_TUPLE_POSITION * dst_p, const QFILE_TUPLE_POSITION * src_p)
+{
+  dst_p->coord_type = src_p->coord_type;
+  if (qfile_tuple_position_is_raw_fd (src_p))
+    {
+      qfile_tuple_position_set_raw_fd (dst_p, src_p->raw_fd_segment_id, src_p->page_index, src_p->tuple_offset);
+    }
+  else
+    {
+      qfile_tuple_position_set_vpid (dst_p, &src_p->vpid, src_p->offset);
+    }
+}
+
+static inline bool
+qfile_tuple_position_db_is_raw_fd (const QFILE_TUPLE_POSITION_DB * tuple_position_p)
+{
+  return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
+}
+
+static inline void
+qfile_tuple_position_store_to_db (QFILE_TUPLE_POSITION_DB * stored_p, const QFILE_TUPLE_POSITION * src_p)
+{
+  stored_p->status = src_p->status;
+  stored_p->position = src_p->position;
+  if (qfile_tuple_position_is_raw_fd (src_p))
+    {
+      stored_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
+      stored_p->raw_fd_segment_id = src_p->raw_fd_segment_id;
+      stored_p->page_index = src_p->page_index;
+      stored_p->tuple_offset = src_p->tuple_offset;
+      stored_p->raw_fd_reserved = 0;
+    }
+  else
+    {
+      stored_p->coord_type = QFILE_TUPLE_POSITION_COORD_VPID;
+      stored_p->vpid = src_p->vpid;
+      stored_p->offset = src_p->offset;
+      stored_p->vpid_reserved = 0;
+    }
+  stored_p->tplno = src_p->tplno;
+}
+
+
+static inline void
+qfile_tuple_position_restore_from_stored (QFILE_TUPLE_POSITION * dst_p, const QFILE_TUPLE_POSITION_DB * stored_p)
+{
+  dst_p->status = stored_p->status;
+  dst_p->position = stored_p->position;
+  if (qfile_tuple_position_db_is_raw_fd (stored_p))
+    {
+      qfile_tuple_position_set_raw_fd (dst_p, stored_p->raw_fd_segment_id, stored_p->page_index,
+				       stored_p->tuple_offset);
+    }
+  else
+    {
+      qfile_tuple_position_set_vpid (dst_p, &stored_p->vpid, stored_p->offset);
+    }
+  dst_p->tpl = NULL;
+  dst_p->tplno = stored_p->tplno;
+}
 
 #define QFILE_OUTER_LIST  0	/* outer list file indicator */
 #define QFILE_INNER_LIST  1	/* inner list file indicator */

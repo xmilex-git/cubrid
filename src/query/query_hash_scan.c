@@ -489,8 +489,16 @@ qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *dat
     }
   else if (hash_list_scan_type == HASH_METH_HYBRID)
     {
-      fprintf (fp, "pageid = [%d]  volid = [%d]  offset = [%d]", data_p->pos->vpid.pageid,
-	       data_p->pos->vpid.volid, data_p->pos->offset);
+      if (qfile_tuple_simple_pos_is_raw_fd (data_p->pos))
+	{
+	  fprintf (fp, "raw_fd_segment_id = [%u]  page_index = [%d]  tuple_offset = [%d]",
+		   data_p->pos->raw_fd_segment_id, data_p->pos->page_index, data_p->pos->tuple_offset);
+	}
+      else
+	{
+	  fprintf (fp, "pageid = [%d]  volid = [%d]  offset = [%d]", data_p->pos->vpid.pageid,
+		   data_p->pos->vpid.volid, data_p->pos->offset);
+	}
     }
   else if (hash_list_scan_type == HASH_METH_HASH_FILE)
     {
@@ -688,8 +696,7 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
     }
 
   /* save position */
-  value->pos->offset = scan_id_p->curr_offset;
-  value->pos->vpid = scan_id_p->curr_vpid;
+  qfile_tuple_simple_pos_set_vpid (value->pos, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
 
   return value;
 }

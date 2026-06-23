@@ -34,9 +34,11 @@
 #include "compile_context.h"
 #include "log_append.hpp"
 #include "object_primitive.h"
+#include "dbtype.h"
 #include "object_representation.h"
 #include "xserver_interface.h"
 #include "query_executor.h"
+#include "query_hash_scan.h"
 #include "stream_to_xasl.h"
 #include "session.h"
 #include "filter_pred_cache.h"
@@ -186,6 +188,9 @@ static QMGR_TEMP_FILE *qmgr_get_temp_file_from_list (QMGR_TEMP_FILE_LIST * temp_
 static void qmgr_put_temp_file_into_list (QMGR_TEMP_FILE * temp_file_p);
 
 static int copy_bind_value_to_tdes (THREAD_ENTRY * thread_p, int num_bind_vals, DB_VALUE * bind_vals);
+#if !defined (NDEBUG)
+static int qmgr_segment_position_selftest (void);
+#endif
 
 /*
  * qmgr_get_page_type () -
@@ -892,6 +897,113 @@ qmgr_dump (void)
     }
 }
 #endif
+#if !defined (NDEBUG)
+static bool
+qmgr_segment_position_same_coord (const QFILE_TUPLE_POSITION * lhs_p, const QFILE_TUPLE_POSITION * rhs_p)
+{
+  if (lhs_p->coord_type != rhs_p->coord_type)
+    {
+      return false;
+    }
+
+  if (qfile_tuple_position_is_raw_fd (lhs_p))
+    {
+      return lhs_p->raw_fd_segment_id == rhs_p->raw_fd_segment_id && lhs_p->page_index == rhs_p->page_index
+	&& lhs_p->tuple_offset == rhs_p->tuple_offset;
+    }
+
+  return lhs_p->vpid.pageid == rhs_p->vpid.pageid && lhs_p->vpid.volid == rhs_p->vpid.volid
+    && lhs_p->offset == rhs_p->offset;
+}
+
+static int
+qmgr_segment_position_selftest (void)
+{
+  VPID vpid = { 17, 3 };
+  QFILE_TUPLE_POSITION vpid_pos = {};
+  QFILE_TUPLE_POSITION raw_pos = {};
+  QFILE_TUPLE_POSITION restored_pos = {};
+  QFILE_TUPLE_SIMPLE_POS simple_pos = {};
+  QFILE_TUPLE_POSITION_DB stored_pos = {};
+  DB_VALUE parent_pos_dbval;
+  const QFILE_TUPLE_POSITION_DB *bitval = NULL;
+  int bit_length = 0;
+  db_make_null (&parent_pos_dbval);
+
+  if (sizeof (QFILE_TUPLE_POSITION) != temp_page_store::projected_tuple_position_bytes
+      || sizeof (QFILE_TUPLE_POSITION_DB) != temp_page_store::projected_tuple_position_db_bytes
+      || sizeof (QFILE_TUPLE_SIMPLE_POS) != temp_page_store::projected_tuple_simple_pos_bytes
+      || QFILE_TUPLE_POSITION_DB_BIT_SIZE != temp_page_store::projected_tuple_position_db_bytes * 8)
+    {
+      return ER_FAILED;
+    }
+
+  vpid_pos.status = S_OPENED;
+  vpid_pos.position = S_ON;
+  qfile_tuple_position_set_vpid (&vpid_pos, &vpid, 123);
+  vpid_pos.tplno = 7;
+  qfile_tuple_position_store_to_db (&stored_pos, &vpid_pos);
+  qfile_tuple_position_restore_from_stored (&restored_pos, &stored_pos);
+  if (!qmgr_segment_position_same_coord (&vpid_pos, &restored_pos) || restored_pos.tplno != vpid_pos.tplno)
+    {
+      return ER_FAILED;
+    }
+
+  qfile_tuple_simple_pos_set_vpid (&simple_pos, &vpid, 123);
+  qfile_tuple_position_set_simple_pos (&restored_pos, &simple_pos);
+  if (!qmgr_segment_position_same_coord (&vpid_pos, &restored_pos))
+    {
+      return ER_FAILED;
+    }
+
+  raw_pos.status = S_OPENED;
+  raw_pos.position = S_ON;
+  qfile_tuple_position_set_raw_fd (&raw_pos, 11, 22, 333);
+  raw_pos.tplno = 9;
+  qfile_tuple_position_store_to_db (&stored_pos, &raw_pos);
+  qfile_tuple_position_restore_from_stored (&restored_pos, &stored_pos);
+  if (!qmgr_segment_position_same_coord (&raw_pos, &restored_pos) || restored_pos.tplno != raw_pos.tplno)
+    {
+      return ER_FAILED;
+    }
+
+  qfile_tuple_simple_pos_set_raw_fd (&simple_pos, 11, 22, 333);
+  qfile_tuple_position_set_simple_pos (&restored_pos, &simple_pos);
+  if (!qmgr_segment_position_same_coord (&raw_pos, &restored_pos))
+    {
+      return ER_FAILED;
+    }
+
+  qfile_tuple_position_store_to_db (&stored_pos, &vpid_pos);
+  db_make_bit (&parent_pos_dbval, DB_DEFAULT_PRECISION, REINTERPRET_CAST (DB_C_BIT, &stored_pos),
+	       QFILE_TUPLE_POSITION_DB_BIT_SIZE);
+  bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION_DB *, db_get_bit (&parent_pos_dbval, &bit_length));
+  if (bitval == NULL || bit_length != QFILE_TUPLE_POSITION_DB_BIT_SIZE)
+    {
+      return ER_FAILED;
+    }
+  qfile_tuple_position_restore_from_stored (&restored_pos, bitval);
+  if (!qmgr_segment_position_same_coord (&vpid_pos, &restored_pos) || restored_pos.tplno != vpid_pos.tplno)
+    {
+      return ER_FAILED;
+    }
+  qfile_tuple_position_store_to_db (&stored_pos, &raw_pos);
+  db_make_bit (&parent_pos_dbval, DB_DEFAULT_PRECISION, REINTERPRET_CAST (DB_C_BIT, &stored_pos),
+	       QFILE_TUPLE_POSITION_DB_BIT_SIZE);
+  bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION_DB *, db_get_bit (&parent_pos_dbval, &bit_length));
+  if (bitval == NULL || bit_length != QFILE_TUPLE_POSITION_DB_BIT_SIZE)
+    {
+      return ER_FAILED;
+    }
+  qfile_tuple_position_restore_from_stored (&restored_pos, bitval);
+  if (!qmgr_segment_position_same_coord (&raw_pos, &restored_pos) || restored_pos.tplno != raw_pos.tplno)
+    {
+      return ER_FAILED;
+    }
+
+  return NO_ERROR;
+}
+#endif /* !NDEBUG */
 
 /*
  * qmgr_initialize () -
@@ -962,6 +1074,12 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       int tempmove_selftest_rc = temp_page_store::qmgr_temp_file_move_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "TEMPMOVE_SELFTEST result=%d (0=PASS)\n", tempmove_selftest_rc);
       fprintf (stderr, "TEMPMOVE_SELFTEST result=%d (0=PASS)\n", tempmove_selftest_rc);
+    }
+  if (getenv ("CUBRID_SEGPOS_SELFTEST") != NULL)
+    {
+      int segpos_selftest_rc = qmgr_segment_position_selftest ();
+      er_log_debug (ARG_FILE_LINE, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
+      fprintf (stderr, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
     }
 #endif /* !NDEBUG */
 

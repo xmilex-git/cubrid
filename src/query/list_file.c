@@ -4987,9 +4987,7 @@ qfile_save_current_scan_tuple_position (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TU
 {
   tuple_position_p->status = scan_id_p->status;
   tuple_position_p->position = scan_id_p->position;
-  tuple_position_p->vpid.pageid = scan_id_p->curr_vpid.pageid;
-  tuple_position_p->vpid.volid = scan_id_p->curr_vpid.volid;
-  tuple_position_p->offset = scan_id_p->curr_offset;
+  qfile_tuple_position_set_vpid (tuple_position_p, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
   tuple_position_p->tpl = scan_id_p->curr_tpl;
   tuple_position_p->tplno = scan_id_p->curr_tplno;
 }
@@ -5062,6 +5060,13 @@ qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * sc
 {
   PAGE_PTR page_p;
 
+  if (qfile_tuple_position_is_raw_fd (tuple_position_p))
+    {
+      /* Segment-positioned raw-fd jumps are wired by the follow-up qmgr_segment_pos_read phase. */
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+      return S_ERROR;
+    }
   if (tuple_position_p->position == S_ON)
     {
       if (scan_id_p->position == S_ON)
@@ -6613,10 +6618,11 @@ qfile_add_tuple_get_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_i
   /* get the information for our QFILE_TUPLE_POSITION */
   if (tuple_pos)
     {
-      tuple_pos->offset = list_id_p->last_offset;
+      tuple_pos->status = S_OPENED;
+      tuple_pos->position = S_ON;
+      qfile_tuple_position_set_vpid (tuple_pos, &list_id_p->last_vpid, list_id_p->last_offset);
       tuple_pos->tpl = page_p;
       tuple_pos->tplno = list_id_p->tuple_cnt;
-      tuple_pos->vpid = list_id_p->last_vpid;
     }
 
   qfile_add_tuple_to_list_id (list_id_p, page_p, tuple_length, tuple_page_size);

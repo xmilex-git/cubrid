@@ -1750,8 +1750,7 @@ namespace temp_page_store
 
     if (!raw_fd_writes_enabled ())
       {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	return ER_FAILED;
+	return NO_ERROR;
       }
     src.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR)));
     dst.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR)));
@@ -2220,20 +2219,17 @@ namespace temp_page_store
   std::size_t
   position_budget_bytes () noexcept
   {
-    /* Segment-aware widened positions do not exist until P4 (the segment-aware QFILE_TUPLE_POSITION).  In P1a there
-     * are no widened positions to account for, so the position term of the work_mem reservation formula evaluates to
-     * ZERO.  The projected per-entry factors below are retained as the P4-activation hook: when POSITION_BUDGET_ACTIVE
-     * flips true in P4 the held reservation will charge the real saved-scan / hash-list / connect-by parent-position
-     * bytes plus the raw-fd read-cache footprint.  Keeping it 0 here avoids over-throttling parallel degree and the
-     * hard-fail tail for positions that are not yet materialized. */
-    constexpr bool POSITION_BUDGET_ACTIVE = false;	/* P4 activates segment-aware position accounting */
+    /* P4 introduces fixed-size segment-aware tuple positions.  Charge the held reservation for widened saved-scan,
+     * hash-list, connect-by parent-position bytes plus the raw-fd read-cache footprint.  reserve_held still enforces
+     * reserved <= cap + worst_case_slack, with worst_case_slack = shard_count * refill_quantum. */
+    constexpr bool POSITION_BUDGET_ACTIVE = true;
     if (!POSITION_BUDGET_ACTIVE)
       {
 	return 0;
       }
     return WORKMEM_POSITION_SAVED_SCAN_BUDGET * projected_tuple_position_bytes
       + WORKMEM_POSITION_HASH_ENTRY_BUDGET * projected_tuple_simple_pos_bytes
-      + WORKMEM_CONNECT_BY_PARENT_BUDGET * projected_tuple_position_bytes
+      + WORKMEM_CONNECT_BY_PARENT_BUDGET * projected_tuple_position_db_bytes
       + future_read_cache_placeholder_bytes;
   }
 }

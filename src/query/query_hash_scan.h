@@ -45,13 +45,79 @@ typedef enum hash_method HASH_METHOD;
 
 #if defined (SERVER_MODE) || defined (SA_MODE)
 
+/* Tuple position structure for hash value */
+typedef struct qfile_tuple_simple_pos QFILE_TUPLE_SIMPLE_POS;
+struct qfile_tuple_simple_pos
+{
+  QFILE_TUPLE_POSITION_COORDINATE_TYPE coord_type;	/* Coordinate discriminator */
+  union
+  {
+    struct
+    {
+      VPID vpid;		/* Real tuple page identifier */
+      int offset;		/* Tuple offset inside the page */
+      int vpid_reserved;	/* Keep coordinate width fixed */
+    };
+    struct
+    {
+      UINT32 raw_fd_segment_id;	/* Raw-fd segment identifier */
+      INT32 page_index;		/* Page index inside the raw-fd segment */
+      INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
+      INT32 raw_fd_reserved;	/* Keep coordinate width fixed */
+    };
+  };
+  int coord_reserved;		/* Keep simple-position size fixed */
+};
+
+static inline bool
+qfile_tuple_simple_pos_is_raw_fd (const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
+{
+  return simple_pos_p != NULL && simple_pos_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
+}
+
+static inline void
+qfile_tuple_simple_pos_set_vpid (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, const VPID * vpid_p, int offset)
+{
+  simple_pos_p->coord_type = QFILE_TUPLE_POSITION_COORD_VPID;
+  simple_pos_p->vpid = *vpid_p;
+  simple_pos_p->offset = offset;
+  simple_pos_p->vpid_reserved = 0;
+  simple_pos_p->coord_reserved = 0;
+}
+
+static inline void
+qfile_tuple_simple_pos_set_raw_fd (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, UINT32 raw_fd_segment_id, INT32 page_index,
+				  INT32 tuple_offset)
+{
+  simple_pos_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
+  simple_pos_p->raw_fd_segment_id = raw_fd_segment_id;
+  simple_pos_p->page_index = page_index;
+  simple_pos_p->tuple_offset = tuple_offset;
+  simple_pos_p->raw_fd_reserved = 0;
+  simple_pos_p->coord_reserved = 0;
+}
+
+static inline void
+qfile_tuple_position_set_simple_pos (QFILE_TUPLE_POSITION * tuple_position_p,
+				     const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
+{
+  if (qfile_tuple_simple_pos_is_raw_fd (simple_pos_p))
+    {
+      qfile_tuple_position_set_raw_fd (tuple_position_p, simple_pos_p->raw_fd_segment_id, simple_pos_p->page_index,
+				       simple_pos_p->tuple_offset);
+    }
+  else
+    {
+      qfile_tuple_position_set_vpid (tuple_position_p, &simple_pos_p->vpid, simple_pos_p->offset);
+    }
+}
+
 #define MAKE_TUPLE_POSTION(tuple_pos, simple_pos, scan_id_p) \
   do \
     { \
       (tuple_pos).status = (scan_id_p)->status; \
       (tuple_pos).position = S_ON; \
-      (tuple_pos).vpid = (simple_pos)->vpid; \
-      (tuple_pos).offset = (simple_pos)->offset; \
+      qfile_tuple_position_set_simple_pos (&(tuple_pos), (simple_pos)); \
       (tuple_pos).tpl = NULL; \
       (tuple_pos).tplno = 0; /* If tplno is needed, add it from scan_build_hash_list_scan() */ \
     } \
@@ -64,19 +130,11 @@ typedef enum hash_method HASH_METHOD;
       (tuple_pos).position = S_ON; \
       (tuple_pos).vpid.pageid = (tftid).pageid; \
       (tuple_pos).vpid.volid = (tftid).volid; \
-      (tuple_pos).offset = (tftid).offset; \
+      qfile_tuple_position_set_vpid (&(tuple_pos), &(tuple_pos).vpid, (tftid).offset); \
       (tuple_pos).tpl = NULL; \
       (tuple_pos).tplno = 0; /* If tplno is needed, add it from scan_build_hash_list_scan() */ \
     } \
   while (0)
-
-/* Tuple position structure for hash value */
-typedef struct qfile_tuple_simple_pos QFILE_TUPLE_SIMPLE_POS;
-struct qfile_tuple_simple_pos
-{
-  VPID vpid;			/* Real tuple page identifier */
-  int offset;			/* Tuple offset inside the page */
-};
 
 /* hash scan value */
 typedef union hash_scan_value HASH_SCAN_VALUE;

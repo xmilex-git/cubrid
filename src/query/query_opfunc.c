@@ -7198,7 +7198,7 @@ qdata_evaluate_connect_by_root (THREAD_ENTRY * thread_p, void *xasl_p, regu_vari
   QFILE_LIST_ID *list_id_p;
   QFILE_LIST_SCAN_ID s_id;
   QFILE_TUPLE_RECORD tuple_rec = { (QFILE_TUPLE) NULL, 0 };
-  const QFILE_TUPLE_POSITION *bitval = NULL;
+  const QFILE_TUPLE_POSITION_DB *bitval = NULL;
   QFILE_TUPLE_POSITION p_pos;
   QPROC_DB_VALUE_LIST valp;
   DB_VALUE p_pos_dbval;
@@ -7252,16 +7252,16 @@ qdata_evaluate_connect_by_root (THREAD_ENTRY * thread_p, void *xasl_p, regu_vari
 	  return false;
 	}
 
-      bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION *, db_get_bit (&p_pos_dbval, &length));
+      bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION_DB *, db_get_bit (&p_pos_dbval, &length));
 
       if (bitval)
 	{
-	  p_pos.status = s_id.status;
-	  p_pos.position = S_ON;
-	  p_pos.vpid = bitval->vpid;
-	  p_pos.offset = bitval->offset;
-	  p_pos.tpl = NULL;
-	  p_pos.tplno = bitval->tplno;
+	  if (length != QFILE_TUPLE_POSITION_DB_BIT_SIZE)
+	    {
+	      qfile_close_scan (thread_p, &s_id);
+	      return false;
+	    }
+	  qfile_tuple_position_restore_from_stored (&p_pos, bitval);
 
 	  if (qfile_jump_scan_tuple_position (thread_p, &s_id, &p_pos, &tuple_rec, PEEK) != S_SUCCESS)
 	    {
@@ -7329,7 +7329,7 @@ qdata_evaluate_qprior (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node
   QFILE_LIST_ID *list_id_p;
   QFILE_LIST_SCAN_ID s_id;
   QFILE_TUPLE_RECORD tuple_rec = { (QFILE_TUPLE) NULL, 0 };
-  const QFILE_TUPLE_POSITION *bitval = NULL;
+  const QFILE_TUPLE_POSITION_DB *bitval = NULL;
   QFILE_TUPLE_POSITION p_pos;
   DB_VALUE p_pos_dbval;
   XASL_NODE *xasl, *xptr;
@@ -7373,16 +7373,16 @@ qdata_evaluate_qprior (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node
       return false;
     }
 
-  bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION *, db_get_bit (&p_pos_dbval, &length));
+  bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION_DB *, db_get_bit (&p_pos_dbval, &length));
 
   if (bitval)
     {
-      p_pos.status = s_id.status;
-      p_pos.position = S_ON;
-      p_pos.vpid = bitval->vpid;
-      p_pos.offset = bitval->offset;
-      p_pos.tpl = NULL;
-      p_pos.tplno = bitval->tplno;
+      if (length != QFILE_TUPLE_POSITION_DB_BIT_SIZE)
+	{
+	  qfile_close_scan (thread_p, &s_id);
+	  return false;
+	}
+      qfile_tuple_position_restore_from_stored (&p_pos, bitval);
 
       if (qfile_jump_scan_tuple_position (thread_p, &s_id, &p_pos, &tuple_rec, PEEK) != S_SUCCESS)
 	{
@@ -7449,7 +7449,7 @@ qdata_evaluate_sys_connect_by_path (THREAD_ENTRY * thread_p, void *xasl_p, regu_
   QFILE_LIST_ID *list_id_p;
   QFILE_LIST_SCAN_ID s_id;
   QFILE_TUPLE_RECORD tuple_rec = { (QFILE_TUPLE) NULL, 0 };
-  const QFILE_TUPLE_POSITION *bitval = NULL;
+  const QFILE_TUPLE_POSITION_DB *bitval = NULL;
   QFILE_TUPLE_POSITION p_pos;
   QPROC_DB_VALUE_LIST valp;
   DB_VALUE p_pos_dbval, cast_value, arg_dbval;
@@ -7707,16 +7707,15 @@ qdata_evaluate_sys_connect_by_path (THREAD_ENTRY * thread_p, void *xasl_p, regu_
 	  goto error;
 	}
 
-      bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION *, db_get_bit (&p_pos_dbval, &length));
+      bitval = REINTERPRET_CAST (const QFILE_TUPLE_POSITION_DB *, db_get_bit (&p_pos_dbval, &length));
 
       if (bitval)
 	{
-	  p_pos.status = s_id.status;
-	  p_pos.position = S_ON;
-	  p_pos.vpid = bitval->vpid;
-	  p_pos.offset = bitval->offset;
-	  p_pos.tpl = NULL;
-	  p_pos.tplno = bitval->tplno;
+	  if (length != QFILE_TUPLE_POSITION_DB_BIT_SIZE)
+	    {
+	      goto error;
+	    }
+	  qfile_tuple_position_restore_from_stored (&p_pos, bitval);
 
 	  if (qfile_jump_scan_tuple_position (thread_p, &s_id, &p_pos, &tuple_rec, PEEK) != S_SUCCESS)
 	    {
