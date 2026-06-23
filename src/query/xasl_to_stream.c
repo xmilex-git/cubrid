@@ -4668,6 +4668,8 @@ xts_process_indx_info (char *ptr, const INDX_INFO * indx_info)
 
   ptr = or_pack_int (ptr, indx_info->use_desc_index);
 
+  ptr = or_pack_int (ptr, indx_info->probe_leaf_memo);
+
   ptr = or_pack_int (ptr, indx_info->orderby_skip);
 
   ptr = or_pack_int (ptr, indx_info->groupby_skip);
@@ -6903,6 +6905,7 @@ xts_sizeof_indx_info (const INDX_INFO * indx_info)
   size += (OR_INT_SIZE		/* orderby_desc */
 	   + OR_INT_SIZE	/* groupby_desc */
 	   + OR_INT_SIZE	/* use_desc_index */
+	   + OR_INT_SIZE	/* probe_leaf_memo */
 	   + OR_INT_SIZE	/* orderby_skip */
 	   + OR_INT_SIZE	/* groupby_skip */
 	   + OR_INT_SIZE	/* use_iss boolean (int) */

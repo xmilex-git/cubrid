@@ -778,6 +778,20 @@ mark_access_as_outer_join (PARSER_CONTEXT * parser, XASL_NODE * xasl)
     }
 }
 
+static void
+mark_index_access_probe_leaf_memo (ACCESS_SPEC_TYPE * spec_list)
+{
+  ACCESS_SPEC_TYPE *access;
+
+  for (access = spec_list; access != NULL; access = access->next)
+    {
+      if (access->access == ACCESS_METHOD_INDEX && access->indexptr != NULL && !access->indexptr->use_desc_index)
+	{
+	  access->indexptr->probe_leaf_memo = 1;
+	}
+    }
+}
+
 /*
  * init_class_scan_proc () -
  *   return: XASL_NODE *
@@ -2203,6 +2217,7 @@ gen_outer (QO_ENV * env, QO_PLAN * plan, BITSET * subqueries, XASL_NODE * inner_
 	  scan = gen_inner (env, inner, &predset, &new_subqueries, inner_scans, fetches);
 	  if (scan)
 	    {
+	      mark_index_access_probe_leaf_memo (scan->spec_list);
 	      if (IS_OUTER_JOIN_TYPE (join_type))
 		{
 		  mark_access_as_outer_join (parser, scan);

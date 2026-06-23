@@ -4737,6 +4737,8 @@ stx_build_indx_info (THREAD_ENTRY * thread_p, char *ptr, INDX_INFO * indx_info)
 
   ptr = or_unpack_int (ptr, &indx_info->use_desc_index);
 
+  ptr = or_unpack_int (ptr, &indx_info->probe_leaf_memo);
+
   ptr = or_unpack_int (ptr, &indx_info->orderby_skip);
 
   ptr = or_unpack_int (ptr, &indx_info->groupby_skip);

@@ -1490,6 +1490,13 @@ static int btree_range_scan_advance_over_filtered_keys (THREAD_ENTRY * thread_p,
 static int btree_range_scan_descending_fix_prev_leaf (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, int *key_count,
 						      BTREE_NODE_HEADER ** node_header_ptr, VPID * next_vpid);
 static int btree_range_scan_start (THREAD_ENTRY * thread_p, BTREE_SCAN * bts);
+static int btree_range_scan_start_from_memo (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, bool * found,
+					     bool * memo_hit);
+static int btree_probe_leaf_memo_check_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, PAGE_PTR leaf,
+					    BTREE_SEARCH_KEY_HELPER * search_key);
+static int btree_probe_leaf_memo_try_page (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, int memo_idx,
+					   BTREE_SEARCH_KEY_HELPER * search_key, PAGE_PTR * leaf_out);
+static void btree_probe_leaf_memo_record (THREAD_ENTRY * thread_p, BTREE_SCAN * bts);
 static int btree_range_scan_resume (THREAD_ENTRY * thread_p, BTREE_SCAN * bts);
 static int btree_range_scan_count_oids_leaf_and_one_ovf (THREAD_ENTRY * thread_p, BTREE_SCAN * bts);
 static int btree_scan_update_range (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, key_val_range * kv_range);
@@ -15864,10 +15871,12 @@ btree_prepare_bts (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, BTID * btid, INDX_
       if (index_scan_id_p->indx_info != NULL)
 	{
 	  bts->use_desc_index = index_scan_id_p->indx_info->use_desc_index != 0;
+	  bts->probe_leaf_memo = index_scan_id_p->indx_info->probe_leaf_memo != 0;
 	}
       else
 	{
 	  bts->use_desc_index = false;
+	  bts->probe_leaf_memo = false;
 	}
       bts->oid_ptr = bts->index_scan_idp->oid_list != NULL ? bts->index_scan_idp->oid_list->oidp : NULL;
 
@@ -16900,10 +16909,12 @@ btree_get_next_key_info (THREAD_ENTRY * thread_p, BTID * btid, BTREE_SCAN * bts,
   if (index_scan_id_p->indx_info)
     {
       bts->use_desc_index = index_scan_id_p->indx_info->use_desc_index != 0;
+      bts->probe_leaf_memo = index_scan_id_p->indx_info->probe_leaf_memo != 0;
     }
   else
     {
       bts->use_desc_index = 0;
+      bts->probe_leaf_memo = false;
     }
 
   if (bts->C_vpid.pageid == NULL_PAGEID)
@@ -24920,6 +24931,330 @@ btree_range_scan_count_oids_leaf_and_one_ovf (THREAD_ENTRY * thread_p, BTREE_SCA
 }
 
 /*
+ * Probe leaf memo is enabled by a compile-time enable gate (ascending NL-inner only); no system parameter, no runtime
+ * suppressor; write-hot workloads pay ~1 speculative page fix per miss -- accepted and documented.
+ */
+#if !defined(NDEBUG)
+/* Probe leaf memo statistics. Debug builds only: the release hot path must not add cross-thread atomic counter
+ * contention, and the periodic er_log_debug report must not flood production logs or perturb shell log-assertion test
+ * cases. Compiled out entirely in release. */
+static volatile UINT64 btree_Memo_probe_count = 0;
+static volatile UINT64 btree_Memo_hit_count = 0;
+static volatile UINT64 btree_Memo_hop_hit_count = 0;
+static volatile UINT64 btree_Memo_miss_smaller_count = 0;	/* key below memoized leaf range */
+static volatile UINT64 btree_Memo_miss_bigger_count = 0;	/* key above; right hop failed or unavailable */
+static volatile UINT64 btree_Memo_miss_page_count = 0;	/* page deallocated or LSA changed */
+static volatile UINT64 btree_Memo_miss_other_count = 0;	/* unknown compare result and other cases */
+
+/* Report probe leaf memo statistics every this many probes (power of two). */
+#define BTREE_MEMO_STAT_REPORT_INTERVAL 0x40000
+#define BTREE_MEMO_STAT_INC(counter) ATOMIC_INC_64 (&(counter), 1)
+#else
+#define BTREE_MEMO_STAT_INC(counter) ((void) 0)
+#endif /* !NDEBUG */
+
+/*
+ * btree_probe_leaf_memo_check_key () - Decide if the scan's lower key belongs to the given leaf page (probe leaf
+ *					memo helper). Outputs BTREE_KEY_FOUND or BTREE_KEY_BETWEEN with the
+ *					positioned slot when it provably does, any other result otherwise.
+ *
+ * return	    : Error code.
+ * thread_p (in)    : Thread entry.
+ * bts (in)	    : B-tree scan structure (provides b-tree info and the lower key).
+ * leaf (in)	    : Leaf page, already validated to be an unchanged leaf of this b-tree.
+ * search_key (out) : Output result of search.
+ */
+static int
+btree_probe_leaf_memo_check_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, PAGE_PTR leaf,
+				 BTREE_SEARCH_KEY_HELPER * search_key)
+{
+  int error_code = NO_ERROR;
+
+  if (btree_node_get_common_prefix (thread_p, &bts->btid_int, leaf) > 0)
+    {
+      /* Compressed page: the binary search compare that skips the common prefix columns is only reliable for keys
+       * inside the fence range. Gate with the border key check first. */
+      error_code = btree_leaf_is_key_between_min_max (thread_p, &bts->btid_int, leaf, bts->key_range.lower_key,
+						      search_key);
+      if (error_code != NO_ERROR)
+	{
+	  ASSERT_ERROR ();
+	  return error_code;
+	}
+      if (search_key->result != BTREE_KEY_BETWEEN)
+	{
+	  /* FOUND (key equals a non-fence border key), SMALLER, BIGGER or NOTFOUND; decided by the borders. */
+	  return NO_ERROR;
+	}
+    }
+
+  /* Uncompressed page (full key compare is safe for any key) or key is between the compressed page's borders.
+   * Binary search the page. */
+  return btree_search_leaf_page (thread_p, &bts->btid_int, leaf, bts->key_range.lower_key, search_key);
+}
+
+/*
+ * btree_probe_leaf_memo_try_page () - Try to position the scan's lower key on one memoized leaf page (probe leaf
+ *				       memo helper).
+ *
+ * return	    : Error code.
+ * thread_p (in)    : Thread entry.
+ * bts (in/out)	    : B-tree scan structure. Dead memo entries are reset.
+ * memo_idx (in)    : Index of the memo entry to try. Entry must not be empty.
+ * search_key (out) : Output result of search. BTREE_KEY_NOTFOUND when the page itself was dead.
+ * leaf_out (out)   : On success (result BTREE_KEY_FOUND or BTREE_KEY_BETWEEN), the fixed leaf page the key belongs
+ *		      to. NULL otherwise.
+ *
+ * NOTE: The memoized leaf is trusted only when both checks below pass; on any doubt the caller falls back to other
+ *	 memo entries or a normal descent, so probe keys do not need to be sorted in any way:
+ *	 1. The page LSA is unchanged since the page was memoized. The page was a leaf of this b-tree with the
+ *	    same content back then; any change (key insert/delete, split, merge, deallocation, reuse by another
+ *	    file) writes log and bumps the page LSA. This is the same trust btree_range_scan_resume () places in
+ *	    cur_leaf_lsa. The page is fixed without the sector reservation check of pgbuf_fix_if_not_deallocated ()
+ *	    - that check costs too much for a per-probe operation and the LSA check subsumes it:
+ *	    pgbuf_dealloc_page () logs the deallocation against the page itself, so a deallocated (or deallocated
+ *	    and reused) page can never keep the memoized LSA.
+ *	 2. The lower key provably belongs to the leaf: equal to a non-fence border key or strictly between the
+ *	    page border keys (btree_probe_leaf_memo_check_key ()). Leaf pages partition the key space, so such a
+ *	    key cannot belong to any other leaf. Keys past the biggest key get one chance on the right sibling:
+ *	    while the verified page is held read-latched its next link cannot change (any link update must
+ *	    write-latch this page), so the right sibling is guaranteed to be a valid leaf of this b-tree, and
+ *	    fixing it while holding the current leaf is the same left-to-right crabbing the ascending scan advance
+ *	    uses.
+ */
+static int
+btree_probe_leaf_memo_try_page (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, int memo_idx,
+				BTREE_SEARCH_KEY_HELPER * search_key, PAGE_PTR * leaf_out)
+{
+  PAGE_PTR leaf = NULL;
+  int error_code = NO_ERROR;
+
+  assert (memo_idx >= 0 && memo_idx < BTREE_PROBE_LEAF_MEMO_SIZE);
+  assert (!VPID_ISNULL (&bts->memo_vpid[memo_idx]));
+
+  *leaf_out = NULL;
+  search_key->result = BTREE_KEY_NOTFOUND;
+
+  leaf = pgbuf_fix (thread_p, &bts->memo_vpid[memo_idx], OLD_PAGE_MAYBE_DEALLOCATED, PGBUF_LATCH_READ,
+		    PGBUF_UNCONDITIONAL_LATCH);
+  if (leaf == NULL)
+    {
+      ASSERT_ERROR_AND_SET (error_code);
+      if (error_code == ER_PB_BAD_PAGEID)
+	{
+	  /* Page was deallocated. Memo entry is dead. */
+	  er_clear ();
+	  error_code = NO_ERROR;
+	  VPID_SET_NULL (&bts->memo_vpid[memo_idx]);
+	}
+      return error_code;
+    }
+  if (!LSA_EQ (&bts->memo_lsa[memo_idx], pgbuf_get_lsa (leaf)))
+    {
+      /* Page suffered changes since it was memoized (or was even deallocated/reused for another purpose). Memo
+       * entry is dead. */
+      pgbuf_unfix_and_init (thread_p, leaf);
+      VPID_SET_NULL (&bts->memo_vpid[memo_idx]);
+      return NO_ERROR;
+    }
+
+  /* Page is unchanged since a previous scan visited it as a leaf of this b-tree. Check that the lower key provably
+   * belongs to this leaf. */
+  error_code = btree_probe_leaf_memo_check_key (thread_p, bts, leaf, search_key);
+  if (error_code != NO_ERROR)
+    {
+      pgbuf_unfix_and_init (thread_p, leaf);
+      ASSERT_ERROR ();
+      return error_code;
+    }
+
+  if (search_key->result == BTREE_KEY_BIGGER)
+    {
+      /* Key is past the biggest key of this leaf. Chase one leaf to the right (see note 2 above). */
+      BTREE_NODE_HEADER *header = btree_get_node_header (thread_p, leaf);
+      PAGE_PTR next_leaf = NULL;
+      VPID next_vpid;
+
+      if (header == NULL)
+	{
+	  assert (false);
+	  pgbuf_unfix_and_init (thread_p, leaf);
+	  return ER_FAILED;
+	}
+      VPID_COPY (&next_vpid, &header->next_vpid);
+      if (VPID_ISNULL (&next_vpid))
+	{
+	  /* This is the rightmost leaf. */
+	  pgbuf_unfix_and_init (thread_p, leaf);
+	  return NO_ERROR;
+	}
+      next_leaf = pgbuf_fix (thread_p, &next_vpid, OLD_PAGE, PGBUF_LATCH_READ, PGBUF_UNCONDITIONAL_LATCH);
+      if (next_leaf == NULL)
+	{
+	  pgbuf_unfix_and_init (thread_p, leaf);
+	  ASSERT_ERROR_AND_SET (error_code);
+	  return error_code;
+	}
+      pgbuf_unfix_and_init (thread_p, leaf);
+      leaf = next_leaf;
+
+      /* Same check on the right sibling. A key bigger than the memoized leaf's keys but smaller than all of the
+       * right sibling's keys (inside the fence gap) stays ambiguous; keep search_key->result of the sibling
+       * (BTREE_KEY_SMALLER), which is not a success. */
+      error_code = btree_probe_leaf_memo_check_key (thread_p, bts, leaf, search_key);
+      if (error_code != NO_ERROR)
+	{
+	  pgbuf_unfix_and_init (thread_p, leaf);
+	  ASSERT_ERROR ();
+	  return error_code;
+	}
+      if (search_key->result == BTREE_KEY_FOUND || search_key->result == BTREE_KEY_BETWEEN)
+	{
+	  BTREE_MEMO_STAT_INC (btree_Memo_hop_hit_count);
+	}
+    }
+
+  if (search_key->result != BTREE_KEY_FOUND && search_key->result != BTREE_KEY_BETWEEN)
+    {
+      /* Key is not covered by this leaf (or compare result is unknown). Keep the memo entry; another probe key may
+       * land back in this leaf. */
+      pgbuf_unfix_and_init (thread_p, leaf);
+      return NO_ERROR;
+    }
+
+  /* Key belongs to this leaf. */
+  *leaf_out = leaf;
+  return NO_ERROR;
+}
+
+/*
+ * btree_range_scan_start_from_memo () - Try to start a range scan directly on one of the leaf pages memoized from
+ *					  previous range scans over the same BTREE_SCAN structure, skipping the
+ *					  root-to-leaf descent (probe leaf memo).
+ *
+ * return	  : Error code.
+ * thread_p (in)  : Thread entry.
+ * bts (in/out)	  : B-tree scan structure. On memo hit, C_page is fixed and C_vpid/slot_id are positioned on the
+ *		    lower key exactly like btree_locate_key () would have positioned them.
+ * found (out)	  : Outputs true if lower key was found in the memoized leaf. Valid only on memo hit.
+ * memo_hit (out) : Outputs true if scan was positioned using a memoized leaf. On false, the caller must do a
+ *		    normal root-to-leaf descent.
+ *
+ * NOTE: Memo entries are tried in most-recently-used order. See btree_probe_leaf_memo_try_page () for the safety
+ *	 argument of each try. Compile-time enable gate (ascending NL-inner only); no system parameter, no runtime
+ *	 suppressor; write-hot workloads pay ~1 speculative page fix per miss -- accepted and documented.
+ */
+static int
+btree_range_scan_start_from_memo (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, bool * found, bool * memo_hit)
+{
+  PAGE_PTR leaf = NULL;
+  BTREE_SEARCH_KEY_HELPER search_key = BTREE_SEARCH_KEY_HELPER_INITIALIZER;
+  BTREE_SEARCH first_result = BTREE_KEY_NOTFOUND;
+  int error_code = NO_ERROR;
+  int i;
+  bool tried_any = false;
+
+  /* Assert expected arguments. The intrinsic applicability conditions are the correctness guarantee. */
+  assert (bts != NULL && found != NULL && memo_hit != NULL);
+  assert (bts->key_range.lower_key != NULL);
+  assert (!bts->use_desc_index);
+  assert (bts->C_page == NULL);
+
+  *found = false;
+  *memo_hit = false;
+
+  for (i = 0; i < BTREE_PROBE_LEAF_MEMO_SIZE; i++)
+    {
+      if (VPID_ISNULL (&bts->memo_vpid[i]))
+	{
+	  continue;
+	}
+      error_code = btree_probe_leaf_memo_try_page (thread_p, bts, i, &search_key, &leaf);
+      if (error_code != NO_ERROR)
+	{
+	  ASSERT_ERROR ();
+	  return error_code;
+	}
+      if (leaf != NULL)
+	{
+	  /* Memo hit. Position scan on the validated leaf. */
+	  bts->C_page = leaf;
+	  pgbuf_get_vpid (leaf, &bts->C_vpid);
+	  bts->slot_id = search_key.slotid;
+	  *found = (search_key.result == BTREE_KEY_FOUND);
+	  *memo_hit = true;
+	  return NO_ERROR;
+	}
+      if (!tried_any)
+	{
+	  tried_any = true;
+	  first_result = search_key.result;
+	}
+    }
+
+  if (tried_any)
+    {
+#if !defined(NDEBUG)
+      /* Classify the miss by the verdict of the most recent entry. */
+      switch (first_result)
+	{
+	case BTREE_KEY_SMALLER:
+	  BTREE_MEMO_STAT_INC (btree_Memo_miss_smaller_count);
+	  break;
+	case BTREE_KEY_BIGGER:
+	  BTREE_MEMO_STAT_INC (btree_Memo_miss_bigger_count);
+	  break;
+	case BTREE_KEY_NOTFOUND:
+	  BTREE_MEMO_STAT_INC (btree_Memo_miss_page_count);
+	  break;
+	default:
+	  BTREE_MEMO_STAT_INC (btree_Memo_miss_other_count);
+	  break;
+	}
+#endif /* !NDEBUG */
+    }
+  return NO_ERROR;
+}
+
+/*
+ * btree_probe_leaf_memo_record () - Memoize the leaf page currently fixed as bts->C_page (most-recently-used
+ *				     insert with duplicate elimination) so following scans started over this
+ *				     structure may resume from it directly (probe leaf memo).
+ *
+ * return	 : Void.
+ * thread_p (in) : Thread entry.
+ * bts (in/out)	 : B-tree scan structure. C_page must be fixed.
+ */
+static void
+btree_probe_leaf_memo_record (THREAD_ENTRY * thread_p, BTREE_SCAN * bts)
+{
+  VPID *cur_vpid = pgbuf_get_vpid_ptr (bts->C_page);
+  int i, last_idx, dup_idx = -1, empty_idx = -1;
+
+  for (i = 0; i < BTREE_PROBE_LEAF_MEMO_SIZE; i++)
+    {
+      if (dup_idx < 0 && VPID_EQ (&bts->memo_vpid[i], cur_vpid))
+	{
+	  dup_idx = i;
+	}
+      if (empty_idx < 0 && VPID_ISNULL (&bts->memo_vpid[i]))
+	{
+	  empty_idx = i;
+	}
+    }
+  /* Shift down to the duplicate of this page (move-to-front instead of duplicating), or to an empty entry, or
+   * evict the least recently used entry. */
+  last_idx = dup_idx >= 0 ? dup_idx : (empty_idx >= 0 ? empty_idx : BTREE_PROBE_LEAF_MEMO_SIZE - 1);
+  for (i = last_idx; i > 0; i--)
+    {
+      VPID_COPY (&bts->memo_vpid[i], &bts->memo_vpid[i - 1]);
+      LSA_COPY (&bts->memo_lsa[i], &bts->memo_lsa[i - 1]);
+    }
+  VPID_COPY (&bts->memo_vpid[0], cur_vpid);
+  LSA_COPY (&bts->memo_lsa[0], pgbuf_get_lsa (bts->C_page));
+}
+
+/*
  * btree_range_scan_start () - Start a range scan by finding the first eligible key.
  *
  * return	 : Error code.
@@ -24964,14 +25299,81 @@ btree_range_scan_start (THREAD_ENTRY * thread_p, BTREE_SCAN * bts)
     }
   else
     {
-      /* Has lower limit. Try to locate the key. */
-      error_code =
-	btree_locate_key (thread_p, &bts->btid_int, bts->key_range.lower_key, &bts->C_vpid, &bts->slot_id,
-			  &bts->C_page, &found);
-      if (error_code != NO_ERROR)
+      bool memo_hit = false;
+
+      if (bts->probe_leaf_memo)
 	{
-	  ASSERT_ERROR ();
-	  return error_code;
+	  error_code = btree_range_scan_start_from_memo (thread_p, bts, &found, &memo_hit);
+	  if (error_code != NO_ERROR)
+	    {
+	      ASSERT_ERROR ();
+	      return error_code;
+	    }
+#if !defined(NDEBUG)
+	  {
+	    UINT64 num_probes = BTREE_MEMO_STAT_INC (btree_Memo_probe_count);
+
+	    if (memo_hit)
+	      {
+		BTREE_MEMO_STAT_INC (btree_Memo_hit_count);
+	      }
+	    if ((num_probes & (BTREE_MEMO_STAT_REPORT_INTERVAL - 1)) == 0)
+	      {
+		UINT64 num_hits = ATOMIC_LOAD_64 (&btree_Memo_hit_count);
+		UINT64 num_hop_hits = ATOMIC_LOAD_64 (&btree_Memo_hop_hit_count);
+		er_log_debug (ARG_FILE_LINE,
+			      "btree probe leaf memo: probes = %llu, hits = %llu (hop hits = %llu), hit rate = %.2f%%, "
+			      "misses: smaller = %llu, bigger = %llu, page = %llu, other = %llu\n",
+			      (unsigned long long) num_probes, (unsigned long long) num_hits,
+			      (unsigned long long) num_hop_hits,
+			      num_probes > 0 ? (double) num_hits * 100.0 / (double) num_probes : 0.0,
+			      (unsigned long long) ATOMIC_LOAD_64 (&btree_Memo_miss_smaller_count),
+			      (unsigned long long) ATOMIC_LOAD_64 (&btree_Memo_miss_bigger_count),
+			      (unsigned long long) ATOMIC_LOAD_64 (&btree_Memo_miss_page_count),
+			      (unsigned long long) ATOMIC_LOAD_64 (&btree_Memo_miss_other_count));
+	      }
+	  }
+#endif /* !NDEBUG */
+
+#if !defined(NDEBUG)
+	  if (memo_hit)
+	    {
+	      /* Parity guard: the memo path must position exactly where a full root-to-leaf descent would. Run the
+	       * descent into throwaway locals and assert it agrees on page, slot and found. Debug builds only. */
+	      VPID dbg_vpid = bts->C_vpid;
+	      PAGE_PTR dbg_page = NULL;
+	      INT16 dbg_slot = NULL_SLOTID;
+	      bool dbg_found = false;
+	      int dbg_error =
+		btree_locate_key (thread_p, &bts->btid_int, bts->key_range.lower_key, &dbg_vpid, &dbg_slot,
+				  &dbg_page, &dbg_found);
+
+	      assert (dbg_error == NO_ERROR);
+	      if (dbg_error == NO_ERROR)
+		{
+		  assert (VPID_EQ (&dbg_vpid, &bts->C_vpid));
+		  assert (dbg_slot == bts->slot_id);
+		  assert (dbg_found == found);
+		}
+	      if (dbg_page != NULL)
+		{
+		  pgbuf_unfix_and_init (thread_p, dbg_page);
+		}
+	    }
+#endif /* !NDEBUG */
+	}
+
+      if (!memo_hit)
+	{
+	  /* Has lower limit. Try to locate the key. */
+	  error_code =
+	    btree_locate_key (thread_p, &bts->btid_int, bts->key_range.lower_key, &bts->C_vpid, &bts->slot_id,
+			      &bts->C_page, &found);
+	  if (error_code != NO_ERROR)
+	    {
+	      ASSERT_ERROR ();
+	      return error_code;
+	    }
 	}
       if (!found)
 	{
@@ -25959,6 +26361,11 @@ end:
       /* Unfix current page and save its LSA. */
       assert (bts->end_scan || VPID_EQ (pgbuf_get_vpid_ptr (bts->C_page), &bts->C_vpid));
       LSA_COPY (&bts->cur_leaf_lsa, pgbuf_get_lsa (bts->C_page));
+
+      if (bts->probe_leaf_memo)
+	{
+	  btree_probe_leaf_memo_record (thread_p, bts);
+	}
 
       if (bts->end_one_iteration)
 	{

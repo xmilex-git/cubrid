@@ -95,6 +95,7 @@ struct indx_info
   int orderby_desc;		/* first column of the order by is desc */
   int groupby_desc;		/* first column of the group by is desc */
   int use_desc_index;		/* using descending index */
+  int probe_leaf_memo;		/* 1 = ascending NL-join inner: enable B-tree probe leaf memo; else 0 */
   int orderby_skip;		/* order by skip information */
   int groupby_skip;		/* group by skip information */
   int use_iss;			/* flag set if using index skip scan */

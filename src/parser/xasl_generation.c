@@ -11948,6 +11948,7 @@ pt_to_index_info (PARSER_CONTEXT * parser, DB_OBJECT * class_, PRED_EXPR * where
 
   indx_infop->class_oid = class_->oid_info.oid;
   indx_infop->use_desc_index = index_entryp->use_descending;
+  indx_infop->probe_leaf_memo = 0;
   indx_infop->orderby_skip = index_entryp->orderby_skip;
   indx_infop->groupby_skip = index_entryp->groupby_skip;
 
