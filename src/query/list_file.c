@@ -4987,7 +4987,18 @@ qfile_save_current_scan_tuple_position (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TU
 {
   tuple_position_p->status = scan_id_p->status;
   tuple_position_p->position = scan_id_p->position;
-  qfile_tuple_position_set_vpid (tuple_position_p, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
+  if (scan_id_p->list_id.tfile_vfid != NULL
+      && scan_id_p->list_id.tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+      && scan_id_p->list_id.tfile_vfid->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
+      && scan_id_p->curr_vpid.pageid > scan_id_p->list_id.tfile_vfid->membuf_last)
+    {
+      qfile_tuple_position_set_raw_fd (tuple_position_p, scan_id_p->list_id.tfile_vfid->raw_fd_handle->segment_id (),
+				       scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
+    }
+  else
+    {
+      qfile_tuple_position_set_vpid (tuple_position_p, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
+    }
   tuple_position_p->tpl = scan_id_p->curr_tpl;
   tuple_position_p->tplno = scan_id_p->curr_tplno;
 }
@@ -5226,13 +5237,8 @@ qfile_start_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
  * Note: A scan identifier is created to scan through the given list of tuples.
  */
 static int
-qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p, bool materialize_raw_fd)
+qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
-  if (materialize_raw_fd && qmgr_materialize_to_pgbuf (thread_get_thread_entry_info (), list_id_p) != NO_ERROR)
-    {
-      return ER_FAILED;
-    }
-
   scan_id_p->status = S_OPENED;
   scan_id_p->position = S_BEFORE;
   scan_id_p->keep_page_on_finish = 0;
@@ -5255,13 +5261,13 @@ qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * s
 int
 qfile_open_list_scan (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
-  return qfile_open_list_scan_internal (list_id_p, scan_id_p, true);
+  return qfile_open_list_scan_internal (list_id_p, scan_id_p);
 }
 
 int
 qfile_open_list_scan_raw_fd_segments (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
-  return qfile_open_list_scan_internal (list_id_p, scan_id_p, false);
+  return qfile_open_list_scan_internal (list_id_p, scan_id_p);
 }
 
 /*
@@ -6672,7 +6678,17 @@ qfile_add_tuple_get_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_i
     {
       tuple_pos->status = S_OPENED;
       tuple_pos->position = S_ON;
-      qfile_tuple_position_set_vpid (tuple_pos, &list_id_p->last_vpid, list_id_p->last_offset);
+      if (list_id_p->tfile_vfid != NULL && list_id_p->tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+	  && list_id_p->tfile_vfid->raw_fd_handle != NULL && list_id_p->last_vpid.volid == NULL_VOLID
+	  && list_id_p->last_vpid.pageid > list_id_p->tfile_vfid->membuf_last)
+	{
+	  qfile_tuple_position_set_raw_fd (tuple_pos, list_id_p->tfile_vfid->raw_fd_handle->segment_id (),
+					   list_id_p->last_vpid.pageid, list_id_p->last_offset);
+	}
+      else
+	{
+	  qfile_tuple_position_set_vpid (tuple_pos, &list_id_p->last_vpid, list_id_p->last_offset);
+	}
       tuple_pos->tpl = page_p;
       tuple_pos->tplno = list_id_p->tuple_cnt;
     }
@@ -6879,7 +6895,8 @@ qfile_set_tuple_column_value (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p
   else
     {
       /* tuple is in overflow pages */
-      if (curr_page_p)
+      if (curr_page_p != NULL && (tuple_p < (QFILE_TUPLE) curr_page_p
+				  || tuple_p >= (QFILE_TUPLE) curr_page_p + DB_PAGESIZE))
 	{
 	  /* tuple_p is not a tuple pointer inside the current page, it is a copy made by qfile_scan_list_next(), so
 	   * avoid fetching it twice, and make sure it doesn't get freed at cleanup stage of this function. For
@@ -6935,6 +6952,51 @@ cleanup:
       qmgr_free_old_page_and_init (thread_p, page_p, list_id_p->tfile_vfid);
     }
 
+  return error;
+}
+
+int
+qfile_set_tuple_column_value_by_position (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p,
+					  QFILE_TUPLE_POSITION * tuple_position_p, int col_num,
+					  DB_VALUE * value_p, TP_DOMAIN * domain_p)
+{
+  PAGE_PTR page_p = NULL;
+  VPID vpid = VPID_INITIALIZER;
+  int tuple_offset = QFILE_NULL_PAGE_OFFSET;
+
+  if (tuple_position_p == NULL || tuple_position_p->position != S_ON)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return ER_FAILED;
+    }
+
+  if (qfile_tuple_position_is_raw_fd (tuple_position_p))
+    {
+      page_p = qmgr_segment_pos_read (thread_p, list_id_p->tfile_vfid, tuple_position_p);
+      vpid.volid = NULL_VOLID;
+      vpid.pageid = tuple_position_p->page_index;
+      tuple_offset = tuple_position_p->tuple_offset;
+    }
+  else
+    {
+      page_p = qmgr_get_old_page (thread_p, &tuple_position_p->vpid, list_id_p->tfile_vfid);
+      vpid = tuple_position_p->vpid;
+      tuple_offset = tuple_position_p->offset;
+    }
+
+  if (page_p == NULL || tuple_offset < QFILE_PAGE_HEADER_SIZE || tuple_offset >= DB_PAGESIZE)
+    {
+      if (page_p != NULL)
+	{
+	  qmgr_free_old_page_and_init (thread_p, page_p, list_id_p->tfile_vfid);
+	}
+      return ER_FAILED;
+    }
+
+  const int error =
+    qfile_set_tuple_column_value (thread_p, list_id_p, page_p, &vpid, (QFILE_TUPLE) page_p + tuple_offset, col_num,
+				  value_p, domain_p);
+  qmgr_free_old_page_and_init (thread_p, page_p, list_id_p->tfile_vfid);
   return error;
 }
 

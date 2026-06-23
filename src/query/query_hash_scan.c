@@ -38,6 +38,7 @@
 #include "query_opfunc.h"
 #include "string_opfunc.h"
 #include "query_hash_scan.h"
+#include "query_manager.h"
 #include "db_value_printer.hpp"
 #include "dbtype.h"
 #include "chartype.h"
@@ -697,7 +698,18 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
     }
 
   /* save position */
-  qfile_tuple_simple_pos_set_vpid (value->pos, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
+  if (scan_id_p->list_id.tfile_vfid != NULL
+      && scan_id_p->list_id.tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+      && scan_id_p->list_id.tfile_vfid->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
+      && scan_id_p->curr_vpid.pageid > scan_id_p->list_id.tfile_vfid->membuf_last)
+    {
+      qfile_tuple_simple_pos_set_raw_fd (value->pos, scan_id_p->list_id.tfile_vfid->raw_fd_handle->segment_id (),
+					 scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
+    }
+  else
+    {
+      qfile_tuple_simple_pos_set_vpid (value->pos, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
+    }
 
   return value;
 }

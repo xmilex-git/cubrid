@@ -98,6 +98,8 @@ namespace temp_page_store
       friend PAGE_PTR rawfd_pos_read (THREAD_ENTRY * thread_p, raw_fd_file &file,
                                       const raw_fd_page_coordinate &coordinate) noexcept;
       friend void rawfd_invalidate_cached_page (raw_fd_file &file, PAGEID page_index) noexcept;
+      friend int rawfd_rewrite_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index,
+                                     PAGE_PTR page_p) noexcept;
 
       int m_fd;
       std::string m_path;
@@ -122,10 +124,12 @@ namespace temp_page_store
   PAGE_PTR rawfd_pos_read (THREAD_ENTRY * thread_p, raw_fd_file &file,
                            const raw_fd_page_coordinate &coordinate) noexcept;
   void rawfd_invalidate_cached_page (raw_fd_file &file, PAGEID page_index) noexcept;
+  int rawfd_rewrite_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index, PAGE_PTR page_p) noexcept;
   int rawfd_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept;
   void rawfd_release_fixed_page (QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept;
 
   int rawfd_single_worker_tde_positioned_read_parity (THREAD_ENTRY * thread_p) noexcept;
+  int rawfd_mutation_nonce_selftest (THREAD_ENTRY * thread_p) noexcept;
   int qmgr_temp_file_move_selftest (THREAD_ENTRY * thread_p) noexcept;
 
   PAGE_PTR alloc_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p);

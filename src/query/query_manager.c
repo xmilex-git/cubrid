@@ -1152,6 +1152,12 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       er_log_debug (ARG_FILE_LINE, "RAWFD_SELFTEST result=%d (0=PASS)\n", rawfd_selftest_rc);
       fprintf (stderr, "RAWFD_SELFTEST result=%d (0=PASS)\n", rawfd_selftest_rc);
     }
+  if (getenv ("CUBRID_MUTATION_NONCE_SELFTEST") != NULL)
+    {
+      int mutation_nonce_selftest_rc = temp_page_store::rawfd_mutation_nonce_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "MUTATION_NONCE_SELFTEST result=%d (0=PASS)\n", mutation_nonce_selftest_rc);
+      fprintf (stderr, "MUTATION_NONCE_SELFTEST result=%d (0=PASS)\n", mutation_nonce_selftest_rc);
+    }
   if (getenv ("CUBRID_TEMPMOVE_SELFTEST") != NULL)
     {
       int tempmove_selftest_rc = temp_page_store::qmgr_temp_file_move_selftest (thread_p);

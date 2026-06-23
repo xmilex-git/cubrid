@@ -17467,18 +17467,18 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 	  /* set CONNECT_BY_ISCYCLE pseudocolumn value */
 	  db_make_int (iscycle_valp, iscycle_value);
 	  /* it is fixed size data, so we can set it in this fashion */
-	  if (qfile_set_tuple_column_value (thread_p, listfile0, NULL, &parent_pos.vpid, parent_pos.tpl,
-					    (xasl->outptr_list->valptr_cnt - PCOL_ISCYCLE_TUPLE_OFFSET), iscycle_valp,
-					    &tp_Integer_domain) != NO_ERROR)
+	  if (qfile_set_tuple_column_value_by_position (thread_p, listfile0, &parent_pos,
+							(xasl->outptr_list->valptr_cnt - PCOL_ISCYCLE_TUPLE_OFFSET),
+							iscycle_valp, &tp_Integer_domain) != NO_ERROR)
 	    {
 	      GOTO_EXIT_ON_ERROR;
 	    }
 
 	  /* set CONNECT_BY_ISLEAF pseudocolumn value */
 	  db_make_int (isleaf_valp, isleaf_value);
-	  if (qfile_set_tuple_column_value (thread_p, listfile0, NULL, &parent_pos.vpid, parent_pos.tpl,
-					    (xasl->outptr_list->valptr_cnt - PCOL_ISLEAF_TUPLE_OFFSET), isleaf_valp,
-					    &tp_Integer_domain) != NO_ERROR)
+	  if (qfile_set_tuple_column_value_by_position (thread_p, listfile0, &parent_pos,
+							(xasl->outptr_list->valptr_cnt - PCOL_ISLEAF_TUPLE_OFFSET),
+							isleaf_valp, &tp_Integer_domain) != NO_ERROR)
 	    {
 	      GOTO_EXIT_ON_ERROR;
 	    }

@@ -22,11 +22,13 @@
 
 #include "temp_page_store.hpp"
 
+#include "dbtype.h"
 #include "error_manager.h"
 #include "boot_sr.h"
 #include "file_manager.h"
 #include "list_file.h"
 #include "log_impl.h"
+#include "object_domain.h"
 #include "object_representation.h"
 #include "page_buffer.h"
 #include "perf_monitor.h"
@@ -115,7 +117,21 @@ namespace
     temp_page_store::raw_fd_file *file { nullptr };
     PAGEID page_index { NULL_PAGEID };
     PAGE_PTR page_p { NULL };
+    int ref_count { 1 };
   };
+
+  bool
+  rawfd_same_fixed_page (const rawfd_fixed_page &entry, temp_page_store::raw_fd_file *file, PAGEID page_index) noexcept
+  {
+    if (entry.file == nullptr || file == nullptr || entry.page_index != page_index)
+      {
+	return false;
+      }
+
+    const temp_page_store::raw_fd_key entry_key = entry.file->key ();
+    const temp_page_store::raw_fd_key file_key = file->key ();
+    return entry_key.boot_incarnation == file_key.boot_incarnation && entry_key.file_seq == file_key.file_seq;
+  }
 
   struct rawfd_file_snapshot
   {
@@ -737,8 +753,30 @@ namespace
   }
 
   PAGE_PTR
-  rawfd_alloc_fixed_page (temp_page_store::raw_fd_file *file, PAGEID page_index, bool zero_page)
+  rawfd_alloc_fixed_page (temp_page_store::raw_fd_file *file, PAGEID page_index, bool zero_page,
+			  bool *reused_out = nullptr)
   {
+    if (reused_out != nullptr)
+      {
+	*reused_out = false;
+      }
+
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      for (auto &fixed : g_rawfd_state.fixed_pages)
+	{
+	  if (rawfd_same_fixed_page (fixed.second, file, page_index))
+	    {
+	      fixed.second.ref_count++;
+	      if (reused_out != nullptr)
+		{
+		  *reused_out = true;
+		}
+	      return fixed.second.page_p;
+	    }
+	}
+    }
+
     PAGE_PTR page_p = alloc_db_page_buffer ();
     if (page_p == NULL)
       {
@@ -754,7 +792,20 @@ namespace
       }
 
     std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
-    g_rawfd_state.fixed_pages[page_p] = rawfd_fixed_page { file, page_index, page_p };
+    for (auto &fixed : g_rawfd_state.fixed_pages)
+      {
+	if (rawfd_same_fixed_page (fixed.second, file, page_index))
+	  {
+	    fixed.second.ref_count++;
+	    if (reused_out != nullptr)
+	      {
+		*reused_out = true;
+	      }
+	    free_db_page_buffer (page_p);
+	    return fixed.second.page_p;
+	  }
+      }
+    g_rawfd_state.fixed_pages[page_p] = rawfd_fixed_page { file, page_index, page_p, 1 };
     return page_p;
   }
 
@@ -766,6 +817,14 @@ namespace
     if (it == g_rawfd_state.fixed_pages.end ())
       {
 	return rawfd_fixed_page {};
+      }
+
+    if (it->second.ref_count > 1)
+      {
+	it->second.ref_count--;
+	rawfd_fixed_page entry = it->second;
+	entry.page_p = NULL;
+	return entry;
       }
 
     rawfd_fixed_page entry = it->second;
@@ -1469,6 +1528,12 @@ namespace temp_page_store
     return NO_ERROR;
   }
 
+  int
+  rawfd_rewrite_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index, PAGE_PTR page_p) noexcept
+  {
+    return rawfd_write_page (thread_p, file, page_index, page_p);
+  }
+
   PAGE_PTR
   rawfd_pos_read (THREAD_ENTRY * thread_p, raw_fd_file &file, const raw_fd_page_coordinate &coordinate) noexcept
   {
@@ -1478,12 +1543,17 @@ namespace temp_page_store
 	return NULL;
       }
 
-    PAGE_PTR page_p = rawfd_alloc_fixed_page (&file, coordinate.page_index, false);
+    bool reused_fixed_page = false;
+    PAGE_PTR page_p = rawfd_alloc_fixed_page (&file, coordinate.page_index, false, &reused_fixed_page);
     if (page_p == NULL)
       {
 	return NULL;
       }
 
+    if (reused_fixed_page)
+      {
+	return page_p;
+      }
     if (cache_lookup_decrypted_page (file.key (), coordinate.page_index, page_p))
       {
 	return page_p;
@@ -1548,7 +1618,7 @@ namespace temp_page_store
 	return NO_ERROR;
       }
 
-    const int error = rawfd_write_page (thread_p, *fixed.file, fixed.page_index, page_p);
+    const int error = rawfd_rewrite_page (thread_p, *fixed.file, fixed.page_index, page_p);
     if (free_page == (int) FREE)
       {
 	rawfd_release_fixed_page (tfile_p, page_p);
@@ -1645,6 +1715,409 @@ namespace temp_page_store
 	error = ER_FAILED;
       }
 
+    destroy_raw_fd_file (file);
+    return error;
+  }
+
+  int
+  rawfd_positional_alias_mutation_selftest (THREAD_ENTRY * thread_p) noexcept
+  {
+    int os_error = 0;
+    raw_fd_file *file = create_raw_fd_file (thread_p, static_cast<QUERY_ID> (-6), LOG_FIND_THREAD_TRAN_INDEX (thread_p),
+					    0, &os_error);
+    if (file == NULL)
+      {
+	return ER_FAILED;
+      }
+
+    QMGR_TEMP_FILE tfile = {};
+    tfile.temp_file_type = FILE_TEMP;
+    tfile.backing = qmgr_temp_backing::RAW_FD_OVERFLOW;
+    tfile.raw_fd_query_id = static_cast<QUERY_ID> (-6);
+    tfile.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+    tfile.raw_fd_handle = file;
+    tfile.raw_fd_next_pageid = 1;
+    tfile.membuf_last = -1;
+    tfile.wm_reserved_shard = -1;
+    tfile.tde_encrypted = true;
+    file->attach_temp_file (&tfile);
+
+    QFILE_LIST_ID list_id;
+    QFILE_CLEAR_LIST_ID (&list_id);
+    list_id.tfile_vfid = &tfile;
+    list_id.page_cnt = 1;
+    list_id.first_vpid.volid = NULL_VOLID;
+    list_id.first_vpid.pageid = 0;
+    list_id.last_vpid.volid = NULL_VOLID;
+    list_id.last_vpid.pageid = 0;
+    list_id.last_offset = QFILE_PAGE_HEADER_SIZE;
+    list_id.query_id = static_cast<QUERY_ID> (-6);
+
+    PAGE_PTR held_page_p = rawfd_alloc_fixed_page (file, 0, true);
+    int error = NO_ERROR;
+    INT64 nonce_after_first = 0;
+    INT64 nonce_after_mutation = 0;
+    INT64 nonce_after_second = 0;
+
+    auto make_int_tuple = [] (int value) -> std::vector<char>
+    {
+      const int tuple_length = QFILE_TUPLE_LENGTH_SIZE + QFILE_TUPLE_VALUE_HEADER_SIZE + OR_INT_SIZE;
+      std::vector<char> tuple (tuple_length, 0);
+
+      QFILE_PUT_TUPLE_LENGTH (tuple.data (), tuple_length);
+      QFILE_PUT_PREV_TUPLE_LENGTH (tuple.data (), 0);
+
+      char *value_p = tuple.data () + QFILE_TUPLE_LENGTH_SIZE;
+      QFILE_PUT_TUPLE_VALUE_FLAG (value_p, V_BOUND);
+      QFILE_PUT_TUPLE_VALUE_LENGTH (value_p, OR_INT_SIZE);
+
+      DB_VALUE int_value;
+      db_make_int (&int_value, value);
+      OR_BUF int_buf;
+      or_init (&int_buf, value_p + QFILE_TUPLE_VALUE_HEADER_SIZE, OR_INT_SIZE);
+      if (tp_Integer_domain.type->data_writeval (&int_buf, &int_value) != NO_ERROR)
+	{
+	  tuple.clear ();
+	}
+      return tuple;
+    };
+
+    const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+    auto read_decrypt_and_nonce = [&] (PAGE_PTR out_page, INT64 *nonce_out) -> int
+    {
+      aligned_io_page cipher_check;
+      aligned_io_page plain_check;
+      if (!cipher_check.valid () || !plain_check.valid ()
+	  || !full_pread (file->fd (), cipher_check.page, IO_PAGESIZE, 0))
+	{
+	  return ER_FAILED;
+	}
+
+      int local_error = tde_decrypt_data_page (cipher_check.page, tde_algo, true, plain_check.page);
+      if (local_error != NO_ERROR)
+	{
+	  return local_error;
+	}
+
+      memcpy (out_page, plain_check.page->page, DB_PAGESIZE);
+      *nonce_out = cipher_check.page->prv.tde_nonce;
+      return NO_ERROR;
+    };
+
+    if (held_page_p == NULL)
+      {
+	error = ER_FAILED;
+      }
+    else
+      {
+	VPID null_vpid = VPID_INITIALIZER;
+	VPID_SET_NULL (&null_vpid);
+	QFILE_PUT_TUPLE_COUNT (held_page_p, 0);
+	QFILE_PUT_PREV_VPID (held_page_p, &null_vpid);
+	QFILE_PUT_NEXT_VPID_NULL (held_page_p);
+	QFILE_PUT_LAST_TUPLE_OFFSET (held_page_p, QFILE_PAGE_HEADER_SIZE);
+	QFILE_PUT_OVERFLOW_VPID_NULL (held_page_p);
+	list_id.last_pgptr = held_page_p;
+      }
+
+    std::vector<char> first_tuple = make_int_tuple (7);
+    std::vector<char> second_tuple = make_int_tuple (11);
+    std::vector<char> expected_first_tuple = make_int_tuple (99);
+    if (error == NO_ERROR && (first_tuple.empty () || second_tuple.empty () || expected_first_tuple.empty ()))
+      {
+	error = ER_FAILED;
+      }
+
+    QFILE_TUPLE_POSITION first_pos = {};
+    if (error == NO_ERROR)
+      {
+	error = qfile_add_tuple_get_pos_in_list (thread_p, &list_id, first_tuple.data (), &first_pos);
+      }
+
+    std::vector<char> decrypted (DB_PAGESIZE, 0);
+    if (error == NO_ERROR)
+      {
+	error = read_decrypt_and_nonce (decrypted.data (), &nonce_after_first);
+      }
+
+    if (error == NO_ERROR)
+      {
+	DB_VALUE int_value;
+	db_make_int (&int_value, 99);
+	error = qfile_set_tuple_column_value_by_position (thread_p, &list_id, &first_pos, 0, &int_value,
+							  &tp_Integer_domain);
+      }
+
+    if (error == NO_ERROR)
+      {
+	error = read_decrypt_and_nonce (decrypted.data (), &nonce_after_mutation);
+      }
+
+    if (error == NO_ERROR)
+      {
+	error = qfile_add_tuple_to_list (thread_p, &list_id, second_tuple.data ());
+      }
+
+    if (error == NO_ERROR)
+      {
+	error = read_decrypt_and_nonce (decrypted.data (), &nonce_after_second);
+      }
+
+    if (error == NO_ERROR)
+      {
+	const char *tuple_p = decrypted.data () + first_pos.tuple_offset;
+	if (first_pos.tuple_offset != QFILE_PAGE_HEADER_SIZE
+	    || memcmp (tuple_p, expected_first_tuple.data (), expected_first_tuple.size ()) != 0
+	    || nonce_after_first == 0 || nonce_after_mutation == 0 || nonce_after_second == 0
+	    || nonce_after_first == nonce_after_mutation || nonce_after_first == nonce_after_second
+	    || nonce_after_mutation == nonce_after_second)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    error = ER_FAILED;
+	  }
+      }
+
+    if (list_id.last_pgptr != NULL)
+      {
+	rawfd_release_fixed_page (&tfile, list_id.last_pgptr);
+	list_id.last_pgptr = NULL;
+      }
+    tfile.raw_fd_handle = NULL;
+    destroy_raw_fd_file (file);
+    return error;
+  }
+
+  int
+  rawfd_mutation_nonce_selftest (THREAD_ENTRY * thread_p) noexcept
+  {
+    int os_error = 0;
+    raw_fd_file *file = create_raw_fd_file (thread_p, static_cast<QUERY_ID> (-5), LOG_FIND_THREAD_TRAN_INDEX (thread_p),
+                                            0, &os_error);
+    if (file == NULL)
+      {
+	return ER_FAILED;
+      }
+
+    QMGR_TEMP_FILE tfile = {};
+    tfile.temp_file_type = FILE_TEMP;
+    tfile.backing = qmgr_temp_backing::RAW_FD_OVERFLOW;
+    tfile.raw_fd_query_id = static_cast<QUERY_ID> (-5);
+    tfile.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+    tfile.raw_fd_handle = file;
+    tfile.raw_fd_next_pageid = 2;
+    tfile.membuf_last = -1;
+    tfile.wm_reserved_shard = -1;
+    tfile.tde_encrypted = true;
+    file->attach_temp_file (&tfile);
+
+    QFILE_LIST_ID list_id;
+    QFILE_CLEAR_LIST_ID (&list_id);
+    list_id.tfile_vfid = &tfile;
+    list_id.tuple_cnt = 1;
+    list_id.page_cnt = 2;
+    list_id.first_vpid.volid = NULL_VOLID;
+    list_id.first_vpid.pageid = 0;
+    list_id.last_vpid.volid = NULL_VOLID;
+    list_id.last_vpid.pageid = 1;
+    list_id.last_offset = QFILE_PAGE_HEADER_SIZE;
+    list_id.query_id = static_cast<QUERY_ID> (-5);
+
+    constexpr PAGEID PAGE_COUNT = 2;
+    const int first_chunk_size = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+    const int filler_len = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+    const int int_value_len = OR_INT_SIZE;
+    const int tuple_length = QFILE_TUPLE_LENGTH_SIZE + QFILE_TUPLE_VALUE_HEADER_SIZE + filler_len
+                             + QFILE_TUPLE_VALUE_HEADER_SIZE + int_value_len;
+
+    std::vector<char> tuple (tuple_length, 0);
+    QFILE_PUT_TUPLE_LENGTH (tuple.data (), tuple_length);
+    QFILE_PUT_PREV_TUPLE_LENGTH (tuple.data (), 0);
+
+    char *value_p = tuple.data () + QFILE_TUPLE_LENGTH_SIZE;
+    QFILE_PUT_TUPLE_VALUE_FLAG (value_p, V_BOUND);
+    QFILE_PUT_TUPLE_VALUE_LENGTH (value_p, filler_len);
+    memset (value_p + QFILE_TUPLE_VALUE_HEADER_SIZE, 0x5a, filler_len);
+
+    value_p += QFILE_TUPLE_VALUE_HEADER_SIZE + filler_len;
+    QFILE_PUT_TUPLE_VALUE_FLAG (value_p, V_BOUND);
+    QFILE_PUT_TUPLE_VALUE_LENGTH (value_p, int_value_len);
+
+    DB_VALUE int_value;
+    db_make_int (&int_value, 7);
+    OR_BUF int_buf;
+    or_init (&int_buf, value_p + QFILE_TUPLE_VALUE_HEADER_SIZE, int_value_len);
+    int error = tp_Integer_domain.type->data_writeval (&int_buf, &int_value);
+    if (error != NO_ERROR)
+      {
+	destroy_raw_fd_file (file);
+	return error;
+      }
+
+    std::vector<std::vector<char>> expected (PAGE_COUNT, std::vector<char> (DB_PAGESIZE, 0));
+    for (PAGEID page = 0; page < PAGE_COUNT; page++)
+      {
+	QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+	put_page_header (expected[page].data (), &page_header);
+      }
+
+    QFILE_PUT_TUPLE_COUNT (expected[0].data (), 1);
+    QFILE_PUT_LAST_TUPLE_OFFSET (expected[0].data (), QFILE_PAGE_HEADER_SIZE);
+    {
+      VPID overflow_vpid = { 1, NULL_VOLID };
+      QFILE_PUT_OVERFLOW_VPID (expected[0].data (), &overflow_vpid);
+    }
+    QFILE_PUT_TUPLE_COUNT (expected[1].data (), QFILE_OVERFLOW_TUPLE_COUNT_FLAG);
+    QFILE_PUT_OVERFLOW_TUPLE_PAGE_SIZE (expected[1].data (), tuple_length - first_chunk_size);
+    QFILE_PUT_OVERFLOW_VPID_NULL (expected[1].data ());
+
+    memcpy (expected[0].data () + QFILE_PAGE_HEADER_SIZE, tuple.data (), first_chunk_size);
+    memcpy (expected[1].data () + QFILE_PAGE_HEADER_SIZE, tuple.data () + first_chunk_size,
+	    tuple_length - first_chunk_size);
+
+    INT64 initial_nonces[PAGE_COUNT] = { 0, 0 };
+    INT64 rewritten_nonces[PAGE_COUNT] = { 0, 0 };
+    const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+
+    auto read_decrypt_and_nonce = [&] (PAGEID page, PAGE_PTR out_page, INT64 *nonce_out) -> int
+    {
+      aligned_io_page cipher_check;
+      aligned_io_page plain_check;
+      if (!cipher_check.valid () || !plain_check.valid ()
+	  || !full_pread (file->fd (), cipher_check.page, IO_PAGESIZE,
+			  static_cast<off_t> (page) * static_cast<off_t> (IO_PAGESIZE)))
+	{
+	  return ER_FAILED;
+	}
+
+      int local_error = tde_decrypt_data_page (cipher_check.page, tde_algo, true, plain_check.page);
+      if (local_error != NO_ERROR)
+	{
+	  return local_error;
+	}
+
+      memcpy (out_page, plain_check.page->page, DB_PAGESIZE);
+      *nonce_out = cipher_check.page->prv.tde_nonce;
+      return NO_ERROR;
+    };
+
+    for (PAGEID page = 0; page < PAGE_COUNT && error == NO_ERROR; page++)
+      {
+	error = rawfd_write_page (thread_p, *file, page, expected[page].data ());
+	if (error == NO_ERROR)
+	  {
+	    std::vector<char> decrypted (DB_PAGESIZE, 0);
+	    error = read_decrypt_and_nonce (page, decrypted.data (), &initial_nonces[page]);
+	    if (error == NO_ERROR && memcmp (decrypted.data (), expected[page].data (), DB_PAGESIZE) != 0)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		error = ER_FAILED;
+	      }
+	  }
+      }
+
+    if (error == NO_ERROR)
+      {
+	raw_fd_page_coordinate coord { file->segment_id (), 0, QFILE_PAGE_HEADER_SIZE };
+	PAGE_PTR cached_page_p = rawfd_pos_read (thread_p, *file, coord);
+	if (cached_page_p == NULL)
+	  {
+	    error = ER_FAILED;
+	  }
+	else
+	  {
+	    rawfd_release_fixed_page (&tfile, cached_page_p);
+	  }
+      }
+
+    if (error == NO_ERROR)
+      {
+	db_make_int (&int_value, 99);
+	VPID first_vpid = { 0, NULL_VOLID };
+	error = qfile_set_tuple_column_value (thread_p, &list_id, NULL, &first_vpid,
+					      expected[0].data () + QFILE_PAGE_HEADER_SIZE, 1, &int_value,
+					      &tp_Integer_domain);
+	if (error == NO_ERROR)
+	  {
+	    QFILE_TUPLE assembled_tuple = tuple.data ();
+	    char *target_value_p = NULL;
+	    int target_value_size = 0;
+	    if (qfile_locate_tuple_value (assembled_tuple, 1, &target_value_p, &target_value_size) != V_BOUND)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		error = ER_FAILED;
+	      }
+	    else
+	      {
+		or_init (&int_buf, target_value_p, target_value_size);
+		error = tp_Integer_domain.type->data_writeval (&int_buf, &int_value);
+	      }
+	  }
+      }
+
+    if (error == NO_ERROR)
+      {
+	memcpy (expected[0].data () + QFILE_PAGE_HEADER_SIZE, tuple.data (), first_chunk_size);
+	memcpy (expected[1].data () + QFILE_PAGE_HEADER_SIZE, tuple.data () + first_chunk_size,
+		tuple_length - first_chunk_size);
+
+	for (PAGEID page = 0; page < PAGE_COUNT && error == NO_ERROR; page++)
+	  {
+	    std::vector<char> decrypted (DB_PAGESIZE, 0);
+	    error = read_decrypt_and_nonce (page, decrypted.data (), &rewritten_nonces[page]);
+	    if (error != NO_ERROR)
+	      {
+		break;
+	      }
+
+	    if (memcmp (decrypted.data (), expected[page].data (), DB_PAGESIZE) != 0
+		|| rewritten_nonces[page] == 0 || rewritten_nonces[page] == initial_nonces[page])
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		error = ER_FAILED;
+	      }
+	  }
+      }
+
+    if (error == NO_ERROR)
+      {
+	std::set<INT64> seen_nonces;
+	for (PAGEID page = 0; page < PAGE_COUNT; page++)
+	  {
+	    seen_nonces.insert (initial_nonces[page]);
+	    seen_nonces.insert (rewritten_nonces[page]);
+	  }
+
+	if (seen_nonces.size () != PAGE_COUNT * 2)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    error = ER_FAILED;
+	  }
+      }
+
+    if (error == NO_ERROR)
+      {
+	raw_fd_page_coordinate coord { file->segment_id (), 0, QFILE_PAGE_HEADER_SIZE };
+	PAGE_PTR actual_page_p = rawfd_pos_read (thread_p, *file, coord);
+	if (actual_page_p == NULL)
+	  {
+	    error = ER_FAILED;
+	  }
+	else
+	  {
+	    if (memcmp (actual_page_p, expected[0].data (), DB_PAGESIZE) != 0)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		error = ER_FAILED;
+	      }
+	    rawfd_release_fixed_page (&tfile, actual_page_p);
+	  }
+      }
+
+    if (error == NO_ERROR)
+      {
+	error = rawfd_positional_alias_mutation_selftest (thread_p);
+      }
+    tfile.raw_fd_handle = NULL;
     destroy_raw_fd_file (file);
     return error;
   }
