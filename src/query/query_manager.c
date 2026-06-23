@@ -1475,6 +1475,8 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
       goto exit_on_error;
     }
 
+  qfile_close_list (thread_p, query_p->list_id);
+
   /* allocate new QFILE_LIST_ID to be returned as the result and copy from the query result; the caller is responsible
    * to free this */
   list_id = qfile_clone_list_id (query_p->list_id, false, QFILE_SKIP_DEPENDENT);
@@ -3363,7 +3365,7 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
     }
 
   QFILE_LIST_ID *materialized_p = qfile_open_list (thread_p, &list_id_p->type_list, list_id_p->sort_list,
-						   list_id_p->query_id, 0, NULL);
+						   list_id_p->query_id, QFILE_FLAG_RESULT_FILE, NULL);
   if (materialized_p == NULL)
     {
       return ER_FAILED;
