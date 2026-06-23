@@ -97,6 +97,11 @@ struct qmgr_temp_file
   qmgr_temp_backing backing;
   size_t wm_reserved_bytes;
   int wm_reserved_shard;
+  QUERY_ID raw_fd_query_id;
+  int raw_fd_owner_tran_index;
+  unsigned int raw_fd_worker_id;
+  temp_page_store::raw_fd_file *raw_fd_handle;
+  int raw_fd_next_pageid;
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };
@@ -184,6 +189,7 @@ extern int qmgr_free_temp_file_list (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * t
 #if defined (SERVER_MODE)
 extern bool qmgr_is_query_interrupted (THREAD_ENTRY * thread_p, QUERY_ID query_id);
 #endif /* SERVER_MODE */
+extern bool qmgr_is_query_live (int tran_index, QUERY_ID query_id);
 
 extern void qmgr_set_query_error (THREAD_ENTRY * thread_p, QUERY_ID query_id);
 extern void qmgr_setup_empty_list_file (char *page_buf);

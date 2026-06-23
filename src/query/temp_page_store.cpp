@@ -23,6 +23,7 @@
 #include "temp_page_store.hpp"
 
 #include "error_manager.h"
+#include "boot_sr.h"
 #include "file_manager.h"
 #include "list_file.h"
 #include "log_impl.h"
@@ -32,14 +33,29 @@
 #include "query_manager.h"
 #include "system_parameter.h"
 #include "tde.h"
+#include "file_io.h"
 
+#include <cerrno>
+#include <chrono>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <deque>
 #include <atomic>
+#include <cstdio>
+#include <dirent.h>
+#include <fcntl.h>
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <new>
+#include <set>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <thread>
+#include <unordered_map>
+#include <unistd.h>
+#include <vector>
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -67,6 +83,708 @@ namespace
   };
 
   workmem_accountant g_accountant;
+  void put_page_header (PAGE_PTR page_p, QFILE_PAGE_HEADER *header_p);
+
+  constexpr std::size_t RAWFD_READ_CACHE_PAGES = 32;
+  constexpr int RAWFD_REAPER_GRACE_SECONDS = 30;
+  constexpr const char *RAWFD_ROOT_SUFFIX = "cubrid-rawfd-workmem";
+  constexpr const char *RAWFD_SERVER_ID_FILE = ".server-id";
+
+  struct rawfd_registry_entry
+  {
+    temp_page_store::raw_fd_key key {};
+    std::string path;
+    QUERY_ID query_id { NULL_QUERY_ID };
+    int owner_tran_index { NULL_TRAN_INDEX };
+    unsigned int worker_id { 0 };
+    int fd { -1 };
+    temp_page_store::raw_fd_file *owner { nullptr };
+    QMGR_TEMP_FILE *tfile_owner { nullptr };
+    std::chrono::steady_clock::time_point created_at;
+  };
+
+  struct rawfd_cached_page
+  {
+    temp_page_store::raw_fd_key key {};
+    PAGEID page_index { NULL_PAGEID };
+    std::vector<char> io_page;
+  };
+
+  struct rawfd_fixed_page
+  {
+    temp_page_store::raw_fd_file *file { nullptr };
+    PAGEID page_index { NULL_PAGEID };
+    PAGE_PTR page_p { NULL };
+  };
+
+  struct rawfd_file_snapshot
+  {
+    temp_page_store::raw_fd_key key {};
+    std::string path;
+    QUERY_ID query_id { NULL_QUERY_ID };
+    int owner_tran_index { NULL_TRAN_INDEX };
+    int fd { -1 };
+    temp_page_store::raw_fd_file *owner { nullptr };
+  };
+
+  struct rawfd_disk_candidate
+  {
+    temp_page_store::raw_fd_key key {};
+    std::string path;
+    QUERY_ID query_id { NULL_QUERY_ID };
+    int owner_tran_index { NULL_TRAN_INDEX };
+    std::chrono::system_clock::time_point modified_at;
+  };
+
+  struct rawfd_state
+  {
+    std::once_flag init_once;
+    std::mutex mutex;
+    std::uint64_t boot_incarnation { 0 };
+    std::atomic<std::uint64_t> file_seq { 0 };
+    std::string scratch_root;
+    std::string db_name;
+    std::string server_id;
+    std::string server_subtree;
+    bool boot_sweep_complete { false };
+    bool tde_wired { false };
+    bool reaper_active { false };
+    std::unordered_map<std::uint64_t, rawfd_registry_entry> registry;
+    std::unordered_map<PAGE_PTR, rawfd_fixed_page> fixed_pages;
+    std::deque<rawfd_cached_page> read_cache;
+  };
+
+  rawfd_state g_rawfd_state;
+
+  std::string
+  sanitize_path_component (const char *input)
+  {
+    std::string out;
+    if (input == NULL || input[0] == '\0')
+      {
+	return "unknown";
+      }
+
+    for (const char *p = input; *p != '\0'; p++)
+      {
+	const unsigned char ch = static_cast<unsigned char> (*p);
+	if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')
+	  {
+	    out.push_back (static_cast<char> (ch));
+	  }
+	else
+	  {
+	    out.push_back ('_');
+	  }
+      }
+
+    return out.empty () ? std::string ("unknown") : out;
+  }
+
+  bool
+  mkdir_if_needed (const std::string &path)
+  {
+    if (path.empty ())
+      {
+	return false;
+      }
+
+    if (mkdir (path.c_str (), 0700) == 0 || errno == EEXIST)
+      {
+	return true;
+      }
+
+    return false;
+  }
+
+  bool
+  mkdir_recursive (const std::string &path)
+  {
+    if (path.empty ())
+      {
+	return false;
+      }
+
+    std::string partial;
+    if (path[0] == '/')
+      {
+	partial = "/";
+      }
+
+    std::size_t start = (path[0] == '/') ? 1 : 0;
+    while (start <= path.size ())
+      {
+	const std::size_t slash = path.find ('/', start);
+	const std::string part = path.substr (start, slash == std::string::npos ? std::string::npos : slash - start);
+	if (!part.empty ())
+	  {
+	    if (!partial.empty () && partial[partial.size () - 1] != '/')
+	      {
+		partial += '/';
+	      }
+	    partial += part;
+	    if (!mkdir_if_needed (partial))
+	      {
+		return false;
+	      }
+	  }
+
+	if (slash == std::string::npos)
+	  {
+	    break;
+	  }
+	start = slash + 1;
+      }
+
+    return true;
+  }
+
+  std::string
+  read_small_file (const std::string &path)
+  {
+    FILE *fp = fopen (path.c_str (), "r");
+    if (fp == NULL)
+      {
+	return std::string ();
+      }
+
+    char buffer[128];
+    const size_t nread = fread (buffer, 1, sizeof (buffer) - 1, fp);
+    fclose (fp);
+    buffer[nread] = '\0';
+
+    std::string value (buffer);
+    while (!value.empty () && (value[value.size () - 1] == '\n' || value[value.size () - 1] == '\r'))
+      {
+	value.erase (value.size () - 1);
+      }
+
+    return value;
+  }
+
+  bool
+  write_small_file (const std::string &path, const std::string &value)
+  {
+    FILE *fp = fopen (path.c_str (), "w");
+    if (fp == NULL)
+      {
+	return false;
+      }
+
+    const bool ok = fwrite (value.c_str (), 1, value.size (), fp) == value.size () && fputc ('\n', fp) != EOF;
+    fclose (fp);
+    return ok;
+  }
+
+  bool
+  unlink_tree_files_only (const std::string &dir)
+  {
+    DIR *dp = opendir (dir.c_str ());
+    if (dp == NULL)
+      {
+	return false;
+      }
+
+    bool ok = true;
+    struct dirent *entry = NULL;
+    while ((entry = readdir (dp)) != NULL)
+      {
+	if (strcmp (entry->d_name, ".") == 0 || strcmp (entry->d_name, "..") == 0)
+	  {
+	    continue;
+	  }
+
+	const std::string child = dir + "/" + entry->d_name;
+	struct stat st;
+	if (lstat (child.c_str (), &st) != 0)
+	  {
+	    ok = false;
+	    continue;
+	  }
+
+	if (S_ISDIR (st.st_mode))
+	  {
+	    ok = unlink_tree_files_only (child) && ok;
+	    if (rmdir (child.c_str ()) != 0 && errno != ENOENT)
+	      {
+		ok = false;
+	      }
+	  }
+	else if (unlink (child.c_str ()) != 0 && errno != ENOENT)
+	  {
+	    ok = false;
+	  }
+      }
+
+    closedir (dp);
+    return ok;
+  }
+
+  std::uint64_t
+  make_boot_incarnation () noexcept
+  {
+    const std::uint64_t now =
+      static_cast<std::uint64_t> (std::chrono::system_clock::now ().time_since_epoch ().count ());
+    const std::uint64_t pid = static_cast<std::uint64_t> (getpid ());
+    return (now << 16) ^ pid;
+  }
+
+  void
+  init_rawfd_state ()
+  {
+    const char *tmp_env = getenv ("TMP");
+    const std::string tmp_root = (tmp_env != NULL && tmp_env[0] != '\0') ? std::string (tmp_env) : std::string ("/tmp");
+    g_rawfd_state.scratch_root = tmp_root + "/" + RAWFD_ROOT_SUFFIX;
+
+    g_rawfd_state.db_name = sanitize_path_component (boot_db_name ());
+    const std::string db_root = g_rawfd_state.scratch_root + "/" + g_rawfd_state.db_name;
+    bool boot_sweep_ok = mkdir_recursive (db_root);
+
+    const std::string server_id_path = db_root + "/" + RAWFD_SERVER_ID_FILE;
+    g_rawfd_state.server_id = sanitize_path_component (read_small_file (server_id_path).c_str ());
+    if (g_rawfd_state.server_id == "unknown")
+      {
+	g_rawfd_state.server_id = "sid_" + std::to_string (make_boot_incarnation ());
+	boot_sweep_ok = write_small_file (server_id_path, g_rawfd_state.server_id) && boot_sweep_ok;
+      }
+
+    g_rawfd_state.server_subtree = db_root + "/" + g_rawfd_state.server_id;
+    boot_sweep_ok = mkdir_recursive (g_rawfd_state.server_subtree) && boot_sweep_ok;
+    if (boot_sweep_ok)
+      {
+	boot_sweep_ok = unlink_tree_files_only (g_rawfd_state.server_subtree);
+      }
+
+    g_rawfd_state.boot_incarnation = make_boot_incarnation ();
+    g_rawfd_state.boot_sweep_complete = boot_sweep_ok;
+    g_rawfd_state.tde_wired = tde_is_loaded ()
+      && ((TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM) != TDE_ALGORITHM_NONE);
+    g_rawfd_state.reaper_active = boot_sweep_ok;
+  }
+
+  void
+  ensure_rawfd_state ()
+  {
+    std::call_once (g_rawfd_state.init_once, init_rawfd_state);
+  }
+
+  std::uint64_t
+  registry_map_key (const temp_page_store::raw_fd_key &key) noexcept
+  {
+    return (key.boot_incarnation << 32) ^ key.file_seq;
+  }
+
+  bool
+  rawfd_key_equals (const temp_page_store::raw_fd_key &lhs, const temp_page_store::raw_fd_key &rhs) noexcept
+  {
+    return lhs.boot_incarnation == rhs.boot_incarnation && lhs.file_seq == rhs.file_seq;
+  }
+
+  void
+  purge_cached_pages_locked (const temp_page_store::raw_fd_key &key) noexcept
+  {
+    g_rawfd_state.read_cache.erase (std::remove_if (g_rawfd_state.read_cache.begin (), g_rawfd_state.read_cache.end (),
+						    [&key] (const rawfd_cached_page &entry)
+    {
+      return rawfd_key_equals (entry.key, key);
+    }),
+				    g_rawfd_state.read_cache.end ());
+  }
+  void
+  purge_fixed_pages_locked (const temp_page_store::raw_fd_key &key) noexcept
+  {
+    for (auto it = g_rawfd_state.fixed_pages.begin (); it != g_rawfd_state.fixed_pages.end ();)
+      {
+	if (it->second.file != NULL && rawfd_key_equals (it->second.file->key (), key))
+	  {
+	    PAGE_PTR page_p = it->second.page_p;
+	    it = g_rawfd_state.fixed_pages.erase (it);
+	    free (page_p);
+	  }
+	else
+	  {
+	    ++it;
+	  }
+      }
+  }
+
+
+  rawfd_file_snapshot
+  detach_registry_entry_locked (rawfd_registry_entry &entry) noexcept
+  {
+    rawfd_file_snapshot snapshot;
+    snapshot.key = entry.key;
+    snapshot.query_id = entry.query_id;
+    snapshot.owner_tran_index = entry.owner_tran_index;
+    snapshot.owner = entry.owner;
+
+    if (entry.owner != NULL)
+      {
+	snapshot.fd = entry.owner->detach_for_unlink (snapshot.path);
+      }
+
+    if (snapshot.fd < 0 && entry.fd >= 0)
+      {
+	snapshot.fd = entry.fd;
+      }
+    if (snapshot.path.empty ())
+      {
+	snapshot.path = entry.path;
+      }
+
+    if (entry.tfile_owner != NULL && entry.tfile_owner->raw_fd_handle == entry.owner)
+      {
+	entry.tfile_owner->raw_fd_handle = NULL;
+	entry.tfile_owner->raw_fd_next_pageid = 0;
+      }
+
+    purge_cached_pages_locked (entry.key);
+    purge_fixed_pages_locked (entry.key);
+    entry.fd = -1;
+    entry.owner = NULL;
+    entry.tfile_owner = NULL;
+    entry.path.clear ();
+    return snapshot;
+  }
+
+  void
+  close_unlink_snapshot (rawfd_file_snapshot &snapshot) noexcept
+  {
+    if (snapshot.fd >= 0)
+      {
+	(void) close (snapshot.fd);
+	snapshot.fd = -1;
+      }
+
+    if (!snapshot.path.empty ())
+      {
+	(void) unlink (snapshot.path.c_str ());
+	snapshot.path.clear ();
+      }
+
+    delete snapshot.owner;
+    snapshot.owner = NULL;
+  }
+
+  bool
+  parse_rawfd_tmp_filename (const char *name, rawfd_disk_candidate &candidate) noexcept
+  {
+    if (name == NULL || name[0] == '\0')
+      {
+	return false;
+      }
+
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long boot = std::strtoull (name, &end, 10);
+    if (errno != 0 || end == name || *end != '.')
+      {
+	return false;
+      }
+
+    const char *p = end + 1;
+    errno = 0;
+    const unsigned long long file_seq = std::strtoull (p, &end, 10);
+    if (errno != 0 || end == p || *end != '.')
+      {
+	return false;
+      }
+
+    p = end + 1;
+    errno = 0;
+    const long long query_id = std::strtoll (p, &end, 10);
+    if (errno != 0 || end == p || *end != '.')
+      {
+	return false;
+      }
+
+    p = end + 1;
+    errno = 0;
+    const long long owner_tran_index = std::strtoll (p, &end, 10);
+    if (errno != 0 || end == p || *end != '.')
+      {
+	return false;
+      }
+
+    p = end + 1;
+    errno = 0;
+    (void) std::strtoull (p, &end, 10);
+    if (errno != 0 || end == p || strcmp (end, ".tmp") != 0)
+      {
+	return false;
+      }
+
+    candidate.key.boot_incarnation = static_cast<std::uint64_t> (boot);
+    candidate.key.file_seq = static_cast<std::uint64_t> (file_seq);
+    candidate.query_id = static_cast<QUERY_ID> (query_id);
+    candidate.owner_tran_index = static_cast<int> (owner_tran_index);
+    return true;
+  }
+
+  std::vector<rawfd_disk_candidate>
+  scan_rawfd_disk_candidates ()
+  {
+    std::vector<rawfd_disk_candidate> candidates;
+    DIR *dp = opendir (g_rawfd_state.server_subtree.c_str ());
+    if (dp == NULL)
+      {
+	return candidates;
+      }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir (dp)) != NULL)
+      {
+	rawfd_disk_candidate candidate;
+	if (!parse_rawfd_tmp_filename (entry->d_name, candidate))
+	  {
+	    continue;
+	  }
+
+	candidate.path = g_rawfd_state.server_subtree + "/" + entry->d_name;
+	struct stat st;
+	if (lstat (candidate.path.c_str (), &st) != 0 || !S_ISREG (st.st_mode))
+	  {
+	    continue;
+	  }
+
+	candidate.modified_at = std::chrono::system_clock::from_time_t (st.st_mtime);
+	candidates.push_back (candidate);
+      }
+
+    closedir (dp);
+    return candidates;
+  }
+
+  bool
+  is_fd_or_space_error (int os_error) noexcept
+  {
+    return os_error == EMFILE || os_error == ENFILE || os_error == ENOSPC || os_error == EDQUOT;
+  }
+
+  std::string
+  make_rawfd_path (const temp_page_store::raw_fd_key &key, QUERY_ID query_id, int owner_tran_index,
+		   unsigned int worker_id)
+  {
+    return g_rawfd_state.server_subtree + "/" + std::to_string (key.boot_incarnation) + "."
+      + std::to_string (key.file_seq) + "." + std::to_string (static_cast<long long> (query_id)) + "."
+      + std::to_string (owner_tran_index) + "." + std::to_string (worker_id) + ".tmp";
+  }
+
+  bool
+  reserve_registry_slot (const rawfd_registry_entry &entry)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    return g_rawfd_state.registry.emplace (registry_map_key (entry.key), entry).second;
+  }
+
+  void
+  install_registry_fd (temp_page_store::raw_fd_file *owner, int fd)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    const auto it = g_rawfd_state.registry.find (registry_map_key (owner->key ()));
+    if (it != g_rawfd_state.registry.end ())
+      {
+	it->second.fd = fd;
+	it->second.owner = owner;
+      }
+  }
+
+  void
+  forget_registry_slot (const temp_page_store::raw_fd_key &key)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    g_rawfd_state.registry.erase (registry_map_key (key));
+  }
+
+  PAGE_PTR
+  alloc_db_page_buffer () noexcept
+  {
+    return static_cast<PAGE_PTR> (malloc (DB_PAGESIZE));
+  }
+
+  void
+  free_db_page_buffer (PAGE_PTR page_p) noexcept
+  {
+    free (page_p);
+  }
+
+  struct aligned_io_page
+  {
+    char *raw { NULL };
+    FILEIO_PAGE *page { NULL };
+
+    aligned_io_page ()
+    {
+      raw = static_cast<char *> (malloc (IO_PAGESIZE + MAX_ALIGNMENT));
+      if (raw != NULL)
+	{
+	  page = reinterpret_cast<FILEIO_PAGE *> (PTR_ALIGN (raw, MAX_ALIGNMENT));
+	  memset (page, 0, IO_PAGESIZE);
+	}
+    }
+
+    ~aligned_io_page ()
+    {
+      free (raw);
+    }
+
+    bool valid () const noexcept
+    {
+      return page != NULL;
+    }
+  };
+
+  bool
+  full_pwrite (int fd, const void *buf, std::size_t len, off_t offset) noexcept
+  {
+    const char *ptr = static_cast<const char *> (buf);
+    while (len > 0)
+      {
+	const ssize_t written = pwrite (fd, ptr, len, offset);
+	if (written < 0)
+	  {
+	    if (errno == EINTR)
+	      {
+		continue;
+	      }
+	    return false;
+	  }
+	if (written == 0)
+	  {
+	    errno = ENOSPC;
+	    return false;
+	  }
+	ptr += written;
+	len -= static_cast<std::size_t> (written);
+	offset += written;
+      }
+
+    return true;
+  }
+
+  bool
+  full_pread (int fd, void *buf, std::size_t len, off_t offset) noexcept
+  {
+    char *ptr = static_cast<char *> (buf);
+    while (len > 0)
+      {
+	const ssize_t nread = pread (fd, ptr, len, offset);
+	if (nread < 0)
+	  {
+	    if (errno == EINTR)
+	      {
+		continue;
+	      }
+	    return false;
+	  }
+	if (nread == 0)
+	  {
+	    errno = EIO;
+	    return false;
+	  }
+	ptr += nread;
+	len -= static_cast<std::size_t> (nread);
+	offset += nread;
+      }
+
+    return true;
+  }
+
+  void
+  cache_insert_decrypted_page (const temp_page_store::raw_fd_key &key, PAGEID page_index, const FILEIO_PAGE *plain)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    const auto same_page = [&key, page_index] (const rawfd_cached_page &entry)
+    {
+      return entry.key.boot_incarnation == key.boot_incarnation && entry.key.file_seq == key.file_seq
+	&& entry.page_index == page_index;
+    };
+
+    g_rawfd_state.read_cache.erase (std::remove_if (g_rawfd_state.read_cache.begin (), g_rawfd_state.read_cache.end (),
+						    same_page),
+				    g_rawfd_state.read_cache.end ());
+
+    rawfd_cached_page entry;
+    entry.key = key;
+    entry.page_index = page_index;
+    entry.io_page.assign (reinterpret_cast<const char *> (plain), reinterpret_cast<const char *> (plain) + IO_PAGESIZE);
+    g_rawfd_state.read_cache.push_front (entry);
+
+    while (g_rawfd_state.read_cache.size () > RAWFD_READ_CACHE_PAGES)
+      {
+	g_rawfd_state.read_cache.pop_back ();
+      }
+  }
+
+  bool
+  cache_lookup_decrypted_page (const temp_page_store::raw_fd_key &key, PAGEID page_index, PAGE_PTR out_page)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    for (auto it = g_rawfd_state.read_cache.begin (); it != g_rawfd_state.read_cache.end (); ++it)
+      {
+	if (it->key.boot_incarnation == key.boot_incarnation && it->key.file_seq == key.file_seq
+	    && it->page_index == page_index)
+	  {
+	    memcpy (out_page, reinterpret_cast<const FILEIO_PAGE *> (it->io_page.data ())->page, DB_PAGESIZE);
+	    const rawfd_cached_page copy = *it;
+	    g_rawfd_state.read_cache.erase (it);
+	    g_rawfd_state.read_cache.push_front (copy);
+	    return true;
+	  }
+      }
+
+    return false;
+  }
+
+  PAGE_PTR
+  rawfd_alloc_fixed_page (temp_page_store::raw_fd_file *file, PAGEID page_index, bool zero_page)
+  {
+    PAGE_PTR page_p = alloc_db_page_buffer ();
+    if (page_p == NULL)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+	return NULL;
+      }
+
+    if (zero_page)
+      {
+	memset (page_p, 0, DB_PAGESIZE);
+	QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+	put_page_header (page_p, &page_header);
+      }
+
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    g_rawfd_state.fixed_pages[page_p] = rawfd_fixed_page { file, page_index, page_p };
+    return page_p;
+  }
+
+  rawfd_fixed_page
+  rawfd_take_fixed_page (PAGE_PTR page_p)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    const auto it = g_rawfd_state.fixed_pages.find (page_p);
+    if (it == g_rawfd_state.fixed_pages.end ())
+      {
+	return rawfd_fixed_page {};
+      }
+
+    rawfd_fixed_page entry = it->second;
+    g_rawfd_state.fixed_pages.erase (it);
+    return entry;
+  }
+
+  rawfd_fixed_page
+  rawfd_find_fixed_page (PAGE_PTR page_p)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    const auto it = g_rawfd_state.fixed_pages.find (page_p);
+    if (it == g_rawfd_state.fixed_pages.end ())
+      {
+	return rawfd_fixed_page {};
+      }
+
+    return it->second;
+  }
 
 
   int64_t
@@ -280,14 +998,609 @@ namespace
 
 namespace temp_page_store
 {
+  raw_fd_file::raw_fd_file () noexcept
+    : m_fd (-1)
+    , m_path ()
+    , m_query_id (NULL_QUERY_ID)
+    , m_owner_tran_index (NULL_TRAN_INDEX)
+    , m_worker_id (0)
+    , m_key { 0, 0 }
+    , m_segment_id (0)
+    , m_tfile_owner (NULL)
+  {
+  }
+
+  raw_fd_file::~raw_fd_file () noexcept
+  {
+    close_and_unlink ();
+  }
+
+
+  int
+  raw_fd_file::fd () const noexcept
+  {
+    return m_fd;
+  }
+
+  const std::string &
+  raw_fd_file::path () const noexcept
+  {
+    return m_path;
+  }
+
+  QUERY_ID
+  raw_fd_file::query_id () const noexcept
+  {
+    return m_query_id;
+  }
+
+  int
+  raw_fd_file::owner_tran_index () const noexcept
+  {
+    return m_owner_tran_index;
+  }
+
+  unsigned int
+  raw_fd_file::worker_id () const noexcept
+  {
+    return m_worker_id;
+  }
+
+  raw_fd_key
+  raw_fd_file::key () const noexcept
+  {
+    return m_key;
+  }
+
+  std::uint64_t
+  raw_fd_file::segment_id () const noexcept
+  {
+    return m_segment_id;
+  }
+
+  bool
+  raw_fd_file::is_open () const noexcept
+  {
+    return m_fd >= 0;
+  }
+
+  void
+  raw_fd_file::close_and_unlink () noexcept
+  {
+    if (m_fd >= 0)
+      {
+	(void) close (m_fd);
+	m_fd = -1;
+      }
+
+    if (!m_path.empty ())
+      {
+	(void) unlink (m_path.c_str ());
+	m_path.clear ();
+      }
+
+    m_tfile_owner = NULL;
+  }
+
+  void
+  raw_fd_file::attach_temp_file (QMGR_TEMP_FILE * tfile_p) noexcept
+  {
+    m_tfile_owner = tfile_p;
+
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    const auto it = g_rawfd_state.registry.find (registry_map_key (m_key));
+    if (it != g_rawfd_state.registry.end ())
+      {
+	it->second.tfile_owner = tfile_p;
+      }
+  }
+
+
+  int
+  raw_fd_file::detach_for_unlink (std::string &path_out) noexcept
+  {
+    const int fd = m_fd;
+    path_out = m_path;
+
+    m_fd = -1;
+    m_path.clear ();
+    m_tfile_owner = NULL;
+    return fd;
+  }
+  raw_fd_file *
+  create_raw_fd_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, int owner_tran_index, unsigned int worker_id,
+		      int *os_error_out) noexcept
+  {
+    (void) thread_p;
+    ensure_rawfd_state ();
+
+    if (os_error_out != NULL)
+      {
+	*os_error_out = 0;
+      }
+
+    if (!g_rawfd_state.boot_sweep_complete || !g_rawfd_state.tde_wired || !g_rawfd_state.reaper_active)
+      {
+	if (os_error_out != NULL)
+	  {
+	    *os_error_out = EAGAIN;
+	  }
+	return NULL;
+      }
+
+    raw_fd_file *file = new raw_fd_file ();
+    if (file == NULL)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (raw_fd_file));
+	return NULL;
+      }
+
+    file->m_query_id = query_id;
+    file->m_owner_tran_index = owner_tran_index;
+    file->m_worker_id = worker_id;
+    file->m_key.boot_incarnation = g_rawfd_state.boot_incarnation;
+    file->m_key.file_seq = g_rawfd_state.file_seq.fetch_add (1, std::memory_order_acq_rel) + 1;
+    file->m_segment_id = file->m_key.file_seq;
+    file->m_path = make_rawfd_path (file->m_key, query_id, owner_tran_index, worker_id);
+
+    rawfd_registry_entry entry;
+    entry.key = file->m_key;
+    entry.path = file->m_path;
+    entry.query_id = query_id;
+    entry.owner_tran_index = owner_tran_index;
+    entry.worker_id = worker_id;
+    entry.created_at = std::chrono::steady_clock::now ();
+    if (!reserve_registry_slot (entry))
+      {
+	delete file;
+	if (os_error_out != NULL)
+	  {
+	    *os_error_out = EEXIST;
+	  }
+	return NULL;
+      }
+
+    const int fd = open (file->m_path.c_str (), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0)
+      {
+	const int saved_errno = errno;
+	(void) unlink (file->m_path.c_str ());
+	forget_registry_slot (file->m_key);
+	delete file;
+	if (os_error_out != NULL)
+	  {
+	    *os_error_out = saved_errno;
+	  }
+	if (!is_fd_or_space_error (saved_errno))
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  }
+	return NULL;
+      }
+
+    file->m_fd = fd;
+    install_registry_fd (file, fd);
+    return file;
+  }
+
+  void
+  destroy_raw_fd_file (raw_fd_file *file_p) noexcept
+  {
+    if (file_p == NULL)
+      {
+	return;
+      }
+
+    ensure_rawfd_state ();
+
+    rawfd_file_snapshot snapshot;
+    const raw_fd_key key = file_p->key ();
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      const auto it = g_rawfd_state.registry.find (registry_map_key (key));
+      if (it != g_rawfd_state.registry.end ())
+	{
+	  snapshot = detach_registry_entry_locked (it->second);
+	  g_rawfd_state.registry.erase (it);
+	}
+      else
+	{
+	  snapshot.key = key;
+	  snapshot.query_id = file_p->query_id ();
+	  snapshot.owner_tran_index = file_p->owner_tran_index ();
+	  snapshot.owner = file_p;
+	  snapshot.fd = file_p->detach_for_unlink (snapshot.path);
+	  purge_cached_pages_locked (key);
+	  purge_fixed_pages_locked (key);
+	}
+    }
+
+    close_unlink_snapshot (snapshot);
+  }
+
+  void
+  cleanup_query_raw_fd_files (int owner_tran_index, QUERY_ID query_id) noexcept
+  {
+    ensure_rawfd_state ();
+
+    std::vector<rawfd_file_snapshot> snapshots;
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      for (auto it = g_rawfd_state.registry.begin (); it != g_rawfd_state.registry.end ();)
+	{
+	  if (it->second.owner_tran_index == owner_tran_index && it->second.query_id == query_id)
+	    {
+	      snapshots.push_back (detach_registry_entry_locked (it->second));
+	      it = g_rawfd_state.registry.erase (it);
+	    }
+	  else
+	    {
+	      ++it;
+	    }
+	}
+    }
+
+    for (rawfd_file_snapshot &snapshot : snapshots)
+      {
+	close_unlink_snapshot (snapshot);
+      }
+
+    for (const rawfd_disk_candidate &candidate : scan_rawfd_disk_candidates ())
+      {
+	if (candidate.owner_tran_index == owner_tran_index && candidate.query_id == query_id)
+	  {
+	    (void) unlink (candidate.path.c_str ());
+	  }
+      }
+
+    reap_raw_fd_files ();
+  }
+
+  void
+  reap_raw_fd_files () noexcept
+  {
+    ensure_rawfd_state ();
+
+    if (!g_rawfd_state.reaper_active)
+      {
+	return;
+      }
+
+    const auto steady_now = std::chrono::steady_clock::now ();
+    const auto wall_now = std::chrono::system_clock::now ();
+    const std::chrono::seconds grace (RAWFD_REAPER_GRACE_SECONDS);
+
+    std::vector<rawfd_registry_entry> registry_candidates;
+    std::set<std::uint64_t> registered_keys;
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      for (const auto &kv : g_rawfd_state.registry)
+	{
+	  registered_keys.insert (kv.first);
+
+	  const bool grace_expired = steady_now - kv.second.created_at > grace;
+	  if (grace_expired)
+	    {
+	      registry_candidates.push_back (kv.second);
+	    }
+	}
+    }
+
+    std::set<std::uint64_t> registry_keys_to_reap;
+    for (const rawfd_registry_entry &entry : registry_candidates)
+      {
+	const bool old_incarnation = entry.key.boot_incarnation != g_rawfd_state.boot_incarnation;
+	const bool query_not_live = old_incarnation || !qmgr_is_query_live (entry.owner_tran_index, entry.query_id);
+	if (old_incarnation || query_not_live)
+	  {
+	    registry_keys_to_reap.insert (registry_map_key (entry.key));
+	  }
+      }
+
+    std::vector<rawfd_file_snapshot> snapshots;
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      for (const std::uint64_t map_key : registry_keys_to_reap)
+	{
+	  const auto it = g_rawfd_state.registry.find (map_key);
+	  if (it != g_rawfd_state.registry.end ()
+	      && steady_now - it->second.created_at > grace)
+	    {
+	      snapshots.push_back (detach_registry_entry_locked (it->second));
+	      g_rawfd_state.registry.erase (it);
+	    }
+	}
+    }
+
+    for (rawfd_file_snapshot &snapshot : snapshots)
+      {
+	close_unlink_snapshot (snapshot);
+      }
+
+    for (const rawfd_disk_candidate &candidate : scan_rawfd_disk_candidates ())
+      {
+	if (registered_keys.find (registry_map_key (candidate.key)) != registered_keys.end ())
+	  {
+	    continue;
+	  }
+
+	if (wall_now < candidate.modified_at || wall_now - candidate.modified_at <= grace)
+	  {
+	    continue;
+	  }
+
+	const bool old_incarnation = candidate.key.boot_incarnation != g_rawfd_state.boot_incarnation;
+	const bool query_not_live = old_incarnation || !qmgr_is_query_live (candidate.owner_tran_index, candidate.query_id);
+	if (old_incarnation || query_not_live)
+	  {
+	    (void) unlink (candidate.path.c_str ());
+	  }
+      }
+  }
+
+  int
+  rawfd_write_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index, PAGE_PTR page_p) noexcept
+  {
+    if (!file.is_open () || page_p == NULL || page_index < 0)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+	return ER_FAILED;
+      }
+
+    if (!tde_is_loaded ())
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
+	return ER_TDE_CIPHER_IS_NOT_LOADED;
+      }
+
+    aligned_io_page plain;
+    aligned_io_page cipher;
+    if (!plain.valid () || !cipher.valid ())
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	return ER_OUT_OF_VIRTUAL_MEMORY;
+      }
+
+    fileio_initialize_res (thread_p, plain.page, IO_PAGESIZE);
+    plain.page->prv.pageid = page_index;
+    plain.page->prv.volid = NULL_VOLID;
+    plain.page->prv.ptype = PAGE_QRESULT;
+    memcpy (plain.page->page, page_p, DB_PAGESIZE);
+
+    const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+    if (tde_algo == TDE_ALGORITHM_NONE)
+      {
+        er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
+        return ER_TDE_CIPHER_IS_NOT_LOADED;
+      }
+    int error = tde_encrypt_data_page (plain.page, tde_algo, true, cipher.page);
+    if (error != NO_ERROR)
+      {
+	return error;
+      }
+
+
+    const off_t offset = static_cast<off_t> (page_index) * static_cast<off_t> (IO_PAGESIZE);
+    rawfd_invalidate_cached_page (file, page_index);
+    if (!full_pwrite (file.fd (), cipher.page, IO_PAGESIZE, offset))
+      {
+	const int saved_errno = errno;
+	if (saved_errno == ENOSPC || saved_errno == EDQUOT)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	  }
+	else
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  }
+	return ER_FAILED;
+      }
+
+    rawfd_invalidate_cached_page (file, page_index);
+    return NO_ERROR;
+  }
+
+  PAGE_PTR
+  rawfd_pos_read (THREAD_ENTRY * thread_p, raw_fd_file &file, const raw_fd_page_coordinate &coordinate) noexcept
+  {
+    if (!file.is_open () || coordinate.raw_fd_segment_id != file.segment_id () || coordinate.page_index < 0)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+	return NULL;
+      }
+
+    PAGE_PTR page_p = rawfd_alloc_fixed_page (&file, coordinate.page_index, false);
+    if (page_p == NULL)
+      {
+	return NULL;
+      }
+
+    if (cache_lookup_decrypted_page (file.key (), coordinate.page_index, page_p))
+      {
+	return page_p;
+      }
+
+    aligned_io_page cipher;
+    aligned_io_page plain;
+    if (!cipher.valid () || !plain.valid ())
+      {
+	rawfd_release_fixed_page (NULL, page_p);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	return NULL;
+      }
+
+    const off_t offset = static_cast<off_t> (coordinate.page_index) * static_cast<off_t> (IO_PAGESIZE);
+    if (!full_pread (file.fd (), cipher.page, IO_PAGESIZE, offset))
+      {
+	rawfd_release_fixed_page (NULL, page_p);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return NULL;
+      }
+
+    const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+    if (tde_algo == TDE_ALGORITHM_NONE)
+      {
+        rawfd_release_fixed_page (NULL, page_p);
+        er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
+        return NULL;
+      }
+    const int error = tde_decrypt_data_page (cipher.page, tde_algo, true, plain.page);
+    if (error != NO_ERROR)
+      {
+	rawfd_release_fixed_page (NULL, page_p);
+	return NULL;
+      }
+
+    memcpy (page_p, plain.page->page, DB_PAGESIZE);
+    cache_insert_decrypted_page (file.key (), coordinate.page_index, plain.page);
+    return page_p;
+  }
+
+  void
+  rawfd_invalidate_cached_page (raw_fd_file &file, PAGEID page_index) noexcept
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    g_rawfd_state.read_cache.erase (std::remove_if (g_rawfd_state.read_cache.begin (), g_rawfd_state.read_cache.end (),
+						    [&file, page_index] (const rawfd_cached_page &entry)
+    {
+      return entry.key.boot_incarnation == file.key ().boot_incarnation && entry.key.file_seq == file.key ().file_seq
+	&& entry.page_index == page_index;
+    }),
+				    g_rawfd_state.read_cache.end ());
+  }
+
+  int
+  rawfd_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept
+  {
+    (void) tfile_p;
+    rawfd_fixed_page fixed = rawfd_find_fixed_page (page_p);
+    if (fixed.file == NULL)
+      {
+	return NO_ERROR;
+      }
+
+    const int error = rawfd_write_page (thread_p, *fixed.file, fixed.page_index, page_p);
+    if (free_page == (int) FREE)
+      {
+	rawfd_release_fixed_page (tfile_p, page_p);
+      }
+
+    return error;
+  }
+
+  void
+  rawfd_release_fixed_page (QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept
+  {
+    (void) tfile_p;
+    rawfd_fixed_page fixed = rawfd_take_fixed_page (page_p);
+    if (fixed.page_p != NULL)
+      {
+	free_db_page_buffer (fixed.page_p);
+      }
+  }
+
+  int
+  rawfd_single_worker_tde_positioned_read_parity (THREAD_ENTRY * thread_p) noexcept
+  {
+    int os_error = 0;
+    raw_fd_file *file = create_raw_fd_file (thread_p, static_cast<QUERY_ID> (-1), LOG_FIND_THREAD_TRAN_INDEX (thread_p),
+					    0, &os_error);
+    if (file == NULL)
+      {
+	return ER_FAILED;
+      }
+
+    constexpr PAGEID PAGE_COUNT = 257;
+    std::vector<std::vector<char>> expected (PAGE_COUNT, std::vector<char> (DB_PAGESIZE));
+    int error = NO_ERROR;
+    std::set<INT64> seen_nonces;
+
+    for (PAGEID page = 0; page < PAGE_COUNT && error == NO_ERROR; page++)
+      {
+	for (int offset = 0; offset < DB_PAGESIZE; offset++)
+	  {
+	    expected[page][offset] = static_cast<char> ((page * 131 + offset * 17 + (offset >> 3)) & 0xff);
+	  }
+	QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+	put_page_header (expected[page].data (), &page_header);
+	error = rawfd_write_page (thread_p, *file, page, expected[page].data ());
+      }
+
+    for (PAGEID step = 0; step < PAGE_COUNT && error == NO_ERROR; step++)
+      {
+	const PAGEID page = static_cast<PAGEID> ((step * 73) % PAGE_COUNT);
+	raw_fd_page_coordinate coord { file->segment_id (), page, static_cast<std::size_t> ((page * 19) % DB_PAGESIZE) };
+        aligned_io_page cipher_check;
+        aligned_io_page plain_check;
+        if (!cipher_check.valid () || !plain_check.valid ()
+            || !full_pread (file->fd (), cipher_check.page, IO_PAGESIZE,
+                            static_cast<off_t> (page) * static_cast<off_t> (IO_PAGESIZE)))
+          {
+            error = ER_FAILED;
+            break;
+          }
+        const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+        error = tde_decrypt_data_page (cipher_check.page, tde_algo, true, plain_check.page);
+        if (error != NO_ERROR)
+          {
+            break;
+          }
+        if (memcmp (plain_check.page->page, expected[page].data (), DB_PAGESIZE) != 0
+            || plain_check.page->prv.tde_nonce != cipher_check.page->prv.tde_nonce
+            || plain_check.page->prv.tde_nonce == 0)
+          {
+            er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+            error = ER_FAILED;
+            break;
+          }
+        seen_nonces.insert (cipher_check.page->prv.tde_nonce);
+	PAGE_PTR actual = rawfd_pos_read (thread_p, *file, coord);
+	if (actual == NULL)
+	  {
+	    error = ER_FAILED;
+	    break;
+	  }
+
+	if (memcmp (actual, expected[page].data (), DB_PAGESIZE) != 0)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    error = ER_FAILED;
+	  }
+	rawfd_release_fixed_page (NULL, actual);
+      }
+
+    if (error == NO_ERROR && seen_nonces.size () != static_cast<std::size_t> (PAGE_COUNT))
+      {
+	/* TDE security gate (b): every raw write must take a FRESH global-counter nonce -> 257 distinct nonces. */
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	error = ER_FAILED;
+      }
+
+    destroy_raw_fd_file (file);
+    return error;
+  }
   bool
   raw_fd_writes_enabled () noexcept
   {
-    const bool boot_sweep_complete = false;
-    const bool tde_wired = false;
-    const bool reaper_active = false;
+    ensure_rawfd_state ();
 
-    return boot_sweep_complete && tde_wired && reaper_active;
+    /* LEADER-GATED P1b FLIP SITE: keep this master flag false until the leader completes the full P1b gate and
+     * deliberately enables raw-fd writes.  The runtime safety state below is wired, but this master switch keeps the
+     * product query path inert/safe in the delegated landing commit. */
+    constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = false;
+    bool master_enable = LEADER_VERIFIED_ENABLE_RAW_FD_WRITES;
+
+#if !defined (NDEBUG)
+    /* Debug-only P1b end-to-end test affordance: exercise the raw-fd product path under the full safety net without
+     * permanently flipping the committed master switch.  Never compiled into release (NDEBUG).  Default stays false. */
+    if (getenv ("CUBRID_RAWFD_ENABLE_TEST") != NULL)
+      {
+	master_enable = true;
+      }
+#endif /* !NDEBUG */
+
+    return master_enable
+      && g_rawfd_state.boot_sweep_complete && g_rawfd_state.tde_wired && g_rawfd_state.reaper_active;
   }
 
   PAGE_PTR
@@ -309,6 +1622,54 @@ namespace temp_page_store
             return tfile_p->membuf[tfile_p->membuf_last];
           }
 
+        if (raw_fd_writes_enabled ())
+          {
+            int os_error = 0;
+            if (tfile_p->raw_fd_handle == NULL)
+              {
+                tfile_p->raw_fd_handle = create_raw_fd_file (thread_p, tfile_p->raw_fd_query_id,
+                                                             tfile_p->raw_fd_owner_tran_index,
+                                                             tfile_p->raw_fd_worker_id, &os_error);
+                if (tfile_p->raw_fd_handle != NULL)
+                  {
+                    tfile_p->raw_fd_handle->attach_temp_file (tfile_p);
+                  }
+              }
+            if (tfile_p->raw_fd_handle != NULL)
+              {
+                if (tfile_p->raw_fd_next_pageid <= tfile_p->membuf_last)
+                  {
+                    tfile_p->raw_fd_next_pageid = tfile_p->membuf_last + 1;
+                  }
+                vpid_p->volid = NULL_VOLID;
+                vpid_p->pageid = tfile_p->raw_fd_next_pageid++;
+                tfile_p->backing = qmgr_temp_backing::RAW_FD_OVERFLOW;
+                PAGE_PTR raw_page_p = rawfd_alloc_fixed_page (tfile_p->raw_fd_handle, vpid_p->pageid, true);
+                if (raw_page_p == NULL)
+                  {
+                    destroy_raw_fd_file (tfile_p->raw_fd_handle);
+                    tfile_p->raw_fd_handle = NULL;
+                    tfile_p->raw_fd_next_pageid = 0;
+                    tfile_p->backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
+                    return NULL;
+                  }
+                if (rawfd_write_page (thread_p, *tfile_p->raw_fd_handle, vpid_p->pageid, raw_page_p) == NO_ERROR)
+                  {
+                    return raw_page_p;
+                  }
+                rawfd_release_fixed_page (tfile_p, raw_page_p);
+                destroy_raw_fd_file (tfile_p->raw_fd_handle);
+                tfile_p->raw_fd_handle = NULL;
+                tfile_p->raw_fd_next_pageid = 0;
+                tfile_p->backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
+                return alloc_private_spill_page (thread_p, tfile_p, vpid_p);
+              }
+            if (!is_fd_or_space_error (os_error))
+              {
+                return NULL;
+              }
+          }
+
         tfile_p->backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
         return alloc_private_spill_page (thread_p, tfile_p, vpid_p);
 
@@ -316,8 +1677,29 @@ namespace temp_page_store
         return alloc_private_spill_page (thread_p, tfile_p, vpid_p);
 
       case qmgr_temp_backing::RAW_FD_OVERFLOW:
-        assert_release_error (raw_fd_writes_enabled ());
-        return unreachable_backing_page (thread_p);
+        if (!raw_fd_writes_enabled () || tfile_p->raw_fd_handle == NULL)
+          {
+            er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+            return NULL;
+          }
+        vpid_p->volid = NULL_VOLID;
+        vpid_p->pageid = tfile_p->raw_fd_next_pageid++;
+        {
+          PAGE_PTR raw_page_p = rawfd_alloc_fixed_page (tfile_p->raw_fd_handle, vpid_p->pageid, true);
+          if (raw_page_p == NULL)
+            {
+              return NULL;
+            }
+          if (rawfd_write_page (thread_p, *tfile_p->raw_fd_handle, vpid_p->pageid, raw_page_p) == NO_ERROR)
+            {
+              return raw_page_p;
+            }
+          rawfd_release_fixed_page (tfile_p, raw_page_p);
+          destroy_raw_fd_file (tfile_p->raw_fd_handle);
+          tfile_p->raw_fd_handle = NULL;
+          tfile_p->raw_fd_next_pageid = 0;
+          return NULL;
+        }
 
       case qmgr_temp_backing::PGBUF_PINNED:
       case qmgr_temp_backing::SHARED_SPILL:
@@ -358,8 +1740,16 @@ namespace temp_page_store
         return fix_private_spill_page (thread_p, vpid_p);
 
       case qmgr_temp_backing::RAW_FD_OVERFLOW:
-        assert_release_error (raw_fd_writes_enabled ());
-        return unreachable_backing_page (thread_p);
+        if (vpid_p->volid == NULL_VOLID && vpid_p->pageid >= 0 && vpid_p->pageid <= tfile_p->membuf_last)
+          {
+            return fix_membuf_page (thread_p, tfile_p, vpid_p);
+          }
+        if (tfile_p->raw_fd_handle == NULL)
+          {
+            return unreachable_backing_page (thread_p);
+          }
+        return rawfd_pos_read (thread_p, *tfile_p->raw_fd_handle,
+                               raw_fd_page_coordinate { tfile_p->raw_fd_handle->segment_id (), vpid_p->pageid, 0 });
 
       case qmgr_temp_backing::PGBUF_PINNED:
       case qmgr_temp_backing::SHARED_SPILL:
@@ -406,7 +1796,18 @@ namespace temp_page_store
   void
   release_held_reservation (QMGR_TEMP_FILE * tfile_p) noexcept
   {
-    if (tfile_p == NULL || tfile_p->wm_reserved_bytes == 0)
+    if (tfile_p == NULL)
+      {
+        return;
+      }
+
+    if (tfile_p->raw_fd_handle != NULL)
+      {
+        destroy_raw_fd_file (tfile_p->raw_fd_handle);
+        tfile_p->raw_fd_handle = NULL;
+      }
+
+    if (tfile_p->wm_reserved_bytes == 0)
       {
         return;
       }
