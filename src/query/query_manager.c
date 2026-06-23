@@ -1460,6 +1460,14 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   assert (query_p->list_id != NULL);
+  /* Class-B sink: before returning a client-fetchable result, ensure the VPID-wire page chain is backed by real
+   * pgbuf pages. Raw-fd overflow segments do not maintain the next_vpid chain consumed by
+   * xqfile_get_list_file_page(). With the raw-fd write guard disabled, qmgr_list_has_raw_fd_segments() is false
+   * and this is a no-op. */
+  if (qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
+    {
+      goto exit_on_error;
+    }
 
   /* allocate new QFILE_LIST_ID to be returned as the result and copy from the query result; the caller is responsible
    * to free this */
@@ -1812,6 +1820,11 @@ xqmgr_execute_query (THREAD_ENTRY * thread_p, const XASL_ID * xasl_id_p, QUERY_I
 	    }
 
 	  if (list_cache_entry_p && !cached_result)
+	    {
+	      goto end;
+	    }
+	  /* Class-B sink: query cache entries must store a real-VPID list, never a raw-fd segment chain. */
+	  if (qmgr_materialize_to_pgbuf (thread_p, list_id_p) != NO_ERROR)
 	    {
 	      goto end;
 	    }
@@ -2584,10 +2597,19 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 		{
 		  er_log_debug (ARG_FILE_LINE, "query %d is completed!\n", query_p->query_id);
 		}
-	      xsession_store_query_entry_info (thread_p, query_p);
-	      /* reset result info */
-	      query_p->list_id = NULL;
-	      query_p->temp_vfid = NULL;
+	      /* Class-B sink: holdable results must be preserved across commit as real-VPID pgbuf-backed lists. */
+	      if (qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
+		{
+		  er_log_debug (ARG_FILE_LINE, "query %d holdable materialize failed !\n", query_p->query_id);
+		  query_p->is_holdable = false;
+		}
+	      else
+		{
+		  xsession_store_query_entry_info (thread_p, query_p);
+		  /* reset result info */
+		  query_p->list_id = NULL;
+		  query_p->temp_vfid = NULL;
+		}
 	    }
 	}
 
