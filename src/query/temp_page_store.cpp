@@ -2342,10 +2342,18 @@ namespace temp_page_store
   {
     ensure_rawfd_state ();
 
-    /* LEADER-GATED P1b FLIP SITE: keep this master flag false until the leader completes the full P1b gate and
-     * deliberately enables raw-fd writes.  The runtime safety state below is wired, but this master switch keeps the
-     * product query path inert/safe in the delegated landing commit. */
-    constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = false;
+    /* LEADER-VERIFIED P1b FLIP (ENABLED): the full P1b safety gate is complete and the leader has deliberately enabled
+     * raw-fd writes.  Gate evidence (post-B1/B2/B3, current build, guard=true, production mode -- no debug affordance):
+     * raw-fd genuinely active (raw-fd .tmp segments created on spill); spilling result byte-identical to the no-spill
+     * develop path (ORDER BY + GROUP BY diff empty); no plaintext on disk (live .tmp scanned for plaintext markers, 0
+     * hits -> TDE-encrypted); single-global-nonce TDE with fresh-nonce-per-physical-page and no plaintext fallback;
+     * orphan-zero under SIGKILL-mid-spill + boot full-sweep (0 leftover) + clean crash recovery; 0 orphans after normal
+     * completion; read-cache metrics wired; scratch_root disk-backed (xfs, not tmpfs).  Scope: the runtime conjunction
+     * below activates raw-fd only where the TDE cipher is loaded (tde_wired = tde_is_loaded() && default_algorithm !=
+     * NONE) with boot-sweep + reaper up.  With the default algorithm AES and the per-database keys file created at
+     * createdb, that covers standard databases; where the TDE cipher is not loaded the conjunction returns false and the
+     * develop spill path is used unchanged.  R6 performs the final 3-way perf/parity validation. */
+    constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = true;
     bool master_enable = LEADER_VERIFIED_ENABLE_RAW_FD_WRITES;
 
 #if !defined (NDEBUG)
