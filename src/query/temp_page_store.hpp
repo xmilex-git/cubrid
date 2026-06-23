@@ -92,6 +92,7 @@ namespace temp_page_store
       friend raw_fd_file *create_raw_fd_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, int owner_tran_index,
                                               unsigned int worker_id, int *os_error_out) noexcept;
       friend void destroy_raw_fd_file (raw_fd_file *file_p) noexcept;
+      friend void reassign_raw_fd_owner (raw_fd_file *file_p, QMGR_TEMP_FILE * new_owner) noexcept;
       friend int rawfd_write_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index, PAGE_PTR page_p) noexcept;
       friend PAGE_PTR rawfd_pos_read (THREAD_ENTRY * thread_p, raw_fd_file &file,
                                       const raw_fd_page_coordinate &coordinate) noexcept;
@@ -112,6 +113,7 @@ namespace temp_page_store
   raw_fd_file *create_raw_fd_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, int owner_tran_index,
                                    unsigned int worker_id, int *os_error_out) noexcept;
   void destroy_raw_fd_file (raw_fd_file *file_p) noexcept;
+  void reassign_raw_fd_owner (raw_fd_file *file_p, QMGR_TEMP_FILE * new_owner) noexcept;
   void cleanup_query_raw_fd_files (int owner_tran_index, QUERY_ID query_id) noexcept;
   void reap_raw_fd_files () noexcept;
 
@@ -123,6 +125,7 @@ namespace temp_page_store
   void rawfd_release_fixed_page (QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept;
 
   int rawfd_single_worker_tde_positioned_read_parity (THREAD_ENTRY * thread_p) noexcept;
+  int qmgr_temp_file_move_selftest (THREAD_ENTRY * thread_p) noexcept;
 
   PAGE_PTR alloc_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p);
   PAGE_PTR fix_old_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p);

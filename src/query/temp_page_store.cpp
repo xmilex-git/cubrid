@@ -994,6 +994,55 @@ namespace
       }
     return NULL;
   }
+
+#if !defined (NDEBUG)
+  void
+  qmgr_temp_file_move_selftest_init (QMGR_TEMP_FILE * tfile_p) noexcept
+  {
+    memset (tfile_p, 0, sizeof (*tfile_p));
+    tfile_p->temp_file_type = FILE_TEMP;
+    VFID_SET_NULL (&tfile_p->temp_vfid);
+    tfile_p->membuf_last = -1;
+    tfile_p->membuf_type = TEMP_FILE_MEMBUF_NONE;
+    tfile_p->backing = qmgr_temp_backing::MEMBUF;
+    tfile_p->wm_reserved_shard = -1;
+    tfile_p->raw_fd_query_id = NULL_QUERY_ID;
+    tfile_p->raw_fd_owner_tran_index = NULL_TRAN_INDEX;
+  }
+
+  int
+  qmgr_temp_file_move_selftest_destroy (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p) noexcept
+  {
+    int error = NO_ERROR;
+
+    if (tfile_p->raw_fd_handle != NULL)
+      {
+	temp_page_store::destroy_raw_fd_file (tfile_p->raw_fd_handle);
+	tfile_p->raw_fd_handle = NULL;
+	tfile_p->raw_fd_next_pageid = 0;
+      }
+
+    if (!VFID_ISNULL (&tfile_p->temp_vfid))
+      {
+	if (file_temp_retire (thread_p, &tfile_p->temp_vfid) != NO_ERROR)
+	  {
+	    error = ER_FAILED;
+	  }
+	VFID_SET_NULL (&tfile_p->temp_vfid);
+      }
+
+    temp_page_store::release_held_reservation (tfile_p);
+
+    if (tfile_p->membuf != NULL)
+      {
+	free (tfile_p->membuf);
+	tfile_p->membuf = NULL;
+      }
+
+    return error;
+  }
+#endif /* !NDEBUG */
+
 }
 
 namespace temp_page_store
@@ -1216,6 +1265,26 @@ namespace temp_page_store
     }
 
     close_unlink_snapshot (snapshot);
+  }
+
+  void
+  reassign_raw_fd_owner (raw_fd_file *file_p, QMGR_TEMP_FILE * new_owner) noexcept
+  {
+    if (file_p == NULL)
+      {
+	return;
+      }
+
+    ensure_rawfd_state ();
+
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    file_p->m_tfile_owner = new_owner;
+
+    const auto it = g_rawfd_state.registry.find (registry_map_key (file_p->key ()));
+    if (it != g_rawfd_state.registry.end () && it->second.owner == file_p)
+      {
+	it->second.tfile_owner = new_owner;
+      }
   }
 
   void
@@ -1579,6 +1648,190 @@ namespace temp_page_store
     destroy_raw_fd_file (file);
     return error;
   }
+
+  int
+  qmgr_temp_file_move_selftest (THREAD_ENTRY * thread_p) noexcept
+  {
+#if !defined (NDEBUG)
+    QMGR_TEMP_FILE src, dst;
+    int error = NO_ERROR;
+
+    qmgr_temp_file_move_selftest_init (&src);
+    qmgr_temp_file_move_selftest_init (&dst);
+
+    src.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR) * 2));
+    dst.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR) * 2));
+    if (src.membuf == NULL || dst.membuf == NULL)
+      {
+	free (src.membuf);
+	free (dst.membuf);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (PAGE_PTR) * 2);
+	return ER_FAILED;
+      }
+
+    const std::size_t reserved_bytes = reservation_bytes_for_pages (1);
+    if (!reserve_held (reserved_bytes, &src.wm_reserved_shard))
+      {
+	free (src.membuf);
+	free (dst.membuf);
+	return ER_FAILED;
+      }
+    src.wm_reserved_bytes = reserved_bytes;
+
+    /* Use a SENTINEL temp-volume VFID (no real file): file_create_temp/file_temp_retire require a sysop/transaction
+     * context that does not exist in qmgr_initialize at server boot (assert tdes->is_allowed_sysop()).  The move
+     * primitive's temp_vfid handling is a pure value-transfer + VFID_SET_NULL(src), so a sentinel exercises it fully;
+     * dst.temp_vfid is nulled before destroy so the sentinel is never retired. */
+    src.temp_vfid.volid = 1;
+    src.temp_vfid.fileid = 0x5A5A5A;
+
+    src.temp_file_type = FILE_QUERY_AREA;
+    src.membuf[0] = NULL;
+    src.membuf[1] = NULL;
+    src.membuf_last = 1;
+    src.membuf_npages = 2;
+    src.membuf_type = TEMP_FILE_MEMBUF_NORMAL;
+    src.membuf_capacity_pages = 2;
+    dst.membuf[0] = NULL;
+    dst.membuf[1] = NULL;
+    dst.membuf_last = 0;
+    dst.membuf_npages = 2;
+    dst.membuf_type = TEMP_FILE_MEMBUF_KEY_BUFFER;
+    dst.membuf_capacity_pages = 2;
+    src.backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
+    src.raw_fd_query_id = static_cast<QUERY_ID> (-2);
+    src.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+    src.raw_fd_worker_id = 7;
+    src.raw_fd_next_pageid = 2;
+    src.tde_encrypted = true;
+    src.preserved = true;
+
+    PAGE_PTR *const src_membuf = src.membuf;
+    PAGE_PTR *const dst_membuf = dst.membuf;
+    const VFID temp_vfid = src.temp_vfid;
+
+    qmgr_temp_file_move (&dst, &src);
+
+    if (src.raw_fd_handle != NULL || !VFID_ISNULL (&src.temp_vfid) || src.membuf != src_membuf
+	|| src.membuf_last != 1 || src.membuf_npages != 2 || src.membuf_type != TEMP_FILE_MEMBUF_NORMAL
+	|| src.membuf_capacity_pages != 2 || src.wm_reserved_bytes != 0 || src.wm_reserved_shard != -1
+	|| src.backing != qmgr_temp_backing::MEMBUF || src.raw_fd_query_id != NULL_QUERY_ID
+	|| src.raw_fd_owner_tran_index != NULL_TRAN_INDEX || src.raw_fd_worker_id != 0 || src.raw_fd_next_pageid != 0
+	|| src.temp_file_type != FILE_TEMP || src.preserved || src.tde_encrypted || dst.membuf != dst_membuf
+	|| dst.membuf_last != 0 || dst.membuf_npages != 2 || dst.membuf_type != TEMP_FILE_MEMBUF_KEY_BUFFER
+	|| dst.membuf_capacity_pages != 2 || !VFID_EQ (&dst.temp_vfid, &temp_vfid)
+	|| dst.temp_file_type != FILE_QUERY_AREA || !dst.preserved || dst.wm_reserved_bytes != reserved_bytes
+	|| dst.wm_reserved_shard < 0 || dst.backing != qmgr_temp_backing::PRIVATE_SPILL_FALLBACK
+	|| dst.raw_fd_query_id != static_cast<QUERY_ID> (-2)
+	|| dst.raw_fd_owner_tran_index != LOG_FIND_THREAD_TRAN_INDEX (thread_p) || dst.raw_fd_worker_id != 7
+	|| dst.raw_fd_next_pageid != 2 || !dst.tde_encrypted)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	error = ER_FAILED;
+      }
+
+    /* Sentinel temp-volume VFID: clear it on dst so destroy does not file_temp_retire a non-existent file at boot. */
+    VFID_SET_NULL (&dst.temp_vfid);
+    if (qmgr_temp_file_move_selftest_destroy (thread_p, &src) != NO_ERROR)
+      {
+	error = ER_FAILED;
+      }
+    if (qmgr_temp_file_move_selftest_destroy (thread_p, &dst) != NO_ERROR)
+      {
+	error = ER_FAILED;
+      }
+    if (error != NO_ERROR)
+      {
+	return error;
+      }
+
+    qmgr_temp_file_move_selftest_init (&src);
+    qmgr_temp_file_move_selftest_init (&dst);
+
+    if (!raw_fd_writes_enabled ())
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+    src.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR)));
+    dst.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR)));
+    if (src.membuf == NULL || dst.membuf == NULL)
+      {
+	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &src);
+	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &dst);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (PAGE_PTR));
+	return ER_FAILED;
+      }
+
+    src.membuf[0] = NULL;
+    src.membuf_last = -1;
+    src.membuf_npages = 0;
+    src.membuf_type = TEMP_FILE_MEMBUF_NORMAL;
+    src.membuf_capacity_pages = 1;
+    dst.membuf[0] = NULL;
+    dst.membuf_last = -1;
+    dst.membuf_npages = 0;
+    dst.membuf_type = TEMP_FILE_MEMBUF_KEY_BUFFER;
+    dst.membuf_capacity_pages = 1;
+
+    src.backing = qmgr_temp_backing::MEMBUF;
+    src.raw_fd_query_id = static_cast<QUERY_ID> (-3);
+    src.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+    src.raw_fd_worker_id = 11;
+
+    VPID raw_vpid;
+    VPID_SET_NULL (&raw_vpid);
+    PAGE_PTR raw_page = alloc_page (thread_p, &src, &raw_vpid);
+    if (raw_page == NULL || src.raw_fd_handle == NULL || src.backing != qmgr_temp_backing::RAW_FD_OVERFLOW)
+      {
+	if (raw_page != NULL)
+	  {
+	    rawfd_release_fixed_page (&src, raw_page);
+	  }
+	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &src);
+	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &dst);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+    rawfd_release_fixed_page (&src, raw_page);
+
+    PAGE_PTR *const raw_src_membuf = src.membuf;
+    PAGE_PTR *const raw_dst_membuf = dst.membuf;
+    raw_fd_file *const raw_fd_handle = src.raw_fd_handle;
+    qmgr_temp_file_move (&dst, &src);
+
+    if (src.raw_fd_handle != NULL || src.membuf != raw_src_membuf || src.membuf_last != -1
+	|| src.membuf_npages != 0 || src.membuf_type != TEMP_FILE_MEMBUF_NORMAL || src.membuf_capacity_pages != 1
+	|| src.raw_fd_query_id != NULL_QUERY_ID || src.raw_fd_owner_tran_index != NULL_TRAN_INDEX
+	|| src.raw_fd_worker_id != 0 || src.raw_fd_next_pageid != 0 || src.backing != qmgr_temp_backing::MEMBUF
+	|| dst.raw_fd_handle != raw_fd_handle || dst.raw_fd_next_pageid != 1
+	|| dst.backing != qmgr_temp_backing::RAW_FD_OVERFLOW || dst.membuf != raw_dst_membuf
+	|| dst.membuf_last != -1 || dst.membuf_npages != 0 || dst.membuf_type != TEMP_FILE_MEMBUF_KEY_BUFFER
+	|| dst.membuf_capacity_pages != 1 || dst.raw_fd_query_id != static_cast<QUERY_ID> (-3)
+	|| dst.raw_fd_owner_tran_index != LOG_FIND_THREAD_TRAN_INDEX (thread_p) || dst.raw_fd_worker_id != 11)
+      {
+	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &src);
+	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &dst);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+
+    (void) qmgr_temp_file_move_selftest_destroy (thread_p, &src);
+    cleanup_query_raw_fd_files (dst.raw_fd_owner_tran_index, dst.raw_fd_query_id);
+    if (dst.raw_fd_handle != NULL)
+      {
+	dst.raw_fd_handle = NULL;
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+
+    return qmgr_temp_file_move_selftest_destroy (thread_p, &dst);
+#else /* !NDEBUG */
+    (void) thread_p;
+    return NO_ERROR;
+#endif /* !NDEBUG */
+  }
+
   bool
   raw_fd_writes_enabled () noexcept
   {

@@ -957,6 +957,12 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       er_log_debug (ARG_FILE_LINE, "RAWFD_SELFTEST result=%d (0=PASS)\n", rawfd_selftest_rc);
       fprintf (stderr, "RAWFD_SELFTEST result=%d (0=PASS)\n", rawfd_selftest_rc);
     }
+  if (getenv ("CUBRID_TEMPMOVE_SELFTEST") != NULL)
+    {
+      int tempmove_selftest_rc = temp_page_store::qmgr_temp_file_move_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "TEMPMOVE_SELFTEST result=%d (0=PASS)\n", tempmove_selftest_rc);
+      fprintf (stderr, "TEMPMOVE_SELFTEST result=%d (0=PASS)\n", tempmove_selftest_rc);
+    }
 #endif /* !NDEBUG */
 
   return scan_initialize ();
@@ -2835,6 +2841,59 @@ PAGE_PTR
 qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfile_vfid_p)
 {
   return temp_page_store::alloc_page (thread_p, tfile_vfid_p, vpid_p);
+}
+
+/*
+ * qmgr_temp_file_move () - move a temporary-file backing owner
+ *   return: none
+ *   dst(in/out): destination temp-file descriptor; must not already own backing resources
+ *   src(in/out): source temp-file descriptor
+ *
+ * Note: List links are intentionally not moved.  The operation adopts only spilled backing (temp-volume/raw-fd)
+ * and workmem reservation state.  Inline membuf storage is per-descriptor self-owned and is not transferred;
+ * callers drain/read membuf data before or independently of this move.
+ */
+void
+qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src)
+{
+  assert (dst != NULL && src != NULL);
+  assert (dst != src);
+
+  if (dst == NULL || src == NULL || dst == src)
+    {
+      return;
+    }
+
+  dst->temp_file_type = src->temp_file_type;
+  VFID_COPY (&dst->temp_vfid, &src->temp_vfid);
+  dst->backing = src->backing;
+  dst->wm_reserved_bytes = src->wm_reserved_bytes;
+  dst->wm_reserved_shard = src->wm_reserved_shard;
+  dst->raw_fd_query_id = src->raw_fd_query_id;
+  dst->raw_fd_owner_tran_index = src->raw_fd_owner_tran_index;
+  dst->raw_fd_worker_id = src->raw_fd_worker_id;
+  dst->raw_fd_handle = src->raw_fd_handle;
+  dst->raw_fd_next_pageid = src->raw_fd_next_pageid;
+  dst->preserved = src->preserved;
+  dst->tde_encrypted = src->tde_encrypted;
+
+  if (dst->raw_fd_handle != NULL)
+    {
+      temp_page_store::reassign_raw_fd_owner (dst->raw_fd_handle, dst);
+    }
+
+  src->temp_file_type = FILE_TEMP;
+  VFID_SET_NULL (&src->temp_vfid);
+  src->backing = qmgr_temp_backing::MEMBUF;
+  src->wm_reserved_bytes = 0;
+  src->wm_reserved_shard = -1;
+  src->raw_fd_query_id = NULL_QUERY_ID;
+  src->raw_fd_owner_tran_index = NULL_TRAN_INDEX;
+  src->raw_fd_worker_id = 0;
+  src->raw_fd_handle = NULL;
+  src->raw_fd_next_pageid = 0;
+  src->preserved = false;
+  src->tde_encrypted = false;
 }
 
 static QMGR_TEMP_FILE *

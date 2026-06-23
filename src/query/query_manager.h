@@ -105,7 +105,6 @@ struct qmgr_temp_file
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };
-
 /*
  * Arguments to pass to the routine used to wait for the next available page
  * for streaming queries.
@@ -182,6 +181,7 @@ extern PAGE_PTR qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpidp, QMGR_T
 extern QMGR_TEMP_FILE *qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id,
 						  QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type);
 extern QMGR_TEMP_FILE *qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id);
+extern void qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src);
 extern int qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_FILE * tfile_vfidp);
 extern int qmgr_free_temp_file_list (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfidp, QUERY_ID query_id,
 				     bool is_error);
