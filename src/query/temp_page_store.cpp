@@ -2342,18 +2342,16 @@ namespace temp_page_store
   {
     ensure_rawfd_state ();
 
-    /* LEADER-VERIFIED P1b FLIP (ENABLED): the full P1b safety gate is complete and the leader has deliberately enabled
-     * raw-fd writes.  Gate evidence (post-B1/B2/B3, current build, guard=true, production mode -- no debug affordance):
-     * raw-fd genuinely active (raw-fd .tmp segments created on spill); spilling result byte-identical to the no-spill
-     * develop path (ORDER BY + GROUP BY diff empty); no plaintext on disk (live .tmp scanned for plaintext markers, 0
-     * hits -> TDE-encrypted); single-global-nonce TDE with fresh-nonce-per-physical-page and no plaintext fallback;
-     * orphan-zero under SIGKILL-mid-spill + boot full-sweep (0 leftover) + clean crash recovery; 0 orphans after normal
-     * completion; read-cache metrics wired; scratch_root disk-backed (xfs, not tmpfs).  Scope: the runtime conjunction
-     * below activates raw-fd only where the TDE cipher is loaded (tde_wired = tde_is_loaded() && default_algorithm !=
-     * NONE) with boot-sweep + reaper up.  With the default algorithm AES and the per-database keys file created at
-     * createdb, that covers standard databases; where the TDE cipher is not loaded the conjunction returns false and the
-     * develop spill path is used unchanged.  R6 performs the final 3-way perf/parity validation. */
-    constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = true;
+    /* LEADER-GATED P1b FLIP SITE -- currently FALSE (reverted from a premature flip).  The single-stream/concurrent
+     * spill, TDE-nonce, orphan-zero, and px_scan ORDER-BY reassembly properties were verified, BUT a later large-data
+     * test found a REGRESSION the earlier verification missed: connect_list-based merges relink page chains and require
+     * homogeneous real-VPID disk lists (qfile_connect_list asserts tfile_vfid->membuf == NULL and walks real VPIDs).
+     * When raw-fd is live, large multi-partition hash joins (hjoin_merge_qlist), external sort (sort_listfile),
+     * and parallel agg merges produce raw-fd-backed (NULL_VOLID) lists that connect_list cannot relink -> server abort.
+     * This flip is therefore gated on P6 first making every connect_list-based merge raw-fd-safe (materialize raw-fd /
+     * membuf lists to real-VPID disk via qmgr_materialize_to_pgbuf before any relink).  Keep FALSE until P6 is complete
+     * and a large-data hash-join/sort/agg + parallel campaign passes.  See .not_git_tracking/scratch/p6-design.md. */
+    constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = false;
     bool master_enable = LEADER_VERIFIED_ENABLE_RAW_FD_WRITES;
 
 #if !defined (NDEBUG)
