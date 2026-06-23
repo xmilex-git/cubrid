@@ -35,6 +35,7 @@
 #include "list_file.h"
 #include "storage_common.h"
 #include "thread_compat.hpp"
+#include "temp_page_store.hpp"
 
 // forward definitions
 struct xasl_cache_ent;
@@ -92,6 +93,10 @@ struct qmgr_temp_file
   PAGE_PTR *membuf;
   int membuf_npages;
   QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type;
+  int membuf_capacity_pages;
+  qmgr_temp_backing backing;
+  size_t wm_reserved_bytes;
+  int wm_reserved_shard;
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };

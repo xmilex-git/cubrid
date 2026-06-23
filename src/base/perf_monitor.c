@@ -97,6 +97,9 @@
 #if !defined (SERVER_MODE)
 #include "network_interface_cl.h"
 #endif /* !defined (SERVER_MODE) */
+#if defined (SERVER_MODE) || defined (SA_MODE)
+#include "temp_page_store.hpp"
+#endif /* defined (SERVER_MODE) || defined (SA_MODE) */
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -298,6 +301,9 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_QM_NUM_HASHJOINS_PARALLEL, "Num_query_hashjoins_parallel"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_QM_NUM_OBJFETCHES, "Num_query_objfetches"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QM_NUM_HOLDABLE_CURSORS, "Num_query_holdable_cursors"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_NUM_DEGRADES, "Num_workmem_degrades"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_RESERVED_BYTES, "Num_workmem_reserved_bytes"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_CAP_BYTES, "Num_workmem_cap_bytes"),
 
   /* Execution statistics for external sort */
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_SORT_NUM_IO_PAGES, "Num_sort_io_pages"),
@@ -4055,6 +4061,8 @@ perfmon_get_peek_stats (UINT64 * stats)
   stats[pstat_Metadata[PSTAT_PC_NUM_CACHE_ENTRIES].start_offset] = xcache_get_entry_count ();
   stats[pstat_Metadata[PSTAT_HF_NUM_STATS_ENTRIES].start_offset] = heap_get_best_space_num_stats_entries ();
   stats[pstat_Metadata[PSTAT_QM_NUM_HOLDABLE_CURSORS].start_offset] = session_get_number_of_holdable_cursors ();
+  stats[pstat_Metadata[PSTAT_WORKMEM_RESERVED_BYTES].start_offset] = temp_page_store::reserved_bytes ();
+  stats[pstat_Metadata[PSTAT_WORKMEM_CAP_BYTES].start_offset] = temp_page_store::cap_bytes ();
 #endif /* defined (SERVER_MODE) || defined (SA_MODE) */
 }
 
