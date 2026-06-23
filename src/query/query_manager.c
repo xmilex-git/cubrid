@@ -189,7 +189,7 @@ static void qmgr_put_temp_file_into_list (QMGR_TEMP_FILE * temp_file_p);
 
 static int copy_bind_value_to_tdes (THREAD_ENTRY * thread_p, int num_bind_vals, DB_VALUE * bind_vals);
 #if !defined (NDEBUG)
-static int qmgr_segment_position_selftest (void);
+static int qmgr_segment_position_selftest (THREAD_ENTRY * thread_p);
 #endif
 
 /*
@@ -917,7 +917,7 @@ qmgr_segment_position_same_coord (const QFILE_TUPLE_POSITION * lhs_p, const QFIL
 }
 
 static int
-qmgr_segment_position_selftest (void)
+qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
 {
   VPID vpid = { 17, 3 };
   QFILE_TUPLE_POSITION vpid_pos = {};
@@ -1001,6 +1001,89 @@ qmgr_segment_position_selftest (void)
       return ER_FAILED;
     }
 
+  if (getenv ("CUBRID_RAWFD_ENABLE_TEST") != NULL)
+    {
+      int os_error = 0;
+      temp_page_store::raw_fd_file *file_p =
+	temp_page_store::create_raw_fd_file (thread_p, static_cast < QUERY_ID > (-4),
+					     LOG_FIND_THREAD_TRAN_INDEX (thread_p), 0, &os_error);
+      if (file_p == NULL)
+	{
+	  return ER_FAILED;
+	}
+
+      QMGR_TEMP_FILE tfile;
+      memset (&tfile, 0, sizeof (tfile));
+      tfile.temp_file_type = FILE_TEMP;
+      VFID_SET_NULL (&tfile.temp_vfid);
+      tfile.membuf_last = -1;
+      tfile.membuf_type = TEMP_FILE_MEMBUF_NONE;
+      tfile.backing = qmgr_temp_backing::RAW_FD_OVERFLOW;
+      tfile.raw_fd_query_id = static_cast < QUERY_ID > (-4);
+      tfile.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+      tfile.raw_fd_handle = file_p;
+      tfile.raw_fd_next_pageid = 1;
+      file_p->attach_temp_file (&tfile);
+
+      PAGE_PTR page_p = (PAGE_PTR) malloc (DB_PAGESIZE);
+      if (page_p == NULL)
+	{
+	  temp_page_store::destroy_raw_fd_file (file_p);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+	  return ER_FAILED;
+	}
+      memset (page_p, 0, DB_PAGESIZE);
+
+      QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+      qmgr_put_page_header (page_p, &page_header);
+      constexpr int tuple_offset = QFILE_PAGE_HEADER_SIZE;
+      constexpr int tuple_length = QFILE_TUPLE_LENGTH_SIZE + 32;
+      QFILE_TUPLE tuple_p = page_p + tuple_offset;
+      QFILE_PUT_TUPLE_LENGTH (tuple_p, tuple_length);
+      for (int i = QFILE_TUPLE_LENGTH_SIZE; i < tuple_length; i++)
+	{
+	  tuple_p[i] = static_cast < char > (0x5a ^ i);
+	}
+      QFILE_PUT_TUPLE_COUNT (page_p, 1);
+      QFILE_PUT_LAST_TUPLE_OFFSET (page_p, tuple_offset);
+
+      int error = temp_page_store::rawfd_write_page (thread_p, *file_p, 0, page_p);
+      if (error != NO_ERROR)
+	{
+	  free_and_init (page_p);
+	  temp_page_store::destroy_raw_fd_file (file_p);
+	  return error;
+	}
+
+      QFILE_TUPLE_POSITION direct_pos = {};
+      direct_pos.status = S_OPENED;
+      direct_pos.position = S_ON;
+      qfile_tuple_position_set_raw_fd (&direct_pos, file_p->segment_id (), 0, tuple_offset);
+      direct_pos.tplno = 0;
+
+      PAGE_PTR fixed_page_p = qmgr_segment_pos_read (thread_p, &tfile, &direct_pos);
+      if (fixed_page_p == NULL)
+	{
+	  free_and_init (page_p);
+	  temp_page_store::destroy_raw_fd_file (file_p);
+	  return ER_FAILED;
+	}
+
+      QFILE_TUPLE fixed_tuple_p = fixed_page_p + tuple_offset;
+      if (QFILE_GET_TUPLE_LENGTH (fixed_tuple_p) != tuple_length
+	  || memcmp (fixed_tuple_p, tuple_p, tuple_length) != 0)
+	{
+	  temp_page_store::rawfd_release_fixed_page (&tfile, fixed_page_p);
+	  free_and_init (page_p);
+	  temp_page_store::destroy_raw_fd_file (file_p);
+	  return ER_FAILED;
+	}
+
+      temp_page_store::rawfd_release_fixed_page (&tfile, fixed_page_p);
+      free_and_init (page_p);
+      tfile.raw_fd_handle = NULL;
+      temp_page_store::destroy_raw_fd_file (file_p);
+    }
   return NO_ERROR;
 }
 #endif /* !NDEBUG */
@@ -1077,7 +1160,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
     }
   if (getenv ("CUBRID_SEGPOS_SELFTEST") != NULL)
     {
-      int segpos_selftest_rc = qmgr_segment_position_selftest ();
+      int segpos_selftest_rc = qmgr_segment_position_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
       fprintf (stderr, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
     }
@@ -3012,6 +3095,303 @@ qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src)
   src->raw_fd_next_pageid = 0;
   src->preserved = false;
   src->tde_encrypted = false;
+}
+void
+qmgr_segment_list_init (QMGR_SEGMENT_LIST * segment_list_p)
+{
+  assert (segment_list_p != NULL);
+  if (segment_list_p == NULL)
+    {
+      return;
+    }
+
+  segment_list_p->segments = NULL;
+  segment_list_p->segment_count = 0;
+  segment_list_p->segment_capacity = 0;
+  segment_list_p->tuple_cnt = 0;
+}
+
+void
+qmgr_segment_list_clear (QMGR_SEGMENT_LIST * segment_list_p)
+{
+  if (segment_list_p == NULL)
+    {
+      return;
+    }
+
+  for (int i = 0; i < segment_list_p->segment_count; i++)
+    {
+      qfile_clear_list_id (&segment_list_p->segments[i].list_id);
+    }
+  free_and_init (segment_list_p->segments);
+  segment_list_p->segment_count = 0;
+  segment_list_p->segment_capacity = 0;
+  segment_list_p->tuple_cnt = 0;
+}
+
+bool
+qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p)
+{
+  return segment_list_p != NULL && segment_list_p->segment_count > 0;
+}
+
+bool
+qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
+{
+  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL; iter_p = iter_p->dependent_list_id)
+    {
+      if (iter_p->tuple_cnt > 0 && iter_p->tfile_vfid != NULL
+	  && iter_p->tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+	  && iter_p->tfile_vfid->raw_fd_handle != NULL)
+	{
+	  return true;
+	}
+    }
+
+  return false;
+}
+
+int
+qmgr_segment_list_add_list_id (QMGR_SEGMENT_LIST * segment_list_p, const QFILE_LIST_ID * list_id_p)
+{
+  if (segment_list_p == NULL || list_id_p == NULL || list_id_p->tuple_cnt <= 0 || list_id_p->tfile_vfid == NULL
+      || list_id_p->tfile_vfid->backing != qmgr_temp_backing::RAW_FD_OVERFLOW
+      || list_id_p->tfile_vfid->raw_fd_handle == NULL)
+    {
+      return NO_ERROR;
+    }
+
+  if (segment_list_p->segment_count == segment_list_p->segment_capacity)
+    {
+      const int new_capacity = (segment_list_p->segment_capacity == 0) ? 4 : segment_list_p->segment_capacity * 2;
+      QMGR_SEGMENT *new_segments_p =
+	(QMGR_SEGMENT *) realloc (segment_list_p->segments, sizeof (QMGR_SEGMENT) * new_capacity);
+      if (new_segments_p == NULL)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		  sizeof (QMGR_SEGMENT) * new_capacity);
+	  return ER_FAILED;
+	}
+      segment_list_p->segments = new_segments_p;
+      segment_list_p->segment_capacity = new_capacity;
+    }
+
+  QMGR_SEGMENT *segment_p = &segment_list_p->segments[segment_list_p->segment_count];
+  QFILE_CLEAR_LIST_ID (&segment_p->list_id);
+  if (qfile_copy_list_id (&segment_p->list_id, list_id_p, true, QFILE_SKIP_DEPENDENT) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+
+  segment_list_p->segment_count++;
+  segment_list_p->tuple_cnt += list_id_p->tuple_cnt;
+  return NO_ERROR;
+}
+
+int
+qmgr_segment_list_open_scan (const QMGR_SEGMENT_LIST * segment_list_p, QMGR_SEGMENT_LIST_SCAN * scan_p)
+{
+  if (scan_p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, NULL_TRAN_INDEX);
+      return ER_FAILED;
+    }
+
+  scan_p->segment_list = segment_list_p;
+  scan_p->segment_index = 0;
+  scan_p->scan_opened = false;
+  QFILE_CLEAR_LIST_ID (&scan_p->scan_id.list_id);
+  scan_p->scan_id.status = S_CLOSED;
+
+  return NO_ERROR;
+}
+
+SCAN_CODE
+qmgr_segment_list_scan_next (THREAD_ENTRY * thread_p, QMGR_SEGMENT_LIST_SCAN * scan_p,
+			     QFILE_TUPLE_RECORD * tuple_record_p, int peek)
+{
+  if (scan_p == NULL || scan_p->segment_list == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return S_ERROR;
+    }
+
+  while (scan_p->segment_index < scan_p->segment_list->segment_count)
+    {
+      if (!scan_p->scan_opened)
+	{
+	  QFILE_LIST_ID *list_id_p =
+	    const_cast < QFILE_LIST_ID * > (&scan_p->segment_list->segments[scan_p->segment_index].list_id);
+	  if (qfile_open_list_scan_raw_fd_segments (list_id_p, &scan_p->scan_id) != NO_ERROR)
+	    {
+	      return S_ERROR;
+	    }
+	  scan_p->scan_opened = true;
+	}
+
+      SCAN_CODE scan_code = qfile_scan_list_next (thread_p, &scan_p->scan_id, tuple_record_p, peek);
+      if (scan_code == S_SUCCESS || scan_code == S_ERROR)
+	{
+	  return scan_code;
+	}
+
+      qfile_close_scan (thread_p, &scan_p->scan_id);
+      scan_p->scan_opened = false;
+      scan_p->segment_index++;
+    }
+
+  return S_END;
+}
+
+void
+qmgr_segment_list_close_scan (THREAD_ENTRY * thread_p, QMGR_SEGMENT_LIST_SCAN * scan_p)
+{
+  if (scan_p != NULL && scan_p->scan_opened)
+    {
+      qfile_close_scan (thread_p, &scan_p->scan_id);
+      scan_p->scan_opened = false;
+    }
+}
+
+int
+qmgr_segment_list_append_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
+				  const QMGR_SEGMENT_LIST * segment_list_p)
+{
+  if (!qmgr_segment_list_has_segments (segment_list_p))
+    {
+      return NO_ERROR;
+    }
+
+  if (dest_list_id_p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return ER_FAILED;
+    }
+
+  if (dest_list_id_p->tuple_cnt > 0 && dest_list_id_p->last_pgptr == NULL)
+    {
+      if (qfile_reopen_list_as_append_mode (thread_p, dest_list_id_p) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
+
+  QMGR_SEGMENT_LIST_SCAN scan;
+  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  if (qmgr_segment_list_open_scan (segment_list_p, &scan) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+
+  SCAN_CODE scan_code;
+  while ((scan_code = qmgr_segment_list_scan_next (thread_p, &scan, &tuple_record, PEEK)) == S_SUCCESS)
+    {
+      if (qfile_add_tuple_to_list (thread_p, dest_list_id_p, tuple_record.tpl) != NO_ERROR)
+	{
+	  qmgr_segment_list_close_scan (thread_p, &scan);
+	  if (tuple_record.tpl != NULL && tuple_record.size > 0)
+	    {
+	      db_private_free_and_init (thread_p, tuple_record.tpl);
+	    }
+	  return ER_FAILED;
+	}
+    }
+
+  qmgr_segment_list_close_scan (thread_p, &scan);
+  if (tuple_record.tpl != NULL && tuple_record.size > 0)
+    {
+      db_private_free_and_init (thread_p, tuple_record.tpl);
+    }
+
+  return (scan_code == S_END) ? NO_ERROR : ER_FAILED;
+}
+
+PAGE_PTR
+qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
+		       const QFILE_TUPLE_POSITION * tuple_position_p)
+{
+  if (tfile_vfid_p == NULL || tuple_position_p == NULL || !qfile_tuple_position_is_raw_fd (tuple_position_p)
+      || tuple_position_p->page_index < 0 || tuple_position_p->tuple_offset < QFILE_PAGE_HEADER_SIZE
+      || tuple_position_p->tuple_offset >= DB_PAGESIZE
+      || tfile_vfid_p->backing != qmgr_temp_backing::RAW_FD_OVERFLOW || tfile_vfid_p->raw_fd_handle == NULL
+      || tfile_vfid_p->raw_fd_handle->segment_id () != tuple_position_p->raw_fd_segment_id)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return NULL;
+    }
+
+  return temp_page_store::rawfd_pos_read (thread_p, *tfile_vfid_p->raw_fd_handle,
+					  temp_page_store::raw_fd_page_coordinate
+					  { tuple_position_p->raw_fd_segment_id, tuple_position_p->page_index,
+					    static_cast < std::size_t > (tuple_position_p->tuple_offset) });
+}
+
+int
+qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
+{
+  if (list_id_p == NULL || !qmgr_list_has_raw_fd_segments (list_id_p))
+    {
+      return NO_ERROR;
+    }
+
+  QFILE_LIST_ID *materialized_p = qfile_open_list (thread_p, &list_id_p->type_list, list_id_p->sort_list,
+						   list_id_p->query_id, 0, NULL);
+  if (materialized_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  int error = NO_ERROR;
+  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = iter_p->dependent_list_id)
+    {
+      QFILE_LIST_SCAN_ID scan_id;
+      if (qfile_open_list_scan_raw_fd_segments (const_cast < QFILE_LIST_ID * > (iter_p), &scan_id) != NO_ERROR)
+	{
+	  error = ER_FAILED;
+	  break;
+	}
+
+      SCAN_CODE scan_code;
+      while ((scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK)) == S_SUCCESS)
+	{
+	  if (qfile_add_tuple_to_list (thread_p, materialized_p, tuple_record.tpl) != NO_ERROR)
+	    {
+	      error = ER_FAILED;
+	      break;
+	    }
+	}
+
+      qfile_close_scan (thread_p, &scan_id);
+      if (scan_code != S_END && error == NO_ERROR)
+	{
+	  error = ER_FAILED;
+	}
+    }
+
+  if (tuple_record.tpl != NULL && tuple_record.size > 0)
+    {
+      db_private_free_and_init (thread_p, tuple_record.tpl);
+    }
+
+  if (error != NO_ERROR)
+    {
+      qfile_destroy_list (thread_p, materialized_p);
+      QFILE_FREE_AND_INIT_LIST_ID (materialized_p);
+      return error;
+    }
+
+  qfile_close_list (thread_p, materialized_p);
+  qfile_destroy_list (thread_p, list_id_p);
+  if (qfile_copy_list_id (list_id_p, materialized_p, true, QFILE_MOVE_DEPENDENT) != NO_ERROR)
+    {
+      qfile_destroy_list (thread_p, materialized_p);
+      QFILE_FREE_AND_INIT_LIST_ID (materialized_p);
+      return ER_FAILED;
+    }
+  QFILE_FREE_AND_INIT_LIST_ID (materialized_p);
+
+  return NO_ERROR;
 }
 
 static QMGR_TEMP_FILE *

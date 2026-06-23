@@ -48,8 +48,8 @@ enum class qmgr_temp_backing : int
 namespace temp_page_store
 {
   constexpr std::size_t projected_tuple_position_bytes = 48;
-  constexpr std::size_t projected_tuple_position_db_bytes = 32;
-  constexpr std::size_t projected_tuple_simple_pos_bytes = 24;
+  constexpr std::size_t projected_tuple_position_db_bytes = 40;
+  constexpr std::size_t projected_tuple_simple_pos_bytes = 32;
   constexpr std::size_t future_read_cache_placeholder_bytes = 512ULL * 1024ULL;
 
   struct raw_fd_key

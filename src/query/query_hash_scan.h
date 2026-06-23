@@ -60,10 +60,9 @@ struct qfile_tuple_simple_pos
     };
     struct
     {
-      UINT32 raw_fd_segment_id;	/* Raw-fd segment identifier */
+      UINT64 raw_fd_segment_id;	/* Raw-fd segment identifier */
       INT32 page_index;		/* Page index inside the raw-fd segment */
       INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
-      INT32 raw_fd_reserved;	/* Keep coordinate width fixed */
     };
   };
   int coord_reserved;		/* Keep simple-position size fixed */
@@ -86,14 +85,13 @@ qfile_tuple_simple_pos_set_vpid (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, const VP
 }
 
 static inline void
-qfile_tuple_simple_pos_set_raw_fd (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, UINT32 raw_fd_segment_id, INT32 page_index,
+qfile_tuple_simple_pos_set_raw_fd (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, UINT64 raw_fd_segment_id, INT32 page_index,
 				  INT32 tuple_offset)
 {
   simple_pos_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
   simple_pos_p->raw_fd_segment_id = raw_fd_segment_id;
   simple_pos_p->page_index = page_index;
   simple_pos_p->tuple_offset = tuple_offset;
-  simple_pos_p->raw_fd_reserved = 0;
   simple_pos_p->coord_reserved = 0;
 }
 

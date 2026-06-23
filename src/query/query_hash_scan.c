@@ -491,8 +491,9 @@ qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *dat
     {
       if (qfile_tuple_simple_pos_is_raw_fd (data_p->pos))
 	{
-	  fprintf (fp, "raw_fd_segment_id = [%u]  page_index = [%d]  tuple_offset = [%d]",
-		   data_p->pos->raw_fd_segment_id, data_p->pos->page_index, data_p->pos->tuple_offset);
+	  fprintf (fp, "raw_fd_segment_id = [%llu]  page_index = [%d]  tuple_offset = [%d]",
+		   (unsigned long long) data_p->pos->raw_fd_segment_id, data_p->pos->page_index,
+		   data_p->pos->tuple_offset);
 	}
       else
 	{

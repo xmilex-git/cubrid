@@ -5062,10 +5062,45 @@ qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * sc
 
   if (qfile_tuple_position_is_raw_fd (tuple_position_p))
     {
-      /* Segment-positioned raw-fd jumps are wired by the follow-up qmgr_segment_pos_read phase. */
-      assert (false);
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
-      return S_ERROR;
+      if (tuple_position_p->position == S_ON)
+	{
+	  page_p = qmgr_segment_pos_read (thread_p, scan_id_p->list_id.tfile_vfid, tuple_position_p);
+	  if (page_p == NULL)
+	    {
+	      return S_ERROR;
+	    }
+
+	  if (scan_id_p->position == S_ON && scan_id_p->curr_pgptr != NULL)
+	    {
+	      qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, scan_id_p->list_id.tfile_vfid);
+	    }
+
+	  scan_id_p->status = tuple_position_p->status;
+	  scan_id_p->position = tuple_position_p->position;
+	  scan_id_p->curr_vpid.volid = NULL_VOLID;
+	  scan_id_p->curr_vpid.pageid = tuple_position_p->page_index;
+	  scan_id_p->curr_pgptr = page_p;
+	  scan_id_p->curr_offset = tuple_position_p->tuple_offset;
+	  scan_id_p->curr_tpl = (char *) scan_id_p->curr_pgptr + scan_id_p->curr_offset;
+	  scan_id_p->curr_tplno = tuple_position_p->tplno;
+
+	  return qfile_retrieve_tuple (thread_p, scan_id_p, tuple_record_p, peek);
+	}
+      else if (tuple_position_p->position == S_BEFORE || tuple_position_p->position == S_AFTER)
+	{
+	  if (scan_id_p->position == S_ON && scan_id_p->curr_pgptr != NULL)
+	    {
+	      qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, scan_id_p->list_id.tfile_vfid);
+	    }
+	  scan_id_p->status = tuple_position_p->status;
+	  scan_id_p->position = tuple_position_p->position;
+	  return S_END;
+	}
+      else
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+	  return S_ERROR;
+	}
     }
   if (tuple_position_p->position == S_ON)
     {
@@ -5190,9 +5225,14 @@ qfile_start_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
  *
  * Note: A scan identifier is created to scan through the given list of tuples.
  */
-int
-qfile_open_list_scan (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
+static int
+qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p, bool materialize_raw_fd)
 {
+  if (materialize_raw_fd && qmgr_materialize_to_pgbuf (thread_get_thread_entry_info (), list_id_p) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+
   scan_id_p->status = S_OPENED;
   scan_id_p->position = S_BEFORE;
   scan_id_p->keep_page_on_finish = 0;
@@ -5210,6 +5250,18 @@ qfile_open_list_scan (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
   scan_id_p->tplrec.tpl = NULL;
 
   return NO_ERROR;
+}
+
+int
+qfile_open_list_scan (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
+{
+  return qfile_open_list_scan_internal (list_id_p, scan_id_p, true);
+}
+
+int
+qfile_open_list_scan_raw_fd_segments (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
+{
+  return qfile_open_list_scan_internal (list_id_p, scan_id_p, false);
 }
 
 /*

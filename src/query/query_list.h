@@ -507,10 +507,9 @@ struct qfile_tuple_position
     };
     struct
     {
-      UINT32 raw_fd_segment_id;	/* Raw-fd segment identifier */
+      UINT64 raw_fd_segment_id;	/* Raw-fd segment identifier */
       INT32 page_index;		/* Page index inside the raw-fd segment */
       INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
-      INT32 raw_fd_reserved;	/* Keep coordinate width fixed */
     };
   };
   QFILE_TUPLE tpl;		/* Tuple pointer inside the page */
@@ -532,10 +531,9 @@ struct qfile_tuple_position_db
     };
     struct
     {
-      UINT32 raw_fd_segment_id;	/* Raw-fd segment identifier */
+      UINT64 raw_fd_segment_id;	/* Raw-fd segment identifier */
       INT32 page_index;		/* Page index inside the raw-fd segment */
       INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
-      INT32 raw_fd_reserved;	/* Keep coordinate width fixed */
     };
   };
   int tplno;			/* Tuple number inside the page */
@@ -560,14 +558,13 @@ qfile_tuple_position_set_vpid (QFILE_TUPLE_POSITION * tuple_position_p, const VP
 }
 
 static inline void
-qfile_tuple_position_set_raw_fd (QFILE_TUPLE_POSITION * tuple_position_p, UINT32 raw_fd_segment_id, INT32 page_index,
+qfile_tuple_position_set_raw_fd (QFILE_TUPLE_POSITION * tuple_position_p, UINT64 raw_fd_segment_id, INT32 page_index,
 				 INT32 tuple_offset)
 {
   tuple_position_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
   tuple_position_p->raw_fd_segment_id = raw_fd_segment_id;
   tuple_position_p->page_index = page_index;
   tuple_position_p->tuple_offset = tuple_offset;
-  tuple_position_p->raw_fd_reserved = 0;
 }
 
 static inline void
@@ -601,7 +598,6 @@ qfile_tuple_position_store_to_db (QFILE_TUPLE_POSITION_DB * stored_p, const QFIL
       stored_p->raw_fd_segment_id = src_p->raw_fd_segment_id;
       stored_p->page_index = src_p->page_index;
       stored_p->tuple_offset = src_p->tuple_offset;
-      stored_p->raw_fd_reserved = 0;
     }
   else
     {

@@ -27,6 +27,7 @@
 #include "object_primitive.h"
 #include "query_opfunc.h"
 #include "list_file.h"
+#include "query_manager.h"
 #include "dbtype_def.h"
 #include "object_representation.h"
 #include <chrono>
@@ -510,6 +511,82 @@ namespace parallel_scan
 
   void merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists)
   {
+    auto attach_merged_list = [thread_p, dest] (QFILE_LIST_ID *tmp_merged_list)
+    {
+      if (tmp_merged_list == nullptr)
+	{
+	  return;
+	}
+
+      if (dest->tuple_cnt > 0)
+	{
+	  if (dest->last_pgptr != nullptr)
+	    {
+	      qfile_close_list (thread_p, dest);
+	    }
+	  qfile_connect_list (thread_p, dest, tmp_merged_list);
+	}
+      else
+	{
+	  if (dest->type_list.type_cnt > 0)
+	    {
+	      qfile_destroy_list (thread_p, dest);
+	    }
+	  qfile_copy_list_id (dest, tmp_merged_list, true, QFILE_MOVE_DEPENDENT);
+	  QFILE_FREE_AND_INIT_LIST_ID (tmp_merged_list);
+	}
+    };
+
+    QMGR_SEGMENT_LIST segment_list;
+    qmgr_segment_list_init (&segment_list);
+    bool saw_raw_fd_segments = false;
+    bool all_nonempty_lists_are_raw_fd = true;
+
+    for (QFILE_LIST_ID *list_id : lists)
+      {
+	assert (list_id != nullptr);
+	assert (list_id->last_pgptr == nullptr);
+	if (list_id->tuple_cnt > 0)
+	  {
+	    const bool has_raw_fd_segments = qmgr_list_has_raw_fd_segments (list_id);
+	    saw_raw_fd_segments = saw_raw_fd_segments || has_raw_fd_segments;
+	    all_nonempty_lists_are_raw_fd = all_nonempty_lists_are_raw_fd && has_raw_fd_segments;
+	    if (has_raw_fd_segments && qmgr_segment_list_add_list_id (&segment_list, list_id) != NO_ERROR)
+	      {
+		qmgr_segment_list_clear (&segment_list);
+		return;
+	      }
+	  }
+      }
+
+    if (saw_raw_fd_segments && all_nonempty_lists_are_raw_fd && qmgr_segment_list_has_segments (&segment_list))
+      {
+	QFILE_LIST_ID *tmp_merged_list =
+	  qfile_open_list (thread_p, &lists.front()->type_list, lists.front()->sort_list, lists.front()->query_id, 0,
+			   nullptr);
+	if (tmp_merged_list != nullptr
+	    && qmgr_segment_list_append_to_list (thread_p, tmp_merged_list, &segment_list) == NO_ERROR)
+	  {
+	    qfile_close_list (thread_p, tmp_merged_list);
+	    for (QFILE_LIST_ID *list_id : lists)
+	      {
+		qfile_destroy_list (thread_p, list_id);
+		QFILE_FREE_AND_INIT_LIST_ID (list_id);
+	      }
+	    lists.clear();
+	    qmgr_segment_list_clear (&segment_list);
+	    attach_merged_list (tmp_merged_list);
+	    return;
+	  }
+
+	if (tmp_merged_list != nullptr)
+	  {
+	    qfile_destroy_list (thread_p, tmp_merged_list);
+	    QFILE_FREE_AND_INIT_LIST_ID (tmp_merged_list);
+	  }
+      }
+    qmgr_segment_list_clear (&segment_list);
+
     QFILE_LIST_ID *tmp_merged_list = nullptr;
     for (QFILE_LIST_ID *list_id : lists)
       {
@@ -534,26 +611,7 @@ namespace parallel_scan
 	list_id = nullptr;
       }
     lists.clear();
-    if (tmp_merged_list != nullptr)
-      {
-	if (dest->tuple_cnt > 0)
-	  {
-	    if (dest->last_pgptr != nullptr)
-	      {
-		qfile_close_list (thread_p, dest);
-	      }
-	    qfile_connect_list (thread_p, dest, tmp_merged_list);
-	  }
-	else
-	  {
-	    if (dest->type_list.type_cnt > 0)
-	      {
-		qfile_destroy_list (thread_p, dest);
-	      }
-	    qfile_copy_list_id (dest, tmp_merged_list, true, QFILE_MOVE_DEPENDENT);
-	    QFILE_FREE_AND_INIT_LIST_ID (tmp_merged_list);
-	  }
-      }
+    attach_merged_list (tmp_merged_list);
   }
 
   template <RESULT_TYPE result_type>

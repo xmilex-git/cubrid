@@ -105,6 +105,30 @@ struct qmgr_temp_file
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };
+typedef struct qmgr_segment QMGR_SEGMENT;
+struct qmgr_segment
+{
+  QFILE_LIST_ID list_id;	/* Borrowed raw-fd backing metadata; owns only copied list descriptors. */
+};
+
+typedef struct qmgr_segment_list QMGR_SEGMENT_LIST;
+struct qmgr_segment_list
+{
+  QMGR_SEGMENT *segments;
+  int segment_count;
+  int segment_capacity;
+  INT64 tuple_cnt;
+};
+
+typedef struct qmgr_segment_list_scan QMGR_SEGMENT_LIST_SCAN;
+struct qmgr_segment_list_scan
+{
+  const QMGR_SEGMENT_LIST *segment_list;
+  int segment_index;
+  QFILE_LIST_SCAN_ID scan_id;
+  bool scan_opened;
+};
+
 /*
  * Arguments to pass to the routine used to wait for the next available page
  * for streaming queries.
@@ -182,6 +206,20 @@ extern QMGR_TEMP_FILE *qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY
 						  QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type);
 extern QMGR_TEMP_FILE *qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id);
 extern void qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src);
+extern void qmgr_segment_list_init (QMGR_SEGMENT_LIST * segment_list_p);
+extern void qmgr_segment_list_clear (QMGR_SEGMENT_LIST * segment_list_p);
+extern bool qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p);
+extern bool qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p);
+extern int qmgr_segment_list_add_list_id (QMGR_SEGMENT_LIST * segment_list_p, const QFILE_LIST_ID * list_id_p);
+extern int qmgr_segment_list_open_scan (const QMGR_SEGMENT_LIST * segment_list_p, QMGR_SEGMENT_LIST_SCAN * scan_p);
+extern SCAN_CODE qmgr_segment_list_scan_next (THREAD_ENTRY * thread_p, QMGR_SEGMENT_LIST_SCAN * scan_p,
+					      QFILE_TUPLE_RECORD * tuple_record_p, int peek);
+extern void qmgr_segment_list_close_scan (THREAD_ENTRY * thread_p, QMGR_SEGMENT_LIST_SCAN * scan_p);
+extern int qmgr_segment_list_append_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
+					     const QMGR_SEGMENT_LIST * segment_list_p);
+extern PAGE_PTR qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
+				       const QFILE_TUPLE_POSITION * tuple_position_p);
+extern int qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
 extern int qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_FILE * tfile_vfidp);
 extern int qmgr_free_temp_file_list (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfidp, QUERY_ID query_id,
 				     bool is_error);
