@@ -304,6 +304,9 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_NUM_DEGRADES, "Num_workmem_degrades"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_RESERVED_BYTES, "Num_workmem_reserved_bytes"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_CAP_BYTES, "Num_workmem_cap_bytes"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_READ_CACHE_HIT, "Num_rawfd_read_cache_hit"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_READ_CACHE_MISS, "Num_rawfd_read_cache_miss"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_DECRYPT_COUNT, "Num_rawfd_decrypt_count"),
 
   /* Execution statistics for external sort */
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_SORT_NUM_IO_PAGES, "Num_sort_io_pages"),

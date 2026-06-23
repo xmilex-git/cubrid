@@ -348,9 +348,36 @@ namespace
   void
   init_rawfd_state ()
   {
-    const char *tmp_env = getenv ("TMP");
-    const std::string tmp_root = (tmp_env != NULL && tmp_env[0] != '\0') ? std::string (tmp_env) : std::string ("/tmp");
-    g_rawfd_state.scratch_root = tmp_root + "/" + RAWFD_ROOT_SUFFIX;
+    /* scratch_root resolution (DISK-BACKED, never tmpfs): raw-fd overflow files are real spill storage;
+     * placing them on tmpfs (/tmp) would defeat the spill and risk OOM. Priority:
+     *   1) $CUBRID_TMP (operator-configured scratch dir),
+     *   2) the database volume directory (disk-backed; where the DB .db volumes live),
+     *   3) $TMP / /tmp as a last-resort fallback. */
+    std::string scratch_base;
+    const char *cubrid_tmp_env = getenv ("CUBRID_TMP");
+    if (cubrid_tmp_env != NULL && cubrid_tmp_env[0] != '\0')
+      {
+	scratch_base = cubrid_tmp_env;
+      }
+    else
+      {
+	const char *db_full = boot_db_full_name ();
+	if (db_full != NULL && db_full[0] != '\0')
+	  {
+	    char dir_buf[PATH_MAX];
+	    const char *dir = fileio_get_directory_path (dir_buf, db_full);
+	    if (dir != NULL && dir[0] != '\0')
+	      {
+		scratch_base = dir;
+	      }
+	  }
+      }
+    if (scratch_base.empty ())
+      {
+	const char *tmp_env = getenv ("TMP");
+	scratch_base = (tmp_env != NULL && tmp_env[0] != '\0') ? std::string (tmp_env) : std::string ("/tmp");
+      }
+    g_rawfd_state.scratch_root = scratch_base + "/" + RAWFD_ROOT_SUFFIX;
 
     g_rawfd_state.db_name = sanitize_path_component (boot_db_name ());
     const std::string db_root = g_rawfd_state.scratch_root + "/" + g_rawfd_state.db_name;
@@ -745,6 +772,7 @@ namespace
 	    const rawfd_cached_page copy = *it;
 	    g_rawfd_state.read_cache.erase (it);
 	    g_rawfd_state.read_cache.push_front (copy);
+	    perfmon_inc_stat_to_global (PSTAT_RAWFD_READ_CACHE_HIT);
 	    return true;
 	  }
       }
@@ -1559,6 +1587,9 @@ namespace temp_page_store
 	return page_p;
       }
 
+    /* cache miss: a real pread + TDE decrypt of the addressed raw-fd page follows. */
+    perfmon_inc_stat_to_global (PSTAT_RAWFD_READ_CACHE_MISS);
+
     aligned_io_page cipher;
     aligned_io_page plain;
     if (!cipher.valid () || !plain.valid ())
@@ -1589,6 +1620,8 @@ namespace temp_page_store
 	rawfd_release_fixed_page (NULL, page_p);
 	return NULL;
       }
+
+    perfmon_inc_stat_to_global (PSTAT_RAWFD_DECRYPT_COUNT);
 
     memcpy (page_p, plain.page->page, DB_PAGESIZE);
     cache_insert_decrypted_page (file.key (), coordinate.page_index, plain.page);
