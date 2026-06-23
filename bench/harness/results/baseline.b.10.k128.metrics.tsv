@@ -1,0 +1,19 @@
+label	metric	value	note
+baseline.b.10.k128	qps	65.230109	computed by env runner when applicable
+baseline.b.10.k128	p50_ms	1623.890	computed by env runner when applicable
+baseline.b.10.k128	p95_ms	1831.501	computed by env runner when applicable
+baseline.b.10.k128	PERF_PAGE_TEMP_delta	0	from cubrid statdump if exposed
+baseline.b.10.k128	LRU_victim_mutex_wait_delta	0	from cubrid statdump if exposed
+baseline.b.10.k128	data_page_ioreads_delta	0	from cubrid statdump if exposed
+baseline.b.10.k128	Num_workmem_degrades	0	placeholder until P1a instrumentation exists
+baseline.b.10.k128	rawfd_overflow_bytes	NA	P1b/P2 placeholder
+baseline.b.10.k128	rawfd_overflow_files	NA	P1b/P2 placeholder
+baseline.b.10.k128	rawfd_fd_in_use	NA	P1b/P2 placeholder
+baseline.b.10.k128	rawfd_reaper_deletions	NA	P1b/P2 placeholder
+baseline.b.10.k128	rawfd_boot_sweep_counts	NA	P1b/P2 placeholder
+baseline.b.10.k128	rawfd_read_cache_hit	NA	P4 placeholder
+baseline.b.10.k128	rawfd_read_cache_miss	NA	P4 placeholder
+baseline.b.10.k128	rawfd_decrypt_cpu	NA	P4/TDE placeholder
+baseline.b.10.k128	separate_class_a_materialize	NA	P4/P5 placeholder
+baseline.b.10.k128	separate_class_a_prime_materialize	NA	P4/P5 placeholder
+baseline.b.10.k128	separate_class_b_materialize	NA	P4/P5 placeholder

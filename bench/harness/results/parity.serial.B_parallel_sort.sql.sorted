@@ -1,0 +1,6 @@
+  '1-URGENT       '     'F'                                 225959  34249530521.19      
+  '2-HIGH         '     'F'                                 225414  34108407327.83      
+  '3-MEDIUM       '     'F'                                 225389  34064159389.62      
+  '4-NOT SPECIFIED'     'F'                                 225573  34047222068.32      
+  '5-LOW          '     'F'                                 225977  34182358957.25      
+  o_orderpriority       o_orderstatus                          cnt  revenue             

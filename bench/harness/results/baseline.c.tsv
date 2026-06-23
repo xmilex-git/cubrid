@@ -1,0 +1,34 @@
+# build=baseline env=c n=10 worktree=/home/cubrid/dev/cubrid-wm-baseline cubrid=/home/cubrid/dev/cubrid-wm-baseline/build_x86_64_release/_install/CUBRID
+# repeat=1
+1	label	wall_ms	rc	out_file
+1	baseline.c.1	6190.767	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.1.k8.1782210195
+# repeat=2
+2	label	wall_ms	rc	out_file
+2	baseline.c.2	4727.688	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.2.k8.1782210201
+# repeat=3
+3	label	wall_ms	rc	out_file
+3	baseline.c.3	4545.092	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.3.k8.1782210206
+# repeat=4
+4	label	wall_ms	rc	out_file
+4	baseline.c.4	4515.144	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.4.k8.1782210211
+# repeat=5
+5	label	wall_ms	rc	out_file
+5	baseline.c.5	4540.826	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.5.k8.1782210216
+# repeat=6
+6	label	wall_ms	rc	out_file
+6	baseline.c.6	4582.943	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.6.k8.1782210221
+# repeat=7
+7	label	wall_ms	rc	out_file
+7	baseline.c.7	4578.041	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.7.k8.1782210226
+# repeat=8
+8	label	wall_ms	rc	out_file
+8	baseline.c.8	4498.456	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.8.k8.1782210231
+# repeat=9
+9	label	wall_ms	rc	out_file
+9	baseline.c.9	4817.021	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.9.k8.1782210235
+# repeat=10
+10	label	wall_ms	rc	out_file
+10	baseline.c.10	4539.274	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/baseline.c.10.k8.1782210241
+# median_ms	4561.566500
+# mean_ms	sigma_ms	low_2sigma_ms	high_2sigma_ms
+# 4753.525200	514.968292	3723.588615	5783.461785

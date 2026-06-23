@@ -1,0 +1,14 @@
+env	workload	metric	n	median	mean	sigma	low_2sigma	high_2sigma	source
+a	A_parallel_hj	wall_ms	10	223.910000	229.303400	14.725927	199.851546	258.755254	results/baseline.a.tsv
+b	B_parallel_sort_k64	qps	10	59.091042	59.068546	2.547119	53.974309	64.162784	results/baseline.b.tsv
+b	B_parallel_sort_k64	p50_ms	10	821.312500	830.836600	53.198267	724.440065	937.233135	results/baseline.b.tsv
+b	B_parallel_sort_k64	p95_ms	10	1018.063000	1016.289400	43.333353	929.622693	1102.956107	results/baseline.b.tsv
+b	B_parallel_sort_k64	rc_failures	10	0.000000	0.000000	0.000000	0.000000	0.000000	results/baseline.b.tsv
+b	B_parallel_sort_k128	qps	10	65.094467	65.222178	1.872101	61.477977	68.966380	results/baseline.b.tsv
+b	B_parallel_sort_k128	p50_ms	10	1646.769500	1636.320800	37.217938	1561.884924	1710.756676	results/baseline.b.tsv
+b	B_parallel_sort_k128	p95_ms	10	1835.311000	1855.940600	60.929716	1734.081167	1977.800033	results/baseline.b.tsv
+b	B_parallel_sort_k128	rc_failures	10	0.000000	0.000000	0.000000	0.000000	0.000000	results/baseline.b.tsv
+c	C_driver_ramrich_k8	wall_ms	10	4561.566500	4753.525200	514.968292	3723.588615	5783.461785	results/baseline.c.tsv
+positioned	hj_probe_heavy	wall_ms	10	202.168000	203.465000	5.164080	193.136839	213.793161	results/baseline.positioned.tsv
+positioned	connect_by	wall_ms	10	161.956500	162.946400	2.374787	158.196826	167.695974	results/baseline.positioned.tsv
+positioned	positional_mutation	wall_ms	10	168.163500	168.371200	1.480019	165.411161	171.331239	results/baseline.positioned.tsv

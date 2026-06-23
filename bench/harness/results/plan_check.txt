@@ -1,0 +1,268 @@
+===== A_parallel_hj =====
+server data_buffer_size=16.0G (512.0M)
+server parallelism=8 (4)
+server max_parallel_workers=8 (100)
+
+=== Plan Dump ===
+
+plan detail (opt level 513)
+
+
+=== Query Trace ===
+
+trace on text
+
+Join graph segments (f indicates final):
+seg[0]: [0]
+seg[1]: l_returnflag[0] (f)
+seg[2]: l_extendedprice[0] (f)
+seg[3]: l_shipdate[0]
+seg[4]: l_orderkey[0]
+seg[5]: [1]
+seg[6]: o_orderkey[1]
+Join graph nodes:
+node[0]: dba.lineitem l(60021304/761802) (sargs 2 3) (loc 0)
+node[1]: dba.orders o(14992976/163434) (sargs 1) (loc 1)
+Join graph equivalence classes:
+eqclass[0]: l_orderkey[0] o_orderkey[1]
+Join graph edges:
+term[0]: o.o_orderkey=l.l_orderkey (sel 6.65877E-08) (join term) (mergeable) (inner-join) (indexable o_orderkey[1] l_orderkey[0]) (loc 0)
+Join graph terms:
+term[1]: o.o_orderkey range (1 ge_le 500000) (sel 0.01) (rank 2) (sarg term) (not-join eligible) (indexable o_orderkey[1]) (loc 0)
+term[2]: l.l_orderkey range (1 ge_le 500000) (sel 0.01) (rank 2) (sarg term) (not-join eligible) (indexable l_orderkey[0]) (loc 0)
+term[3]: l.l_shipdate range (date '01/01/1995' ge_lt date '01/01/1996') (sel 0.01) (rank 2) (sarg term) (not-join eligible) (loc 0)
+
+Query plan:
+
+temp(group by)
+    subplan: hash-join (inner join)
+                 edge:  term[0]
+                 outer: iscan
+                            class: l node[0]
+                            index: fk_lineitem_l_orderkey term[2]
+                            sargs: term[3]
+                            cost:  17013 card 6002
+                 inner: iscan
+                            class: o node[1]
+                            index: pk_orders_o_orderkey term[1] (covers)
+                            cost:  534 card 149930
+                 cost:  25494 card 60
+    sort:  1 asc
+    cost:  25500 card 60
+
+Query stmt:
+
+select /*+ USE_HASH(o, l) PARALLEL(8) */ l.l_returnflag, count(*), sum(l.l_extendedprice) from lineitem l, orders o where (l.l_shipdate>= ?:0  and l.l_shipdate< ?:1 ) and (l.l_orderkey>= ?:2  and l.l_orderkey<= ?:3 ) and (o.o_orderkey>= ?:4  and o.o_orderkey<= ?:5 ) and o.o_orderkey=l.l_orderkey group by l.l_returnflag
+
+
+=== <Result of SELECT Command in Line 14> ===
+
+  l_returnflag                           cnt  revenue             
+==================================================================
+  'A'                                  15873  606801462.43        
+  'N'                                  44609  1706693748.14       
+  'R'                                  15738  601441314.46        
+
+3 rows selected. (X sec) Committed. (X sec) 
+Join graph segments (f indicates final):
+seg[0]: [0]
+Join graph nodes:
+node[0]: dual dual(1/1) (loc -1)
+
+Query plan:
+
+sscan
+    class: dual node[0]
+    cost:  1 card 1
+
+Query stmt:
+
+select  trace_stats() from dual dual
+
+
+=== Auto Trace ===
+
+Query Plan:
+  SORT (group by)
+    HASH JOIN (inner join)
+      INDEX SCAN (l.fk_lineitem_l_orderkey) (key range: (l.l_orderkey>= ?:2  and l.l_orderkey<= ?:3 ))
+      INDEX SCAN (o.pk_orders_o_orderkey) (key range: (o.o_orderkey>= ?:4  and o.o_orderkey<= ?:5 ), covered: true)
+
+  rewritten query: select /*+ USE_HASH(o, l) PARALLEL(8) */ l.l_returnflag, count(*), sum(l.l_extendedprice) from [dba.lineitem] l, [dba.orders] o where (l.l_shipdate>= ?:0  and l.l_shipdate< ?:1 ) and (l.l_orderkey>= ?:2  and l.l_orderkey<= ?:3 ) and (o.o_orderkey>= ?:4  and o.o_orderkey<= ?:5 ) and o.o_orderkey=l.l_orderkey group by l.l_returnflag
+
+Trace Statistics:
+  SELECT (time: 225, fetch: 503776, fetch_time: 404, ioread: 6817)
+    SCAN (temp time: 5, fetch: 188, ioread: 0, readrows: 76220, rows: 76220)
+    GROUPBY (time: 21, hash: true, sort: true, page: 0, ioread: 0, rows: 3)
+      HASHJOIN (time: 185, fetch: 503586, fetch_time: 404, ioread: 6817)
+        BUILD (time: 18, fetch: 340, ioread: 0, rows: 76220, method: memory)
+        PROBE (time: 25, fetch: 682, ioread: 0, readrows: 125000, readkeys: 76220, rows: 76220)
+        SUBQUERY (uncorrelated)
+                 (parallel workers: 2, time: 129, fetch: 502548, fetch_time: 404, ioread: 6817)
+          SELECT (time: 129, fetch: 501345, fetch_time: 398, ioread: 6684)
+            SCAN (index: dba.lineitem.fk_lineitem_l_orderkey), (btree time: 128, fetch: 501341, ioread: 6684, readkeys: 125002, filteredkeys: 125000, rows: 500291) (lookup time: 0, rows: 76220)
+                 (parallel workers: 7, index time: 128..128, readkeys: 17392..18486, filteredkeys: 17391..18486, rows: 69385..74097, gather: mergeable list) (lookup time: 0..0, rows: 10757..11064)
+          SELECT (time: 86, fetch: 1201, fetch_time: 6, ioread: 133)
+            SCAN (index: dba.orders.pk_orders_o_orderkey), (btree time: 52, fetch: 577, ioread: 132, readkeys: 125000, filteredkeys: 125000, rows: 125000, covered: true)
+
+
+=== Query Trace ===
+
+trace off
+
+===== B_parallel_sort =====
+server data_buffer_size=16.0G (512.0M)
+server parallelism=8 (4)
+server max_parallel_workers=8 (100)
+
+=== Plan Dump ===
+
+plan detail (opt level 513)
+
+
+=== Query Trace ===
+
+trace on text
+
+Join graph segments (f indicates final):
+seg[0]: [0]
+seg[1]: o_orderpriority[0] (f)
+seg[2]: o_orderstatus[0] (f)
+seg[3]: o_totalprice[0] (f)
+seg[4]: o_orderdate[0]
+Join graph nodes:
+node[0]: dba.orders dba.orders(14992976/163434) (sargs 0) (loc 0)
+Join graph terms:
+term[0]: [dba.orders].o_orderdate range (date '01/01/1994' ge_lt date '07/01/1994') (sel 0.01) (rank 2) (sarg term) (not-join eligible) (loc 0)
+
+Query plan:
+
+temp(order by)
+    subplan: temp(group by)
+                 subplan: sscan
+                              class: orders node[0]
+                              sargs: term[0]
+                              cost:  200916 card 149930
+                 sort:  1 asc, 2 asc
+                 cost:  201589 card 149930
+    sort:  4 desc, 1 asc, 2 asc
+    cost:  202262 card 149930
+
+Query stmt:
+
+select /*+ PARALLEL(8) */ orders.o_orderpriority, orders.o_orderstatus, count(*), sum(orders.o_totalprice) from orders orders where (orders.o_orderdate>= ?:0  and orders.o_orderdate< ?:1 ) group by orders.o_orderpriority, orders.o_orderstatus order by 4 desc , 1, 2
+
+
+=== <Result of SELECT Command in Line 12> ===
+
+  o_orderpriority       o_orderstatus                          cnt  revenue             
+========================================================================================
+  '1-URGENT       '     'F'                                 225959  34249530521.19      
+  '5-LOW          '     'F'                                 225977  34182358957.25      
+  '2-HIGH         '     'F'                                 225414  34108407327.83      
+  '3-MEDIUM       '     'F'                                 225389  34064159389.62      
+  '4-NOT SPECIFIED'     'F'                                 225573  34047222068.32      
+
+5 rows selected. (X sec) Committed. (X sec) 
+
+=== Auto Trace ===
+
+Query Plan:
+  SORT (order by)
+    SORT (group by)
+      TABLE SCAN (dba.orders)
+
+  rewritten query: select /*+ PARALLEL(8) */ [dba.orders].o_orderpriority, [dba.orders].o_orderstatus, count(*), sum([dba.orders].o_totalprice) from [dba.orders] [dba.orders] where ([dba.orders].o_orderdate>= ?:0  and [dba.orders].o_orderdate< ?:1 ) group by [dba.orders].o_orderpriority, [dba.orders].o_orderstatus order by 4 desc , 1, 2
+
+Trace Statistics:
+  SELECT (time: 763, fetch: 163646, fetch_time: 1950, ioread: 163435)
+    SCAN (table: dba.orders), (heap time: 763, fetch: 163515, ioread: 163434, readrows: 15000000, rows: 15000000)
+         (parallel workers: 8, heap time: 726..763, readrows: 1836268..1885580, rows: 1836268..1885580, gather: mergeable list)
+    GROUPBY (time: 0, hash: partial, sort: true, page: 0, ioread: 0, rows: 5)
+    ORDERBY (time: 0, sort: true, page: 0, ioread: 0)
+
+
+=== Query Trace ===
+
+trace off
+
+===== C_driver =====
+server data_buffer_size=16.0G (512.0M)
+server parallelism=8 (4)
+server max_parallel_workers=8 (100)
+
+=== Plan Dump ===
+
+plan detail (opt level 513)
+
+
+=== Query Trace ===
+
+trace on text
+
+Join graph segments (f indicates final):
+seg[0]: [0]
+seg[1]: o_orderpriority[0] (f)
+seg[2]: o_totalprice[0] (f)
+seg[3]: o_orderdate[0]
+Join graph nodes:
+node[0]: dba.orders dba.orders(14992976/163434) (sargs 0) (loc 0)
+Join graph terms:
+term[0]: [dba.orders].o_orderdate range (date '01/01/1994' ge_lt date '01/01/1995') (sel 0.01) (rank 2) (sarg term) (not-join eligible) (loc 0)
+
+Query plan:
+
+temp(order by)
+    subplan: temp(group by)
+                 subplan: sscan
+                              class: orders node[0]
+                              sargs: term[0]
+                              cost:  200916 card 149930
+                 sort:  1 asc
+                 cost:  201516 card 149930
+    sort:  3 desc, 1 asc
+    cost:  202115 card 149930
+
+Query stmt:
+
+select /*+ PARALLEL(8) */ orders.o_orderpriority, count(*), sum(orders.o_totalprice) from orders orders where (orders.o_orderdate>= ?:0  and orders.o_orderdate< ?:1 ) group by orders.o_orderpriority order by 3 desc , 1
+
+
+=== <Result of SELECT Command in Line 11> ===
+
+  o_orderpriority                order_count  revenue             
+==================================================================
+  '1-URGENT       '                   455871  69005155502.24      
+  '2-HIGH         '                   455636  68945427740.39      
+  '5-LOW          '                   455023  68834759050.14      
+  '3-MEDIUM       '                   454837  68682263143.15      
+  '4-NOT SPECIFIED'                   454552  68621442863.28      
+
+5 rows selected. (X sec) Committed. (X sec) 
+
+=== Auto Trace ===
+
+Query Plan:
+  SORT (order by)
+    SORT (group by)
+      TABLE SCAN (dba.orders)
+
+  rewritten query: select /*+ PARALLEL(8) */ [dba.orders].o_orderpriority, count(*), sum([dba.orders].o_totalprice) from [dba.orders] [dba.orders] where ([dba.orders].o_orderdate>= ?:0  and [dba.orders].o_orderdate< ?:1 ) group by [dba.orders].o_orderpriority order by 3 desc , 1
+
+Trace Statistics:
+  SELECT (time: 598, fetch: 163625, fetch_time: 74, ioread: 0)
+    SCAN (table: dba.orders), (heap time: 597, fetch: 163494, ioread: 0, readrows: 15000000, rows: 15000000)
+         (parallel workers: 8, heap time: 575..597, readrows: 1836268..1885580, rows: 1836268..1885580, gather: mergeable list)
+    GROUPBY (time: 1, hash: partial, sort: true, page: 0, ioread: 0, rows: 5)
+    ORDERBY (time: 0, sort: true, page: 0, ioread: 0)
+
+
+=== Query Trace ===
+
+trace off
+
+----- C runtime metric gate -----
+C gate note: this build keeps LRU victim mutex wait timers at zero under the RAM-rich 16G C workload; gate uses the exposed buffer victim-candidate runtime counter instead.
+Num_data_page_victim_candidate_before=0
+Num_data_page_victim_candidate_after=13714
+Num_data_page_victim_candidate_delta=13714

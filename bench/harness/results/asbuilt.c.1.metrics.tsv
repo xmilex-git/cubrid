@@ -1,0 +1,19 @@
+label	metric	value	note
+asbuilt.c.1	qps	NA	computed by env runner when applicable
+asbuilt.c.1	p50_ms	NA	computed by env runner when applicable
+asbuilt.c.1	p95_ms	NA	computed by env runner when applicable
+asbuilt.c.1	PERF_PAGE_TEMP_delta	0	from cubrid statdump if exposed
+asbuilt.c.1	LRU_victim_mutex_wait_delta	0	from cubrid statdump if exposed
+asbuilt.c.1	data_page_ioreads_delta	0	from cubrid statdump if exposed
+asbuilt.c.1	Num_workmem_degrades	0	placeholder until P1a instrumentation exists
+asbuilt.c.1	rawfd_overflow_bytes	NA	P1b/P2 placeholder
+asbuilt.c.1	rawfd_overflow_files	NA	P1b/P2 placeholder
+asbuilt.c.1	rawfd_fd_in_use	NA	P1b/P2 placeholder
+asbuilt.c.1	rawfd_reaper_deletions	NA	P1b/P2 placeholder
+asbuilt.c.1	rawfd_boot_sweep_counts	NA	P1b/P2 placeholder
+asbuilt.c.1	rawfd_read_cache_hit	NA	P4 placeholder
+asbuilt.c.1	rawfd_read_cache_miss	NA	P4 placeholder
+asbuilt.c.1	rawfd_decrypt_cpu	NA	P4/TDE placeholder
+asbuilt.c.1	separate_class_a_materialize	NA	P4/P5 placeholder
+asbuilt.c.1	separate_class_a_prime_materialize	NA	P4/P5 placeholder
+asbuilt.c.1	separate_class_b_materialize	NA	P4/P5 placeholder

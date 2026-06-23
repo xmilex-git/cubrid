@@ -1,0 +1,41 @@
+# build=baseline env=b n=10 worktree=/home/cubrid/dev/cubrid-wm-baseline cubrid=/home/cubrid/dev/cubrid-wm-baseline/build_x86_64_release/_install/CUBRID
+# repeat=1
+1	label	k	qps	p50_ms	p95_ms	rc_failures
+1	baseline.b.1	64	58.860371	871.879	975.852	0
+1	baseline.b.1	128	62.429158	1660.275	1927.380	0
+# repeat=2
+2	label	k	qps	p50_ms	p95_ms	rc_failures
+2	baseline.b.2	64	55.189304	957.725	1081.543	0
+2	baseline.b.2	128	64.389557	1663.913	1894.739	0
+# repeat=3
+3	label	k	qps	p50_ms	p95_ms	rc_failures
+3	baseline.b.3	64	55.159480	814.159	1079.753	0
+3	baseline.b.3	128	64.476351	1653.232	1884.839	0
+# repeat=4
+4	label	k	qps	p50_ms	p95_ms	rc_failures
+4	baseline.b.4	64	58.596951	843.069	1027.784	0
+4	baseline.b.4	128	62.550945	1694.382	1968.029	0
+# repeat=5
+5	label	k	qps	p50_ms	p95_ms	rc_failures
+5	baseline.b.5	64	61.709349	816.377	978.102	0
+5	baseline.b.5	128	66.411742	1578.222	1779.179	0
+# repeat=6
+6	label	k	qps	p50_ms	p95_ms	rc_failures
+6	baseline.b.6	64	63.252607	772.322	959.395	0
+6	baseline.b.6	128	67.150606	1617.426	1793.808	0
+# repeat=7
+7	label	k	qps	p50_ms	p95_ms	rc_failures
+7	baseline.b.7	64	59.321712	828.504	1033.254	0
+7	baseline.b.7	128	66.470578	1648.493	1839.121	0
+# repeat=8
+8	label	k	qps	p50_ms	p95_ms	rc_failures
+8	baseline.b.8	64	60.551644	781.817	980.221	0
+8	baseline.b.8	128	64.958825	1578.329	1831.484	0
+# repeat=9
+9	label	k	qps	p50_ms	p95_ms	rc_failures
+9	baseline.b.9	64	58.298468	796.266	1038.648	0
+9	baseline.b.9	128	68.153913	1645.046	1809.326	0
+# repeat=10
+10	label	k	qps	p50_ms	p95_ms	rc_failures
+10	baseline.b.10	64	59.745577	826.248	1008.342	0
+10	baseline.b.10	128	65.230109	1623.890	1831.501	0

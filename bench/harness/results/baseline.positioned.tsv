@@ -1,0 +1,54 @@
+# build=baseline env=positioned n=10 worktree=/home/cubrid/dev/cubrid-wm-baseline cubrid=/home/cubrid/dev/cubrid-wm-baseline/build_x86_64_release/_install/CUBRID
+# repeat=1
+1	workload	wall_ms	rc	out_file
+1	hj_probe_heavy	215.049	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210125.out
+1	connect_by	167.187	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210125.out
+1	positional_mutation	169.100	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210126.out
+# repeat=2
+2	workload	wall_ms	rc	out_file
+2	hj_probe_heavy	200.237	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210126.out
+2	connect_by	162.011	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210126.out
+2	positional_mutation	168.987	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210126.out
+# repeat=3
+3	workload	wall_ms	rc	out_file
+3	hj_probe_heavy	196.803	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210126.out
+3	connect_by	161.701	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210127.out
+3	positional_mutation	168.159	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210127.out
+# repeat=4
+4	workload	wall_ms	rc	out_file
+4	hj_probe_heavy	202.445	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210127.out
+4	connect_by	161.902	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210127.out
+4	positional_mutation	172.051	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210127.out
+# repeat=5
+5	workload	wall_ms	rc	out_file
+5	hj_probe_heavy	204.869	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210128.out
+5	connect_by	161.569	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210128.out
+5	positional_mutation	168.168	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210128.out
+# repeat=6
+6	workload	wall_ms	rc	out_file
+6	hj_probe_heavy	206.474	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210128.out
+6	connect_by	166.314	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210128.out
+6	positional_mutation	167.321	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210129.out
+# repeat=7
+7	workload	wall_ms	rc	out_file
+7	hj_probe_heavy	206.702	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210129.out
+7	connect_by	161.531	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210129.out
+7	positional_mutation	167.046	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210129.out
+# repeat=8
+8	workload	wall_ms	rc	out_file
+8	hj_probe_heavy	198.822	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210129.out
+8	connect_by	165.154	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210130.out
+8	positional_mutation	168.247	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210130.out
+# repeat=9
+9	workload	wall_ms	rc	out_file
+9	hj_probe_heavy	201.358	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210130.out
+9	connect_by	162.030	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210130.out
+9	positional_mutation	167.513	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210130.out
+# repeat=10
+10	workload	wall_ms	rc	out_file
+10	hj_probe_heavy	201.891	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.hj_probe_heavy.1782210130.out
+10	connect_by	160.065	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.connect_by.1782210131.out
+10	positional_mutation	167.120	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/positioned.positional_mutation.1782210131.out
+# median_ms	168.163500
+# mean_ms	sigma_ms	low_2sigma_ms	high_2sigma_ms
+# 178.260867	18.556853	141.147160	215.374574

@@ -1,0 +1,12 @@
+
+=== <Result of SELECT Command in Line 9> ===
+
+  o_orderpriority                order_count  revenue             
+==================================================================
+  '1-URGENT       '                   455871  69005155502.24      
+  '2-HIGH         '                   455636  68945427740.39      
+  '5-LOW          '                   455023  68834759050.14      
+  '3-MEDIUM       '                   454837  68682263143.15      
+  '4-NOT SPECIFIED'                   454552  68621442863.28      
+
+5 rows selected. (4.365000 sec) Committed. (0.000000 sec) 

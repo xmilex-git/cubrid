@@ -1,0 +1,10 @@
+# build=asbuilt env=c n=2 worktree=/home/cubrid/dev/cubrid-wm-asbuilt cubrid=/home/cubrid/dev/cubrid-wm-asbuilt/build_x86_64_release/_install/CUBRID
+# repeat=1
+1	label	wall_ms	rc	out_file
+1	asbuilt.c.1	156.959	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/asbuilt.c.1.1782208352.out
+# repeat=2
+2	label	wall_ms	rc	out_file
+2	asbuilt.c.2	113.280	0	/home/cubrid/dev/cubrid-workmem/bench/harness/results/asbuilt.c.2.1782208352.out
+# median_ms	135.119500
+# mean_ms	sigma_ms	low_2sigma_ms	high_2sigma_ms
+# 135.119500	30.885717	73.348066	196.890934
