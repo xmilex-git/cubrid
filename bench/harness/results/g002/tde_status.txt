@@ -1,0 +1,1 @@
+Unable to restart/initialize the database server. Unable to mount disk volume "/home/cubrid/dev/cubrid-workmem/wmg001_lgat". The database "/home/cubrid/dev/cubrid-workmem/wmg001", to which the disk volume belongs, is in use by user cubrid on process 2652118 of host ilhansong since Wed Jun 24 21:53:21 2026.

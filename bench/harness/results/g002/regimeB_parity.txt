@@ -1,0 +1,6 @@
+Regime B hash GROUP BY parity md5 (guard TRUE raw-fd live)
+parallel_gby_sorted_md5=314974c58603f0deea335c2c95eed8ed
+serial_gby_sorted_md5=314974c58603f0deea335c2c95eed8ed
+gby_cmp=PASS
+gby_parallel_rows=1048576
+gby_serial_rows=1048576

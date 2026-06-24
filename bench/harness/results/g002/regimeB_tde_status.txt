@@ -1,0 +1,12 @@
+Key File: /home/cubrid/dev/cubrid-workmem/wmg001_keys
+
+The current key set on wmg001:
+Key Index: 0
+Created on Wed Jun 24 20:35:14 2026
+Set     on Wed Jun 24 20:35:14 2026
+
+Keys Information: 
+Key Index: 0 created on Wed Jun 24 20:35:14 2026
+Key Index: 1 created on Wed Jun 24 20:35:42 2026
+
+The number of keys: 2

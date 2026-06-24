@@ -1,0 +1,31 @@
+
+=== Query Trace ===
+
+trace on text
+
+
+=== <Result of SELECT Command in Line 2> ===
+
+              count(*)
+======================
+               1048576
+
+1 row selected. (2.554000 sec) Committed. (0.000000 sec) 
+
+=== Auto Trace ===
+
+Trace Statistics:
+  SELECT (time: 2550, fetch: 247023, fetch_time: 357, ioread: 359)
+    SCAN (temp time: 30, fetch: 6164, ioread: 0, readrows: 1048576, rows: 1048576)
+         (parallel workers: 4, temp time: 30..30, readrows: 260057..264331, rows: 260057..264331, gather: buildvalue)
+    SUBQUERY (uncorrelated)
+      SELECT (time: 2520, fetch: 240855, fetch_time: 351, ioread: 359)
+        SCAN (table: dba.t), (heap time: 829, fetch: 97485, ioread: 0, readrows: 1048576, rows: 1048576)
+             (parallel workers: 4, heap time: 424..607, readrows: 259317..266112, rows: 259317..266112, gather: mergeable list)
+        GROUPBY (time: 1690, hash: partial, sort: true, page: 10087, ioread: 359, rows: 1048576)
+
+
+=== Query Trace ===
+
+trace off
+

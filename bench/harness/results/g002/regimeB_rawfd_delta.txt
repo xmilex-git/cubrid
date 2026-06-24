@@ -1,0 +1,8 @@
+before:
+Num_rawfd_read_cache_hit      =          0
+Num_rawfd_read_cache_miss     =          0
+Num_rawfd_decrypt_count       =          0
+after:
+Num_rawfd_read_cache_hit      =          0
+Num_rawfd_read_cache_miss     =      16081
+Num_rawfd_decrypt_count       =      16081

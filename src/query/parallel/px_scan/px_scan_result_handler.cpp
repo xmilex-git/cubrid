@@ -36,7 +36,6 @@
 #include "query_aggregate.hpp"
 #include "xasl_aggregate.hpp"
 #include "object_domain.h"
-#include "temp_page_store.hpp"
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -95,13 +94,6 @@ namespace parallel_scan
 	m_.active_results = parallelism;
 	m_.is_list_id_domain_resolved = false;
 	m_.g_hash_eligible = (bool) orig_xasl_tree_for_domain_resolve->proc.buildlist.g_hash_eligible;
-	/* Scope-limit: worker-side hash aggregation spills partial groups into per-worker temp lists.
-	 * Raw-fd-backed cross-file partial-list merge still needs a segment-native implementation; keep
-	 * parallel GROUP BY on the regular merge path so raw-fd-live verification remains byte-correct. */
-	if (temp_page_store::raw_fd_master_enabled ())
-	  {
-	    m_.g_hash_eligible = false;
-	  }
       }
     else if constexpr (result_type == RESULT_TYPE::XASL_SNAPSHOT)
       {
@@ -517,7 +509,8 @@ namespace parallel_scan
       }
   }
 
-  void merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists)
+  void merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists,
+      bool segment_native)
   {
     if (dest->last_pgptr != nullptr)
       {
@@ -533,7 +526,14 @@ namespace parallel_scan
 
 	if (!merge_failed && list_id->tuple_cnt > 0)
 	  {
-	    merge_failed = qmgr_append_list_to_single_owner (thread_p, dest, list_id) != NO_ERROR;
+	    if (segment_native)
+	      {
+		merge_failed = qmgr_append_list_to_list_segment_native (thread_p, dest, list_id) != NO_ERROR;
+	      }
+	    else
+	      {
+		merge_failed = qmgr_append_list_to_single_owner (thread_p, dest, list_id) != NO_ERROR;
+	      }
 	  }
 
 	qfile_destroy_list (thread_p, list_id);
@@ -568,12 +568,12 @@ namespace parallel_scan
 	    return S_ERROR;
 	  }
 
-	merge_list_ids (thread_p, dest, m_.writer_results);
+	merge_list_ids (thread_p, dest, m_.writer_results, false);
 
 	if (m_.g_hash_eligible)
 	  {
 	    BUILDLIST_PROC_NODE *buildlist_proc = &m_.orig_xasl->proc.buildlist;
-	    merge_list_ids (thread_p, buildlist_proc->agg_hash_context->part_list_id, m_.hgby_results);
+	    merge_list_ids (thread_p, buildlist_proc->agg_hash_context->part_list_id, m_.hgby_results, true);
 	    /* HS_REJECT_ALL forces 'hash: partial' trace for hgby with part list IDs (cf. qdump_print_stats_text). */
 	    m_.orig_xasl->groupby_stats.groupby_hash = HS_REJECT_ALL;
 	  }

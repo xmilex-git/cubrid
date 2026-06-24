@@ -1,0 +1,2 @@
+pid=2652118
+/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_server

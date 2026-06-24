@@ -5443,13 +5443,6 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
      * result file. */
 
     QFILE_SET_FLAG (ls_flag, QFILE_FLAG_ALL);
-    /* Scope-limit for parallel hash GROUP BY raw-fd verification: hash aggregate partition lists
-     * are cross-file merge inputs, so keep them on the private-spill (develop) backing until their
-     * partial-list consumption is segment-native. */
-    if (buildlist->g_hash_eligible && temp_page_store::raw_fd_master_enabled ())
-      {
-	QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
-      }
     if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL) && XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED)
 	&& (xasl->orderby_list == NULL || XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST)) && xasl->option != Q_DISTINCT)
       {
@@ -5570,12 +5563,6 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
     {
       SORT_CMP_FUNC *cmp_fn;
 
-      if (temp_page_store::raw_fd_master_enabled ()
-	  && qmgr_materialize_list_to_single_owner (thread_p, gbstate.agg_hash_context->part_list_id) != NO_ERROR)
-	{
-	  GOTO_EXIT_ON_ERROR;
-	}
-
       /* open scan on partial list */
       if (qfile_open_list_scan (gbstate.agg_hash_context->part_list_id, &gbstate.agg_hash_context->part_scan_id) !=
 	  NO_ERROR)
@@ -5627,11 +5614,6 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       qfile_free_list_id (gbstate.agg_hash_context->part_list_id);
       gbstate.agg_hash_context->part_list_id = NULL;
 
-      if (temp_page_store::raw_fd_master_enabled ()
-	  && qmgr_materialize_list_to_single_owner (thread_p, gbstate.agg_hash_context->sorted_part_list_id) != NO_ERROR)
-	{
-	  GOTO_EXIT_ON_ERROR;
-	}
       /* reopen scan on newly sorted list */
       if (qfile_open_list_scan (gbstate.agg_hash_context->sorted_part_list_id, &gbstate.agg_hash_context->part_scan_id)
 	  != NO_ERROR)
@@ -14673,14 +14655,7 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
 		GOTO_EXIT_ON_ERROR;
 	      }
 
-
 	    QFILE_SET_FLAG (ls_flag, QFILE_FLAG_ALL);
-	    /* Scope-limit for hash aggregate partition lists: keep spill files private-spill backed
-	     * instead of raw-fd-backed until parallel partial-list merge is segment-native. */
-	    if (buildlist->g_hash_eligible && temp_page_store::raw_fd_master_enabled ())
-	      {
-		QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
-	      }
 	    if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL) && XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED)
 		&& buildlist->groupby_list == NULL && buildlist->a_eval_list == NULL
 		&& (xasl->orderby_list == NULL || XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST))

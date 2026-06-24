@@ -864,7 +864,7 @@ extern "C"
 	return NO_ERROR;
       }
 
-    if (temp_page_store::raw_fd_master_enabled ())
+    if (temp_page_store::raw_fd_master_enabled () && !ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST))
       {
 	return NO_ERROR;
       }

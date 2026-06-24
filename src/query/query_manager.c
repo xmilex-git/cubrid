@@ -3434,6 +3434,39 @@ qmgr_copy_list_tuples_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_lis
 }
 
 int
+qmgr_append_list_to_list_segment_native (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
+					 QFILE_LIST_ID * append_list_id_p)
+{
+  int error;
+
+  if (dest_list_id_p == NULL || append_list_id_p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return ER_FAILED;
+    }
+
+  assert (append_list_id_p->last_pgptr == NULL);
+
+  if (append_list_id_p->tuple_cnt <= 0)
+    {
+      return NO_ERROR;
+    }
+
+  if (dest_list_id_p->last_pgptr == NULL && qfile_reopen_list_as_append_mode (thread_p, dest_list_id_p) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+
+  error = qmgr_copy_list_tuples_to_list (thread_p, dest_list_id_p, append_list_id_p);
+  if (dest_list_id_p->last_pgptr != NULL)
+    {
+      qfile_close_list (thread_p, dest_list_id_p);
+    }
+
+  return error;
+}
+
+int
 qmgr_append_list_to_single_owner (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
 				  QFILE_LIST_ID * append_list_id_p)
 {

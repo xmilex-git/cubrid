@@ -1,0 +1,676 @@
+[2026-06-24 22:00:58] Build target [build]
+
+[2026-06-24 22:00:59] Entering target [build]
+
+  [ERROR] Manager server source path does not exist. It will not be built
+
+  [ERROR] JDBC source path does not exist. It will not be built
+-- ======== CMakeLists.txt
+    ==== with_unit_tests() = 
+--   OS = UNIX
+--   CMAKE_RUNTIME_OUTPUT_DIRECTORY=/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/bin
+-- Get version information from VERSION
+-- Build CUBRID 11.5.0.2278-6c17fa6 64bit Debug on Linux x86_64
+Including Third Party Libraries
+-- Build with flex and bison library: SYSTEM
+-- Build with expat library: EXTERNAL
+-- Build with jansson library: EXTERNAL
+-- Build with editline library: EXTERNAL
+-- Build with openssl library: EXTERNAL
+-- Build with unixODBC library: EXTERNAL
+-- Build with RE2 library: EXTERNAL
+-- Build with LZ4 library: EXTERNAL
+-- Build with TBB library: EXTERNAL
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:187 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:239 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:289 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:332 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:368 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:411 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:437 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:466 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/share/cmake/Modules/ExternalProject.cmake:3091 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  /usr/share/cmake/Modules/ExternalProject.cmake:4208 (_ep_add_download_command)
+  3rdparty/CMakeLists.txt:505 (externalproject_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Default install prefix: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID
+-- JAVA_HOME: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/vm/jdk8
+-- Found Java: /usr/lib/jvm/java-1.8.0-openjdk/bin/java
+-- Found JNI: /usr/lib/jvm/java/include;/usr/lib/jvm/java/include/linux;/usr/lib/jvm/java/include
+-- ======== WITH_CCI ==========
+-- Get version information from /home/cubrid/dev/cubrid-workmem/cubrid-cci/BUILD_NUMBER
+-- CCI_BUILD_NUMBER:[11.2.0.0037-ef5470f]
+-- Building CGW libraries.
+CMake Warning (dev) at cm_common/CMakeLists.txt:104 (install):
+  Target cmstat has PUBLIC_HEADER files but no PUBLIC_HEADER DESTINATION.
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at cm_common/CMakeLists.txt:104 (install):
+  Target cmdep has PUBLIC_HEADER files but no PUBLIC_HEADER DESTINATION.
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- .. timezone shared library
+-- .... gen_timezone executable
+-- ...... source files: /home/cubrid/dev/cubrid-workmem/src/executables/generate_timezone.cpp
+-- .... generate timezone command
+-- .... cubrid_timezones lib
+-- Get version information CCI_VERSION: 11.2.0.0037-ef5470f
+-- Configuring done (0.4s)
+-- Generating done (0.1s)
+-- Build files have been written to: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug
+[1/20] Running utility command for pl_install_jdk
+[INFO] Install JDK 8
+[2/20] Running utility command for pl_build
+> Task :pl_server:generateGrammarSource UP-TO-DATE
+> Task :pl_server:compileJava UP-TO-DATE
+> Task :pl_server:processResources UP-TO-DATE
+> Task :pl_server:classes UP-TO-DATE
+> Task :pl_server:jar UP-TO-DATE
+> Task :pl_server:startScripts UP-TO-DATE
+> Task :pl_server:distTar UP-TO-DATE
+> Task :pl_server:distZip UP-TO-DATE
+> Task :pl_server:assemble UP-TO-DATE
+> Task :pl_server:check
+> Task :pl_server:build
+
+BUILD SUCCESSFUL in 610ms
+7 actionable tasks: 7 up-to-date
+[3/20] Building CXX object sa/CMakeFiles/cubridsa.dir/__/src/query/temp_page_store.cpp.o
+[4/20] Building CXX object cubrid/CMakeFiles/cubrid.dir/__/src/query/temp_page_store.cpp.o
+[5/20] Linking CXX shared library sa/libcubridsa.so.11.5
+[6/20] Creating library symlink sa/libcubridsa.so
+[7/20] Linking CXX executable bin/cubrid_rel
+[8/20] Linking CXX executable bin/cubrid
+[9/20] Linking CXX executable bin/gen_timezone
+[10/20] Linking CXX executable bin/cub_jobsa
+[11/20] Linking CXX executable bin/cub_sainfo
+[12/20] Linking CXX executable bin/cub_pl
+[13/20] Linking CXX executable bin/loadjava
+[14/20] Linking CXX shared library cubrid/libcubrid.so.11.5
+[15/20] Creating library symlink cubrid/libcubrid.so
+[16/20] Linking CXX executable bin/cub_server
+[17/20] Linking CXX executable bin/unittests_bit
+[18/20] Linking CXX executable bin/unittests_area
+[19/20] Linking CXX executable bin/unittests_snapshot
+[20/20] Linking CXX executable bin/unittests_lf
+[1/3] Running utility command for pl_install_jdk
+[INFO] Install JDK 8
+[2/3] Running utility command for pl_build
+> Task :pl_server:generateGrammarSource UP-TO-DATE
+> Task :pl_server:compileJava UP-TO-DATE
+> Task :pl_server:processResources UP-TO-DATE
+> Task :pl_server:classes UP-TO-DATE
+> Task :pl_server:jar UP-TO-DATE
+> Task :pl_server:startScripts UP-TO-DATE
+> Task :pl_server:distTar UP-TO-DATE
+> Task :pl_server:distZip UP-TO-DATE
+> Task :pl_server:assemble UP-TO-DATE
+> Task :pl_server:check
+> Task :pl_server:build
+
+BUILD SUCCESSFUL in 578ms
+7 actionable tasks: 7 up-to-date
+[2/3] Install the project...
+-- Install configuration: "Debug"
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/pl_server.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/logging.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/release
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/LICENSE
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/dt.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/jconsole.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/ct.sym
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/amd64
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/amd64/jli
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/amd64/jli/libjli.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/amd64/libjawt.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/sa-jdi.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/tools.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/ir.idl
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/orb.idl
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/lib/jexec
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/ASSEMBLY_EXCEPTION
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/javah
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/javac
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jdeps
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jjs
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/wsgen
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/java
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jps
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/policytool
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/hsdb
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/native2ascii
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/unpack200
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jdb
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/javap
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/rmiregistry
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/tnameserv
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/wsimport
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/clhsdb
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jmap
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jfr
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jcmd
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/pack200
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/java-rmi.cgi
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/rmid
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jrunscript
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jconsole
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/idlj
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/servertool
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jsadebugd
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/extcheck
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jstack
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jstat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/orbd
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/appletviewer
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jinfo
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/schemagen
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/keytool
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/javadoc
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jarsigner
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/xjc
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/rmic
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jstatd
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/serialver
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/bin/jhat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/NOTICE
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/THIRD_PARTY_README
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/jawt.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/jni.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/jvmti.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/linux
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/linux/jawt_md.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/linux/jni_md.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/classfile_constants.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/jdwpTransport.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/include/jvmticmlr.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/LICENSE
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/psfont.properties.ja
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/cmm
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/cmm/sRGB.pf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/cmm/PYCC.pf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/cmm/CIEXYZ.pf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/cmm/GRAY.pf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/cmm/LINEAR_RGB.pf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/psfontj2d.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/charsets.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/net.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jvm.hprof.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/management-agent.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/content-types.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/meta-index
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/calendars.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jfr.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjpeg.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libawt_xawt.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjsig.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libj2gss.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjaas_unix.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libunpack.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/jvm.cfg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libmlib_image.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libawt_headless.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libmanagement.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libattach.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjava_crw_demo.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libsaproc.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libhprof.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libdt_socket.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/server
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/server/libjsig.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/server/libjvm.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/server/Xusage.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libsunec.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libnet.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libj2pcsc.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libnio.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libverify.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libnpt.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libawt.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libzip.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/jli
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/jli/libjli.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjdwp.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libj2pkcs11.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libsplashscreen.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libfontmanager.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjava.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjsdt.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjsound.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/liblcms.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libinstrument.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libsctp.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjsoundalsa.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/amd64/libjawt.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jsse.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jfr
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jfr/default.jfc
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jfr/profile.jfc
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/tzdb.dat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/management
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/management/management.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/management/jmxremote.password.template
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/management/jmxremote.access
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/management/snmp.acl.template
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/classlist
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/motif_LinkNoDrop32x32.gif
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/motif_MoveNoDrop32x32.gif
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/motif_MoveDrop32x32.gif
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/motif_CopyDrop32x32.gif
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/motif_LinkDrop32x32.gif
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/invalid32x32.gif
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/cursors.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/images/cursors/motif_CopyNoDrop32x32.gif
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/sound.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/applet
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/cldrdata.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/sunjce_provider.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/localedata.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/meta-index
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/sunec.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/zipfs.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/dnsns.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/nashorn.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/jaccess.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/ext/sunpkcs11.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/flavormap.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/resources.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/hijrah-config-umalqura.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jce.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/currency.data
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/jexec
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/cacerts
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/blacklisted.certs
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/java.security
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/java.policy
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/policy
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/policy/unlimited
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/policy/unlimited/US_export_policy.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/policy/unlimited/local_policy.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/policy/limited
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/policy/limited/US_export_policy.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/security/policy/limited/local_policy.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/logging.properties
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/lib/rt.jar
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/ASSEMBLY_EXCEPTION
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/jjs
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/java
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/policytool
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/unpack200
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/rmiregistry
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/tnameserv
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/pack200
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/rmid
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/servertool
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/orbd
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/bin/keytool
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/vm/jdk8/jre/THIRD_PARTY_README
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubridsa.so.11.5
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubridsa.so.11.5" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubridsa.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubridcs.so.11.5
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubridcs.so
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubrid.so.11.5
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubrid.so.11.5" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubrid.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/dbi.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/dbtran_def.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/dbtype_def.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/db_set_function.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/dbtype_function.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/db_date.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/db_elo.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/cache_time.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/error_code.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/cubrid_log.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/cm_stat.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/csql
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_master
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_server
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_server" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cubrid
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cubrid" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_commdb
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cubrid_rel
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cubrid_rel" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/loadjava
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/loadjava" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_pl
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_pl" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_admin
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/cci/lib/libcascci.so.11.2
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/cci/lib/libcascci.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/cci/include/cas_cci.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/cci/include/compat_dbtran_def.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/cci/include/broker_cas_error.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/cas_cci.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/broker_cas_error.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/compat_dbtran_def.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcascci.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcascci.so.11.2
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cci_applier
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/broker_log_converter
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/broker_log_runner
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/broker_tester
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cubrid_replay
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_broker
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_gateway
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/broker_monitor
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/gateway_monitor
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/broker_changer
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cubrid_broker
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cubrid_gateway
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_cas
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_cas_cgw
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_proxy
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/include/shard_key.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/broker_log_top
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libbrokeradmin.so.11.5
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libbrokeradmin.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcmstat.so.11.5
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcmstat.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcmdep.so.11.5
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcmdep.so
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_jobsa
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_jobsa" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_sainfo
+-- Set runtime path of "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/cub_sainfo" to "/home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib"
+-- Installing: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid.conf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid.conf.large
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid.conf.small
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid_broker.conf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid_broker.conf.shard
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid_gateway.conf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid_ha.conf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid_hosts.conf
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/shard_connection.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/shard_key.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid_locales.all.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cubrid_locales.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cas_ssl_cert.crt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/conf/cas_ssl_cert.key
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8/utils.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8/cubrid.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8/csql.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8/utils.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8/cubrid.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US.utf8/csql.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US/csql.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US/cubrid.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US/utils.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US/csql.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US/cubrid.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/en_US/utils.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8/cubrid.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8/utils.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8/csql.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8/cubrid.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8/csql.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.utf8/utils.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr/csql.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr/utils.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr/cubrid.msg
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr/cubrid.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr/csql.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/msg/ko_KR.euckr/utils.cat
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/demo/demodb_objects
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/demo/demodb_schema
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/demo/make_cubrid_demo.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/init.d/cubrid-ha
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/init.d/cubrid
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/check_reserved.sql
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/broker_log_top.py
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/brokerstatus_to_csv.py
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/statdump_to_csv.py
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/ha_make_slavedb.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/VERSION
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/README
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/functions/ha_check_environment.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/functions/ha_check_script.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/expect/scp_from.exp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/expect/scp_to.exp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/expect/ssh.exp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/ha/common/common.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/cubrid_func.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/buffer_access.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/global_time.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/io_stat.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/lock_time.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/obj_access.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/query_time.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/transaction.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/topcallstack_helper.stp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/get_file_line.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/systemtap/tapset/scripts/topcallstack
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/setup.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/cubrid.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/cubrid.csh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/unloaddb.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/restore_to_newdb.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/share/scripts/check_index_ovfps.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/make_locale.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/loclib/build_locale.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/8859-1.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/8859-15.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/8859-9.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/CP1250.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/CP1258.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/CP932.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/CP936.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/codepages/CP949.TXT
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ducet.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/common_collations.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_de_DE.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_es_ES.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_fr_FR.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_it_IT.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_ja_JP.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_km_KH.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_ko_KR.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_ro_RO.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_tr_TR.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_vi_VN.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/ldml/cubrid_zh_CN.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/data/unicodedata.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/locales/loclib/locale_lib_common.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubrid_timezones.so.11.5
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/lib/libcubrid_timezones.so
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/bin/make_tz.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzlib/build_tz.sh
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/africa
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/antarctica
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/asia
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/australasia
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/backward
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/etcetera
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/europe
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/iso3166.tab
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/leapseconds
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/northamerica
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/pacificnew
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/southamerica
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/windowsZones.xml
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzdata/zone.tab
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/timezones/tzlib/timezone_lib_common.h
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/log
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/var
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/tmp
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/databases
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/var/CUBRID_SOCK
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/adoptium.temurin_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/adoptium.temurin_license_assembly_exception.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/libedit_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/libexpat_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/libjansson_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/libodbc_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/libopenssl_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/libtbb_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/lz4_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/rapidjson_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/3rdparty/re2_license.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/./COPYING
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/./CREDITS
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/./README.md
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/./README_TAR_INSTALL
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/databases/databases.txt.sample
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/var/CUBRID_SOCK/README.txt
+-- Up-to-date: /home/cubrid/dev/cubrid-workmem/build_x86_64_debug/_install/CUBRID/tmp/README.txt
+
+[2026-06-24 22:01:12] Leaving target [build]
+
+[2026-06-24 22:01:12] Completed
+
+*** Summary ***
+  Target [build]
+  Version [11.5.0.0000-unknown]
+  Build mode [x86_64/debug]
+    Configured with [ -DWITH_CCI=true -DCMAKE_BUILD_TYPE=Debug]
+
