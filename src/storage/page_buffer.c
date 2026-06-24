@@ -6784,6 +6784,35 @@ pgbuf_unlatch_void_zone_bcb (THREAD_ENTRY * thread_p, PGBUF_BCB * bcb, int threa
 	}
     }
 
+  if (!PGBUF_VACUUM_SHOULD_IGNORE_UNFIX (thread_p) && (PGBUF_SHOULD_IGNORE_UNFIX (thread_p, bcb)))
+    {
+      /* temp/temporary-volume page (non-vacuum) on first unfix: do not promote it to the private LRU top and do not
+       * register an LRU hit, mirroring the re-fix temp handling (PGBUF_SHOULD_IGNORE_UNFIX, LRU_3 zone). Feed a
+       * direct victim when there is demand, otherwise leave the page reclaim-ready at the middle of a shared LRU so
+       * a single-touch temp/cache page never displaces a data hot page. Pins stay UAF-safe: a fixed bcb is still
+       * skipped by the victim fix-count guard (pgbuf_is_bcb_fixed_by_any). */
+      if (!pgbuf_bcb_avoid_victim (bcb) && pgbuf_assign_direct_victim (thread_p, bcb))
+	{
+	  /* assigned victim directly */
+	  if (perfmon_is_perf_tracking_and_active (PERFMON_ACTIVATION_FLAG_PB_VICTIMIZATION))
+	    {
+	      perfmon_inc_stat (thread_p, PSTAT_PB_VICTIM_ASSIGN_DIRECT_VACUUM_VOID);
+	    }
+
+	  /* add to AOUT */
+	  if (pgbuf_Pool.buf_AOUT_list.max_count > 0)
+	    {
+	      pgbuf_add_vpid_to_aout_list (thread_p, &bcb->vpid, aout_list_id);
+	    }
+	  return;
+	}
+
+      /* no victim demand: add to middle of a shared list (reclaim-ready), no hit registered */
+      pgbuf_lru_add_new_bcb_to_middle (thread_p, bcb, pgbuf_get_shared_lru_index_for_add ());
+      perfmon_inc_stat (thread_p, PSTAT_PB_UNFIX_VOID_TO_SHARED_MID);
+      return;
+    }
+
   if (thread_private_lru_index != -1)
     {
       if (PGBUF_VACUUM_SHOULD_IGNORE_UNFIX (thread_p))
