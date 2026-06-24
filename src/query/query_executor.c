@@ -724,8 +724,8 @@ static void qexec_clear_pred_xasl (THREAD_ENTRY * thread_p, PRED_EXPR * pred);
 static void qexec_set_xasl_trace_to_session (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 #endif /* SERVER_MODE */
 
-static int qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc, XASL_STATE * xasl_state,
-					 bool not_use_membuf);
+static int qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc,
+					 XASL_STATE * xasl_state);
 static void qexec_free_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc);
 static int qexec_build_agg_hkey (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, REGU_VARIABLE_LIST regu_list,
 				 QFILE_TUPLE tpl, AGGREGATE_HASH_KEY * key);
@@ -4830,6 +4830,11 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
       /* add first tuple of group to groupby list */
       if (value->first_tuple.tpl != NULL)
 	{
+	  if (qmgr_materialize_list_to_single_owner (thread_p, groupby_list) != NO_ERROR)
+	    {
+	      return ER_FAILED;
+	    }
+
 	  rc = qfile_add_tuple_to_list (thread_p, groupby_list, value->first_tuple.tpl);
 	  if (rc != NO_ERROR)
 	    {
@@ -4857,6 +4862,10 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 	  /* very high selectivity, abort hash aggregation */
 	  context->state = HS_REJECT_ALL;
 
+	  if (qmgr_materialize_list_to_single_owner (thread_p, groupby_list) != NO_ERROR)
+	    {
+	      return ER_FAILED;
+	    }
 	  /* dump hash table to list file, no need to keep it in memory */
 	  qdata_save_agg_htable_to_list (thread_p, context->hash_table, groupby_list, context->part_list_id,
 					 context->temp_dbval_array);
@@ -5431,6 +5440,13 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
      * result file. */
 
     QFILE_SET_FLAG (ls_flag, QFILE_FLAG_ALL);
+    /* Scope-limit for parallel hash GROUP BY raw-fd verification: hash aggregate partition lists
+     * are cross-file merge inputs, so keep them on the private-spill (develop) backing until their
+     * partial-list consumption is segment-native. */
+    if (buildlist->g_hash_eligible)
+      {
+	QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
+      }
     if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL) && XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED)
 	&& (xasl->orderby_list == NULL || XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST)) && xasl->option != Q_DISTINCT)
       {
@@ -5551,6 +5567,11 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
     {
       SORT_CMP_FUNC *cmp_fn;
 
+      if (qmgr_materialize_list_to_single_owner (thread_p, gbstate.agg_hash_context->part_list_id) != NO_ERROR)
+	{
+	  GOTO_EXIT_ON_ERROR;
+	}
+
       /* open scan on partial list */
       if (qfile_open_list_scan (gbstate.agg_hash_context->part_list_id, &gbstate.agg_hash_context->part_scan_id) !=
 	  NO_ERROR)
@@ -5602,6 +5623,10 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       qfile_free_list_id (gbstate.agg_hash_context->part_list_id);
       gbstate.agg_hash_context->part_list_id = NULL;
 
+      if (qmgr_materialize_list_to_single_owner (thread_p, gbstate.agg_hash_context->sorted_part_list_id) != NO_ERROR)
+	{
+	  GOTO_EXIT_ON_ERROR;
+	}
       /* reopen scan on newly sorted list */
       if (qfile_open_list_scan (gbstate.agg_hash_context->sorted_part_list_id, &gbstate.agg_hash_context->part_scan_id)
 	  != NO_ERROR)
@@ -5626,6 +5651,10 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
   /*
    * Open a scan on the unsorted input file
    */
+  if (qmgr_materialize_list_to_single_owner (thread_p, list_id) != NO_ERROR)
+    {
+      GOTO_EXIT_ON_ERROR;
+    }
   if (qfile_open_list_scan (list_id, &input_scan_id) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
@@ -14640,6 +14669,12 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
 
 
 	    QFILE_SET_FLAG (ls_flag, QFILE_FLAG_ALL);
+	    /* Scope-limit for hash aggregate partition lists: keep spill files private-spill backed
+	     * instead of raw-fd-backed until parallel partial-list merge is segment-native. */
+	    if (buildlist->g_hash_eligible)
+	      {
+		QFILE_SET_FLAG (ls_flag, QFILE_FLAG_PRIVATE_SPILL);
+	      }
 	    if (XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL) && XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED)
 		&& buildlist->groupby_list == NULL && buildlist->a_eval_list == NULL
 		&& (xasl->orderby_list == NULL || XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST))
@@ -15605,7 +15640,7 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 		  /* disable hash aggregate evaluation when group by skip is possible */
 		  xasl->proc.buildlist.g_hash_eligible = 0;
 		}
-	      else if (qexec_alloc_agg_hash_context (thread_p, &xasl->proc.buildlist, xasl_state, false) != NO_ERROR)
+	      else if (qexec_alloc_agg_hash_context (thread_p, &xasl->proc.buildlist, xasl_state) != NO_ERROR)
 		{
 		  GOTO_EXIT_ON_ERROR;
 		}
@@ -27218,11 +27253,10 @@ qexec_clear_pred_xasl (THREAD_ENTRY * thread_p, PRED_EXPR * pred)
 }
 
 int
-qexec_alloc_agg_hash_context_buildlist_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, XASL_STATE * xasl_state,
-					     bool not_use_membuf)
+qexec_alloc_agg_hash_context_buildlist_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, XASL_STATE * xasl_state)
 {
   assert (xasl->type == BUILDLIST_PROC);
-  return qexec_alloc_agg_hash_context (thread_p, &xasl->proc.buildlist, xasl_state, not_use_membuf);
+  return qexec_alloc_agg_hash_context (thread_p, &xasl->proc.buildlist, xasl_state);
 }
 
 /*
@@ -27234,14 +27268,12 @@ qexec_alloc_agg_hash_context_buildlist_xasl (THREAD_ENTRY * thread_p, xasl_node 
  *   xasl_state(in): XASL state
  */
 static int
-qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc, XASL_STATE * xasl_state,
-			      bool not_use_membuf)
+qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc, XASL_STATE * xasl_state)
 {
   QFILE_TUPLE_VALUE_TYPE_LIST type_list;
   REGU_VARIABLE_LIST regu_list;
   AGGREGATE_TYPE *agg_list;
   int value_count = 0, i = 0, error_code = NO_ERROR;
-  int open_list_flag = not_use_membuf ? QFILE_NOT_USE_MEMBUF : 0;
 
   if (!proc->g_hash_eligible)
     {
@@ -27363,9 +27395,9 @@ qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * pro
 
   /* create list files */
   proc->agg_hash_context->part_list_id =
-    qfile_open_list (thread_p, &type_list, NULL, xasl_state->query_id, open_list_flag, NULL);
+    qfile_open_list (thread_p, &type_list, NULL, xasl_state->query_id, QFILE_FLAG_PRIVATE_SPILL, NULL);
   proc->agg_hash_context->sorted_part_list_id =
-    qfile_open_list (thread_p, &type_list, NULL, xasl_state->query_id, 0, NULL);
+    qfile_open_list (thread_p, &type_list, NULL, xasl_state->query_id, QFILE_FLAG_PRIVATE_SPILL, NULL);
 
   /* create tuple descriptor for partial list files */
   proc->agg_hash_context->part_list_id->tpl_descr.f_cnt = type_list.type_cnt;

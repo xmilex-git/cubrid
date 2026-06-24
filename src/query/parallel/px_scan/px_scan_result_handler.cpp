@@ -93,7 +93,10 @@ namespace parallel_scan
 	m_.orig_xasl = orig_xasl_tree_for_domain_resolve;
 	m_.active_results = parallelism;
 	m_.is_list_id_domain_resolved = false;
-	m_.g_hash_eligible = (bool) orig_xasl_tree_for_domain_resolve->proc.buildlist.g_hash_eligible;
+	/* Scope-limit: worker-side hash aggregation spills partial groups into per-worker temp lists.
+	 * Raw-fd-backed cross-file partial-list merge still needs a segment-native implementation; keep
+	 * parallel GROUP BY on the regular merge path so raw-fd-live verification remains byte-correct. */
+	m_.g_hash_eligible = false;
       }
     else if constexpr (result_type == RESULT_TYPE::XASL_SNAPSHOT)
       {
@@ -228,7 +231,7 @@ namespace parallel_scan
 	      m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
 	      return;
 	    }
-	  list_id = qfile_open_list (thread_p, &type_list, NULL, m_query_id, QFILE_FLAG_ALL|QFILE_NOT_USE_MEMBUF, NULL );
+	  list_id = qfile_open_list (thread_p, &type_list, NULL, m_query_id, QFILE_FLAG_ALL, NULL );
 	  if (!list_id)
 	    {
 	      m_err_messages_p->move_top_error_message_to_this();
@@ -276,7 +279,7 @@ namespace parallel_scan
 	tl.g_agg_domains_resolved = TRUE;
 	if (m_.g_hash_eligible)
 	  {
-	    if (qexec_alloc_agg_hash_context_buildlist_xasl (thread_p, curr_xasl, vd->xasl_state, true) != NO_ERROR)
+	    if (qexec_alloc_agg_hash_context_buildlist_xasl (thread_p, curr_xasl, vd->xasl_state) != NO_ERROR)
 	      {
 		m_err_messages_p->move_top_error_message_to_this();
 		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
@@ -511,107 +514,28 @@ namespace parallel_scan
 
   void merge_list_ids (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, std::vector<QFILE_LIST_ID *> &lists)
   {
-    auto attach_merged_list = [thread_p, dest] (QFILE_LIST_ID *tmp_merged_list)
-    {
-      if (tmp_merged_list == nullptr)
-	{
-	  return;
-	}
+    if (dest->last_pgptr != nullptr)
+      {
+	qfile_close_list (thread_p, dest);
+      }
 
-      if (dest->tuple_cnt > 0)
-	{
-	  if (dest->last_pgptr != nullptr)
-	    {
-	      qfile_close_list (thread_p, dest);
-	    }
-	  qfile_connect_list (thread_p, dest, tmp_merged_list);
-	}
-      else
-	{
-	  if (dest->type_list.type_cnt > 0)
-	    {
-	      qfile_destroy_list (thread_p, dest);
-	    }
-	  qfile_copy_list_id (dest, tmp_merged_list, true, QFILE_MOVE_DEPENDENT);
-	  QFILE_FREE_AND_INIT_LIST_ID (tmp_merged_list);
-	}
-    };
-
-    QMGR_SEGMENT_LIST segment_list;
-    qmgr_segment_list_init (&segment_list);
-    bool saw_raw_fd_segments = false;
-    bool all_nonempty_lists_are_raw_fd = true;
+    bool merge_failed = false;
 
     for (QFILE_LIST_ID *list_id : lists)
       {
 	assert (list_id != nullptr);
 	assert (list_id->last_pgptr == nullptr);
-	if (list_id->tuple_cnt > 0)
-	  {
-	    const bool has_raw_fd_segments = qmgr_list_has_raw_fd_segments (list_id);
-	    saw_raw_fd_segments = saw_raw_fd_segments || has_raw_fd_segments;
-	    all_nonempty_lists_are_raw_fd = all_nonempty_lists_are_raw_fd && has_raw_fd_segments;
-	    if (has_raw_fd_segments && qmgr_segment_list_add_list_id (&segment_list, list_id) != NO_ERROR)
-	      {
-		qmgr_segment_list_clear (&segment_list);
-		return;
-	      }
-	  }
-      }
 
-    if (saw_raw_fd_segments && all_nonempty_lists_are_raw_fd && qmgr_segment_list_has_segments (&segment_list))
-      {
-	QFILE_LIST_ID *tmp_merged_list =
-	  qfile_open_list (thread_p, &lists.front()->type_list, lists.front()->sort_list, lists.front()->query_id, 0,
-			   nullptr);
-	if (tmp_merged_list != nullptr
-	    && qmgr_segment_list_append_to_list (thread_p, tmp_merged_list, &segment_list) == NO_ERROR)
+	if (!merge_failed && list_id->tuple_cnt > 0)
 	  {
-	    qfile_close_list (thread_p, tmp_merged_list);
-	    for (QFILE_LIST_ID *list_id : lists)
-	      {
-		qfile_destroy_list (thread_p, list_id);
-		QFILE_FREE_AND_INIT_LIST_ID (list_id);
-	      }
-	    lists.clear();
-	    qmgr_segment_list_clear (&segment_list);
-	    attach_merged_list (tmp_merged_list);
-	    return;
+	    merge_failed = qmgr_append_list_to_single_owner (thread_p, dest, list_id) != NO_ERROR;
 	  }
 
-	if (tmp_merged_list != nullptr)
-	  {
-	    qfile_destroy_list (thread_p, tmp_merged_list);
-	    QFILE_FREE_AND_INIT_LIST_ID (tmp_merged_list);
-	  }
+	qfile_destroy_list (thread_p, list_id);
+	QFILE_FREE_AND_INIT_LIST_ID (list_id);
       }
-    qmgr_segment_list_clear (&segment_list);
 
-    QFILE_LIST_ID *tmp_merged_list = nullptr;
-    for (QFILE_LIST_ID *list_id : lists)
-      {
-	assert (list_id != nullptr);
-	assert (list_id->last_pgptr == nullptr);
-	if (list_id->tuple_cnt > 0)
-	  {
-	    if (tmp_merged_list == nullptr)
-	      {
-		tmp_merged_list = list_id;
-	      }
-	    else
-	      {
-		qfile_connect_list (thread_p, tmp_merged_list, list_id);
-	      }
-	  }
-	else
-	  {
-	    qfile_destroy_list (thread_p, list_id);
-	    QFILE_FREE_AND_INIT_LIST_ID (list_id);
-	  }
-	list_id = nullptr;
-      }
     lists.clear();
-    attach_merged_list (tmp_merged_list);
   }
 
   template <RESULT_TYPE result_type>
@@ -1090,7 +1014,7 @@ namespace parallel_scan
 	else if (agg_node->option == Q_DISTINCT
 		 && agg_node->function != PT_MIN && agg_node->function != PT_MAX)
 	  {
-	    int ls_flag = QFILE_FLAG_DISTINCT | QFILE_NOT_USE_MEMBUF;
+	    int ls_flag = QFILE_FLAG_DISTINCT;
 	    QFILE_TUPLE_VALUE_TYPE_LIST type_list;
 	    type_list.type_cnt = 1;
 	    type_list.domp = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *));
@@ -1486,36 +1410,20 @@ namespace parallel_scan
 		  continue;
 		}
 
-	      if (orig_agg_p->list_id->tuple_cnt > 0)
+	      qfile_close_list (thread_p, orig_agg_p->list_id);
+	      if (qmgr_append_list_to_single_owner (thread_p, orig_agg_p->list_id, cur_agg_p->list_id) != NO_ERROR)
 		{
-		  QFILE_LIST_ID *list_id_p = (QFILE_LIST_ID *) malloc (sizeof (QFILE_LIST_ID));
-		  if (list_id_p == nullptr)
-		    {
-		      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-			      (size_t) sizeof (QFILE_LIST_ID));
-		      m_err_messages_p->move_top_error_message_to_this ();
-		      m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		      qfile_destroy_list (thread_p, cur_agg_p->list_id);
-		      cur_agg_p = cur_agg_p->next;
-		      continue;
-		    }
-		  qfile_copy_list_id (list_id_p, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT);
-		  qfile_connect_list (thread_p, orig_agg_p->list_id, list_id_p);
-		  qfile_clear_list_id (cur_agg_p->list_id);
+		  m_err_messages_p->move_top_error_message_to_this ();
+		  m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		  qfile_destroy_list (thread_p, cur_agg_p->list_id);
 		  cur_agg_p = cur_agg_p->next;
 		  continue;
 		}
-	      else if (orig_agg_p->list_id->type_list.type_cnt > 0)
-		{
-		  qfile_clear_list_id (orig_agg_p->list_id);
-		}
-	      else
-		{
-		  QFILE_CLEAR_LIST_ID (orig_agg_p->list_id);
-		}
 
-	      qfile_copy_list_id (orig_agg_p->list_id, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT);
+	      qfile_destroy_list (thread_p, cur_agg_p->list_id);
 	      qfile_clear_list_id (cur_agg_p->list_id);
+	      cur_agg_p = cur_agg_p->next;
+	      continue;
 	    }
 	  else if (orig_agg_p->function == PT_COUNT)
 	    {

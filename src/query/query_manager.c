@@ -3336,6 +3336,232 @@ qmgr_segment_list_append_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_
   return (scan_code == S_END) ? NO_ERROR : ER_FAILED;
 }
 
+static bool
+qmgr_list_is_private_spill_single_owner (const QFILE_LIST_ID * list_id_p)
+{
+  return list_id_p != NULL && list_id_p->dependent_list_id == NULL && list_id_p->tfile_vfid != NULL
+    && list_id_p->tfile_vfid->backing == qmgr_temp_backing::PRIVATE_SPILL_FALLBACK
+    && list_id_p->tfile_vfid->membuf == NULL;
+}
+
+static QFILE_LIST_ID *
+qmgr_open_private_spill_list_like (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * list_id_p)
+{
+  if (list_id_p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return NULL;
+    }
+
+  return qfile_open_list (thread_p, const_cast < QFILE_TUPLE_VALUE_TYPE_LIST * > (&list_id_p->type_list),
+			  list_id_p->sort_list, list_id_p->query_id, QFILE_FLAG_PRIVATE_SPILL | QFILE_FLAG_ALL, NULL);
+}
+
+static int
+qmgr_copy_regular_list_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
+				QFILE_LIST_ID * src_list_id_p)
+{
+  QFILE_LIST_SCAN_ID scan_id;
+  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  SCAN_CODE scan_code;
+
+  if (qfile_open_list_scan (src_list_id_p, &scan_id) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+
+  while ((scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK)) == S_SUCCESS)
+    {
+      if (qfile_add_tuple_to_list (thread_p, dest_list_id_p, tuple_record.tpl) != NO_ERROR)
+	{
+	  qfile_close_scan (thread_p, &scan_id);
+	  if (tuple_record.tpl != NULL && tuple_record.size > 0)
+	    {
+	      db_private_free_and_init (thread_p, tuple_record.tpl);
+	    }
+	  return ER_FAILED;
+	}
+    }
+
+  qfile_close_scan (thread_p, &scan_id);
+  if (tuple_record.tpl != NULL && tuple_record.size > 0)
+    {
+      db_private_free_and_init (thread_p, tuple_record.tpl);
+    }
+
+  return (scan_code == S_END) ? NO_ERROR : ER_FAILED;
+}
+
+static int
+qmgr_copy_list_tuples_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
+			       QFILE_LIST_ID * src_list_id_p)
+{
+  int error = NO_ERROR;
+
+  if (dest_list_id_p == NULL || src_list_id_p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return ER_FAILED;
+    }
+
+  for (QFILE_LIST_ID * iter_p = src_list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = iter_p->dependent_list_id)
+    {
+      if (iter_p->tuple_cnt <= 0)
+	{
+	  continue;
+	}
+
+      if (iter_p->tfile_vfid != NULL && iter_p->tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+	  && iter_p->tfile_vfid->raw_fd_handle != NULL)
+	{
+	  QMGR_SEGMENT_LIST segment_list;
+	  qmgr_segment_list_init (&segment_list);
+	  if (qmgr_segment_list_add_list_id (&segment_list, iter_p) != NO_ERROR)
+	    {
+	      qmgr_segment_list_clear (&segment_list);
+	      return ER_FAILED;
+	    }
+	  error = qmgr_segment_list_append_to_list (thread_p, dest_list_id_p, &segment_list);
+	  qmgr_segment_list_clear (&segment_list);
+	}
+      else
+	{
+	  error = qmgr_copy_regular_list_to_list (thread_p, dest_list_id_p, iter_p);
+	}
+    }
+
+  return error;
+}
+
+int
+qmgr_append_list_to_single_owner (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
+				  QFILE_LIST_ID * append_list_id_p)
+{
+  QFILE_LIST_ID *single_owner_p = NULL;
+  int error = NO_ERROR;
+
+  if (dest_list_id_p == NULL || append_list_id_p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+      return ER_FAILED;
+    }
+
+  assert (dest_list_id_p->last_pgptr == NULL);
+  assert (append_list_id_p->last_pgptr == NULL);
+
+  if (append_list_id_p->tuple_cnt <= 0)
+    {
+      return NO_ERROR;
+    }
+
+  if (dest_list_id_p->tuple_cnt <= 0)
+    {
+      single_owner_p = qmgr_open_private_spill_list_like (thread_p, append_list_id_p);
+      if (single_owner_p == NULL)
+	{
+	  return ER_FAILED;
+	}
+
+      error = qmgr_copy_list_tuples_to_list (thread_p, single_owner_p, append_list_id_p);
+    }
+  else if (qmgr_list_is_private_spill_single_owner (dest_list_id_p))
+    {
+      if (dest_list_id_p->last_pgptr == NULL && qfile_reopen_list_as_append_mode (thread_p, dest_list_id_p) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+      error = qmgr_copy_list_tuples_to_list (thread_p, dest_list_id_p, append_list_id_p);
+      qfile_close_list (thread_p, dest_list_id_p);
+      return error;
+    }
+  else
+    {
+      single_owner_p = qmgr_open_private_spill_list_like (thread_p, dest_list_id_p);
+      if (single_owner_p == NULL)
+	{
+	  return ER_FAILED;
+	}
+
+      error = qmgr_copy_list_tuples_to_list (thread_p, single_owner_p, dest_list_id_p);
+      if (error == NO_ERROR)
+	{
+	  error = qmgr_copy_list_tuples_to_list (thread_p, single_owner_p, append_list_id_p);
+	}
+    }
+
+  if (single_owner_p == NULL)
+    {
+      return error;
+    }
+
+  qfile_close_list (thread_p, single_owner_p);
+
+  if (error != NO_ERROR)
+    {
+      qfile_destroy_list (thread_p, single_owner_p);
+      QFILE_FREE_AND_INIT_LIST_ID (single_owner_p);
+      return error;
+    }
+
+  QFILE_TUPLE_DESCRIPTOR saved_tpl_descr = dest_list_id_p->tpl_descr;
+  memset (&dest_list_id_p->tpl_descr, 0, sizeof (QFILE_TUPLE_DESCRIPTOR));
+  qfile_destroy_list (thread_p, dest_list_id_p);
+  if (qfile_copy_list_id (dest_list_id_p, single_owner_p, true, QFILE_MOVE_DEPENDENT) != NO_ERROR)
+    {
+      dest_list_id_p->tpl_descr = saved_tpl_descr;
+      qfile_destroy_list (thread_p, single_owner_p);
+      QFILE_FREE_AND_INIT_LIST_ID (single_owner_p);
+      return ER_FAILED;
+    }
+  dest_list_id_p->tpl_descr = saved_tpl_descr;
+  QFILE_FREE_AND_INIT_LIST_ID (single_owner_p);
+
+  return NO_ERROR;
+}
+
+int
+qmgr_materialize_list_to_single_owner (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
+{
+  QFILE_LIST_ID *single_owner_p = NULL;
+  QFILE_TUPLE_DESCRIPTOR saved_tpl_descr;
+  int error = NO_ERROR;
+
+  if (list_id_p == NULL || qmgr_list_is_private_spill_single_owner (list_id_p))
+    {
+      return NO_ERROR;
+    }
+
+  single_owner_p = qmgr_open_private_spill_list_like (thread_p, list_id_p);
+  if (single_owner_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  error = qmgr_copy_list_tuples_to_list (thread_p, single_owner_p, list_id_p);
+  qfile_close_list (thread_p, single_owner_p);
+
+  if (error != NO_ERROR)
+    {
+      qfile_destroy_list (thread_p, single_owner_p);
+      QFILE_FREE_AND_INIT_LIST_ID (single_owner_p);
+      return error;
+    }
+
+  saved_tpl_descr = list_id_p->tpl_descr;
+  memset (&list_id_p->tpl_descr, 0, sizeof (QFILE_TUPLE_DESCRIPTOR));
+  qfile_destroy_list (thread_p, list_id_p);
+  if (qfile_copy_list_id (list_id_p, single_owner_p, true, QFILE_MOVE_DEPENDENT) != NO_ERROR)
+    {
+      list_id_p->tpl_descr = saved_tpl_descr;
+      qfile_destroy_list (thread_p, single_owner_p);
+      QFILE_FREE_AND_INIT_LIST_ID (single_owner_p);
+      return ER_FAILED;
+    }
+  list_id_p->tpl_descr = saved_tpl_descr;
+  QFILE_FREE_AND_INIT_LIST_ID (single_owner_p);
+
+  return NO_ERROR;
+}
 PAGE_PTR
 qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
 		       const QFILE_TUPLE_POSITION * tuple_position_p)
