@@ -1,0 +1,30 @@
+                 temp_page_store::rawfd_flush_page                                                            
+                  [Unknown stack frame(s)]                                                                    
+                   aesni_ctr32_encrypt_blocks                                                                 
+                    _aesni_encrypt8                                                                           
+                  temp_page_store::rawfd_write_page                                                           
+                   full_pwrite                                                                                
+                    pwrite                                                                                    
+                   __memmove_evex_unaligned_erms                                                              
+                   tde_encrypt_data_page                                                                      
+                    tde_encrypt_internal                                                                      
+                     EVP_CipherInit_ex                                                                        
+                      aesni_init_key                                                                          
+                       aesni_set_encrypt_key                                                                  
+                       func@0x325580                                                                          
+                       func@0x2fb2b0                                                                          
+                      CRYPTO_zalloc                                                                           
+                       __memset_evex_unaligned_erms                                                           
+                       __GI___libc_malloc                                                                     
+                      func@0x2f97f0                                                                           
+                      ENGINE_get_cipher_engine                                                                
+                     evp_EncryptDecryptUpdate                                                                 
+                      aes_ctr_cipher                                                                          
+                       CRYPTO_ctr128_encrypt_ctr32                                                            
+                        aesni_ctr32_encrypt_blocks                                                            
+                      [Unknown stack frame(s)]                                                                
+                       aesni_ctr32_encrypt_blocks                                                             
+                     EVP_CIPHER_CTX_free                                                                      
+                      EVP_CIPHER_CTX_reset                                                                    
+                       __GI___libc_free                                                                       
+                       OPENSSL_cleanse                                                                        
