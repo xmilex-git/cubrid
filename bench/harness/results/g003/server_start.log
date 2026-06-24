@@ -1,0 +1,11 @@
+@ cubrid master start
+++ cubrid master start: success
+@ cubrid server start: wmg003
+
+This may take a long time depending on the amount of recovery works to do.
+
+CUBRID 11.5.0 (11.5.0.2279) (64 debug build)
+
+++ cubrid server start: success
+
+This may take a long time depending on the amount of recovery works to do.

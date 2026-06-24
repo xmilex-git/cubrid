@@ -72,16 +72,19 @@ namespace
   constexpr std::size_t WORKMEM_POSITION_HASH_ENTRY_BUDGET = 4096;
   constexpr std::size_t WORKMEM_CONNECT_BY_PARENT_BUDGET = 1024;
 
-  /* LEADER-GATED P1b FLIP SITE -- currently FALSE (reverted from a premature flip).  The single-stream/concurrent
-   * spill, TDE-nonce, orphan-zero, and px_scan ORDER-BY reassembly properties were verified, BUT a later large-data
-   * test found a REGRESSION the earlier verification missed: connect_list-based merges relink page chains and require
-   * homogeneous real-VPID disk lists (qfile_connect_list asserts tfile_vfid->membuf == NULL and walks real VPIDs).
-   * When raw-fd is live, large multi-partition hash joins (hjoin_merge_qlist), external sort (sort_listfile),
-   * and parallel agg merges produce raw-fd-backed (NULL_VOLID) lists that connect_list cannot relink -> server abort.
-   * This flip is therefore gated on P6 first making every connect_list-based merge raw-fd-safe (materialize raw-fd /
-   * membuf lists to real-VPID disk via qmgr_materialize_to_pgbuf before any relink).  Keep FALSE until P6 is complete
-   * and a large-data hash-join/sort/agg + parallel campaign passes.  See .not_git_tracking/scratch/p6-design.md. */
-  constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = false;
+  /* LEADER-VERIFIED P5 PRODUCTION FLIP -- now TRUE.  The earlier large-data regression (connect_list-based
+   * merges require homogeneous real-VPID disk lists; raw-fd-backed NULL_VOLID lists could not be relinked ->
+   * server abort) was root-caused to VPID-only cross-file identity and fixed by the segment-native merge
+   * (qmgr per-segment copy into a single-owner real-VPID destination) and the segment-native parallel
+   * hash-aggregate partial-list consumption; the parallel-hash-GBY scope-limit was removed once that
+   * consumption became segment-native.  A large-data guard-reflip campaign on a fresh 1,048,576-row TDE DB
+   * then passed with raw-fd LIVE: hash join / external sort / hash aggregate / DISTINCT / ORDER BY all
+   * correct and parallel==serial md5-parity at parallelism 4 and 1; TDE raw-fd pages encrypted (no
+   * plaintext, fresh nonce per write/physical-page); orphan-zero across SIGKILL-mid-spill + boot full-sweep.
+   * Raw-fd writes remain runtime-gated on (master && boot_sweep_complete && tde_wired && reaper_active), so
+   * raw-fd activates only on TDE databases after the full safety net is live.  Revert this line to false to
+   * return to the develop overflow path.  See .not_git_tracking/scratch/p6-design.md + bench/harness/results/g003. */
+  constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = true;
 
   struct alignas (64) workmem_shard
   {

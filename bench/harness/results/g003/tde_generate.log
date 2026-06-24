@@ -1,0 +1,12 @@
+tde: invalid option -- 'g'
+tde: Transparent Data Encryption (TDE) management
+usage: cubrid tde OPERATION(-s|-n|-d|-c) [OPTION] database-name
+
+valid options:
+    -p, --dba-password=PASS       password of the DBA user; will prompt if don't specify
+
+OPERATIONs: one of the operations must be given, and they are exclusive 
+    -s, --show-keys               print key information set on the database and the key file (_keys)
+    -n, --generate-new-key        generate a new key in the key file (_keys); max count: 128
+    -d, --delete-key=KEY_INDEX    delete a key in the key file (_keys)
+    -c, --change-key=KEY_INDEX    change the key set on the database for another key in the key file (_keys)

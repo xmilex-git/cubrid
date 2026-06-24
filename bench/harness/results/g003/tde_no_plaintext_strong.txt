@@ -1,0 +1,4 @@
+G003 TDE no-plaintext scan (raw-fd live .tmp files during spill)
+files_scanned=16
+plaintext_pad_token_hits=0  (expect 0)
+long_printable_runs_ge16=0  (encrypted pages -> expect ~0; non-zero would warrant inspection)

@@ -1,0 +1,11 @@
+Key File: /home/cubrid/dev/workspace/wmg003_keys
+
+The current key set on wmg003:
+Key Index: 0
+Created on Wed Jun 24 22:36:54 2026
+Set     on Wed Jun 24 22:36:54 2026
+
+Keys Information: 
+Key Index: 0 created on Wed Jun 24 22:36:54 2026
+
+The number of keys: 1

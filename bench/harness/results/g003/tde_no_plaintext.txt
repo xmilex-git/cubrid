@@ -1,0 +1,1 @@
+rawfd_tmp_scanned=1 plaintext_pad_hits=0 (expect 0)

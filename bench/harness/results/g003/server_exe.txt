@@ -1,0 +1,1 @@
+/home/cubrid/debug/CUBRID-temp-workmem/bin/cub_server

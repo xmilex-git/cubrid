@@ -1,0 +1,8 @@
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/.server-id
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/sid_567765714663458295/616799097820369096.2.1.2.0.tmp
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/sid_567765714663458295/616799097820369096.8.1.2.0.tmp
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/sid_567765714663458295/616799097820369096.1.1.3.0.tmp
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/sid_567765714663458295/616799097820369096.4.1.3.0.tmp
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/sid_567765714663458295/616799097820369096.5.2.1.0.tmp
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/sid_567765714663458295/616799097820369096.10.1.2.0.tmp
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/sid_567765714663458295/616799097820369096.11.1.3.0.tmp

@@ -1,0 +1,2 @@
+rawfd_tmp_after_postrestart_spill=0
+/home/cubrid/CUBRID/var/CUBRID_SOCK/cubrid-rawfd-workmem/wmg003/.server-id
