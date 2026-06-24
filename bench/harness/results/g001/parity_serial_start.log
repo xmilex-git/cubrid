@@ -1,0 +1,11 @@
+[log: /home/cubrid/dev/cubrid-workmem/.agents/scratch/cubrid-server-ctl/20260624-205427.start.wmg001.log]
+RESULT: OK
+@ cubrid server start: wmg001
+
+This may take a long time depending on the amount of recovery works to do.
+
+CUBRID 11.5.0 (11.5.0.2278) (64 debug build)
+
+++ cubrid server start: success
+@ cubrid server status
+ Server wmg001 (rel 11.5.0, pid 2589466)

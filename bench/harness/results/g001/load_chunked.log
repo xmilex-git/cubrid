@@ -1,0 +1,121 @@
+chunk iteration 1: 65536
+16384 rows affected. (2.593000 sec) Committed. (0.000000 sec) 
+chunk iteration 2: 81920
+16384 rows affected. (2.432000 sec) Committed. (0.000000 sec) 
+chunk iteration 3: 98304
+16384 rows affected. (2.354000 sec) Committed. (0.000000 sec) 
+chunk iteration 4: 114688
+16384 rows affected. (2.391000 sec) Committed. (0.000000 sec) 
+chunk iteration 5: 131072
+16384 rows affected. (2.366000 sec) Committed. (0.000000 sec) 
+chunk iteration 6: 147456
+16384 rows affected. (2.363000 sec) Committed. (0.000000 sec) 
+chunk iteration 7: 163840
+16384 rows affected. (2.350999 sec) Committed. (0.000000 sec) 
+chunk iteration 8: 180224
+16384 rows affected. (3.301000 sec) Committed. (0.000000 sec) 
+chunk iteration 9: 196608
+16384 rows affected. (3.288000 sec) Committed. (0.000000 sec) 
+chunk iteration 10: 212992
+16384 rows affected. (2.365000 sec) Committed. (0.000000 sec) 
+chunk iteration 11: 229376
+16384 rows affected. (2.424000 sec) Committed. (0.000000 sec) 
+chunk iteration 12: 245760
+16384 rows affected. (2.500000 sec) Committed. (0.000000 sec) 
+chunk iteration 13: 262144
+16384 rows affected. (3.292000 sec) Committed. (0.000000 sec) 
+chunk iteration 14: 278528
+16384 rows affected. (2.390000 sec) Committed. (0.000000 sec) 
+chunk iteration 15: 294912
+16384 rows affected. (2.368000 sec) Committed. (0.000000 sec) 
+chunk iteration 16: 311296
+16384 rows affected. (2.359000 sec) Committed. (0.000000 sec) 
+chunk iteration 17: 327680
+16384 rows affected. (2.455000 sec) Committed. (0.000000 sec) 
+chunk iteration 18: 344064
+16384 rows affected. (2.451999 sec) Committed. (0.000000 sec) 
+chunk iteration 19: 360448
+16384 rows affected. (2.453000 sec) Committed. (0.000000 sec) 
+chunk iteration 20: 376832
+16384 rows affected. (2.441000 sec) Committed. (0.000000 sec) 
+chunk iteration 21: 393216
+16384 rows affected. (2.455000 sec) Committed. (0.000000 sec) 
+chunk iteration 22: 409600
+16384 rows affected. (2.464000 sec) Committed. (0.000000 sec) 
+chunk iteration 23: 425984
+16384 rows affected. (2.452000 sec) Committed. (0.000000 sec) 
+chunk iteration 24: 442368
+16384 rows affected. (2.466000 sec) Committed. (0.000000 sec) 
+chunk iteration 25: 458752
+16384 rows affected. (2.468000 sec) Committed. (0.000000 sec) 
+chunk iteration 26: 475136
+16384 rows affected. (2.489000 sec) Committed. (0.000000 sec) 
+chunk iteration 27: 491520
+16384 rows affected. (2.484000 sec) Committed. (0.000000 sec) 
+chunk iteration 28: 507904
+16384 rows affected. (2.490000 sec) Committed. (0.000000 sec) 
+chunk iteration 29: 524288
+16384 rows affected. (2.474999 sec) Committed. (0.000000 sec) 
+chunk iteration 30: 540672
+16384 rows affected. (2.470000 sec) Committed. (0.000000 sec) 
+chunk iteration 31: 557056
+16384 rows affected. (2.477000 sec) Committed. (0.000000 sec) 
+chunk iteration 32: 573440
+16384 rows affected. (3.296000 sec) Committed. (0.000000 sec) 
+chunk iteration 33: 589824
+16384 rows affected. (2.364000 sec) Committed. (0.000000 sec) 
+chunk iteration 34: 606208
+16384 rows affected. (2.542000 sec) Committed. (0.000000 sec) 
+chunk iteration 35: 622592
+16384 rows affected. (2.623000 sec) Committed. (0.000000 sec) 
+chunk iteration 36: 638976
+16384 rows affected. (2.633000 sec) Committed. (0.000000 sec) 
+chunk iteration 37: 655360
+16384 rows affected. (2.627000 sec) Committed. (0.000000 sec) 
+chunk iteration 38: 671744
+16384 rows affected. (2.634000 sec) Committed. (0.000000 sec) 
+chunk iteration 39: 688128
+16384 rows affected. (2.629000 sec) Committed. (0.000000 sec) 
+chunk iteration 40: 704512
+16384 rows affected. (2.603999 sec) Committed. (0.000000 sec) 
+chunk iteration 41: 720896
+16384 rows affected. (2.625000 sec) Committed. (0.000000 sec) 
+chunk iteration 42: 737280
+16384 rows affected. (2.612000 sec) Committed. (0.000000 sec) 
+chunk iteration 43: 753664
+16384 rows affected. (2.616000 sec) Committed. (0.000000 sec) 
+chunk iteration 44: 770048
+16384 rows affected. (2.601000 sec) Committed. (0.000000 sec) 
+chunk iteration 45: 786432
+16384 rows affected. (2.625000 sec) Committed. (0.000000 sec) 
+chunk iteration 46: 802816
+16384 rows affected. (2.621000 sec) Committed. (0.001000 sec) 
+chunk iteration 47: 819200
+16384 rows affected. (2.649000 sec) Committed. (0.000000 sec) 
+chunk iteration 48: 835584
+16384 rows affected. (2.632000 sec) Committed. (0.000000 sec) 
+chunk iteration 49: 851968
+16384 rows affected. (2.613000 sec) Committed. (0.000000 sec) 
+chunk iteration 50: 868352
+16384 rows affected. (2.620999 sec) Committed. (0.000000 sec) 
+chunk iteration 51: 884736
+16384 rows affected. (2.610000 sec) Committed. (0.000000 sec) 
+chunk iteration 52: 901120
+16384 rows affected. (2.613000 sec) Committed. (0.000000 sec) 
+chunk iteration 53: 917504
+16384 rows affected. (2.641000 sec) Committed. (0.000000 sec) 
+chunk iteration 54: 933888
+16384 rows affected. (2.617000 sec) Committed. (0.000000 sec) 
+chunk iteration 55: 950272
+16384 rows affected. (2.643000 sec) Committed. (0.000000 sec) 
+chunk iteration 56: 966656
+16384 rows affected. (2.638000 sec) Committed. (0.000000 sec) 
+chunk iteration 57: 983040
+16384 rows affected. (2.642000 sec) Committed. (0.000000 sec) 
+chunk iteration 58: 999424
+16384 rows affected. (2.623000 sec) Committed. (0.000000 sec) 
+chunk iteration 59: 1015808
+16384 rows affected. (2.636000 sec) Committed. (0.001000 sec) 
+chunk iteration 60: 1032192
+16384 rows affected. (2.665000 sec) Committed. (0.000000 sec) 
+chunk iteration 61: 1048576

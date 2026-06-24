@@ -217,6 +217,9 @@ extern SCAN_CODE qmgr_segment_list_scan_next (THREAD_ENTRY * thread_p, QMGR_SEGM
 extern void qmgr_segment_list_close_scan (THREAD_ENTRY * thread_p, QMGR_SEGMENT_LIST_SCAN * scan_p);
 extern int qmgr_segment_list_append_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
 					     const QMGR_SEGMENT_LIST * segment_list_p);
+extern int qmgr_append_list_to_single_owner (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_list_id_p,
+					     QFILE_LIST_ID * append_list_id_p);
+extern int qmgr_materialize_list_to_single_owner (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
 extern PAGE_PTR qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
 				       const QFILE_TUPLE_POSITION * tuple_position_p);
 extern int qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);

@@ -37,6 +37,7 @@
 #include "list_file.h"				/* qfile_close_list, qfile_destroy_list */
 #include "heap_file.h"				/* heap_attrinfo_end */
 #include "file_manager.h"			/* file_get_num_user_pages */
+#include "temp_page_store.hpp"			/* temp_page_store::raw_fd_master_enabled */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -859,6 +860,11 @@ extern "C"
 
     /* NO_PARALLEL_SCAN hint blocks parallel list scan */
     if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN))
+      {
+	return NO_ERROR;
+      }
+
+    if (temp_page_store::raw_fd_master_enabled ())
       {
 	return NO_ERROR;
       }

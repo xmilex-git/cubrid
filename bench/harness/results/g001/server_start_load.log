@@ -1,0 +1,25 @@
+[log: /home/cubrid/dev/cubrid-workmem/.agents/scratch/cubrid-server-ctl/20260624-203554.start.wmg001.log]
+RESULT: FAILED
+@ cubrid master start
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+cub_master: Cannot bind local address... aborting.... Address already in use
+@ cubrid server status
+++ cubrid master is not running.

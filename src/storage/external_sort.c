@@ -4574,7 +4574,7 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
   int remaining_run, level, merge_num;
   RESULT_RUN result_run[SORT_MAX_PARALLEL];
   QFILE_LIST_ID *origin_list_id, *mergeable_list_id;
-  SORT_INFO *sort_info_p;
+  SORT_INFO *sort_info_p, *origin_sort_info_p;
 
   if (parallel_num > SORT_MAX_PARALLEL)
     {
@@ -4662,7 +4662,8 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
     }
 
   /* merge last output file */
-  origin_list_id = ((SORT_INFO *) px_sort_param[0].put_arg)->output_file;
+  origin_sort_info_p = (SORT_INFO *) px_sort_param[0].put_arg;
+  origin_list_id = origin_sort_info_p->output_file;
 
   /* merge lists */
   for (int i = 1; i < parallel_num; i++)
@@ -4688,12 +4689,14 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
 	}
       else
 	{
-	  error = qfile_connect_list (thread_p, origin_list_id, sort_info_p->output_file);
+	  error = qmgr_append_list_to_single_owner (thread_p, origin_list_id, sort_info_p->output_file);
 	  if (error != NO_ERROR)
 	    {
 	      goto cleanup;
 	    }
-	  sort_info_p->output_file = NULL;
+	  qfile_destroy_list (thread_p, sort_info_p->output_file);
+	  QFILE_FREE_AND_INIT_LIST_ID (sort_info_p->output_file);
+	  origin_sort_info_p->output_file = origin_list_id;
 	}
     }
   /* reopen final output file */
@@ -5073,7 +5076,7 @@ sort_put_result_for_parallel (cubthread::entry & thread_ref, SORT_PARAM * sort_p
 	{
 	  sort_info_p->output_file =
 	    qfile_open_list (thread_p, &ori_sort_info_p->input_file->type_list, ori_sort_info_p->sort_list_p,
-			     ori_sort_info_p->input_file->query_id, ori_sort_info_p->flag | QFILE_NOT_USE_MEMBUF, NULL);
+			     ori_sort_info_p->input_file->query_id, ori_sort_info_p->flag, NULL);
 	}
     }
 

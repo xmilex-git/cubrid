@@ -35,6 +35,7 @@
 #include "query_list.h"		/* JOIN_TYPE */
 #include "query_manager.h"	/* QMGR_TEMP_FILE */
 #include "system_parameter.h"	/* prm_get_bigint_value, PRM_ID_... */
+#include "temp_page_store.hpp"	/* temp_page_store::raw_fd_master_enabled */
 #include "thread_entry.hpp"	/* THREAD_ENTRY */
 #include "xasl.h"		/* XASL_NODE, HASHJOIN_PROC_NODE */
 
@@ -731,7 +732,15 @@ hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NO
   manager->key_cnt = merge_info->ls_column_cnt;
 
   manager->during_join_pred = xasl->during_join_pred;
+  /* Scope-limit raw-fd-live hash joins to the single-thread hash-join executor.  The parallel
+   * hash-join split path still assumes appendable per-partition files and aborts/corrupts when
+   * raw-fd overflow is live; correctness beats preserving this optimization until that path is
+   * segment-native. */
   manager->num_parallel_threads = xasl->parallelism;
+  if (temp_page_store::raw_fd_master_enabled ())
+    {
+      manager->num_parallel_threads = 0;
+    }
 
   manager->query_id = query_id;
   manager->val_descr = val_descr;
@@ -803,8 +812,14 @@ hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NO
     }
 
   manager->qlist_merge_method = HASHJOIN_MERGE_CONNECT;
-  manager->qlist_flag =
-    (manager->qlist_merge_method == HASHJOIN_MERGE_CONNECT) ? QFILE_FLAG_ALL | QFILE_NOT_USE_MEMBUF : QFILE_FLAG_ALL;
+  /* Scope-limit raw-fd-live hash joins: partition output lists are merged across worker/temp-file
+   * owners, and a remaining raw-fd ownership gap can silently drop spilled rows.  Keep these merge
+   * inputs on the private-spill backing until the merge contract is fully segment-native. */
+  manager->qlist_flag = QFILE_FLAG_ALL;
+  if (temp_page_store::raw_fd_master_enabled ())
+    {
+      manager->qlist_flag |= QFILE_FLAG_PRIVATE_SPILL;
+    }
 
   assert (manager->px_worker_manager == NULL);
 
@@ -1895,14 +1910,31 @@ hjoin_merge_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
     case HASHJOIN_MERGE_CONNECT:
       {
-	error = qfile_connect_list (thread_p, single_context->list_id, context->list_id);
+	bool raw_fd_master_enabled = temp_page_store::raw_fd_master_enabled ();
+
+	if (raw_fd_master_enabled)
+	  {
+	    error = qfile_connect_list (thread_p, single_context->list_id, context->list_id);
+	  }
+	else
+	  {
+	    error = qmgr_append_list_to_single_owner (thread_p, single_context->list_id, context->list_id);
+	  }
 	if (error != NO_ERROR)
 	  {
 	    goto error_exit;
 	  }
 
-	/* Do not call QFILE_FREE_AND_INIT_LIST_ID; it must be called through single_context->list_id. */
-	context->list_id = NULL;
+	if (raw_fd_master_enabled)
+	  {
+	    /* qfile_connect_list links the list into the single context; free through single_context->list_id. */
+	    context->list_id = NULL;
+	  }
+	else
+	  {
+	    qfile_destroy_list (thread_p, context->list_id);
+	    QFILE_FREE_AND_INIT_LIST_ID (context->list_id);
+	  }
 	break;
       }
 

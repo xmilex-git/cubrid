@@ -1,0 +1,52 @@
+before iteration 1: 000000
+1 row affected. (0.004000 sec) Committed. (0.000000 sec) 
+before iteration 2: 000000
+2 rows affected. (0.003000 sec) Committed. (0.000000 sec) 
+before iteration 3: 000000
+4 rows affected. (0.003000 sec) Committed. (0.000000 sec) 
+before iteration 4: 000000
+8 rows affected. (0.003000 sec) Committed. (0.000000 sec) 
+before iteration 5: 000000
+16 rows affected. (0.004000 sec) Committed. (0.000000 sec) 
+before iteration 6: 000000
+32 rows affected. (0.006000 sec) Committed. (0.000000 sec) 
+before iteration 7: 000000
+
+In the command from line 1,
+
+ERROR: Your transaction has been aborted by the system due to server failure or mode change.
+
+
+ERROR: Your transaction has been aborted by the system due to server failure or mode change.
+
+Exiting ...
+continue iteration 1: 64
+64 rows affected. (0.014000 sec) Committed. (0.000000 sec) 
+continue iteration 2: 128
+128 rows affected. (0.016000 sec) Committed. (0.000000 sec) 
+continue iteration 3: 256
+256 rows affected. (0.029000 sec) Committed. (0.000000 sec) 
+continue iteration 4: 512
+512 rows affected. (0.059000 sec) Committed. (0.000000 sec) 
+continue iteration 5: 1024
+1024 rows affected. (0.118000 sec) Committed. (0.000000 sec) 
+continue iteration 6: 2048
+2048 rows affected. (0.233000 sec) Committed. (0.000000 sec) 
+continue iteration 7: 4096
+4096 rows affected. (0.487999 sec) Committed. (0.000000 sec) 
+continue iteration 8: 8192
+8192 rows affected. (0.909000 sec) Committed. (0.000000 sec) 
+continue iteration 9: 16384
+16384 rows affected. (1.795000 sec) Committed. (0.000000 sec) 
+continue iteration 10: 32768
+32768 rows affected. (3.532000 sec) Committed. (0.000000 sec) 
+continue iteration 11: 65536
+
+In the command from line 1,
+
+ERROR: Your transaction has been aborted by the system due to server failure or mode change.
+
+
+ERROR: Your transaction has been aborted by the system due to server failure or mode change.
+
+Exiting ...

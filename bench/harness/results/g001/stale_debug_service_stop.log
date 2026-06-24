@@ -1,0 +1,6 @@
+@ cubrid broker stop
+++ cubrid broker is not running.
+@ cubrid manager server stop
+cubrid manager server is not installed.
+@ cubrid master stop
+++ cubrid master is not running.

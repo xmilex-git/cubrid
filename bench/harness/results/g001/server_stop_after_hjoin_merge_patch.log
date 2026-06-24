@@ -1,0 +1,5 @@
+[log: /home/cubrid/dev/cubrid-workmem/.agents/scratch/cubrid-server-ctl/20260624-204930.stop.wmg001.log]
+RESULT: FAILED
+@ cubrid server stop: wmg001
+++ cubrid server 'wmg001' is not running.
+@ cubrid server status

@@ -1,0 +1,2 @@
+@ cubrid server status
+ Server wmg001 (rel 11.5.0, pid 2620257)

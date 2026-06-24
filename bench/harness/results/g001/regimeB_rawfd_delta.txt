@@ -1,0 +1,4 @@
+Regime B raw-fd statdump delta after G001 fix round (guard TRUE)
+Num_rawfd_decrypt_count: before=0 after=17610 delta=17610
+Num_rawfd_read_cache_hit: before=0 after=0 delta=0
+Num_rawfd_read_cache_miss: before=0 after=17610 delta=17610

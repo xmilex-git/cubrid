@@ -111,6 +111,7 @@ namespace temp_page_store
       QMGR_TEMP_FILE *m_tfile_owner;
   };
 
+  bool raw_fd_master_enabled () noexcept;
   bool raw_fd_writes_enabled () noexcept;
 
   raw_fd_file *create_raw_fd_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, int owner_tran_index,

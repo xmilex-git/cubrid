@@ -1,0 +1,45 @@
+
+=== Query Trace ===
+
+trace on text
+
+
+=== <Result of SELECT Command in Line 2> ===
+
+              count(*)
+======================
+               1048576
+
+1 row selected. (2.181000 sec) Committed. (0.000000 sec)
+
+=== Auto Trace ===
+
+Query Plan:
+  HASH JOIN (inner join)
+    TABLE SCAN (a)
+    TABLE SCAN (b)
+
+  rewritten query: select /*+ USE_HASH */ count(*) from [dba.t] a, [dba.t] b where a.a=b.a
+
+Trace Statistics:
+  SELECT (time: 2173, fetch: 385923, fetch_time: 1567, ioread: 16663)
+    SCAN (temp time: 17, fetch: 10308, ioread: 0, readrows: 1048576, rows: 1048576)
+         (parallel workers: 4, temp time: 15..16, readrows: 260480..267136, rows: 260480..267136, gather: buildvalue)
+      HASHJOIN (time: 2154, fetch: 375600, fetch_time: 1556, ioread: 16663, parallel workers: 4)
+        SPLIT (time: 233, fetch: 66836, ioread: 0, partitions: 10)
+        PARALLEL (time: 643, fetch: 41020, ioread: 0)
+          BUILD (time: 131..174, fetch: 10204, ioread: 0, rows: 1048576, method: memory)
+          PROBE (time: 233..333, fetch: 30656, ioread: 0, readrows: 1048576, readkeys: 1048576, rows: 1048576)
+        SUBQUERY (uncorrelated)
+                 (parallel workers: 2, time: 969, fetch: 236695, fetch_time: 1250, ioread: 16663)
+          SELECT (time: 969, fetch: 118352, fetch_time: 644, ioread: 9956)
+            SCAN (table: dba.t), (heap time: 969, fetch: 118344, ioread: 9955, readrows: 1048576, rows: 1048576)
+                 (parallel workers: 4, heap time: 558..611, readrows: 259317..266112, rows: 259317..266112, gather: mergeable list)
+          SELECT (time: 898, fetch: 118343, fetch_time: 606, ioread: 6707)
+            SCAN (table: dba.t), (heap time: 898, fetch: 118335, ioread: 6707, readrows: 1048576, rows: 1048576)
+                 (parallel workers: 4, heap time: 558..611, readrows: 259317..266112, rows: 259317..266112, gather: mergeable list)
+
+
+=== Query Trace ===
+
+trace off

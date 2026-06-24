@@ -1,0 +1,8 @@
+[log: /home/cubrid/dev/cubrid-workmem/.agents/scratch/cubrid-server-ctl/20260624-205409.stop.wmg001.log]
+RESULT: OK
+@ cubrid server stop: wmg001
+
+Server wmg001 notified of shutdown.
+This may take several minutes. Please wait.
+++ cubrid server stop: success
+@ cubrid server status

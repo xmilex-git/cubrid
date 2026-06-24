@@ -72,6 +72,17 @@ namespace
   constexpr std::size_t WORKMEM_POSITION_HASH_ENTRY_BUDGET = 4096;
   constexpr std::size_t WORKMEM_CONNECT_BY_PARENT_BUDGET = 1024;
 
+  /* LEADER-GATED P1b FLIP SITE -- currently FALSE (reverted from a premature flip).  The single-stream/concurrent
+   * spill, TDE-nonce, orphan-zero, and px_scan ORDER-BY reassembly properties were verified, BUT a later large-data
+   * test found a REGRESSION the earlier verification missed: connect_list-based merges relink page chains and require
+   * homogeneous real-VPID disk lists (qfile_connect_list asserts tfile_vfid->membuf == NULL and walks real VPIDs).
+   * When raw-fd is live, large multi-partition hash joins (hjoin_merge_qlist), external sort (sort_listfile),
+   * and parallel agg merges produce raw-fd-backed (NULL_VOLID) lists that connect_list cannot relink -> server abort.
+   * This flip is therefore gated on P6 first making every connect_list-based merge raw-fd-safe (materialize raw-fd /
+   * membuf lists to real-VPID disk via qmgr_materialize_to_pgbuf before any relink).  Keep FALSE until P6 is complete
+   * and a large-data hash-join/sort/agg + parallel campaign passes.  See .not_git_tracking/scratch/p6-design.md. */
+  constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = false;
+
   struct alignas (64) workmem_shard
   {
     std::atomic<int64_t> reserved { 0 };
@@ -2338,20 +2349,8 @@ namespace temp_page_store
   }
 
   bool
-  raw_fd_writes_enabled () noexcept
+  raw_fd_master_enabled () noexcept
   {
-    ensure_rawfd_state ();
-
-    /* LEADER-GATED P1b FLIP SITE -- currently FALSE (reverted from a premature flip).  The single-stream/concurrent
-     * spill, TDE-nonce, orphan-zero, and px_scan ORDER-BY reassembly properties were verified, BUT a later large-data
-     * test found a REGRESSION the earlier verification missed: connect_list-based merges relink page chains and require
-     * homogeneous real-VPID disk lists (qfile_connect_list asserts tfile_vfid->membuf == NULL and walks real VPIDs).
-     * When raw-fd is live, large multi-partition hash joins (hjoin_merge_qlist), external sort (sort_listfile),
-     * and parallel agg merges produce raw-fd-backed (NULL_VOLID) lists that connect_list cannot relink -> server abort.
-     * This flip is therefore gated on P6 first making every connect_list-based merge raw-fd-safe (materialize raw-fd /
-     * membuf lists to real-VPID disk via qmgr_materialize_to_pgbuf before any relink).  Keep FALSE until P6 is complete
-     * and a large-data hash-join/sort/agg + parallel campaign passes.  See .not_git_tracking/scratch/p6-design.md. */
-    constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = false;
     bool master_enable = LEADER_VERIFIED_ENABLE_RAW_FD_WRITES;
 
 #if !defined (NDEBUG)
@@ -2363,8 +2362,20 @@ namespace temp_page_store
       }
 #endif /* !NDEBUG */
 
-    return master_enable
-      && g_rawfd_state.boot_sweep_complete && g_rawfd_state.tde_wired && g_rawfd_state.reaper_active;
+    return master_enable;
+  }
+
+  bool
+  raw_fd_writes_enabled () noexcept
+  {
+    if (!raw_fd_master_enabled ())
+      {
+	return false;
+      }
+
+    ensure_rawfd_state ();
+
+    return g_rawfd_state.boot_sweep_complete && g_rawfd_state.tde_wired && g_rawfd_state.reaper_active;
   }
 
   PAGE_PTR
