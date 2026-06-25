@@ -1251,6 +1251,10 @@ qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALUE_TYPE_LIST * type_lis
       return NULL;
     }
 
+  if (sort_list_p != NULL)
+    {
+      list_id_p->tfile_vfid->raw_fd_hint = temp_page_store::raw_fd_access_hint::SEQUENTIAL_ONCE;
+    }
 
   VFID_COPY (&(list_id_p->temp_vfid), &(list_id_p->tfile_vfid->temp_vfid));
   list_id_p->type_list.domp = NULL;
@@ -1392,12 +1396,22 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
 
   temp_file_p = list_id_p->tfile_vfid;
 
-  if (temp_file_p->membuf && list_id_p->last_vpid.volid == NULL_VOLID)
+  if (temp_file_p->membuf && list_id_p->last_vpid.volid == NULL_VOLID
+      && list_id_p->last_vpid.pageid <= temp_file_p->membuf_last)
     {
       /* The last page is in the membuf */
       assert_release (temp_file_p->membuf_last >= list_id_p->last_vpid.pageid);
       /* The page of last record in the membuf */
       last_page_ptr = temp_file_p->membuf[list_id_p->last_vpid.pageid];
+    }
+  else if (list_id_p->last_vpid.volid == NULL_VOLID)
+    {
+      assert_release (!VPID_ISNULL (&list_id_p->last_vpid));
+      last_page_ptr = qmgr_get_old_page (thread_p, &list_id_p->last_vpid, temp_file_p);
+      if (last_page_ptr == NULL)
+	{
+	  return ER_FAILED;
+	}
     }
   else
     {
@@ -2975,6 +2989,11 @@ qfile_append_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_
   assert (append_list_id->last_pgptr == NULL);
 
   assert (append_list_id->tuple_cnt > 0);
+  if (qmgr_list_has_raw_fd_segments (base_list_id) || qmgr_list_has_raw_fd_segments (append_list_id))
+    {
+      return qmgr_append_list_to_list_segment_native (thread_p, base_list_id, append_list_id);
+    }
+
   assert (!VPID_ISNULL (&append_list_id->first_vpid));
 
   if (!VPID_ISNULL (&base_list_id->last_vpid))
@@ -4805,6 +4824,54 @@ qfile_scan_fix_old_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p
 }
 
 static SCAN_CODE
+qfile_scan_first_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
+{
+  QMGR_TEMP_FILE *tfile_vfid_p = scan_id_p->list_id.tfile_vfid;
+  PAGEID pageid = scan_id_p->list_id.first_vpid.pageid;
+  PAGEID end_pageid = tfile_vfid_p->raw_fd_next_pageid;
+
+  if (pageid == NULL_PAGEID || pageid == NULL_PAGEID_IN_PROGRESS)
+    {
+      pageid = 0;
+    }
+
+  if (end_pageid <= pageid && scan_id_p->list_id.last_vpid.pageid >= pageid)
+    {
+      end_pageid = scan_id_p->list_id.last_vpid.pageid + 1;
+    }
+
+  while (pageid < end_pageid)
+    {
+      VPID vpid;
+      PAGE_PTR page_p;
+
+      vpid.volid = NULL_VOLID;
+      vpid.pageid = pageid;
+      page_p = qfile_scan_fix_old_page (thread_p, scan_id_p, &vpid);
+      if (page_p == NULL)
+	{
+	  return S_ERROR;
+	}
+
+      if (QFILE_GET_TUPLE_COUNT (page_p) > 0)
+	{
+	  QFILE_COPY_VPID (&scan_id_p->curr_vpid, &vpid);
+	  scan_id_p->curr_pgptr = page_p;
+	  scan_id_p->curr_offset = QFILE_PAGE_HEADER_SIZE;
+	  scan_id_p->curr_tpl = (char *) scan_id_p->curr_pgptr + QFILE_PAGE_HEADER_SIZE;
+	  scan_id_p->curr_tplno = 0;
+	  scan_id_p->position = S_ON;
+	  return S_SUCCESS;
+	}
+
+      qmgr_free_old_page_and_init (thread_p, page_p, tfile_vfid_p);
+      pageid++;
+    }
+
+  return S_END;
+}
+
+static SCAN_CODE
 qfile_scan_next_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
   QMGR_TEMP_FILE *tfile_vfid_p = scan_id_p->list_id.tfile_vfid;
@@ -4855,6 +4922,48 @@ qfile_scan_next_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_
   return S_END;
 }
 
+static SCAN_CODE
+qfile_scan_last_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
+{
+  QMGR_TEMP_FILE *tfile_vfid_p = scan_id_p->list_id.tfile_vfid;
+  PAGEID pageid = scan_id_p->list_id.last_vpid.pageid;
+
+  if (pageid == NULL_PAGEID || pageid == NULL_PAGEID_IN_PROGRESS)
+    {
+      pageid = tfile_vfid_p->raw_fd_next_pageid - 1;
+    }
+
+  while (pageid >= 0)
+    {
+      VPID vpid;
+      PAGE_PTR page_p;
+
+      vpid.volid = NULL_VOLID;
+      vpid.pageid = pageid;
+      page_p = qfile_scan_fix_old_page (thread_p, scan_id_p, &vpid);
+      if (page_p == NULL)
+	{
+	  return S_ERROR;
+	}
+
+      if (QFILE_GET_TUPLE_COUNT (page_p) > 0)
+	{
+	  scan_id_p->position = S_ON;
+	  QFILE_COPY_VPID (&scan_id_p->curr_vpid, &vpid);
+	  scan_id_p->curr_pgptr = page_p;
+	  scan_id_p->curr_tplno = QFILE_GET_TUPLE_COUNT (page_p) - 1;
+	  scan_id_p->curr_offset = QFILE_GET_LAST_TUPLE_OFFSET (page_p);
+	  scan_id_p->curr_tpl = (char *) scan_id_p->curr_pgptr + scan_id_p->curr_offset;
+	  return S_SUCCESS;
+	}
+
+      qmgr_free_old_page_and_init (thread_p, page_p, tfile_vfid_p);
+      pageid--;
+    }
+
+  return S_END;
+}
+
 /*
  * qfile_scan_next  () -
  *   return: SCAN_CODE (S_SUCCESS, S_END, S_ERROR)
@@ -4876,6 +4985,10 @@ qfile_scan_next (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
     {
       if (scan_id_p->list_id.tuple_cnt > 0)
 	{
+	  if (qfile_scan_is_raw_fd_backed (scan_id_p))
+	    {
+	      return qfile_scan_first_raw_fd_page (thread_p, scan_id_p);
+	    }
 	  page_p = qfile_scan_fix_old_page (thread_p, scan_id_p, &scan_id_p->list_id.first_vpid);
 	  if (page_p == NULL)
 	    {
@@ -5019,6 +5132,10 @@ qfile_scan_prev (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
   else if (scan_id_p->position == S_AFTER)
     {
 
+      if (qfile_scan_is_raw_fd_backed (scan_id_p))
+	{
+	  return qfile_scan_last_raw_fd_page (thread_p, scan_id_p);
+	}
       if (VPID_ISNULL (&scan_id_p->list_id.first_vpid))
 	{
 	  return S_END;

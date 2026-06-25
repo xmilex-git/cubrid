@@ -68,6 +68,8 @@ namespace
   constexpr std::size_t WORKMEM_REFILL_QUANTUM_BYTES = 256ULL * 1024ULL;
   constexpr std::size_t WORKMEM_MIN_CAP_BYTES = 64ULL * 1024ULL * 1024ULL;
   constexpr std::size_t WORKMEM_MAX_CAP_BYTES = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+  constexpr std::size_t WORKMEM_MIN_TEMP_FILE_BYTES = 4ULL * 1024ULL * 1024ULL;
+  constexpr std::size_t WORKMEM_MAX_TEMP_FILE_BYTES = 256ULL * 1024ULL * 1024ULL;
   constexpr std::size_t WORKMEM_POSITION_SAVED_SCAN_BUDGET = 64;
   constexpr std::size_t WORKMEM_POSITION_HASH_ENTRY_BUDGET = 4096;
   constexpr std::size_t WORKMEM_CONNECT_BY_PARENT_BUDGET = 1024;
@@ -81,8 +83,8 @@ namespace
    * then passed with raw-fd LIVE: hash join / external sort / hash aggregate / DISTINCT / ORDER BY all
    * correct and parallel==serial md5-parity at parallelism 4 and 1; TDE raw-fd pages encrypted (no
    * plaintext, fresh nonce per write/physical-page); orphan-zero across SIGKILL-mid-spill + boot full-sweep.
-   * Raw-fd writes remain runtime-gated on (master && boot_sweep_complete && tde_wired && reaper_active), so
-   * raw-fd activates only on TDE databases after the full safety net is live.  Revert this line to false to
+   * Raw-fd writes remain runtime-gated on (master && boot_sweep_complete && reaper_active), so raw-fd activates
+   * after the full safety net is live.  Revert this line to false to
    * return to the develop overflow path.  See .not_git_tracking/scratch/p6-design.md + bench/harness/results/g003. */
   constexpr bool LEADER_VERIFIED_ENABLE_RAW_FD_WRITES = true;
 
@@ -132,6 +134,7 @@ namespace
     PAGEID page_index { NULL_PAGEID };
     PAGE_PTR page_p { NULL };
     int ref_count { 1 };
+    bool dirty { false };
   };
 
   bool
@@ -185,6 +188,10 @@ namespace
   };
 
   rawfd_state g_rawfd_state;
+
+#if !defined (NDEBUG)
+  std::atomic<int64_t> g_rawfd_fault_inject_spill_writes { 0 };
+#endif /* !NDEBUG */
 
   std::string
   sanitize_path_component (const char *input)
@@ -747,6 +754,12 @@ namespace
     return true;
   }
 
+  bool
+  rawfd_use_read_cache (const temp_page_store::raw_fd_file &file) noexcept
+  {
+    return file.access_hint () == temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  }
+
   void
   cache_insert_decrypted_page (const temp_page_store::raw_fd_key &key, PAGEID page_index, const FILEIO_PAGE *plain)
   {
@@ -887,6 +900,20 @@ namespace
     return it->second;
   }
 
+  bool
+  rawfd_mark_fixed_page_dirty (PAGE_PTR page_p)
+  {
+    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    const auto it = g_rawfd_state.fixed_pages.find (page_p);
+    if (it == g_rawfd_state.fixed_pages.end ())
+      {
+	return false;
+      }
+
+    it->second.dirty = true;
+    return true;
+  }
+
 
   int64_t
   clamp_to_accounting_bytes (std::size_t bytes) noexcept
@@ -919,6 +946,12 @@ namespace
       }
 
     return pages * DB_PAGESIZE;
+  }
+
+  std::size_t
+  checked_bytes_to_pages (std::size_t bytes) noexcept
+  {
+    return (bytes + DB_PAGESIZE - 1) / DB_PAGESIZE;
   }
 
   void
@@ -1109,6 +1142,7 @@ namespace
     tfile_p->wm_reserved_shard = -1;
     tfile_p->raw_fd_query_id = NULL_QUERY_ID;
     tfile_p->raw_fd_owner_tran_index = NULL_TRAN_INDEX;
+    tfile_p->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
   }
 
   int
@@ -1148,6 +1182,8 @@ namespace
 
 namespace temp_page_store
 {
+  void reserve_held_soft (std::size_t bytes, int *shard_out) noexcept;
+
   raw_fd_file::raw_fd_file () noexcept
     : m_fd (-1)
     , m_path ()
@@ -1156,6 +1192,7 @@ namespace temp_page_store
     , m_worker_id (0)
     , m_key { 0, 0 }
     , m_segment_id (0)
+    , m_tde_encrypted (false)
     , m_tfile_owner (NULL)
   {
   }
@@ -1208,6 +1245,12 @@ namespace temp_page_store
     return m_segment_id;
   }
 
+  raw_fd_access_hint
+  raw_fd_file::access_hint () const noexcept
+  {
+    return m_tfile_owner == NULL ? raw_fd_access_hint::RANDOM_REACCESS : m_tfile_owner->raw_fd_hint;
+  }
+
   bool
   raw_fd_file::is_open () const noexcept
   {
@@ -1236,6 +1279,7 @@ namespace temp_page_store
   raw_fd_file::attach_temp_file (QMGR_TEMP_FILE * tfile_p) noexcept
   {
     m_tfile_owner = tfile_p;
+    m_tde_encrypted = tfile_p != NULL && tfile_p->tde_encrypted;
 
     std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
     const auto it = g_rawfd_state.registry.find (registry_map_key (m_key));
@@ -1269,7 +1313,7 @@ namespace temp_page_store
 	*os_error_out = 0;
       }
 
-    if (!g_rawfd_state.boot_sweep_complete || !g_rawfd_state.tde_wired || !g_rawfd_state.reaper_active)
+    if (!g_rawfd_state.boot_sweep_complete || !g_rawfd_state.reaper_active)
       {
 	if (os_error_out != NULL)
 	  {
@@ -1325,6 +1369,7 @@ namespace temp_page_store
 	  {
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	  }
+	perfmon_inc_stat_to_global (PSTAT_RAWFD_CREATE_FAILURE);
 	return NULL;
       }
 
@@ -1380,6 +1425,7 @@ namespace temp_page_store
 
     std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
     file_p->m_tfile_owner = new_owner;
+    file_p->m_tde_encrypted = new_owner != NULL && new_owner->tde_encrypted;
 
     const auto it = g_rawfd_state.registry.find (registry_map_key (file_p->key ()));
     if (it != g_rawfd_state.registry.end () && it->second.owner == file_p)
@@ -1460,8 +1506,7 @@ namespace temp_page_store
     for (const rawfd_registry_entry &entry : registry_candidates)
       {
 	const bool old_incarnation = entry.key.boot_incarnation != g_rawfd_state.boot_incarnation;
-	const bool query_not_live = old_incarnation || !qmgr_is_query_live (entry.owner_tran_index, entry.query_id);
-	if (old_incarnation || query_not_live)
+	if (old_incarnation)
 	  {
 	    registry_keys_to_reap.insert (registry_map_key (entry.key));
 	  }
@@ -1517,54 +1562,97 @@ namespace temp_page_store
 	return ER_FAILED;
       }
 
-    if (!tde_is_loaded ())
+    const bool tde_encrypted = file.m_tde_encrypted;
+    if (!tde_encrypted)
       {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
-	return ER_TDE_CIPHER_IS_NOT_LOADED;
-      }
+	assert (!file.m_tde_encrypted);
+	perfmon_inc_stat_to_global (PSTAT_RAWFD_PLAINTEXT_WRITE_COUNT);
 
-    aligned_io_page plain;
-    aligned_io_page cipher;
-    if (!plain.valid () || !cipher.valid ())
-      {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
-	return ER_OUT_OF_VIRTUAL_MEMORY;
-      }
-
-    fileio_initialize_res (thread_p, plain.page, IO_PAGESIZE);
-    plain.page->prv.pageid = page_index;
-    plain.page->prv.volid = NULL_VOLID;
-    plain.page->prv.ptype = PAGE_QRESULT;
-    memcpy (plain.page->page, page_p, DB_PAGESIZE);
-
-    const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
-    if (tde_algo == TDE_ALGORITHM_NONE)
-      {
-        er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
-        return ER_TDE_CIPHER_IS_NOT_LOADED;
-      }
-    int error = tde_encrypt_data_page (plain.page, tde_algo, true, cipher.page);
-    if (error != NO_ERROR)
-      {
-	return error;
-      }
-
-
-    const off_t offset = static_cast<off_t> (page_index) * static_cast<off_t> (IO_PAGESIZE);
-    rawfd_invalidate_cached_page (file, page_index);
-    if (!full_pwrite (file.fd (), cipher.page, IO_PAGESIZE, offset))
-      {
-	const int saved_errno = errno;
-	if (saved_errno == ENOSPC || saved_errno == EDQUOT)
+	const off_t offset = static_cast<off_t> (page_index) * static_cast<off_t> (DB_PAGESIZE);
+	rawfd_invalidate_cached_page (file, page_index);
+	if (!full_pwrite (file.fd (), page_p, DB_PAGESIZE, offset))
 	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	    const int saved_errno = errno;
+	    if (saved_errno == ENOSPC || saved_errno == EDQUOT)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	      }
+	    else
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	      }
+	    return ER_FAILED;
 	  }
-	else
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	  }
-	return ER_FAILED;
+
+	goto rawfd_write_success;
       }
+
+    {
+      aligned_io_page plain;
+      aligned_io_page cipher;
+      if (!plain.valid () || !cipher.valid ())
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+
+      fileio_initialize_res (thread_p, plain.page, IO_PAGESIZE);
+      plain.page->prv.pageid = page_index;
+      plain.page->prv.volid = NULL_VOLID;
+      plain.page->prv.ptype = PAGE_QRESULT;
+      memcpy (plain.page->page, page_p, DB_PAGESIZE);
+
+      {
+	if (!tde_is_loaded ())
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
+	    return ER_TDE_CIPHER_IS_NOT_LOADED;
+	  }
+
+	const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+	if (tde_algo == TDE_ALGORITHM_NONE)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
+	    return ER_TDE_CIPHER_IS_NOT_LOADED;
+	  }
+
+	const int error = tde_encrypt_data_page (plain.page, tde_algo, true, cipher.page);
+	if (error != NO_ERROR)
+	  {
+	    return error;
+	  }
+      }
+
+      const off_t offset = static_cast<off_t> (page_index) * static_cast<off_t> (IO_PAGESIZE);
+      rawfd_invalidate_cached_page (file, page_index);
+      if (!full_pwrite (file.fd (), cipher.page, IO_PAGESIZE, offset))
+	{
+	  const int saved_errno = errno;
+	  if (saved_errno == ENOSPC || saved_errno == EDQUOT)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	    }
+	  else
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    }
+	  return ER_FAILED;
+	}
+      }
+
+rawfd_write_success:
+#if !defined (NDEBUG)
+    {
+      const char *kill_after_env = getenv ("CUBRID_RAWFD_FAULT_INJECT_SPILL_KILL_AFTER_PAGES");
+      const int kill_after = (kill_after_env != NULL && kill_after_env[0] != '\0') ? atoi (kill_after_env) : 0;
+      if (kill_after > 0
+	  && g_rawfd_fault_inject_spill_writes.fetch_add (1, std::memory_order_acq_rel) + 1 == kill_after)
+	{
+	  er_log_debug (ARG_FILE_LINE, "RAWFD_FAULT_INJECT: pausing at spill");
+	  pause ();
+	}
+    }
+#endif /* !NDEBUG */
 
     rawfd_invalidate_cached_page (file, page_index);
     return NO_ERROR;
@@ -1596,7 +1684,7 @@ namespace temp_page_store
       {
 	return page_p;
       }
-    if (cache_lookup_decrypted_page (file.key (), coordinate.page_index, page_p))
+    if (rawfd_use_read_cache (file) && cache_lookup_decrypted_page (file.key (), coordinate.page_index, page_p))
       {
 	return page_p;
       }
@@ -1604,19 +1692,33 @@ namespace temp_page_store
     /* cache miss: a real pread + TDE decrypt of the addressed raw-fd page follows. */
     perfmon_inc_stat_to_global (PSTAT_RAWFD_READ_CACHE_MISS);
 
-    aligned_io_page cipher;
-    aligned_io_page plain;
-    if (!cipher.valid () || !plain.valid ())
+    const bool tde_encrypted = file.m_tde_encrypted;
+    if (!tde_encrypted)
       {
-	rawfd_release_fixed_page (NULL, page_p);
+	assert (!file.m_tde_encrypted);
+	const off_t offset = static_cast<off_t> (coordinate.page_index) * static_cast<off_t> (DB_PAGESIZE);
+	if (!full_pread (file.fd (), page_p, DB_PAGESIZE, offset))
+	  {
+	    rawfd_release_fixed_page (thread_p, NULL, page_p);
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    return NULL;
+	  }
+	return page_p;
+      }
+
+    aligned_io_page stored;
+    aligned_io_page plain;
+    if (!stored.valid () || !plain.valid ())
+      {
+	rawfd_release_fixed_page (thread_p, NULL, page_p);
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
 	return NULL;
       }
 
     const off_t offset = static_cast<off_t> (coordinate.page_index) * static_cast<off_t> (IO_PAGESIZE);
-    if (!full_pread (file.fd (), cipher.page, IO_PAGESIZE, offset))
+    if (!full_pread (file.fd (), stored.page, IO_PAGESIZE, offset))
       {
-	rawfd_release_fixed_page (NULL, page_p);
+	rawfd_release_fixed_page (thread_p, NULL, page_p);
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return NULL;
       }
@@ -1624,21 +1726,24 @@ namespace temp_page_store
     const TDE_ALGORITHM tde_algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
     if (tde_algo == TDE_ALGORITHM_NONE)
       {
-        rawfd_release_fixed_page (NULL, page_p);
-        er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
-        return NULL;
-      }
-    const int error = tde_decrypt_data_page (cipher.page, tde_algo, true, plain.page);
-    if (error != NO_ERROR)
-      {
-	rawfd_release_fixed_page (NULL, page_p);
+	rawfd_release_fixed_page (thread_p, NULL, page_p);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
 	return NULL;
       }
 
+    const int error = tde_decrypt_data_page (stored.page, tde_algo, true, plain.page);
+    if (error != NO_ERROR)
+      {
+	rawfd_release_fixed_page (thread_p, NULL, page_p);
+	return NULL;
+      }
     perfmon_inc_stat_to_global (PSTAT_RAWFD_DECRYPT_COUNT);
 
     memcpy (page_p, plain.page->page, DB_PAGESIZE);
-    cache_insert_decrypted_page (file.key (), coordinate.page_index, plain.page);
+    if (rawfd_use_read_cache (file))
+      {
+	cache_insert_decrypted_page (file.key (), coordinate.page_index, plain.page);
+      }
     return page_p;
   }
 
@@ -1665,24 +1770,38 @@ namespace temp_page_store
 	return NO_ERROR;
       }
 
-    const int error = rawfd_rewrite_page (thread_p, *fixed.file, fixed.page_index, page_p);
-    if (free_page == (int) FREE)
+    if (!rawfd_mark_fixed_page_dirty (page_p))
       {
-	rawfd_release_fixed_page (tfile_p, page_p);
+	return NO_ERROR;
       }
 
-    return error;
+    if (free_page != (int) FREE)
+      {
+	return NO_ERROR;
+      }
+
+    return rawfd_release_fixed_page (thread_p, tfile_p, page_p);
   }
 
-  void
-  rawfd_release_fixed_page (QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept
+  int
+  rawfd_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept
   {
     (void) tfile_p;
     rawfd_fixed_page fixed = rawfd_take_fixed_page (page_p);
     if (fixed.page_p != NULL)
       {
+	if (fixed.dirty)
+	  {
+	    const int error = rawfd_rewrite_page (thread_p, *fixed.file, fixed.page_index, fixed.page_p);
+	    if (error != NO_ERROR)
+	      {
+		return error;
+	      }
+	  }
 	free_db_page_buffer (fixed.page_p);
       }
+
+    return NO_ERROR;
   }
 
   int
@@ -1752,7 +1871,7 @@ namespace temp_page_store
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	    error = ER_FAILED;
 	  }
-	rawfd_release_fixed_page (NULL, actual);
+	rawfd_release_fixed_page (thread_p, NULL, actual);
       }
 
     if (error == NO_ERROR && seen_nonces.size () != static_cast<std::size_t> (PAGE_COUNT))
@@ -1926,7 +2045,7 @@ namespace temp_page_store
 
     if (list_id.last_pgptr != NULL)
       {
-	rawfd_release_fixed_page (&tfile, list_id.last_pgptr);
+	rawfd_release_fixed_page (thread_p, &tfile, list_id.last_pgptr);
 	list_id.last_pgptr = NULL;
       }
     tfile.raw_fd_handle = NULL;
@@ -2072,7 +2191,7 @@ namespace temp_page_store
 	  }
 	else
 	  {
-	    rawfd_release_fixed_page (&tfile, cached_page_p);
+	    rawfd_release_fixed_page (thread_p, &tfile, cached_page_p);
 	  }
       }
 
@@ -2156,7 +2275,7 @@ namespace temp_page_store
 		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 		error = ER_FAILED;
 	      }
-	    rawfd_release_fixed_page (&tfile, actual_page_p);
+	    rawfd_release_fixed_page (thread_p, &tfile, actual_page_p);
 	  }
       }
 
@@ -2305,14 +2424,14 @@ namespace temp_page_store
       {
 	if (raw_page != NULL)
 	  {
-	    rawfd_release_fixed_page (&src, raw_page);
+	    rawfd_release_fixed_page (thread_p, &src, raw_page);
 	  }
 	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &src);
 	(void) qmgr_temp_file_move_selftest_destroy (thread_p, &dst);
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return ER_FAILED;
       }
-    rawfd_release_fixed_page (&src, raw_page);
+    rawfd_release_fixed_page (thread_p, &src, raw_page);
 
     PAGE_PTR *const raw_src_membuf = src.membuf;
     PAGE_PTR *const raw_dst_membuf = dst.membuf;
@@ -2368,6 +2487,15 @@ namespace temp_page_store
     return master_enable;
   }
 
+  void
+  initialize_raw_fd_boot_sweep () noexcept
+  {
+    if (raw_fd_master_enabled ())
+      {
+	ensure_rawfd_state ();
+      }
+  }
+
   bool
   raw_fd_writes_enabled () noexcept
   {
@@ -2378,7 +2506,7 @@ namespace temp_page_store
 
     ensure_rawfd_state ();
 
-    return g_rawfd_state.boot_sweep_complete && g_rawfd_state.tde_wired && g_rawfd_state.reaper_active;
+    return g_rawfd_state.boot_sweep_complete && g_rawfd_state.reaper_active;
   }
 
   PAGE_PTR
@@ -2393,67 +2521,60 @@ namespace temp_page_store
     switch (tfile_p->backing)
       {
       case qmgr_temp_backing::MEMBUF:
-        if (tfile_p->membuf != NULL && tfile_p->membuf_last < tfile_p->membuf_npages - 1)
-          {
-            vpid_p->volid = NULL_VOLID;
-            vpid_p->pageid = ++(tfile_p->membuf_last);
-            return tfile_p->membuf[tfile_p->membuf_last];
-          }
+        {
+          if (tfile_p->membuf != NULL && tfile_p->membuf_last < tfile_p->membuf_npages - 1)
+            {
+	      QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
 
-        /* Use the raw-fd encrypted overflow ONLY when this temp actually holds TDE-encrypted data
-         * (tde_encrypted is set from the query's includes_tde_class, query_manager.c). For non-TDE data
-         * the temp is plaintext anyway, so fall through to the develop temp-volume path (PRIVATE_SPILL_FALLBACK)
-         * -- no needless AES on plaintext temp, keeping non-TDE workloads at develop-baseline speed. */
-        if (raw_fd_writes_enabled () && tfile_p->tde_encrypted)
-          {
-            int os_error = 0;
-            if (tfile_p->raw_fd_handle == NULL)
-              {
-                tfile_p->raw_fd_handle = create_raw_fd_file (thread_p, tfile_p->raw_fd_query_id,
-                                                             tfile_p->raw_fd_owner_tran_index,
-                                                             tfile_p->raw_fd_worker_id, &os_error);
-                if (tfile_p->raw_fd_handle != NULL)
-                  {
-                    tfile_p->raw_fd_handle->attach_temp_file (tfile_p);
-                  }
-              }
-            if (tfile_p->raw_fd_handle != NULL)
-              {
-                if (tfile_p->raw_fd_next_pageid <= tfile_p->membuf_last)
-                  {
-                    tfile_p->raw_fd_next_pageid = tfile_p->membuf_last + 1;
-                  }
-                vpid_p->volid = NULL_VOLID;
-                vpid_p->pageid = tfile_p->raw_fd_next_pageid++;
-                tfile_p->backing = qmgr_temp_backing::RAW_FD_OVERFLOW;
-                PAGE_PTR raw_page_p = rawfd_alloc_fixed_page (tfile_p->raw_fd_handle, vpid_p->pageid, true);
-                if (raw_page_p == NULL)
-                  {
-                    destroy_raw_fd_file (tfile_p->raw_fd_handle);
-                    tfile_p->raw_fd_handle = NULL;
-                    tfile_p->raw_fd_next_pageid = 0;
-                    tfile_p->backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
-                    return NULL;
-                  }
-                if (rawfd_write_page (thread_p, *tfile_p->raw_fd_handle, vpid_p->pageid, raw_page_p) == NO_ERROR)
-                  {
-                    return raw_page_p;
-                  }
-                rawfd_release_fixed_page (tfile_p, raw_page_p);
-                destroy_raw_fd_file (tfile_p->raw_fd_handle);
-                tfile_p->raw_fd_handle = NULL;
-                tfile_p->raw_fd_next_pageid = 0;
-                tfile_p->backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
-                return alloc_private_spill_page (thread_p, tfile_p, vpid_p);
-              }
-            if (!is_fd_or_space_error (os_error))
-              {
-                return NULL;
-              }
-          }
+              vpid_p->volid = NULL_VOLID;
+              vpid_p->pageid = ++(tfile_p->membuf_last);
+	      put_page_header (tfile_p->membuf[tfile_p->membuf_last], &page_header);
+              return tfile_p->membuf[tfile_p->membuf_last];
+            }
 
-        tfile_p->backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
-        return alloc_private_spill_page (thread_p, tfile_p, vpid_p);
+          if (!raw_fd_writes_enabled ())
+            {
+              er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+              return NULL;
+            }
+
+          int os_error = 0;
+          if (tfile_p->raw_fd_handle == NULL)
+            {
+              tfile_p->raw_fd_handle = create_raw_fd_file (thread_p, tfile_p->raw_fd_query_id,
+                                                           tfile_p->raw_fd_owner_tran_index,
+                                                           tfile_p->raw_fd_worker_id, &os_error);
+              if (tfile_p->raw_fd_handle != NULL)
+                {
+                  tfile_p->raw_fd_handle->attach_temp_file (tfile_p);
+                }
+            }
+          if (tfile_p->raw_fd_handle == NULL)
+            {
+              if (is_fd_or_space_error (os_error))
+                {
+                  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+                }
+              return NULL;
+            }
+
+          if (tfile_p->raw_fd_next_pageid <= tfile_p->membuf_last)
+            {
+              tfile_p->raw_fd_next_pageid = tfile_p->membuf_last + 1;
+            }
+          vpid_p->volid = NULL_VOLID;
+          vpid_p->pageid = tfile_p->raw_fd_next_pageid++;
+          tfile_p->backing = qmgr_temp_backing::RAW_FD_OVERFLOW;
+          PAGE_PTR raw_page_p = rawfd_alloc_fixed_page (tfile_p->raw_fd_handle, vpid_p->pageid, true);
+          if (raw_page_p == NULL)
+            {
+              destroy_raw_fd_file (tfile_p->raw_fd_handle);
+              tfile_p->raw_fd_handle = NULL;
+              tfile_p->raw_fd_next_pageid = 0;
+              return NULL;
+            }
+          return raw_page_p;
+        }
 
       case qmgr_temp_backing::PRIVATE_SPILL_FALLBACK:
         return alloc_private_spill_page (thread_p, tfile_p, vpid_p);
@@ -2472,15 +2593,7 @@ namespace temp_page_store
             {
               return NULL;
             }
-          if (rawfd_write_page (thread_p, *tfile_p->raw_fd_handle, vpid_p->pageid, raw_page_p) == NO_ERROR)
-            {
-              return raw_page_p;
-            }
-          rawfd_release_fixed_page (tfile_p, raw_page_p);
-          destroy_raw_fd_file (tfile_p->raw_fd_handle);
-          tfile_p->raw_fd_handle = NULL;
-          tfile_p->raw_fd_next_pageid = 0;
-          return NULL;
+          return raw_page_p;
         }
 
       case qmgr_temp_backing::PGBUF_PINNED:
@@ -2541,38 +2654,52 @@ namespace temp_page_store
     return unreachable_backing_page (thread_p);
   }
 
-  bool
-  reserve_membuf_budget (int requested_pages, int *granted_pages_out, std::size_t *reserved_bytes_out,
-                         int *reserved_shard_out) noexcept
+  budget_result
+  reserve_membuf_budget (int requested_pages, std::size_t *reserved_bytes_out, int *reserved_shard_out) noexcept
   {
-    const int requested = std::max (requested_pages, 0);
-    bool degraded = false;
+    const std::size_t cap = cap_bytes ();
+    const std::size_t headroom = headroom_bytes ();
+    const std::size_t requested_page_count = static_cast<std::size_t> (std::max (requested_pages, 0));
+    const std::size_t per_file_target_bytes = std::min (std::max (cap / 8, WORKMEM_MIN_TEMP_FILE_BYTES),
+							WORKMEM_MAX_TEMP_FILE_BYTES);
+    const std::size_t target_pages = checked_bytes_to_pages (per_file_target_bytes);
+    const std::size_t requested = std::max (requested_page_count, target_pages);
+    std::size_t pages = requested;
 
-    for (int pages = requested; pages >= 0; pages--)
+    if (cap > 0 && reservation_bytes_for_pages (requested) > headroom)
       {
-        const std::size_t bytes = reservation_bytes_for_pages (static_cast<std::size_t> (pages));
-        int shard = -1;
+        const std::size_t requested_bytes = reservation_bytes_for_pages (requested);
 
-        if (reserve_held (bytes, &shard))
+        if (headroom == 0 || requested_bytes == 0)
           {
-            if (pages != requested || degraded)
-              {
-                record_degrade ();
-              }
-            *granted_pages_out = pages;
-            *reserved_bytes_out = bytes;
-            *reserved_shard_out = shard;
-            return true;
+            pages = requested > 0 ? 1 : 0;
           }
-
-        degraded = true;
+        else
+          {
+            pages = std::max (static_cast<std::size_t> (1), requested * headroom / requested_bytes);
+          }
       }
 
-    record_degrade ();
-    *granted_pages_out = 0;
+    const std::size_t bytes = reservation_bytes_for_pages (pages);
+    int shard = -1;
+    reserve_held_soft (bytes, &shard);
+    if (shard >= 0)
+      {
+        const bool over_cap = pages != requested;
+        if (over_cap)
+          {
+            record_degrade ();
+          }
+        *reserved_bytes_out = bytes;
+        *reserved_shard_out = shard;
+        return budget_result { static_cast<int> (std::min<std::size_t> (pages,
+									 static_cast<std::size_t> (std::numeric_limits<int>::max ()))),
+			       over_cap, false };
+      }
+
     *reserved_bytes_out = 0;
     *reserved_shard_out = -1;
-    return false;
+    return budget_result { 0, true, true };
   }
 
   void
@@ -2628,6 +2755,16 @@ namespace temp_page_store
   }
 
   void
+  reserve_held_soft (std::size_t bytes, int *shard_out) noexcept
+  {
+    ensure_init ();
+
+    const int shard = choose_shard ();
+    g_accountant.shards[shard].reserved.fetch_add (clamp_to_accounting_bytes (bytes), std::memory_order_acq_rel);
+    *shard_out = shard;
+  }
+
+  void
   release_held (std::size_t bytes, int shard_index) noexcept
   {
     if (bytes == 0 || shard_index < 0 || shard_index >= static_cast<int> (WORKMEM_SHARD_COUNT))
@@ -2658,39 +2795,6 @@ namespace temp_page_store
       }
 
     return per_worker_bytes * degree;
-  }
-
-  UINT32
-  clamp_degree_for_workmem (UINT32 requested_degree, std::size_t pages_per_worker) noexcept
-  {
-    constexpr UINT32 start_degree = 2;
-
-    if (requested_degree < start_degree)
-      {
-        return requested_degree;
-      }
-
-    const std::size_t per_worker_bytes = reservation_bytes_for_degree (1, pages_per_worker);
-    if (per_worker_bytes == 0)
-      {
-        return requested_degree;
-      }
-
-    const std::size_t headroom = headroom_bytes ();
-    UINT32 granted_degree = static_cast<UINT32> (std::min<std::size_t> (requested_degree, headroom / per_worker_bytes));
-
-    if (granted_degree < start_degree)
-      {
-        record_degrade ();
-        return 0;
-      }
-
-    if (granted_degree < requested_degree)
-      {
-        record_degrade ();
-      }
-
-    return granted_degree;
   }
 
   void

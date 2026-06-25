@@ -84,6 +84,7 @@ namespace parallel_scan
       err_messages_with_lock *err_messages_p, int parallelism, bool g_agg_domain_resolve_need,
       XASL_NODE *orig_xasl_tree_for_domain_resolve)
   {
+    assert (parallelism > 0);
     m_parallelism = parallelism;
     m_query_id = query_id;
     m_interrupt_p = interrupt_p;
@@ -92,12 +93,14 @@ namespace parallel_scan
       {
 	m_.orig_xasl = orig_xasl_tree_for_domain_resolve;
 	m_.active_results = parallelism;
+	assert (m_.active_results == m_parallelism);
 	m_.is_list_id_domain_resolved = false;
 	m_.g_hash_eligible = (bool) orig_xasl_tree_for_domain_resolve->proc.buildlist.g_hash_eligible;
       }
     else if constexpr (result_type == RESULT_TYPE::XASL_SNAPSHOT)
       {
 	m_.list_id_headers.resize (parallelism);
+	assert ((int) m_.list_id_headers.size () == m_parallelism);
 	m_.list_id_header_index.store (0);
 	m_.current_read_spec = nullptr;
 	for (list_id_header &list_id_header : m_.list_id_headers)

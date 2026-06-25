@@ -102,6 +102,7 @@ struct qmgr_temp_file
   unsigned int raw_fd_worker_id;
   temp_page_store::raw_fd_file *raw_fd_handle;
   int raw_fd_next_pageid;
+  temp_page_store::raw_fd_access_hint raw_fd_hint;
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };

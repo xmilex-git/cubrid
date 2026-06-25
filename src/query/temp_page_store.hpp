@@ -50,7 +50,20 @@ namespace temp_page_store
   constexpr std::size_t projected_tuple_position_bytes = 48;
   constexpr std::size_t projected_tuple_position_db_bytes = 40;
   constexpr std::size_t projected_tuple_simple_pos_bytes = 32;
-  constexpr std::size_t future_read_cache_placeholder_bytes = 512ULL * 1024ULL;
+  constexpr std::size_t future_read_cache_placeholder_bytes = 32ULL * IO_MAX_PAGE_SIZE;
+
+  enum class raw_fd_access_hint : int
+  {
+    SEQUENTIAL_ONCE = 0,
+    RANDOM_REACCESS
+  };
+
+  struct budget_result
+  {
+    int pages_granted;
+    bool over_cap;
+    bool hard_oom;
+  };
 
   struct raw_fd_key
   {
@@ -84,6 +97,7 @@ namespace temp_page_store
       unsigned int worker_id () const noexcept;
       raw_fd_key key () const noexcept;
       std::uint64_t segment_id () const noexcept;
+      raw_fd_access_hint access_hint () const noexcept;
       bool is_open () const noexcept;
       void close_and_unlink () noexcept;
       void attach_temp_file (QMGR_TEMP_FILE * tfile_p) noexcept;
@@ -108,10 +122,12 @@ namespace temp_page_store
       unsigned int m_worker_id;
       raw_fd_key m_key;
       std::uint64_t m_segment_id;
+      bool m_tde_encrypted;
       QMGR_TEMP_FILE *m_tfile_owner;
   };
 
   bool raw_fd_master_enabled () noexcept;
+  void initialize_raw_fd_boot_sweep () noexcept;
   bool raw_fd_writes_enabled () noexcept;
 
   raw_fd_file *create_raw_fd_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, int owner_tran_index,
@@ -127,7 +143,7 @@ namespace temp_page_store
   void rawfd_invalidate_cached_page (raw_fd_file &file, PAGEID page_index) noexcept;
   int rawfd_rewrite_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index, PAGE_PTR page_p) noexcept;
   int rawfd_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept;
-  void rawfd_release_fixed_page (QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept;
+  int rawfd_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept;
 
   int rawfd_single_worker_tde_positioned_read_parity (THREAD_ENTRY * thread_p) noexcept;
   int rawfd_mutation_nonce_selftest (THREAD_ENTRY * thread_p) noexcept;
@@ -136,8 +152,8 @@ namespace temp_page_store
   PAGE_PTR alloc_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p);
   PAGE_PTR fix_old_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p);
 
-  bool reserve_membuf_budget (int requested_pages, int *granted_pages_out, std::size_t *reserved_bytes_out,
-                              int *reserved_shard_out) noexcept;
+  budget_result reserve_membuf_budget (int requested_pages, std::size_t *reserved_bytes_out,
+                                        int *reserved_shard_out) noexcept;
   void release_held_reservation (QMGR_TEMP_FILE * tfile_p) noexcept;
 
   bool reserve_held (std::size_t bytes, int *shard_out) noexcept;
@@ -145,7 +161,6 @@ namespace temp_page_store
 
   std::size_t reservation_bytes_for_pages (std::size_t pages) noexcept;
   std::size_t reservation_bytes_for_degree (UINT32 degree, std::size_t pages_per_worker = 0) noexcept;
-  UINT32 clamp_degree_for_workmem (UINT32 requested_degree, std::size_t pages_per_worker = 0) noexcept;
   void record_degrade () noexcept;
 
   std::size_t cap_bytes () noexcept;

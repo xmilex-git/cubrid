@@ -27,7 +27,6 @@
 #include "system.h"		/* UINT32, UINT64 */
 #include "system_parameter.h"	/* sysprm_get_range, PRM_ID_PARALLELISM */
 #include "thread_manager.hpp"	/* cubthread::system_core_count */
-#include "temp_page_store.hpp"	/* workmem degree clamp */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -134,11 +133,11 @@ namespace parallel_query
 	/* hint first, ignore the parallelism parameter */
 	if (num_pages < (UINT64) hint_degree)
 	  {
-	    return temp_page_store::clamp_degree_for_workmem ((UINT32) num_pages);
+	    return (UINT32) num_pages;
 	  }
 	else
 	  {
-	    return temp_page_store::clamp_degree_for_workmem ((UINT32) hint_degree);
+	    return (UINT32) hint_degree;
 	  }
       }
     else
@@ -168,6 +167,6 @@ namespace parallel_query
 #endif
     // *INDENT-ON*
 
-    return temp_page_store::clamp_degree_for_workmem (MIN (auto_degree, (UINT32) parallelism));
+    return MIN (auto_degree, (UINT32) parallelism);
   }
 }				/* namespace parallel_query */
