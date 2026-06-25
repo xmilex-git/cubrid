@@ -1,0 +1,6 @@
+baseline HJ median_ms=677 samples=[ 712 678 677 659 672]
+baseline GBY median_ms=697 samples=[ 724 698 664 669 697]
+redesign HJ median_ms=975 samples=[ 975 976 915 934 1023]
+redesign GBY median_ms=662 samples=[ 678 653 662 666 660]
+wmnt(non-TDE) rawfd_decrypt before=0 after=0 (expect NO change = raw-fd OFF)
+tpch_sf10(TDE) rawfd_decrypt before=0 after=0 (expect INCREASE = raw-fd still ON for TDE)

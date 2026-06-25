@@ -2400,7 +2400,11 @@ namespace temp_page_store
             return tfile_p->membuf[tfile_p->membuf_last];
           }
 
-        if (raw_fd_writes_enabled ())
+        /* Use the raw-fd encrypted overflow ONLY when this temp actually holds TDE-encrypted data
+         * (tde_encrypted is set from the query's includes_tde_class, query_manager.c). For non-TDE data
+         * the temp is plaintext anyway, so fall through to the develop temp-volume path (PRIVATE_SPILL_FALLBACK)
+         * -- no needless AES on plaintext temp, keeping non-TDE workloads at develop-baseline speed. */
+        if (raw_fd_writes_enabled () && tfile_p->tde_encrypted)
           {
             int os_error = 0;
             if (tfile_p->raw_fd_handle == NULL)

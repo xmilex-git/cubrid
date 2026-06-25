@@ -1,0 +1,4 @@
+t(plaintext) GBY: rawfd_decrypt 15633 -> 15633 (delta 0)
+te(TDE) GBY: rawfd_decrypt 15633 -> 20244 (delta 4611)
+te(TDE) HJ: rawfd_decrypt 20244 -> 31706 (delta 11462)
+te HJ=1048576 te GBY=1048576

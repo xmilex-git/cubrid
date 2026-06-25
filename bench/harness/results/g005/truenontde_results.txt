@@ -1,0 +1,4 @@
+baseline HJ median_ms=12 samples=[ 12 13 14 12 12]
+baseline GBY median_ms=12 samples=[ 12 12 11 12 12]
+redesign HJ median_ms=12 samples=[ 12 14 12 12 12]
+redesign GBY median_ms=12 samples=[ 12 12 12 12 11]

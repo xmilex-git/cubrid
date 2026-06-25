@@ -1,0 +1,6 @@
+baseline HJ median_ms=673  samples=[ 664 682 678 670 673]
+baseline SORTSPILL median_ms=23  samples=[ 23 23 23 21 20]
+baseline GBY median_ms=669  samples=[ 664 669 680 684 667]
+redesign HJ median_ms=6480  samples=[ 6399 6392 6480 6693 6597]
+redesign SORTSPILL median_ms=21  samples=[ 23 23 21 21 20]
+redesign GBY median_ms=27401  samples=[ 27287 27401 27423 27402 27386]

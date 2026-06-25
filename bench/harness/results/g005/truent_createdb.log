@@ -1,0 +1,2 @@
+The 'tde_default_algorithm' parameter at line 80 in file '/home/cubrid/dev/cubrid-workmem/build_x86_64_release/_install/CUBRID/conf/cubrid.conf' : Value type does not match parameter type.
+Could not load one or more mandatory properties in configuration files.
