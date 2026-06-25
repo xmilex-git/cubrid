@@ -1,0 +1,20 @@
+--- baseline PSORT I/O delta ---
+  Num_data_page_fetches: 0
+  Num_data_page_ioreads: 0
+  Num_data_page_iowrites: 0
+  Num_data_page_fix_ext:: 0
+--- redesign PSORT I/O delta ---
+  Num_data_page_fetches: 0
+  Num_data_page_ioreads: 0
+  Num_data_page_iowrites: 0
+  Num_data_page_fix_ext:: 0
+--- baseline HASHAGG I/O delta ---
+  Num_data_page_fetches: 0
+  Num_data_page_ioreads: 0
+  Num_data_page_iowrites: 0
+  Num_data_page_fix_ext:: 0
+--- redesign HASHAGG I/O delta ---
+  Num_data_page_fetches: 0
+  Num_data_page_ioreads: 0
+  Num_data_page_iowrites: 0
+  Num_data_page_fix_ext:: 0

@@ -1,0 +1,9 @@
+rows=4194304 buffer=256M parallelism=8 (non-TDE, spill-forced)
+baseline PHJ median_ms=2392 samples=[ 2392 2531 2239 2457 2271]
+baseline PSORT median_ms=3617 samples=[ 3567 3561 3779 3756 3617]
+baseline PSCAN median_ms=24507 samples=[ 24529 24426 24467 24552 24507]
+baseline HASHAGG median_ms=2502 samples=[ 2502 2495 2520 2511 2493]
+redesign PHJ median_ms=593 samples=[ 665 603 571 593 574]
+redesign PSORT median_ms=4442 samples=[ 4441 4649 4648 4442 4386]
+redesign PSCAN median_ms=24202 samples=[ 24257 24249 24202 24132 24160]
+redesign HASHAGG median_ms=2707 samples=[ 2766 2756 2698 2707 2686]
