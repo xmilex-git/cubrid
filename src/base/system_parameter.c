@@ -133,9 +133,7 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_IO_LOCKF_ENABLE "file_lock"
 
-#define PRM_NAME_SR_NBUFFERS "sort_buffer_pages"
-
-#define PRM_NAME_SORT_BUFFER_SIZE "sort_buffer_size"
+#define PRM_NAME_WORK_MEM "work_mem"
 
 #define PRM_NAME_PB_NBUFFERS "data_buffer_pages"
 
@@ -232,7 +230,7 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_PTHREAD_SCOPE_PROCESS "pthread_scope_process"
 
-#define PRM_NAME_TEMP_MEM_BUFFER_PAGES "temp_file_memory_size_in_pages"
+
 
 #define PRM_NAME_INDEX_SCAN_KEY_BUFFER_PAGES "index_scan_key_buffer_pages"
 
@@ -586,7 +584,6 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 #define PRM_NAME_USE_BTREE_FENCE_KEY "use_btree_fence_key"
 
 #define PRM_NAME_OPTIMIZER_ENABLE_MERGE_JOIN "optimizer_enable_merge_join"
-#define PRM_NAME_MAX_HASH_LIST_SCAN_SIZE "max_hash_list_scan_size"
 #define PRM_NAME_OPTIMIZER_RESERVE_02 "optimizer_reserve_02"
 #define PRM_NAME_OPTIMIZER_RESERVE_03 "optimizer_reserve_03"
 #define PRM_NAME_OPTIMIZER_RESERVE_04 "optimizer_reserve_04"
@@ -1127,28 +1124,18 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
-  {PRM_ID_SR_NBUFFERS,
-   PRM_NAME_SR_NBUFFERS,
-   (PRM_FOR_SERVER | PRM_DEPRECATED | PRM_RELOADABLE),
-   PRM_INTEGER,
+  {PRM_ID_WORK_MEM,
+   PRM_NAME_WORK_MEM,
+   (PRM_FOR_SESSION | PRM_FOR_QRY_STRING | PRM_USER_CHANGE | PRM_FOR_SERVER | PRM_FOR_CLIENT | PRM_SIZE_UNIT),
+   PRM_BIGINT,
    PRM_CLEAR_DYNAMIC_FLAG,
-   {false, {.i = 128}},
-   {false, {.i = 128}},
-   NULL_SYSPRM_PARAM_VALUE, {false, {.i = 1}},
+   {false, {.bi = 4LL * 1024 * 1024 /* 4 MB */ }},
+   {false, {.bi = 4LL * 1024 * 1024 /* 4 MB */ }},
+   {false, {.bi = 4LL * 1024 * 1024 * 1024 /* 4 GB */ }},
+   {false, {.bi = 64LL * 1024 /* 64 KB */ }},
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
-  {PRM_ID_SORT_BUFFER_SIZE,
-   PRM_NAME_SORT_BUFFER_SIZE,
-   (PRM_FOR_SERVER | PRM_USER_CHANGE | PRM_SIZE_UNIT | PRM_DIFFER_UNIT | PRM_RELOADABLE),
-   PRM_INTEGER,
-   PRM_CLEAR_DYNAMIC_FLAG,
-   {false, {.i = 128}},
-   {false, {.i = 128}},
-   NULL_SYSPRM_PARAM_VALUE, {false, {.i = 1}},
-   (char *) NULL,
-   (DUP_PRM_FUNC) prm_size_to_io_pages,
-   (DUP_PRM_FUNC) prm_io_pages_to_size},
   {PRM_ID_PB_BUFFER_FLUSH_RATIO,
    PRM_NAME_PB_BUFFER_FLUSH_RATIO,
    (PRM_FOR_SERVER | PRM_HIDDEN | PRM_USER_CHANGE),	/* todo: why user change? */
@@ -1676,18 +1663,7 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
-  {PRM_ID_TEMP_MEM_BUFFER_PAGES,
-   PRM_NAME_TEMP_MEM_BUFFER_PAGES,
-   (PRM_FOR_SERVER),
-   PRM_INTEGER,
-   PRM_CLEAR_DYNAMIC_FLAG,
-   {false, {.i = 4}},
-   {false, {.i = 4}},
-   {false, {.i = 20}},
-   {false, {.i = 0}},
-   (char *) NULL,
-   (DUP_PRM_FUNC) NULL,
-   (DUP_PRM_FUNC) NULL},
+
   {PRM_ID_INDEX_SCAN_KEY_BUFFER_PAGES,
    PRM_NAME_INDEX_SCAN_KEY_BUFFER_PAGES,
    (PRM_FOR_SERVER | PRM_DEPRECATED | PRM_RELOADABLE),
@@ -3512,18 +3488,7 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
-  {PRM_ID_MAX_HASH_LIST_SCAN_SIZE,
-   PRM_NAME_MAX_HASH_LIST_SCAN_SIZE,
-   (PRM_USER_CHANGE | PRM_FOR_CLIENT | PRM_FOR_SERVER | PRM_FOR_SESSION | PRM_FOR_QRY_STRING | PRM_SIZE_UNIT),
-   PRM_BIGINT,
-   PRM_CLEAR_DYNAMIC_FLAG,
-   {false, {.bi = 8 * 1024 * 1024 /* 8 MB */ }},
-   {false, {.bi = 8 * 1024 * 1024 /* 8 MB */ }},
-   {false, {.bi = 128 * 1024 * 1024 /* 128 MB */ }},
-   {false, {.bi = 0}},
-   (char *) NULL,
-   (DUP_PRM_FUNC) NULL,
-   (DUP_PRM_FUNC) NULL},
+
   {PRM_ID_OPTIMIZER_RESERVE_02,
    PRM_NAME_OPTIMIZER_RESERVE_02,
    (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
@@ -5394,7 +5359,6 @@ static const int *PARAM_VALUE_SHARE[] = {
    * For the logic behind these rules, refer to the sysprm_check_id_order() function.
    */
   // (int[]){n, V1, V2, ..., Vn},
-  (int[]) {2, PRM_ID_SR_NBUFFERS, PRM_ID_SORT_BUFFER_SIZE},
   (int[]) {2, PRM_ID_PB_NBUFFERS, PRM_ID_PAGE_BUFFER_SIZE},
   (int[]) {2, PRM_ID_BT_OID_NBUFFERS, PRM_ID_BT_OID_BUFFER_SIZE},
   (int[]) {2, PRM_ID_LK_TIMEOUT_SECS, PRM_ID_LK_TIMEOUT},

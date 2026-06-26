@@ -1323,7 +1323,7 @@ hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASH
   assert (outer_list_id != NULL);
   assert (inner_list_id != NULL);
 
-  mem_limit = prm_get_bigint_value (PRM_ID_MAX_HASH_LIST_SCAN_SIZE);
+  mem_limit = prm_get_bigint_value (PRM_ID_WORK_MEM);
   assert (mem_limit > 0);
 
   min_tuple_cnt =
@@ -2636,7 +2636,7 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
   assert (list_id == NULL || list_id->tuple_cnt > 0);
   assert (key_cnt > 0);
 
-  mem_limit = prm_get_bigint_value (PRM_ID_MAX_HASH_LIST_SCAN_SIZE);
+  mem_limit = prm_get_bigint_value (PRM_ID_WORK_MEM);
   assert (mem_limit > 0);
 
   assert (hash_scan->build_regu_list == NULL);	/* Unused */

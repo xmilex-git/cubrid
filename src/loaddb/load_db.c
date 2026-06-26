@@ -48,8 +48,8 @@
           } \
 	} while (0)
 
-const int LOAD_INDEX_MIN_SORT_BUFFER_PAGES = 8192;
-const char *LOAD_INDEX_MIN_SORT_BUFFER_PAGES_STRING = "8192";
+const UINT64 LOAD_INDEX_MIN_WORK_MEM_BYTES = 128ULL * 1024 * 1024;
+const char *LOAD_INDEX_MIN_WORK_MEM_STRING = "128M";
 const char *LOADDB_LOG_FILENAME_SUFFIX = "loaddb.log";
 
 using namespace cubload;
@@ -567,9 +567,9 @@ loaddb_internal (UTIL_FUNCTION_ARG * arg, int dba_mode)
   sprintf (log_file_name, "%s_%s.err", args.volume.c_str (), arg->command_name);
   er_init (log_file_name, ER_NEVER_EXIT);
 
-  if (!args.index_file.empty () && prm_get_integer_value (PRM_ID_SR_NBUFFERS) < LOAD_INDEX_MIN_SORT_BUFFER_PAGES)
+  if (!args.index_file.empty () && prm_get_bigint_value (PRM_ID_WORK_MEM) < LOAD_INDEX_MIN_WORK_MEM_BYTES)
     {
-      sysprm_set_force (PRM_ID_SR_NBUFFERS, LOAD_INDEX_MIN_SORT_BUFFER_PAGES_STRING);
+      sysprm_set_force (PRM_ID_WORK_MEM, LOAD_INDEX_MIN_WORK_MEM_STRING);
     }
 
   /* open loaddb log file */

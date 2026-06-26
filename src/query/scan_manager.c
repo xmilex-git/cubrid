@@ -740,8 +740,7 @@ scan_init_indx_coverage (THREAD_ENTRY * thread_p, int coverage_enabled, valptr_l
        * Covering index scan needs large-size memory buffer in order to decrease
        * the number of times doing stop-and-resume during btree_range_search.
        * To do it, QFILE_FLAG_USE_KEY_BUFFER is introduced. If the flag is set,
-       * the list file allocates PRM_INDEX_SCAN_KEY_BUFFER_PAGES pages memory
-       * for its memory buffer, which is generally larger than prm_get_integer_value (PRM_ID_TEMP_MEM_BUFFER_PAGES).
+       * the list file allocates index_scan_key_buffer_pages memory buffer, which is generally larger than work_mem.
        */
       indx_cov->list_id =
 	qfile_open_list (thread_p, indx_cov->type_list, NULL, query_id, QFILE_FLAG_USE_KEY_BUFFER, indx_cov->list_id);
@@ -9176,7 +9175,7 @@ check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_y
   int build_cnt;
   regu_variable_list_node *build, *probe;
   DB_TYPE vtype1, vtype2;
-  UINT64 mem_limit = prm_get_bigint_value (PRM_ID_MAX_HASH_LIST_SCAN_SIZE);
+  UINT64 mem_limit = prm_get_bigint_value (PRM_ID_WORK_MEM);
 
   assert (hash_list_scan_yn == 0 || hash_list_scan_yn == 1);
   /* no_hash_list_scan sql hint check */

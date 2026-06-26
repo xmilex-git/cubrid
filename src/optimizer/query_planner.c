@@ -2755,7 +2755,7 @@ qo_sort_cost (QO_PLAN * planp)
 
 	  if (objects > 1.0)
 	    {
-	      if (pages < (double) prm_get_integer_value (PRM_ID_SR_NBUFFERS))
+	      if (pages < (double) (prm_get_bigint_value (PRM_ID_WORK_MEM) / IO_PAGESIZE))
 		{
 		  /* We can sort the result in memory without any additional io costs. Assume cpu costs are n*log(n) in
 		   * number of recors.
@@ -3578,7 +3578,7 @@ qo_hjoin_cost (QO_PLAN * plan_p)
 #if 0
   /* No need to increase weight since partitioned hash join is used even when mem_limit is exceeded. */
 
-  UINT64 mem_limit = prm_get_bigint_value (PRM_ID_MAX_HASH_LIST_SCAN_SIZE);
+  UINT64 mem_limit = prm_get_bigint_value (PRM_ID_WORK_MEM);
 
   if ((inner_cardinality * (sizeof (HENTRY_HLS) + 16 /* sizeof (QFILE_TUPLE_SIMPLE_POS) */ )) > mem_limit)
     {
@@ -6548,7 +6548,7 @@ qo_examine_hash_join (QO_INFO * info, JOIN_TYPE join_type, QO_INFO * outer, QO_I
   int bitset_index;
   int i, n = 0;
 
-  UINT64 mem_limit = prm_get_bigint_value (PRM_ID_MAX_HASH_LIST_SCAN_SIZE);
+  UINT64 mem_limit = prm_get_bigint_value (PRM_ID_WORK_MEM);
   if (mem_limit <= 0)
     {
       goto exit;		/* give up */

@@ -3719,6 +3719,14 @@ qmgr_allocate_tempfile_with_buffer (int num_buffer_pages)
 
   return tempfile_p;
 }
+static int
+qmgr_work_mem_buffer_pages (void)
+{
+  UINT64 work_mem_pages = prm_get_bigint_value (PRM_ID_WORK_MEM) / DB_PAGESIZE;
+
+  return (int) MAX (work_mem_pages, 1);
+}
+
 
 /*
  * qmgr_create_new_temp_file () -
@@ -3745,8 +3753,7 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
     }
 
   requested_buffer_pages =
-    ((membuf_type == TEMP_FILE_MEMBUF_NORMAL) ? prm_get_integer_value (PRM_ID_TEMP_MEM_BUFFER_PAGES)
-     : index_scan_key_buffer_pages);
+    ((membuf_type == TEMP_FILE_MEMBUF_NORMAL) ? qmgr_work_mem_buffer_pages () : index_scan_key_buffer_pages);
   budget = temp_page_store::reserve_membuf_budget (requested_buffer_pages, &reserved_bytes, &reserved_shard);
   if (budget.hard_oom)
     {
@@ -3891,7 +3898,7 @@ qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id)
 
   tfile_vfid_p->temp_file_type = FILE_QUERY_AREA;
 
-  tfile_vfid_p->membuf_last = prm_get_integer_value (PRM_ID_TEMP_MEM_BUFFER_PAGES) - 1;
+  tfile_vfid_p->membuf_last = qmgr_work_mem_buffer_pages () - 1;
   tfile_vfid_p->membuf = NULL;
   tfile_vfid_p->membuf_npages = 0;
   tfile_vfid_p->membuf_type = TEMP_FILE_MEMBUF_NONE;
@@ -4403,7 +4410,7 @@ qmgr_initialize_temp_file_list (QMGR_TEMP_FILE_LIST * temp_file_list_p, QMGR_TEM
       return;
     }
 
-  num_buffer_pages = ((membuf_type == TEMP_FILE_MEMBUF_NORMAL) ? prm_get_integer_value (PRM_ID_TEMP_MEM_BUFFER_PAGES)
+  num_buffer_pages = ((membuf_type == TEMP_FILE_MEMBUF_NORMAL) ? qmgr_work_mem_buffer_pages ()
 		      : prm_get_integer_value (PRM_ID_INDEX_SCAN_KEY_BUFFER_PAGES));
 
   pthread_mutex_init (&temp_file_list_p->mutex, NULL);

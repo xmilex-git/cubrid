@@ -26356,7 +26356,7 @@ qexec_setup_topn_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd
   TOPN_TUPLES *top_n = NULL;
   int error = NO_ERROR, ubound = 0, count = 0;
   UINT64 estimated_size = 0, max_size = 0;
-  static int sr_nbuffers = prm_get_integer_value (PRM_ID_SR_NBUFFERS);
+
 
   if (xasl->type != BUILDLIST_PROC)
     {
@@ -26461,11 +26461,11 @@ qexec_setup_topn_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd
 
   /* At any time, we will handle at most ubound tuples */
   estimated_size *= ubound;
-  max_size = (UINT64) sr_nbuffers *IO_PAGESIZE;
+  max_size = prm_get_bigint_value (PRM_ID_WORK_MEM);
   if (estimated_size > max_size)
     {
-      /* Do not use more than the sort buffer size. Using the entire sort buffer is possible because this is the only
-       * sort operation which is being executed for this transaction at this time. */
+      /* Do not use more than work_mem. Using the entire work_mem is possible because this is the only sort operation
+       * which is being executed for this transaction at this time. */
       return NO_ERROR;
     }
 

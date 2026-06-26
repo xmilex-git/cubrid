@@ -1353,6 +1353,7 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   SORT_PARAM ori_sort_param;
   SORT_PARAM *sort_param = &ori_sort_param;
   INT32 input_pages;
+  INT32 work_mem_pages;
   int i;
 
   /* for parallel sort */
@@ -1418,6 +1419,7 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->vol_list.vol_cnt = 0;
   sort_param->vol_list.vol_info = NULL;
 
+  work_mem_pages = (INT32) MAX (prm_get_bigint_value (PRM_ID_WORK_MEM) / DB_PAGESIZE, 4);
   if (est_inp_pg_cnt > 0)
     {
       /* 10% of overhead and fragmentation */
@@ -1425,11 +1427,11 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
     }
   else
     {
-      input_pages = prm_get_integer_value (PRM_ID_SR_NBUFFERS);
+      input_pages = work_mem_pages;
     }
 
-  /* The size of a sort buffer is limited to PRM_SR_NBUFFERS. */
-  sort_param->tot_buffers = MIN (prm_get_integer_value (PRM_ID_SR_NBUFFERS), input_pages);
+  /* The size of a sort buffer is limited to work_mem, converted from bytes to pages. */
+  sort_param->tot_buffers = MIN (work_mem_pages, input_pages);
   sort_param->tot_buffers = MAX (4, sort_param->tot_buffers);
 
   sort_param->internal_memory = (char *) malloc ((size_t) sort_param->tot_buffers * (size_t) DB_PAGESIZE);

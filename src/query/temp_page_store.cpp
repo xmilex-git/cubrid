@@ -3371,7 +3371,7 @@ rawfd_write_success:
   reservation_bytes_for_degree (UINT32 degree, std::size_t pages_per_worker) noexcept
   {
     const std::size_t tier_pages = (pages_per_worker == 0)
-      ? static_cast<std::size_t> (std::max (prm_get_integer_value (PRM_ID_TEMP_MEM_BUFFER_PAGES), 0))
+      ? static_cast<std::size_t> (std::max<UINT64> (prm_get_bigint_value (PRM_ID_WORK_MEM) / DB_PAGESIZE, 1))
       : pages_per_worker;
     const std::size_t per_worker_bytes = reservation_bytes_for_pages (tier_pages);
 
