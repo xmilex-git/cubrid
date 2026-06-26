@@ -4831,12 +4831,6 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
       /* add first tuple of group to groupby list */
       if (value->first_tuple.tpl != NULL)
 	{
-	  if (temp_page_store::raw_fd_master_enabled ()
-	      && qmgr_materialize_list_to_single_owner (thread_p, groupby_list) != NO_ERROR)
-	    {
-	      return ER_FAILED;
-	    }
-
 	  rc = qfile_add_tuple_to_list (thread_p, groupby_list, value->first_tuple.tpl);
 	  if (rc != NO_ERROR)
 	    {
@@ -4864,11 +4858,6 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 	  /* very high selectivity, abort hash aggregation */
 	  context->state = HS_REJECT_ALL;
 
-	  if (temp_page_store::raw_fd_master_enabled ()
-	      && qmgr_materialize_list_to_single_owner (thread_p, groupby_list) != NO_ERROR)
-	    {
-	      return ER_FAILED;
-	    }
 	  /* dump hash table to list file, no need to keep it in memory */
 	  qdata_save_agg_htable_to_list (thread_p, context->hash_table, groupby_list, context->part_list_id,
 					 context->temp_dbval_array);
@@ -5638,11 +5627,6 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
   /*
    * Open a scan on the unsorted input file
    */
-  if (temp_page_store::raw_fd_master_enabled ()
-      && qmgr_materialize_list_to_single_owner (thread_p, list_id) != NO_ERROR)
-    {
-      GOTO_EXIT_ON_ERROR;
-    }
   if (qfile_open_list_scan (list_id, &input_scan_id) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
