@@ -139,6 +139,38 @@ namespace
     bool dirty { false };
   };
   using rawfd_sec_map = std::unordered_map<temp_page_store::rawfd_sec_key, PAGE_PTR>;
+  constexpr std::size_t RAWFD_FIXED_PAGE_SHARD_COUNT = 64;
+  constexpr std::uint64_t RAWFD_SHARD_GOLDEN = 0x9E3779B97F4A7C15ULL;
+
+  struct alignas (64) rawfd_primary_shard
+  {
+    std::mutex m;
+    std::unordered_map<PAGE_PTR, rawfd_fixed_page> map;
+  };
+
+  struct alignas (64) rawfd_secondary_shard
+  {
+    std::mutex m;
+    rawfd_sec_map map;
+  };
+
+  std::uint64_t
+  rawfd_sec_key_hash (const temp_page_store::rawfd_sec_key &key) noexcept
+  {
+    return static_cast<std::uint64_t> (std::hash<temp_page_store::rawfd_sec_key> {} (key));
+  }
+
+  std::size_t
+  primary_shard_of (PAGE_PTR page_p) noexcept
+  {
+    return (reinterpret_cast<std::uintptr_t> (page_p) >> 6) & (RAWFD_FIXED_PAGE_SHARD_COUNT - 1);
+  }
+
+  std::size_t
+  secondary_shard_of (const temp_page_store::rawfd_sec_key &key) noexcept
+  {
+    return ((rawfd_sec_key_hash (key) * RAWFD_SHARD_GOLDEN) >> 58) & (RAWFD_FIXED_PAGE_SHARD_COUNT - 1);
+  }
 
   constexpr int RAWFD_ALLOC_MAX_RETRIES = 16;
 
@@ -194,7 +226,6 @@ namespace
   {
     std::once_flag init_once;
     std::mutex registry_mutex;
-    std::mutex fixed_pages_mutex;
     std::mutex read_cache_mutex;
     std::uint64_t boot_incarnation { 0 };
     std::atomic<std::uint64_t> file_seq { 0 };
@@ -206,8 +237,8 @@ namespace
     bool tde_wired { false };
     bool reaper_active { false };
     std::unordered_map<std::uint64_t, rawfd_registry_entry> registry;
-    std::unordered_map<PAGE_PTR, rawfd_fixed_page> fixed_pages;
-    rawfd_sec_map fixed_secondary_index;
+    rawfd_primary_shard fixed_primary_shards[RAWFD_FIXED_PAGE_SHARD_COUNT];
+    rawfd_secondary_shard fixed_secondary_shards[RAWFD_FIXED_PAGE_SHARD_COUNT];
     std::deque<rawfd_cached_page> read_cache;
   };
 
@@ -499,47 +530,55 @@ namespace
   {
     std::vector<rawfd_purge_item> purge_items;
 
-    {
-      std::lock_guard<std::mutex> fixed_pages_guard (g_rawfd_state.fixed_pages_mutex);
+    for (std::size_t shard_index = 0; shard_index < RAWFD_FIXED_PAGE_SHARD_COUNT; shard_index++)
+      {
+	rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[shard_index];
+	std::lock_guard<std::mutex> primary_guard (primary_shard.m);
 
-      for (const auto &fixed : g_rawfd_state.fixed_pages)
-	{
-	  const rawfd_fixed_page &entry = fixed.second;
-	  if (entry.file == NULL || !rawfd_key_equals (entry.file->key (), key))
-	    {
-	      continue;
-	    }
+	for (const auto &fixed : primary_shard.map)
+	  {
+	    const rawfd_fixed_page &entry = fixed.second;
+	    if (entry.file == NULL || !rawfd_key_equals (entry.file->key (), key))
+	      {
+		continue;
+	      }
 
-	  if (entry.ref_count > 0)
-	    {
-	      er_log_debug (ARG_FILE_LINE, "RAWFD: skipping fixed page purge for referenced page %d (ref_count=%d)",
-			    entry.page_index, entry.ref_count);
-	      continue;
-	    }
+	    if (entry.ref_count > 0)
+	      {
+		er_log_debug (ARG_FILE_LINE, "RAWFD: skipping fixed page purge for referenced page %d (ref_count=%d)",
+			      entry.page_index, entry.ref_count);
+		continue;
+	      }
 
-	  purge_items.push_back (rawfd_purge_item { rawfd_make_sec_key (key, entry.page_index), entry.page_p });
-	}
-
-      for (const rawfd_purge_item &item : purge_items)
-	{
-	  const auto sec_it = g_rawfd_state.fixed_secondary_index.find (item.sec_key);
-	  if (sec_it != g_rawfd_state.fixed_secondary_index.end () && sec_it->second == item.page_p)
-	    {
-	      g_rawfd_state.fixed_secondary_index.erase (sec_it);
-#ifdef RAWFD_UNIT_TEST
-	      g_rawfd_test_purge_events.push_back (RAWFD_TEST_EVENT_SECONDARY_ERASE);
-#endif
-	    }
-	}
-
-      for (const rawfd_purge_item &item : purge_items)
-	{
-	  g_rawfd_state.fixed_pages.erase (item.page_p);
-	}
-    }
+	    if (entry.ref_count == 0)
+	      {
+		purge_items.push_back (rawfd_purge_item { rawfd_make_sec_key (key, entry.page_index), entry.page_p });
+	      }
+	  }
+      }
 
     for (const rawfd_purge_item &item : purge_items)
       {
+	rawfd_secondary_shard &secondary_shard = g_rawfd_state.fixed_secondary_shards[secondary_shard_of (item.sec_key)];
+	std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+	const auto sec_it = secondary_shard.map.find (item.sec_key);
+	if (sec_it != secondary_shard.map.end () && sec_it->second == item.page_p)
+	  {
+	    secondary_shard.map.erase (sec_it);
+#ifdef RAWFD_UNIT_TEST
+	    g_rawfd_test_purge_events.push_back (RAWFD_TEST_EVENT_SECONDARY_ERASE);
+#endif
+	  }
+      }
+
+    for (const rawfd_purge_item &item : purge_items)
+      {
+	rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (item.page_p)];
+	{
+	  std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+	  primary_shard.map.erase (item.page_p);
+	}
+
 #ifdef RAWFD_UNIT_TEST
 	g_rawfd_test_purge_events.push_back (RAWFD_TEST_EVENT_FREE_BUFFER);
 #endif
@@ -948,71 +987,150 @@ namespace
 
     for (;;)
       {
+	if (file->destroyed ())
+	  {
+	    if (allocated_page != NULL)
+	      {
+		free_db_page_buffer (allocated_page);
+	      }
+	    return NULL;
+	  }
+
+	PAGE_PTR candidate_page = NULL;
+	bool found_secondary = false;
+	rawfd_secondary_shard &secondary_shard = g_rawfd_state.fixed_secondary_shards[secondary_shard_of (sec_key)];
 	{
-	  std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-	  if (file->destroyed ())
-	    {
-	      if (allocated_page != NULL)
-		{
-		  free_db_page_buffer (allocated_page);
-		}
-	      return NULL;
-	    }
+	  std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
 #ifdef RAWFD_UNIT_TEST
 	  if (g_rawfd_test_force_persistent_primary_absent.load (std::memory_order_acquire))
 	    {
-	      g_rawfd_state.fixed_secondary_index[sec_key] = reinterpret_cast<PAGE_PTR> (static_cast<uintptr_t> (1));
+	      secondary_shard.map[sec_key] = reinterpret_cast<PAGE_PTR> (static_cast<uintptr_t> (1));
 	    }
 #endif
-
-	  const auto sec_it = g_rawfd_state.fixed_secondary_index.find (sec_key);
-	  if (sec_it != g_rawfd_state.fixed_secondary_index.end ())
+	  const auto sec_it = secondary_shard.map.find (sec_key);
+	  if (sec_it != secondary_shard.map.end ())
 	    {
-	      PAGE_PTR candidate_page = sec_it->second;
-	      const auto primary_it = g_rawfd_state.fixed_pages.find (candidate_page);
-	      if (primary_it != g_rawfd_state.fixed_pages.end ()
-		  && rawfd_fixed_page_matches_sec_key (primary_it->second, sec_key))
+	      candidate_page = sec_it->second;
+	      found_secondary = true;
+	    }
+	}
+
+	if (found_secondary)
+	  {
+	    bool erase_secondary = false;
+	    {
+	      rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (candidate_page)];
+	      std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+	      const auto primary_it = primary_shard.map.find (candidate_page);
+	      if (primary_it != primary_shard.map.end ())
 		{
-		  if (primary_it->second.file != NULL && primary_it->second.file->destroyed ())
+		  if (rawfd_fixed_page_matches_sec_key (primary_it->second, sec_key)
+		      && primary_it->second.ref_count > 0)
 		    {
+		      if (primary_it->second.file != NULL && primary_it->second.file->destroyed ())
+			{
+			  if (allocated_page != NULL)
+			    {
+			      free_db_page_buffer (allocated_page);
+			    }
+			  return NULL;
+			}
+
+		      primary_it->second.ref_count++;
+		      if (reused_out != nullptr)
+			{
+			  *reused_out = true;
+			}
 		      if (allocated_page != NULL)
 			{
 			  free_db_page_buffer (allocated_page);
 			}
-		      return NULL;
+		      return primary_it->second.page_p;
 		    }
 
-		  primary_it->second.ref_count++;
-		  if (reused_out != nullptr)
-		    {
-		      *reused_out = true;
-		    }
-		  if (allocated_page != NULL)
-		    {
-		      free_db_page_buffer (allocated_page);
-		    }
-		  return primary_it->second.page_p;
+		  erase_secondary = true;
 		}
-
-	      g_rawfd_state.fixed_secondary_index.erase (sec_it);
-	      if (!rawfd_alloc_retry (retry_count))
-		{
-		  if (allocated_page != NULL)
-		    {
-		      free_db_page_buffer (allocated_page);
-		    }
-		  return NULL;
-		}
-	      continue;
 	    }
 
-	  if (allocated_page != NULL)
+	    if (erase_secondary)
+	      {
+		std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+		const auto sec_it = secondary_shard.map.find (sec_key);
+		if (sec_it != secondary_shard.map.end () && sec_it->second == candidate_page)
+		  {
+		    secondary_shard.map.erase (sec_it);
+		  }
+	      }
+
+	    if (!rawfd_alloc_retry (retry_count))
+	      {
+		if (allocated_page != NULL)
+		  {
+		    free_db_page_buffer (allocated_page);
+		  }
+		return NULL;
+	      }
+	    continue;
+	  }
+
+	if (allocated_page != NULL)
+	  {
+	    bool inserted_secondary = false;
 	    {
-	      g_rawfd_state.fixed_pages[allocated_page] = rawfd_fixed_page { file, page_index, allocated_page, 1 };
-	      g_rawfd_state.fixed_secondary_index.emplace (sec_key, allocated_page);
-	      return allocated_page;
+	      std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+	      inserted_secondary = secondary_shard.map.emplace (sec_key, allocated_page).second;
 	    }
-	}
+
+	    if (!inserted_secondary)
+	      {
+		free_db_page_buffer (allocated_page);
+		allocated_page = NULL;
+		if (!rawfd_alloc_retry (retry_count))
+		  {
+		    return NULL;
+		  }
+		continue;
+	      }
+
+	    if (file->destroyed ())
+	      {
+		{
+		  std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+		  const auto sec_it = secondary_shard.map.find (sec_key);
+		  if (sec_it != secondary_shard.map.end () && sec_it->second == allocated_page)
+		    {
+		      secondary_shard.map.erase (sec_it);
+		    }
+		}
+		free_db_page_buffer (allocated_page);
+		return NULL;
+	      }
+
+	    rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (allocated_page)];
+	    {
+	      std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+	      if (file->destroyed ())
+		{
+		  primary_shard.map.erase (allocated_page);
+		}
+	      else
+		{
+		  primary_shard.map[allocated_page] = rawfd_fixed_page { file, page_index, allocated_page, 1 };
+		  return allocated_page;
+		}
+	    }
+
+	    {
+	      std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+	      const auto sec_it = secondary_shard.map.find (sec_key);
+	      if (sec_it != secondary_shard.map.end () && sec_it->second == allocated_page)
+		{
+		  secondary_shard.map.erase (sec_it);
+		}
+	    }
+	    free_db_page_buffer (allocated_page);
+	    return NULL;
+	  }
 
 	allocated_page = alloc_db_page_buffer ();
 	if (allocated_page == NULL)
@@ -1033,42 +1151,63 @@ namespace
   rawfd_fixed_page
   rawfd_take_fixed_page (PAGE_PTR page_p)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-    const auto it = g_rawfd_state.fixed_pages.find (page_p);
-    if (it == g_rawfd_state.fixed_pages.end ())
-      {
-	return rawfd_fixed_page {};
-      }
-
-
-    if (it->second.ref_count > 1)
-      {
-	it->second.ref_count--;
-	rawfd_fixed_page entry = it->second;
-	entry.page_p = NULL;
-	return entry;
-      }
-
-    rawfd_fixed_page entry = it->second;
+    rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (page_p)];
+    rawfd_fixed_page entry;
     temp_page_store::rawfd_sec_key sec_key {};
-    if (rawfd_make_sec_key (entry, sec_key))
+    bool has_sec_key = false;
+
+    {
+      std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+      const auto it = primary_shard.map.find (page_p);
+      if (it == primary_shard.map.end ())
+	{
+	  return rawfd_fixed_page {};
+	}
+
+      if (it->second.ref_count > 1)
+	{
+	  it->second.ref_count--;
+	  entry = it->second;
+	  entry.page_p = NULL;
+	  return entry;
+	}
+
+      entry = it->second;
+      has_sec_key = rawfd_make_sec_key (entry, sec_key);
+      it->second.ref_count = -1;
+    }
+
+    if (has_sec_key)
       {
-	const auto sec_it = g_rawfd_state.fixed_secondary_index.find (sec_key);
-	if (sec_it != g_rawfd_state.fixed_secondary_index.end () && sec_it->second == entry.page_p)
+	rawfd_secondary_shard &secondary_shard = g_rawfd_state.fixed_secondary_shards[secondary_shard_of (sec_key)];
+	std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+	const auto sec_it = secondary_shard.map.find (sec_key);
+	if (sec_it != secondary_shard.map.end () && sec_it->second == entry.page_p)
 	  {
-	    g_rawfd_state.fixed_secondary_index.erase (sec_it);
+	    secondary_shard.map.erase (sec_it);
 	  }
       }
-    g_rawfd_state.fixed_pages.erase (it);
+
+    {
+      std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+      const auto it = primary_shard.map.find (page_p);
+      if (it != primary_shard.map.end () && it->second.ref_count < 1
+	  && (!has_sec_key || rawfd_fixed_page_matches_sec_key (it->second, sec_key)))
+	{
+	  primary_shard.map.erase (it);
+	}
+    }
+
     return entry;
   }
 
   bool
   rawfd_find_and_mark_dirty (PAGE_PTR page_p)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-    const auto it = g_rawfd_state.fixed_pages.find (page_p);
-    if (it == g_rawfd_state.fixed_pages.end ())
+    rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (page_p)];
+    std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+    const auto it = primary_shard.map.find (page_p);
+    if (it == primary_shard.map.end ())
       {
 	return false;
       }
@@ -1995,22 +2134,31 @@ rawfd_write_success:
   rawfd_test_reset_registry () noexcept
   {
     std::vector<PAGE_PTR> pages_to_free;
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      for (const auto &fixed : g_rawfd_state.fixed_pages)
-	{
-	  if (fixed.second.page_p != NULL)
-	    {
-	      pages_to_free.push_back (fixed.second.page_p);
-	    }
-	}
-      g_rawfd_state.fixed_pages.clear ();
-      g_rawfd_state.fixed_secondary_index.clear ();
-      g_rawfd_test_force_persistent_primary_absent.store (false, std::memory_order_release);
-      g_rawfd_test_alloc_calls.store (0, std::memory_order_relaxed);
-      g_rawfd_test_alloc_retries.store (0, std::memory_order_relaxed);
-      g_rawfd_test_purge_events.clear ();
-    }
+    for (std::size_t shard_index = 0; shard_index < RAWFD_FIXED_PAGE_SHARD_COUNT; shard_index++)
+      {
+	rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[shard_index];
+	std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+	for (const auto &fixed : primary_shard.map)
+	  {
+	    if (fixed.second.page_p != NULL)
+	      {
+		pages_to_free.push_back (fixed.second.page_p);
+	      }
+	  }
+	primary_shard.map.clear ();
+      }
+
+    for (std::size_t shard_index = 0; shard_index < RAWFD_FIXED_PAGE_SHARD_COUNT; shard_index++)
+      {
+	rawfd_secondary_shard &secondary_shard = g_rawfd_state.fixed_secondary_shards[shard_index];
+	std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+	secondary_shard.map.clear ();
+      }
+
+    g_rawfd_test_force_persistent_primary_absent.store (false, std::memory_order_release);
+    g_rawfd_test_alloc_calls.store (0, std::memory_order_relaxed);
+    g_rawfd_test_alloc_retries.store (0, std::memory_order_relaxed);
+    g_rawfd_test_purge_events.clear ();
 
     for (PAGE_PTR page_p : pages_to_free)
       {
@@ -2031,6 +2179,72 @@ rawfd_write_success:
     file.m_segment_id = file_seq;
     file.m_destroyed.store (false, std::memory_order_release);
   }
+  std::size_t
+  rawfd_test_primary_size () noexcept
+  {
+    std::size_t size = 0;
+    for (std::size_t shard_index = 0; shard_index < RAWFD_FIXED_PAGE_SHARD_COUNT; shard_index++)
+      {
+	rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[shard_index];
+	std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+	size += primary_shard.map.size ();
+      }
+    return size;
+  }
+
+  std::size_t
+  rawfd_test_secondary_size () noexcept
+  {
+    std::size_t size = 0;
+    for (std::size_t shard_index = 0; shard_index < RAWFD_FIXED_PAGE_SHARD_COUNT; shard_index++)
+      {
+	rawfd_secondary_shard &secondary_shard = g_rawfd_state.fixed_secondary_shards[shard_index];
+	std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+	size += secondary_shard.map.size ();
+      }
+    return size;
+  }
+
+  bool
+  rawfd_test_secondary_points_to (const temp_page_store::rawfd_sec_key &sec_key, PAGE_PTR page_p) noexcept
+  {
+    rawfd_secondary_shard &secondary_shard = g_rawfd_state.fixed_secondary_shards[secondary_shard_of (sec_key)];
+    std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+    const auto sec_it = secondary_shard.map.find (sec_key);
+    return sec_it != secondary_shard.map.end () && sec_it->second == page_p;
+  }
+
+  bool
+  rawfd_test_primary_contains (PAGE_PTR page_p) noexcept
+  {
+    rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (page_p)];
+    std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+    return primary_shard.map.find (page_p) != primary_shard.map.end ();
+  }
+
+  void
+  rawfd_test_insert_fixed_page (PAGE_PTR page_p, const rawfd_fixed_page &entry) noexcept
+  {
+    rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (page_p)];
+    std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+    primary_shard.map[page_p] = entry;
+  }
+
+  void
+  rawfd_test_insert_secondary (const temp_page_store::rawfd_sec_key &sec_key, PAGE_PTR page_p) noexcept
+  {
+    rawfd_secondary_shard &secondary_shard = g_rawfd_state.fixed_secondary_shards[secondary_shard_of (sec_key)];
+    std::lock_guard<std::mutex> secondary_guard (secondary_shard.m);
+    secondary_shard.map[sec_key] = page_p;
+  }
+
+  void
+  rawfd_test_set_ref_count (PAGE_PTR page_p, int ref_count) noexcept
+  {
+    rawfd_primary_shard &primary_shard = g_rawfd_state.fixed_primary_shards[primary_shard_of (page_p)];
+    std::lock_guard<std::mutex> primary_guard (primary_shard.m);
+    primary_shard.map[page_p].ref_count = ref_count;
+  }
 
   int
   rawfd_test_t1_hash_collision () noexcept
@@ -2044,8 +2258,8 @@ rawfd_write_success:
 
     const temp_page_store::rawfd_sec_key first_key = rawfd_make_sec_key (first.key (), 0);
     const temp_page_store::rawfd_sec_key second_key = rawfd_make_sec_key (second.key (), 1);
-    if (std::hash<temp_page_store::rawfd_sec_key> {} (first_key)
-	!= std::hash<temp_page_store::rawfd_sec_key> {} (second_key))
+    if (secondary_shard_of (first_key) != secondary_shard_of (second_key)
+	|| rawfd_sec_key_hash (first_key) != rawfd_sec_key_hash (second_key))
       {
 	rawfd_test_reset_registry ();
 	return ER_FAILED;
@@ -2055,12 +2269,9 @@ rawfd_write_success:
     PAGE_PTR second_page = rawfd_alloc_fixed_page (&second, 1, true);
     bool ok = first_page != NULL && second_page != NULL && first_page != second_page;
 
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      ok = ok && g_rawfd_state.fixed_pages.size () == 2 && g_rawfd_state.fixed_secondary_index.size () == 2
-	   && g_rawfd_state.fixed_secondary_index[first_key] == first_page
-	   && g_rawfd_state.fixed_secondary_index[second_key] == second_page;
-    }
+    ok = ok && rawfd_test_primary_size () == 2 && rawfd_test_secondary_size () == 2
+	 && rawfd_test_secondary_points_to (first_key, first_page)
+	 && rawfd_test_secondary_points_to (second_key, second_page);
 
     rawfd_test_reset_registry ();
     return ok ? NO_ERROR : ER_FAILED;
@@ -2084,21 +2295,14 @@ rawfd_write_success:
 	return ER_FAILED;
       }
 
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      g_rawfd_state.fixed_pages[stale_page] = rawfd_fixed_page { &other_file, 21, stale_page, 1 };
-      g_rawfd_state.fixed_secondary_index[request_key] = stale_page;
-    }
+    rawfd_test_insert_fixed_page (stale_page, rawfd_fixed_page { &other_file, 21, stale_page, 1 });
+    rawfd_test_insert_secondary (request_key, stale_page);
 
     PAGE_PTR fresh_page = rawfd_alloc_fixed_page (&request_file, request_page, true);
     bool ok = fresh_page != NULL && fresh_page != stale_page
 	      && g_rawfd_test_alloc_retries.load (std::memory_order_relaxed) == 1;
 
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      const auto sec_it = g_rawfd_state.fixed_secondary_index.find (request_key);
-      ok = ok && sec_it != g_rawfd_state.fixed_secondary_index.end () && sec_it->second == fresh_page;
-    }
+    ok = ok && rawfd_test_secondary_points_to (request_key, fresh_page);
 
     rawfd_test_reset_registry ();
     return ok ? NO_ERROR : ER_FAILED;
@@ -2142,23 +2346,17 @@ rawfd_write_success:
 	return ER_FAILED;
       }
 
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      g_rawfd_state.fixed_pages[fixed_page] = rawfd_fixed_page { &file, 26, fixed_page, 1 };
-      g_rawfd_state.fixed_secondary_index[rawfd_make_sec_key (file.key (), 26)] = fixed_page;
-    }
+    const temp_page_store::rawfd_sec_key fixed_key = rawfd_make_sec_key (file.key (), 26);
+    rawfd_test_insert_fixed_page (fixed_page, rawfd_fixed_page { &file, 26, fixed_page, 1 });
+    rawfd_test_insert_secondary (fixed_key, fixed_page);
 
     ok = ok && !rawfd_find_and_mark_dirty (fixed_page)
 	 && rawfd_release_fixed_page (NULL, NULL, fixed_page) == NO_ERROR
 	 && rawfd_write_page (NULL, file, 26, fixed_page) == ER_FAILED
 	 && rawfd_pos_read (NULL, file, raw_fd_page_coordinate { file.segment_id (), 26, 0 }) == NULL;
 
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      ok = ok && g_rawfd_state.fixed_pages.find (fixed_page) == g_rawfd_state.fixed_pages.end ()
-	   && g_rawfd_state.fixed_secondary_index.find (rawfd_make_sec_key (file.key (), 26))
-	      == g_rawfd_state.fixed_secondary_index.end ();
-    }
+    ok = ok && !rawfd_test_primary_contains (fixed_page)
+	 && !rawfd_test_secondary_points_to (fixed_key, fixed_page);
 
     rawfd_test_reset_registry ();
     return ok ? NO_ERROR : ER_FAILED;
@@ -2178,22 +2376,15 @@ rawfd_write_success:
 	return ER_FAILED;
       }
 
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      g_rawfd_state.fixed_pages[page_p].ref_count = 0;
-      g_rawfd_test_purge_events.clear ();
-    }
+    rawfd_test_set_ref_count (page_p, 0);
+    g_rawfd_test_purge_events.clear ();
 
     purge_fixed_pages_for_key (file.key ());
 
-    bool ok = false;
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      ok = g_rawfd_state.fixed_pages.empty () && g_rawfd_state.fixed_secondary_index.empty ()
-	   && g_rawfd_test_purge_events.size () == 2
-	   && g_rawfd_test_purge_events[0] == RAWFD_TEST_EVENT_SECONDARY_ERASE
-	   && g_rawfd_test_purge_events[1] == RAWFD_TEST_EVENT_FREE_BUFFER;
-    }
+    bool ok = rawfd_test_primary_size () == 0 && rawfd_test_secondary_size () == 0
+	      && g_rawfd_test_purge_events.size () == 2
+	      && g_rawfd_test_purge_events[0] == RAWFD_TEST_EVENT_SECONDARY_ERASE
+	      && g_rawfd_test_purge_events[1] == RAWFD_TEST_EVENT_FREE_BUFFER;
 
     rawfd_test_reset_registry ();
     return ok ? NO_ERROR : ER_FAILED;
