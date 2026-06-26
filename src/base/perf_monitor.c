@@ -310,6 +310,8 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_PLAINTEXT_WRITE_COUNT, "Num_rawfd_plaintext_write_count"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_PGBUF_SPILL_OVERFLOW, "Num_rawfd_pgbuf_spill_overflow"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_CREATE_FAILURE, "Num_rawfd_create_failure"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_ALLOC_CALLS, "Num_rawfd_alloc_calls"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_RAWFD_ALLOC_RETRY, "Num_rawfd_alloc_retry"),
 
   /* Execution statistics for external sort */
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_SORT_NUM_IO_PAGES, "Num_sort_io_pages"),

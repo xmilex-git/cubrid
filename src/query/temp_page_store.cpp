@@ -48,10 +48,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <functional>
+#include <immintrin.h>
 #include <limits>
 #include <mutex>
 #include <new>
 #include <set>
+#include <sched.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
@@ -136,18 +138,37 @@ namespace
     int ref_count { 1 };
     bool dirty { false };
   };
+  using rawfd_sec_map = std::unordered_map<temp_page_store::rawfd_sec_key, PAGE_PTR>;
+
+  constexpr int RAWFD_ALLOC_MAX_RETRIES = 16;
+
+  temp_page_store::rawfd_sec_key
+  rawfd_make_sec_key (const temp_page_store::raw_fd_key &file_key, PAGEID page_index) noexcept
+  {
+    return temp_page_store::rawfd_sec_key { file_key.file_seq, page_index };
+  }
 
   bool
-  rawfd_same_fixed_page (const rawfd_fixed_page &entry, temp_page_store::raw_fd_file *file, PAGEID page_index) noexcept
+  rawfd_make_sec_key (const rawfd_fixed_page &entry, temp_page_store::rawfd_sec_key &sec_key) noexcept
   {
-    if (entry.file == nullptr || file == nullptr || entry.page_index != page_index)
+    if (entry.file == nullptr)
       {
 	return false;
       }
 
-    const temp_page_store::raw_fd_key entry_key = entry.file->key ();
-    const temp_page_store::raw_fd_key file_key = file->key ();
-    return entry_key.boot_incarnation == file_key.boot_incarnation && entry_key.file_seq == file_key.file_seq;
+    sec_key = rawfd_make_sec_key (entry.file->key (), entry.page_index);
+    return true;
+  }
+
+  bool
+  rawfd_fixed_page_matches_sec_key (const rawfd_fixed_page &entry, const temp_page_store::rawfd_sec_key &sec_key) noexcept
+  {
+    if (entry.file == nullptr || entry.page_index != sec_key.page_index)
+      {
+	return false;
+      }
+
+    return entry.file->key ().file_seq == sec_key.file_seq;
   }
 
   struct rawfd_file_snapshot
@@ -186,10 +207,19 @@ namespace
     bool reaper_active { false };
     std::unordered_map<std::uint64_t, rawfd_registry_entry> registry;
     std::unordered_map<PAGE_PTR, rawfd_fixed_page> fixed_pages;
+    rawfd_sec_map fixed_secondary_index;
     std::deque<rawfd_cached_page> read_cache;
   };
 
   rawfd_state g_rawfd_state;
+#ifdef RAWFD_UNIT_TEST
+  std::atomic<int> g_rawfd_test_alloc_calls { 0 };
+  std::atomic<int> g_rawfd_test_alloc_retries { 0 };
+  std::atomic<bool> g_rawfd_test_force_persistent_primary_absent { false };
+  std::vector<int> g_rawfd_test_purge_events;
+  constexpr int RAWFD_TEST_EVENT_SECONDARY_ERASE = 1;
+  constexpr int RAWFD_TEST_EVENT_FREE_BUFFER = 2;
+#endif
 
 #if !defined (NDEBUG)
   std::atomic<int64_t> g_rawfd_fault_inject_spill_writes { 0 };
@@ -445,6 +475,14 @@ namespace
   {
     return lhs.boot_incarnation == rhs.boot_incarnation && lhs.file_seq == rhs.file_seq;
   }
+  void free_db_page_buffer (PAGE_PTR page_p) noexcept;
+
+  struct rawfd_purge_item
+  {
+    temp_page_store::rawfd_sec_key sec_key {};
+    PAGE_PTR page_p { NULL };
+  };
+
 
   void
   purge_cached_pages_locked (const temp_page_store::raw_fd_key &key) noexcept
@@ -457,27 +495,62 @@ namespace
 				    g_rawfd_state.read_cache.end ());
   }
   void
-  purge_fixed_pages_locked (const temp_page_store::raw_fd_key &key) noexcept
+  purge_fixed_pages_for_key (const temp_page_store::raw_fd_key &key) noexcept
   {
-    for (auto it = g_rawfd_state.fixed_pages.begin (); it != g_rawfd_state.fixed_pages.end ();)
+    std::vector<rawfd_purge_item> purge_items;
+
+    {
+      std::lock_guard<std::mutex> fixed_pages_guard (g_rawfd_state.fixed_pages_mutex);
+
+      for (const auto &fixed : g_rawfd_state.fixed_pages)
+	{
+	  const rawfd_fixed_page &entry = fixed.second;
+	  if (entry.file == NULL || !rawfd_key_equals (entry.file->key (), key))
+	    {
+	      continue;
+	    }
+
+	  if (entry.ref_count > 0)
+	    {
+	      er_log_debug (ARG_FILE_LINE, "RAWFD: skipping fixed page purge for referenced page %d (ref_count=%d)",
+			    entry.page_index, entry.ref_count);
+	      continue;
+	    }
+
+	  purge_items.push_back (rawfd_purge_item { rawfd_make_sec_key (key, entry.page_index), entry.page_p });
+	}
+
+      for (const rawfd_purge_item &item : purge_items)
+	{
+	  const auto sec_it = g_rawfd_state.fixed_secondary_index.find (item.sec_key);
+	  if (sec_it != g_rawfd_state.fixed_secondary_index.end () && sec_it->second == item.page_p)
+	    {
+	      g_rawfd_state.fixed_secondary_index.erase (sec_it);
+#ifdef RAWFD_UNIT_TEST
+	      g_rawfd_test_purge_events.push_back (RAWFD_TEST_EVENT_SECONDARY_ERASE);
+#endif
+	    }
+	}
+
+      for (const rawfd_purge_item &item : purge_items)
+	{
+	  g_rawfd_state.fixed_pages.erase (item.page_p);
+	}
+    }
+
+    for (const rawfd_purge_item &item : purge_items)
       {
-	if (it->second.file != NULL && rawfd_key_equals (it->second.file->key (), key))
-	  {
-	    PAGE_PTR page_p = it->second.page_p;
-	    it = g_rawfd_state.fixed_pages.erase (it);
-	    free (page_p);
-	  }
-	else
-	  {
-	    ++it;
-	  }
+#ifdef RAWFD_UNIT_TEST
+	g_rawfd_test_purge_events.push_back (RAWFD_TEST_EVENT_FREE_BUFFER);
+#endif
+	free_db_page_buffer (item.page_p);
       }
   }
+
   void
   purge_fixed_and_cached_pages_locked (const temp_page_store::raw_fd_key &key) noexcept
   {
-    std::lock_guard<std::mutex> fixed_pages_guard (g_rawfd_state.fixed_pages_mutex);
-    purge_fixed_pages_locked (key);
+    purge_fixed_pages_for_key (key);
 
     std::lock_guard<std::mutex> read_cache_guard (g_rawfd_state.read_cache_mutex);
     purge_cached_pages_locked (key);
@@ -514,7 +587,6 @@ namespace
 	entry.tfile_owner->raw_fd_next_pageid = 0;
       }
 
-    purge_fixed_and_cached_pages_locked (entry.key);
     entry.fd = -1;
     entry.owner = NULL;
     entry.tfile_owner = NULL;
@@ -525,11 +597,18 @@ namespace
   void
   close_unlink_snapshot (rawfd_file_snapshot &snapshot) noexcept
   {
+    if (snapshot.owner != NULL)
+      {
+	snapshot.owner->mark_destroyed ();
+      }
+
     if (snapshot.fd >= 0)
       {
 	(void) close (snapshot.fd);
 	snapshot.fd = -1;
       }
+
+    purge_fixed_and_cached_pages_locked (snapshot.key);
 
     if (!snapshot.path.empty ())
       {
@@ -818,61 +897,137 @@ namespace
     return false;
   }
 
+  bool
+  rawfd_alloc_retry (int &retry_count) noexcept
+  {
+    if (retry_count >= RAWFD_ALLOC_MAX_RETRIES)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return false;
+      }
+
+    retry_count++;
+    perfmon_inc_stat_to_global (PSTAT_RAWFD_ALLOC_RETRY);
+#ifdef RAWFD_UNIT_TEST
+    g_rawfd_test_alloc_retries.fetch_add (1, std::memory_order_relaxed);
+#endif
+    if (retry_count <= 8)
+      {
+	_mm_pause ();
+      }
+    else
+      {
+	(void) sched_yield ();
+      }
+
+    return true;
+  }
+
   PAGE_PTR
   rawfd_alloc_fixed_page (temp_page_store::raw_fd_file *file, PAGEID page_index, bool zero_page,
 			  bool *reused_out = nullptr)
   {
+    perfmon_inc_stat_to_global (PSTAT_RAWFD_ALLOC_CALLS);
+#ifdef RAWFD_UNIT_TEST
+    g_rawfd_test_alloc_calls.fetch_add (1, std::memory_order_relaxed);
+#endif
+
     if (reused_out != nullptr)
       {
 	*reused_out = false;
       }
 
-    {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-      for (auto &fixed : g_rawfd_state.fixed_pages)
-	{
-	  if (rawfd_same_fixed_page (fixed.second, file, page_index))
-	    {
-	      fixed.second.ref_count++;
-	      if (reused_out != nullptr)
-		{
-		  *reused_out = true;
-		}
-	      return fixed.second.page_p;
-	    }
-	}
-    }
-
-    PAGE_PTR page_p = alloc_db_page_buffer ();
-    if (page_p == NULL)
+    if (file == NULL || page_index < 0 || file->destroyed ())
       {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
 	return NULL;
       }
 
-    if (zero_page)
-      {
-	memset (page_p, 0, DB_PAGESIZE);
-	QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
-	put_page_header (page_p, &page_header);
-      }
+    const temp_page_store::rawfd_sec_key sec_key = rawfd_make_sec_key (file->key (), page_index);
+    PAGE_PTR allocated_page = NULL;
+    int retry_count = 0;
 
-    std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
-    for (auto &fixed : g_rawfd_state.fixed_pages)
+    for (;;)
       {
-	if (rawfd_same_fixed_page (fixed.second, file, page_index))
+	{
+	  std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+	  if (file->destroyed ())
+	    {
+	      if (allocated_page != NULL)
+		{
+		  free_db_page_buffer (allocated_page);
+		}
+	      return NULL;
+	    }
+#ifdef RAWFD_UNIT_TEST
+	  if (g_rawfd_test_force_persistent_primary_absent.load (std::memory_order_acquire))
+	    {
+	      g_rawfd_state.fixed_secondary_index[sec_key] = reinterpret_cast<PAGE_PTR> (static_cast<uintptr_t> (1));
+	    }
+#endif
+
+	  const auto sec_it = g_rawfd_state.fixed_secondary_index.find (sec_key);
+	  if (sec_it != g_rawfd_state.fixed_secondary_index.end ())
+	    {
+	      PAGE_PTR candidate_page = sec_it->second;
+	      const auto primary_it = g_rawfd_state.fixed_pages.find (candidate_page);
+	      if (primary_it != g_rawfd_state.fixed_pages.end ()
+		  && rawfd_fixed_page_matches_sec_key (primary_it->second, sec_key))
+		{
+		  if (primary_it->second.file != NULL && primary_it->second.file->destroyed ())
+		    {
+		      if (allocated_page != NULL)
+			{
+			  free_db_page_buffer (allocated_page);
+			}
+		      return NULL;
+		    }
+
+		  primary_it->second.ref_count++;
+		  if (reused_out != nullptr)
+		    {
+		      *reused_out = true;
+		    }
+		  if (allocated_page != NULL)
+		    {
+		      free_db_page_buffer (allocated_page);
+		    }
+		  return primary_it->second.page_p;
+		}
+
+	      g_rawfd_state.fixed_secondary_index.erase (sec_it);
+	      if (!rawfd_alloc_retry (retry_count))
+		{
+		  if (allocated_page != NULL)
+		    {
+		      free_db_page_buffer (allocated_page);
+		    }
+		  return NULL;
+		}
+	      continue;
+	    }
+
+	  if (allocated_page != NULL)
+	    {
+	      g_rawfd_state.fixed_pages[allocated_page] = rawfd_fixed_page { file, page_index, allocated_page, 1 };
+	      g_rawfd_state.fixed_secondary_index.emplace (sec_key, allocated_page);
+	      return allocated_page;
+	    }
+	}
+
+	allocated_page = alloc_db_page_buffer ();
+	if (allocated_page == NULL)
 	  {
-	    fixed.second.ref_count++;
-	    if (reused_out != nullptr)
-	      {
-		*reused_out = true;
-	      }
-	    free_db_page_buffer (page_p);
-	    return fixed.second.page_p;
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+	    return NULL;
+	  }
+
+	if (zero_page)
+	  {
+	    memset (allocated_page, 0, DB_PAGESIZE);
+	    QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+	    put_page_header (allocated_page, &page_header);
 	  }
       }
-    g_rawfd_state.fixed_pages[page_p] = rawfd_fixed_page { file, page_index, page_p, 1 };
-    return page_p;
   }
 
   rawfd_fixed_page
@@ -885,6 +1040,7 @@ namespace
 	return rawfd_fixed_page {};
       }
 
+
     if (it->second.ref_count > 1)
       {
 	it->second.ref_count--;
@@ -894,6 +1050,15 @@ namespace
       }
 
     rawfd_fixed_page entry = it->second;
+    temp_page_store::rawfd_sec_key sec_key {};
+    if (rawfd_make_sec_key (entry, sec_key))
+      {
+	const auto sec_it = g_rawfd_state.fixed_secondary_index.find (sec_key);
+	if (sec_it != g_rawfd_state.fixed_secondary_index.end () && sec_it->second == entry.page_p)
+	  {
+	    g_rawfd_state.fixed_secondary_index.erase (sec_it);
+	  }
+      }
     g_rawfd_state.fixed_pages.erase (it);
     return entry;
   }
@@ -904,6 +1069,10 @@ namespace
     std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
     const auto it = g_rawfd_state.fixed_pages.find (page_p);
     if (it == g_rawfd_state.fixed_pages.end ())
+      {
+	return false;
+      }
+    if (it->second.file != NULL && it->second.file->destroyed ())
       {
 	return false;
       }
@@ -1254,10 +1423,22 @@ namespace temp_page_store
   {
     return m_fd >= 0;
   }
+  bool
+  raw_fd_file::destroyed () const noexcept
+  {
+    return m_destroyed.load (std::memory_order_acquire);
+  }
+
+  void
+  raw_fd_file::mark_destroyed () noexcept
+  {
+    m_destroyed.store (true, std::memory_order_release);
+  }
 
   void
   raw_fd_file::close_and_unlink () noexcept
   {
+    m_destroyed.store (true, std::memory_order_release);
     if (m_fd >= 0)
       {
 	(void) close (m_fd);
@@ -1403,7 +1584,6 @@ namespace temp_page_store
 	  snapshot.owner_tran_index = file_p->owner_tran_index ();
 	  snapshot.owner = file_p;
 	  snapshot.fd = file_p->detach_for_unlink (snapshot.path);
-	  purge_fixed_and_cached_pages_locked (key);
 	}
     }
 
@@ -1553,6 +1733,11 @@ namespace temp_page_store
   int
   rawfd_write_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index, PAGE_PTR page_p) noexcept
   {
+    if (file.destroyed ())
+      {
+	return ER_FAILED;
+      }
+
     if (!file.is_open () || page_p == NULL || page_index < 0)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
@@ -1664,6 +1849,11 @@ rawfd_write_success:
   PAGE_PTR
   rawfd_pos_read (THREAD_ENTRY * thread_p, raw_fd_file &file, const raw_fd_page_coordinate &coordinate) noexcept
   {
+    if (file.destroyed ())
+      {
+	return NULL;
+      }
+
     if (!file.is_open () || coordinate.raw_fd_segment_id != file.segment_id () || coordinate.page_index < 0)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
@@ -1747,6 +1937,11 @@ rawfd_write_success:
   void
   rawfd_invalidate_cached_page (raw_fd_file &file, PAGEID page_index) noexcept
   {
+    if (file.destroyed ())
+      {
+	return;
+      }
+
     std::lock_guard<std::mutex> guard (g_rawfd_state.read_cache_mutex);
     g_rawfd_state.read_cache.erase (std::remove_if (g_rawfd_state.read_cache.begin (), g_rawfd_state.read_cache.end (),
 						    [&file, page_index] (const rawfd_cached_page &entry)
@@ -1781,7 +1976,7 @@ rawfd_write_success:
     rawfd_fixed_page fixed = rawfd_take_fixed_page (page_p);
     if (fixed.page_p != NULL)
       {
-	if (fixed.dirty)
+	if (fixed.dirty && fixed.file != NULL && !fixed.file->destroyed ())
 	  {
 	    const int error = rawfd_rewrite_page (thread_p, *fixed.file, fixed.page_index, fixed.page_p);
 	    if (error != NO_ERROR)
@@ -1795,6 +1990,215 @@ rawfd_write_success:
     return NO_ERROR;
   }
 
+#ifdef RAWFD_UNIT_TEST
+  void
+  rawfd_test_reset_registry () noexcept
+  {
+    std::vector<PAGE_PTR> pages_to_free;
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      for (const auto &fixed : g_rawfd_state.fixed_pages)
+	{
+	  if (fixed.second.page_p != NULL)
+	    {
+	      pages_to_free.push_back (fixed.second.page_p);
+	    }
+	}
+      g_rawfd_state.fixed_pages.clear ();
+      g_rawfd_state.fixed_secondary_index.clear ();
+      g_rawfd_test_force_persistent_primary_absent.store (false, std::memory_order_release);
+      g_rawfd_test_alloc_calls.store (0, std::memory_order_relaxed);
+      g_rawfd_test_alloc_retries.store (0, std::memory_order_relaxed);
+      g_rawfd_test_purge_events.clear ();
+    }
+
+    for (PAGE_PTR page_p : pages_to_free)
+      {
+	free_db_page_buffer (page_p);
+      }
+
+    {
+      std::lock_guard<std::mutex> cache_guard (g_rawfd_state.read_cache_mutex);
+      g_rawfd_state.read_cache.clear ();
+    }
+  }
+
+  void
+  rawfd_test_init_file (raw_fd_file &file, std::uint64_t file_seq) noexcept
+  {
+    file.m_key.boot_incarnation = 1;
+    file.m_key.file_seq = file_seq;
+    file.m_segment_id = file_seq;
+    file.m_destroyed.store (false, std::memory_order_release);
+  }
+
+  int
+  rawfd_test_t1_hash_collision () noexcept
+  {
+    rawfd_test_reset_registry ();
+
+    raw_fd_file first;
+    raw_fd_file second;
+    rawfd_test_init_file (first, 0);
+    rawfd_test_init_file (second, 0x9E3779B97F4A7C15ULL);
+
+    const temp_page_store::rawfd_sec_key first_key = rawfd_make_sec_key (first.key (), 0);
+    const temp_page_store::rawfd_sec_key second_key = rawfd_make_sec_key (second.key (), 1);
+    if (std::hash<temp_page_store::rawfd_sec_key> {} (first_key)
+	!= std::hash<temp_page_store::rawfd_sec_key> {} (second_key))
+      {
+	rawfd_test_reset_registry ();
+	return ER_FAILED;
+      }
+
+    PAGE_PTR first_page = rawfd_alloc_fixed_page (&first, 0, true);
+    PAGE_PTR second_page = rawfd_alloc_fixed_page (&second, 1, true);
+    bool ok = first_page != NULL && second_page != NULL && first_page != second_page;
+
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      ok = ok && g_rawfd_state.fixed_pages.size () == 2 && g_rawfd_state.fixed_secondary_index.size () == 2
+	   && g_rawfd_state.fixed_secondary_index[first_key] == first_page
+	   && g_rawfd_state.fixed_secondary_index[second_key] == second_page;
+    }
+
+    rawfd_test_reset_registry ();
+    return ok ? NO_ERROR : ER_FAILED;
+  }
+
+  int
+  rawfd_test_t2_aba_validation () noexcept
+  {
+    rawfd_test_reset_registry ();
+
+    raw_fd_file request_file;
+    raw_fd_file other_file;
+    rawfd_test_init_file (request_file, 10);
+    rawfd_test_init_file (other_file, 11);
+
+    const PAGEID request_page = 20;
+    const temp_page_store::rawfd_sec_key request_key = rawfd_make_sec_key (request_file.key (), request_page);
+    PAGE_PTR stale_page = alloc_db_page_buffer ();
+    if (stale_page == NULL)
+      {
+	return ER_FAILED;
+      }
+
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      g_rawfd_state.fixed_pages[stale_page] = rawfd_fixed_page { &other_file, 21, stale_page, 1 };
+      g_rawfd_state.fixed_secondary_index[request_key] = stale_page;
+    }
+
+    PAGE_PTR fresh_page = rawfd_alloc_fixed_page (&request_file, request_page, true);
+    bool ok = fresh_page != NULL && fresh_page != stale_page
+	      && g_rawfd_test_alloc_retries.load (std::memory_order_relaxed) == 1;
+
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      const auto sec_it = g_rawfd_state.fixed_secondary_index.find (request_key);
+      ok = ok && sec_it != g_rawfd_state.fixed_secondary_index.end () && sec_it->second == fresh_page;
+    }
+
+    rawfd_test_reset_registry ();
+    return ok ? NO_ERROR : ER_FAILED;
+  }
+
+  int
+  rawfd_test_t3_retry_bound () noexcept
+  {
+    rawfd_test_reset_registry ();
+
+    raw_fd_file file;
+    rawfd_test_init_file (file, 22);
+    g_rawfd_test_force_persistent_primary_absent.store (true, std::memory_order_release);
+
+    PAGE_PTR page_p = rawfd_alloc_fixed_page (&file, 23, true);
+    const bool ok = page_p == NULL
+		    && g_rawfd_test_alloc_calls.load (std::memory_order_relaxed) == 1
+		    && g_rawfd_test_alloc_retries.load (std::memory_order_relaxed) == RAWFD_ALLOC_MAX_RETRIES;
+
+    g_rawfd_test_force_persistent_primary_absent.store (false, std::memory_order_release);
+    rawfd_test_reset_registry ();
+    return ok ? NO_ERROR : ER_FAILED;
+  }
+
+  int
+  rawfd_test_t4_destroyed_gate () noexcept
+  {
+    rawfd_test_reset_registry ();
+
+    raw_fd_file file;
+    rawfd_test_init_file (file, 24);
+    file.m_destroyed.store (true, std::memory_order_release);
+
+    PAGE_PTR page_p = rawfd_alloc_fixed_page (&file, 25, true);
+    bool ok = page_p == NULL;
+
+    PAGE_PTR fixed_page = alloc_db_page_buffer ();
+    if (fixed_page == NULL)
+      {
+	rawfd_test_reset_registry ();
+	return ER_FAILED;
+      }
+
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      g_rawfd_state.fixed_pages[fixed_page] = rawfd_fixed_page { &file, 26, fixed_page, 1 };
+      g_rawfd_state.fixed_secondary_index[rawfd_make_sec_key (file.key (), 26)] = fixed_page;
+    }
+
+    ok = ok && !rawfd_find_and_mark_dirty (fixed_page)
+	 && rawfd_release_fixed_page (NULL, NULL, fixed_page) == NO_ERROR
+	 && rawfd_write_page (NULL, file, 26, fixed_page) == ER_FAILED
+	 && rawfd_pos_read (NULL, file, raw_fd_page_coordinate { file.segment_id (), 26, 0 }) == NULL;
+
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      ok = ok && g_rawfd_state.fixed_pages.find (fixed_page) == g_rawfd_state.fixed_pages.end ()
+	   && g_rawfd_state.fixed_secondary_index.find (rawfd_make_sec_key (file.key (), 26))
+	      == g_rawfd_state.fixed_secondary_index.end ();
+    }
+
+    rawfd_test_reset_registry ();
+    return ok ? NO_ERROR : ER_FAILED;
+  }
+
+  int
+  rawfd_test_t5_purge_order () noexcept
+  {
+    rawfd_test_reset_registry ();
+
+    raw_fd_file file;
+    rawfd_test_init_file (file, 30);
+    PAGE_PTR page_p = rawfd_alloc_fixed_page (&file, 31, true);
+    if (page_p == NULL)
+      {
+	rawfd_test_reset_registry ();
+	return ER_FAILED;
+      }
+
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      g_rawfd_state.fixed_pages[page_p].ref_count = 0;
+      g_rawfd_test_purge_events.clear ();
+    }
+
+    purge_fixed_pages_for_key (file.key ());
+
+    bool ok = false;
+    {
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
+      ok = g_rawfd_state.fixed_pages.empty () && g_rawfd_state.fixed_secondary_index.empty ()
+	   && g_rawfd_test_purge_events.size () == 2
+	   && g_rawfd_test_purge_events[0] == RAWFD_TEST_EVENT_SECONDARY_ERASE
+	   && g_rawfd_test_purge_events[1] == RAWFD_TEST_EVENT_FREE_BUFFER;
+    }
+
+    rawfd_test_reset_registry ();
+    return ok ? NO_ERROR : ER_FAILED;
+  }
+#endif /* RAWFD_UNIT_TEST */
   int
   rawfd_single_worker_tde_positioned_read_parity (THREAD_ENTRY * thread_p) noexcept
   {

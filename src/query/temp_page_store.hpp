@@ -29,6 +29,8 @@
 #include "system.h"
 #include "thread_compat.hpp"
 
+#include <atomic>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -70,6 +72,17 @@ namespace temp_page_store
     std::uint64_t boot_incarnation;
     std::uint64_t file_seq;
   };
+  struct rawfd_sec_key
+  {
+    std::uint64_t file_seq;
+    PAGEID page_index;
+
+    bool operator== (const rawfd_sec_key &other) const noexcept
+    {
+      return file_seq == other.file_seq && page_index == other.page_index;
+    }
+  };
+
 
   struct raw_fd_page_coordinate
   {
@@ -99,6 +112,8 @@ namespace temp_page_store
       std::uint64_t segment_id () const noexcept;
       raw_fd_access_hint access_hint () const noexcept;
       bool is_open () const noexcept;
+      bool destroyed () const noexcept;
+      void mark_destroyed () noexcept;
       void close_and_unlink () noexcept;
       void attach_temp_file (QMGR_TEMP_FILE * tfile_p) noexcept;
       int detach_for_unlink (std::string &path_out) noexcept;
@@ -115,6 +130,16 @@ namespace temp_page_store
       friend int rawfd_rewrite_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index,
                                      PAGE_PTR page_p) noexcept;
 
+#ifdef RAWFD_UNIT_TEST
+      friend void rawfd_test_init_file (raw_fd_file &file, std::uint64_t file_seq) noexcept;
+#endif
+#ifdef RAWFD_UNIT_TEST
+      friend int rawfd_test_t1_hash_collision () noexcept;
+      friend int rawfd_test_t2_aba_validation () noexcept;
+      friend int rawfd_test_t3_retry_bound () noexcept;
+      friend int rawfd_test_t4_destroyed_gate () noexcept;
+      friend int rawfd_test_t5_purge_order () noexcept;
+#endif
       int m_fd;
       std::string m_path;
       QUERY_ID m_query_id;
@@ -124,6 +149,7 @@ namespace temp_page_store
       std::uint64_t m_segment_id;
       bool m_tde_encrypted;
       QMGR_TEMP_FILE *m_tfile_owner;
+      std::atomic<bool> m_destroyed { false };
   };
 
   bool raw_fd_master_enabled () noexcept;
@@ -148,6 +174,13 @@ namespace temp_page_store
   int rawfd_single_worker_tde_positioned_read_parity (THREAD_ENTRY * thread_p) noexcept;
   int rawfd_mutation_nonce_selftest (THREAD_ENTRY * thread_p) noexcept;
   int qmgr_temp_file_move_selftest (THREAD_ENTRY * thread_p) noexcept;
+#ifdef RAWFD_UNIT_TEST
+  int rawfd_test_t1_hash_collision () noexcept;
+  int rawfd_test_t2_aba_validation () noexcept;
+  int rawfd_test_t3_retry_bound () noexcept;
+  int rawfd_test_t4_destroyed_gate () noexcept;
+  int rawfd_test_t5_purge_order () noexcept;
+#endif
 
   PAGE_PTR alloc_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p);
   PAGE_PTR fix_old_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p);
@@ -173,4 +206,17 @@ namespace temp_page_store
   std::size_t position_budget_bytes () noexcept;
 }
 
+namespace std
+{
+  template <>
+  struct hash<temp_page_store::rawfd_sec_key>
+  {
+    std::size_t operator() (const temp_page_store::rawfd_sec_key &key) const noexcept
+    {
+      const std::uint64_t page_component = static_cast<std::uint64_t> (static_cast<std::int64_t> (key.page_index));
+      const std::uint64_t h = key.file_seq ^ (page_component * 0x9E3779B97F4A7C15ULL);
+      return static_cast<std::size_t> (h ^ (h >> 32));
+    }
+  };
+}
 #endif /* _TEMP_PAGE_STORE_HPP_ */

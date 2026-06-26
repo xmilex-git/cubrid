@@ -21,6 +21,7 @@
 # - some: cmake -DUNIT_TEST_ABC=ON -DUNIT_TEST_XYZ=ON <path>
 
 project(Test)
+enable_testing()
 
 set(TEST_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
 
@@ -32,6 +33,7 @@ set (TEST_INCLUDES
 option (UNIT_TEST_MEMORY_ALLOC  "Unit testing: memory allocation")
 option (UNIT_TEST_STRING_BUFFER "Unit testing: string buffer with format")
 option (UNIT_TEST_LOCKFREE "Unit testing: lockfree module")
+option (UNIT_TEST_RAWFD "Unit testing: rawfd registry")
 option (UNIT_TEST_THREAD "Unit testing: thread module")
 option (UNIT_TEST_PACKING "Unit testing: packing")
 option (UNIT_TEST_RESOURCE_TRACKER "Unit testing: resource tracker")
@@ -77,6 +79,10 @@ if (UNIT_TESTS OR UNIT_TEST_LOCKFREE)
   add_subdirectory(lockfree)
 endif (UNIT_TESTS OR UNIT_TEST_LOCKFREE)
 ]]
+if (UNIT_TESTS OR UNIT_TEST_RAWFD)
+  message("    rawfd")
+  add_subdirectory(rawfd)
+endif(UNIT_TESTS OR UNIT_TEST_RAWFD)
 
 if (UNIT_TESTS OR UNIT_TEST_THREAD)
   message("    thread")
