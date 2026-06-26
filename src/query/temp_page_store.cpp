@@ -172,7 +172,9 @@ namespace
   struct rawfd_state
   {
     std::once_flag init_once;
-    std::mutex mutex;
+    std::mutex registry_mutex;
+    std::mutex fixed_pages_mutex;
+    std::mutex read_cache_mutex;
     std::uint64_t boot_incarnation { 0 };
     std::atomic<std::uint64_t> file_seq { 0 };
     std::string scratch_root;
@@ -471,6 +473,16 @@ namespace
 	  }
       }
   }
+  void
+  purge_fixed_and_cached_pages_locked (const temp_page_store::raw_fd_key &key) noexcept
+  {
+    std::lock_guard<std::mutex> fixed_pages_guard (g_rawfd_state.fixed_pages_mutex);
+    purge_fixed_pages_locked (key);
+
+    std::lock_guard<std::mutex> read_cache_guard (g_rawfd_state.read_cache_mutex);
+    purge_cached_pages_locked (key);
+  }
+
 
 
   rawfd_file_snapshot
@@ -502,8 +514,7 @@ namespace
 	entry.tfile_owner->raw_fd_next_pageid = 0;
       }
 
-    purge_cached_pages_locked (entry.key);
-    purge_fixed_pages_locked (entry.key);
+    purge_fixed_and_cached_pages_locked (entry.key);
     entry.fd = -1;
     entry.owner = NULL;
     entry.tfile_owner = NULL;
@@ -637,14 +648,14 @@ namespace
   bool
   reserve_registry_slot (const rawfd_registry_entry &entry)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
     return g_rawfd_state.registry.emplace (registry_map_key (entry.key), entry).second;
   }
 
   void
   install_registry_fd (temp_page_store::raw_fd_file *owner, int fd)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
     const auto it = g_rawfd_state.registry.find (registry_map_key (owner->key ()));
     if (it != g_rawfd_state.registry.end ())
       {
@@ -656,7 +667,7 @@ namespace
   void
   forget_registry_slot (const temp_page_store::raw_fd_key &key)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
     g_rawfd_state.registry.erase (registry_map_key (key));
   }
 
@@ -763,7 +774,7 @@ namespace
   void
   cache_insert_decrypted_page (const temp_page_store::raw_fd_key &key, PAGEID page_index, const FILEIO_PAGE *plain)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.read_cache_mutex);
     const auto same_page = [&key, page_index] (const rawfd_cached_page &entry)
     {
       return entry.key.boot_incarnation == key.boot_incarnation && entry.key.file_seq == key.file_seq
@@ -789,7 +800,7 @@ namespace
   bool
   cache_lookup_decrypted_page (const temp_page_store::raw_fd_key &key, PAGEID page_index, PAGE_PTR out_page)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.read_cache_mutex);
     for (auto it = g_rawfd_state.read_cache.begin (); it != g_rawfd_state.read_cache.end (); ++it)
       {
 	if (it->key.boot_incarnation == key.boot_incarnation && it->key.file_seq == key.file_seq
@@ -817,7 +828,7 @@ namespace
       }
 
     {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
       for (auto &fixed : g_rawfd_state.fixed_pages)
 	{
 	  if (rawfd_same_fixed_page (fixed.second, file, page_index))
@@ -846,7 +857,7 @@ namespace
 	put_page_header (page_p, &page_header);
       }
 
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
     for (auto &fixed : g_rawfd_state.fixed_pages)
       {
 	if (rawfd_same_fixed_page (fixed.second, file, page_index))
@@ -867,7 +878,7 @@ namespace
   rawfd_fixed_page
   rawfd_take_fixed_page (PAGE_PTR page_p)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
     const auto it = g_rawfd_state.fixed_pages.find (page_p);
     if (it == g_rawfd_state.fixed_pages.end ())
       {
@@ -887,23 +898,10 @@ namespace
     return entry;
   }
 
-  rawfd_fixed_page
-  rawfd_find_fixed_page (PAGE_PTR page_p)
-  {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
-    const auto it = g_rawfd_state.fixed_pages.find (page_p);
-    if (it == g_rawfd_state.fixed_pages.end ())
-      {
-	return rawfd_fixed_page {};
-      }
-
-    return it->second;
-  }
-
   bool
-  rawfd_mark_fixed_page_dirty (PAGE_PTR page_p)
+  rawfd_find_and_mark_dirty (PAGE_PTR page_p)
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.fixed_pages_mutex);
     const auto it = g_rawfd_state.fixed_pages.find (page_p);
     if (it == g_rawfd_state.fixed_pages.end ())
       {
@@ -1281,7 +1279,7 @@ namespace temp_page_store
     m_tfile_owner = tfile_p;
     m_tde_encrypted = tfile_p != NULL && tfile_p->tde_encrypted;
 
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
     const auto it = g_rawfd_state.registry.find (registry_map_key (m_key));
     if (it != g_rawfd_state.registry.end ())
       {
@@ -1391,7 +1389,7 @@ namespace temp_page_store
     rawfd_file_snapshot snapshot;
     const raw_fd_key key = file_p->key ();
     {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
       const auto it = g_rawfd_state.registry.find (registry_map_key (key));
       if (it != g_rawfd_state.registry.end ())
 	{
@@ -1405,8 +1403,7 @@ namespace temp_page_store
 	  snapshot.owner_tran_index = file_p->owner_tran_index ();
 	  snapshot.owner = file_p;
 	  snapshot.fd = file_p->detach_for_unlink (snapshot.path);
-	  purge_cached_pages_locked (key);
-	  purge_fixed_pages_locked (key);
+	  purge_fixed_and_cached_pages_locked (key);
 	}
     }
 
@@ -1423,7 +1420,7 @@ namespace temp_page_store
 
     ensure_rawfd_state ();
 
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
     file_p->m_tfile_owner = new_owner;
     file_p->m_tde_encrypted = new_owner != NULL && new_owner->tde_encrypted;
 
@@ -1441,7 +1438,7 @@ namespace temp_page_store
 
     std::vector<rawfd_file_snapshot> snapshots;
     {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
       for (auto it = g_rawfd_state.registry.begin (); it != g_rawfd_state.registry.end ();)
 	{
 	  if (it->second.owner_tran_index == owner_tran_index && it->second.query_id == query_id)
@@ -1489,7 +1486,7 @@ namespace temp_page_store
     std::vector<rawfd_registry_entry> registry_candidates;
     std::set<std::uint64_t> registered_keys;
     {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
       for (const auto &kv : g_rawfd_state.registry)
 	{
 	  registered_keys.insert (kv.first);
@@ -1514,7 +1511,7 @@ namespace temp_page_store
 
     std::vector<rawfd_file_snapshot> snapshots;
     {
-      std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+      std::lock_guard<std::mutex> guard (g_rawfd_state.registry_mutex);
       for (const std::uint64_t map_key : registry_keys_to_reap)
 	{
 	  const auto it = g_rawfd_state.registry.find (map_key);
@@ -1750,7 +1747,7 @@ rawfd_write_success:
   void
   rawfd_invalidate_cached_page (raw_fd_file &file, PAGEID page_index) noexcept
   {
-    std::lock_guard<std::mutex> guard (g_rawfd_state.mutex);
+    std::lock_guard<std::mutex> guard (g_rawfd_state.read_cache_mutex);
     g_rawfd_state.read_cache.erase (std::remove_if (g_rawfd_state.read_cache.begin (), g_rawfd_state.read_cache.end (),
 						    [&file, page_index] (const rawfd_cached_page &entry)
     {
@@ -1764,13 +1761,7 @@ rawfd_write_success:
   rawfd_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept
   {
     (void) tfile_p;
-    rawfd_fixed_page fixed = rawfd_find_fixed_page (page_p);
-    if (fixed.file == NULL)
-      {
-	return NO_ERROR;
-      }
-
-    if (!rawfd_mark_fixed_page_dirty (page_p))
+    if (!rawfd_find_and_mark_dirty (page_p))
       {
 	return NO_ERROR;
       }
