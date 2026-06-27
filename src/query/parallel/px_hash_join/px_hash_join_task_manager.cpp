@@ -34,6 +34,7 @@
 #include "query_hash_scan.h"
 #include "query_manager.h"		/* qmgr_get_old_page, qmgr_free_old_page_and_init, ... */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
+#include <unordered_map>
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -42,6 +43,82 @@ namespace parallel_query
 {
   namespace hash_join
   {
+    namespace
+    {
+      std::mutex sector_scan_list_id_mutex;
+      std::unordered_map<QFILE_LIST_SECTOR_SCAN_INFO *, QFILE_LIST_ID *> sector_scan_list_ids;
+
+      bool
+      has_raw_fd_overflow_pages (const QMGR_TEMP_FILE *tfile)
+      {
+	return tfile != nullptr && tfile->backing == qmgr_temp_backing::RAW_FD_OVERFLOW && tfile->raw_fd_handle != nullptr
+	  && tfile->raw_fd_next_pageid > tfile->membuf_last + 1;
+      }
+
+      QFILE_LIST_ID *
+      get_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan)
+      {
+	std::lock_guard<std::mutex> lock (sector_scan_list_id_mutex);
+	auto iter = sector_scan_list_ids.find (&sector_scan);
+	return iter == sector_scan_list_ids.end () ? nullptr : iter->second;
+      }
+
+      bool
+      get_raw_fd_overflow_page (QFILE_LIST_ID *list_id, int raw_fd_index, VPID &vpid, QMGR_TEMP_FILE *&tfile)
+      {
+	if (raw_fd_index < 0)
+	  {
+	    return false;
+	  }
+
+	for (QFILE_LIST_ID *current = list_id; current != nullptr; current = current->dependent_list_id)
+	  {
+	    QMGR_TEMP_FILE *current_tfile = current->tfile_vfid;
+	    if (!has_raw_fd_overflow_pages (current_tfile))
+	      {
+		continue;
+	      }
+
+	    const int first_pageid = current_tfile->membuf_last + 1;
+	    const int page_cnt = current_tfile->raw_fd_next_pageid - first_pageid;
+	    assert (page_cnt > 0);
+
+	    if (raw_fd_index < page_cnt)
+	      {
+		vpid.volid = NULL_VOLID;
+		vpid.pageid = first_pageid + raw_fd_index;
+		tfile = current_tfile;
+		return true;
+	      }
+
+	    raw_fd_index -= page_cnt;
+	  }
+
+	return false;
+      }
+    } // namespace
+
+    void
+    register_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan, QFILE_LIST_ID *list_id)
+    {
+      std::lock_guard<std::mutex> lock (sector_scan_list_id_mutex);
+      if (list_id == nullptr)
+	{
+	  sector_scan_list_ids.erase (&sector_scan);
+	}
+      else
+	{
+	  sector_scan_list_ids[&sector_scan] = list_id;
+	}
+    }
+
+    void
+    unregister_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan)
+    {
+      std::lock_guard<std::mutex> lock (sector_scan_list_id_mutex);
+      sector_scan_list_ids.erase (&sector_scan);
+    }
+
     /*
      * task_manager
      */
@@ -233,7 +310,10 @@ namespace parallel_query
 	  break;
 	}
 
-      /* Phase 2: sector-based disk pages */
+      /* Phase 2: sector-based disk pages.
+       * Phase 3: raw-fd overflow pages.  Ordinals claimed from next_sector_index
+       *          after sector_cnt map to [membuf_last + 1, raw_fd_next_pageid)
+       *          across the dependent_list_id chain. */
       while (true)
 	{
 	  /* find next set bit in current sector bitmap */
@@ -267,16 +347,41 @@ namespace parallel_query
 	      return page;
 	    }
 
-	  /* current sector exhausted — grab next sector atomically */
+	  /* current sector exhausted — grab next sector/raw-fd page atomically */
 	  sector_index = sector_scan.next_sector_index.fetch_add (1, std::memory_order_relaxed);
-	  if (sector_index >= sector_info->sector_cnt)
+	  if (sector_index < sector_info->sector_cnt)
 	    {
-	      return nullptr;		/* all sectors distributed */
+	      m_sector_index = sector_index;
+	      m_current_vsid = sectors[sector_index].vsid;
+	      m_current_bitmap = sectors[sector_index].page_bitmap;
+	      continue;
 	    }
 
-	  m_sector_index = sector_index;
-	  m_current_vsid = sectors[sector_index].vsid;
-	  m_current_bitmap = sectors[sector_index].page_bitmap;
+	  VPID raw_fd_vpid;
+	  QMGR_TEMP_FILE *raw_fd_tfile = nullptr;
+	  QFILE_LIST_ID *list_id = get_sector_scan_list_id (sector_scan);
+	  if (!get_raw_fd_overflow_page (list_id, sector_index - sector_info->sector_cnt, raw_fd_vpid, raw_fd_tfile))
+	    {
+	      return nullptr;		/* all sectors/raw-fd pages distributed */
+	    }
+
+	  PAGE_PTR page = qmgr_get_old_page_read_only (&thread_ref, &raw_fd_vpid, raw_fd_tfile);
+	  if (page == nullptr)
+	    {
+	      assert_release_error (er_errid () != NO_ERROR);
+	      return nullptr;
+	    }
+
+	  /* skip overflow continuation pages — they are followed via VPID chain
+	   * by the worker that owns the overflow start page */
+	  if (QFILE_GET_TUPLE_COUNT (page) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG)
+	    {
+	      qmgr_free_old_page_and_init (&thread_ref, page, raw_fd_tfile);
+	      continue;
+	    }
+
+	  m_current_tfile = raw_fd_tfile;
+	  return page;
 	}
     }
 
