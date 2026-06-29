@@ -36,6 +36,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <string>
+
+#include <unistd.h>
+#include <sys/stat.h>
 
 namespace
 {
@@ -108,6 +112,279 @@ namespace
     ts.append_tape (t2);
 
     expected = { 0, 1, 2, 3, 4, 5, 6, 7 };
+  }
+
+  /* ---- Phase1 1B (issue #71) file-backed helpers ------------------- */
+
+  /* A DB_PAGESIZE list page (the BufFile reads/writes full 16KB pages, unlike
+   * the 1A in-RAM tapes that only needed a small header buffer). */
+  char *
+  make_db_page (const std::vector<int> &ids)
+  {
+    char *page = (char *) malloc (DB_PAGESIZE);
+    std::memset (page, 0, DB_PAGESIZE);
+
+    int n = (int) ids.size ();
+    QFILE_PUT_TUPLE_COUNT (page, n);
+    QFILE_PUT_PREV_VPID_NULL (page);
+    QFILE_PUT_NEXT_VPID_NULL (page);
+    QFILE_PUT_OVERFLOW_VPID_NULL (page);
+
+    int off = QFILE_PAGE_HEADER_SIZE;
+    int prev_len = 0;
+    for (int i = 0; i < n; i++)
+      {
+	char *tpl = page + off;
+	QFILE_PUT_TUPLE_LENGTH (tpl, TEST_TUPLE_LEN);
+	QFILE_PUT_PREV_TUPLE_LENGTH (tpl, prev_len);
+	OR_PUT_INT (tpl + TEST_ID_OFFSET, ids[i]);
+	QFILE_PUT_LAST_TUPLE_OFFSET (page, off);
+	prev_len = TEST_TUPLE_LEN;
+	off += TEST_TUPLE_LEN;
+      }
+    return page;
+  }
+
+  const char *
+  test_scratch_dir ()
+  {
+    static std::string dir;
+    if (dir.empty ())
+      {
+	char buf[256];
+	std::snprintf (buf, sizeof (buf), "/tmp/cubrid_buffile_ut_%ld", (long) getpid ());
+	dir = buf;
+      }
+    return dir.c_str ();
+  }
+
+  struct writer_result
+  {
+    qfile::tape *tape;		/* frozen tape (caller owns / hands to a tapeset) */
+    bool spilled;
+    long producer_pgbuf_fixes;	/* MUST be 0 (producer-side pgbuf-bypass) */
+    long pages_appended_to_file;
+    int file_pages;
+  };
+
+  /* Drive a tape_writer over `pages` with the given prefix budget; freeze.
+   * Producer metrics are snapshotted before freeze (which transfers the
+   * BufFile out of the writer). */
+  writer_result
+  build_writer_tape (int budget, const std::vector<std::vector<int> > &pages)
+  {
+    static std::uint64_t seq = 1000;
+    writer_result r = { NULL, false, -1, 0, 0 };
+
+    qfile::tape_writer w (budget, TDE_ALGORITHM_NONE, test_scratch_dir (), seq++, 0);
+    for (const std::vector<int> &ids : pages)
+      {
+	char *p = make_db_page (ids);
+	int rc = w.append_page (NULL, (PAGE_PTR) p);
+	free (p);
+	if (rc != NO_ERROR)
+	  {
+	    return r;		/* tape == NULL signals failure */
+	  }
+      }
+
+    r.spilled = w.spilled ();
+    r.file_pages = w.file_pages ();
+    if (r.spilled && w.file_metrics () != NULL)
+      {
+	r.producer_pgbuf_fixes = w.file_metrics ()->pgbuf_fixes;
+	r.pages_appended_to_file = w.file_metrics ()->pages_appended;
+      }
+    else
+      {
+	r.producer_pgbuf_fixes = 0;
+      }
+    r.tape = w.freeze (NULL);
+    return r;
+  }
+
+  int
+  scan_forward_ids (qfile::tapeset &ts, std::vector<int> &out, long *scan_pgbuf_fixes)
+  {
+    qfile::tapeset_scan scan (&ts);
+    QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+    SCAN_CODE code;
+    while ((code = scan.forward (NULL, &tplrec, PEEK)) == S_SUCCESS)
+      {
+	out.push_back (tuple_id (tplrec.tpl));
+      }
+    if (scan_pgbuf_fixes != NULL)
+      {
+	*scan_pgbuf_fixes = scan.metrics ().pgbuf_fixes;
+      }
+    scan.close (NULL);
+    return (code == S_END) ? 0 : 1;
+  }
+
+  /* G8: a spilled file-backed Tape returns identical tuples forward (robust
+   * parity) and reversed backward; producer + scan do 0 pgbuf fixes. */
+  int
+  run_file_parity ()
+  {
+    std::vector<std::vector<int> > pages = {
+      { 0, 1, 2 }, { 3, 4 }, { 5, 6, 7, 8 }, { 9 }, { 10, 11 }, { 12 }
+    };
+    std::vector<int> expected;
+    for (const std::vector<int> &p : pages)
+      {
+	for (int id : p)
+	  {
+	    expected.push_back (id);
+	  }
+      }
+
+    writer_result wr = build_writer_tape (/*budget*/ 2, pages);
+    if (wr.tape == NULL)
+      {
+	return 1;
+      }
+    if (!wr.spilled || wr.file_pages != 4 || wr.producer_pgbuf_fixes != 0)
+      {
+	delete wr.tape;
+	return 2;
+      }
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    ts.append_tape (wr.tape);
+
+    /* forward parity */
+    std::vector<int> got;
+    long scan_fixes = -1;
+    if (scan_forward_ids (ts, got, &scan_fixes) != 0 || got != expected || scan_fixes != 0)
+      {
+	return 3;
+      }
+
+    /* backward == reversed */
+    {
+      qfile::tapeset_scan scan (&ts);
+      QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+      SCAN_CODE code;
+      while ((code = scan.forward (NULL, &tplrec, PEEK)) == S_SUCCESS)
+	{
+	  ;
+	}
+      if (code != S_END)
+	{
+	  return 4;
+	}
+      std::vector<int> back;
+      while ((code = scan.backward (NULL, &tplrec, PEEK)) == S_SUCCESS)
+	{
+	  back.push_back (tuple_id (tplrec.tpl));
+	}
+      std::vector<int> reversed (expected.rbegin (), expected.rend ());
+      if (code != S_END || back != reversed || scan.metrics ().pgbuf_fixes != 0)
+	{
+	  return 5;
+	}
+      scan.close (NULL);
+    }
+
+    /* save + jump across the spill boundary (prefix page 1 -> file pages) */
+    {
+      qfile::tapeset_scan scan (&ts);
+      QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+      std::vector<QFILE_TUPLE_POSITION> positions;
+      SCAN_CODE code;
+      while ((code = scan.forward (NULL, &tplrec, PEEK)) == S_SUCCESS)
+	{
+	  QFILE_TUPLE_POSITION pos;
+	  std::memset (&pos, 0, sizeof (pos));
+	  scan.save_position (&pos);
+	  positions.push_back (pos);
+	}
+      if (code != S_END || (int) positions.size () != (int) expected.size ())
+	{
+	  return 6;
+	}
+      /* probe ids that span prefix(0..4) and file(5..12) */
+      const int probes[] = { 1, 5, 8, 12 };
+      for (int p = 0; p < 4; p++)
+	{
+	  int k = probes[p];
+	  if (scan.jump (NULL, &positions[k], &tplrec, PEEK) != S_SUCCESS || tuple_id (tplrec.tpl) != expected[k])
+	    {
+	      return 10 + p;
+	    }
+	}
+      scan.close (NULL);
+    }
+    return 0;
+  }
+
+  /* G9: tiny result fits the work buffer -> no spill, all-RAM Tape (no file). */
+  int
+  run_tiny_no_spill ()
+  {
+    std::vector<std::vector<int> > pages = { { 0, 1 }, { 2 }, { 3, 4 } };
+    std::vector<int> expected = { 0, 1, 2, 3, 4 };
+
+    writer_result wr = build_writer_tape (/*budget*/ 10, pages);
+    if (wr.tape == NULL)
+      {
+	return 1;
+      }
+    if (wr.spilled || wr.file_pages != 0)	/* tiny-no-spill: disk untouched */
+      {
+	delete wr.tape;
+	return 2;
+      }
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    ts.append_tape (wr.tape);
+
+    std::vector<int> got;
+    long scan_fixes = -1;
+    if (scan_forward_ids (ts, got, &scan_fixes) != 0 || got != expected || scan_fixes != 0)
+      {
+	return 3;
+      }
+    return 0;
+  }
+
+  /* G10: a multi-Tape Tapeset mixing spilled and tiny Tapes scans as one stream;
+   * every spilled producer did 0 pgbuf fixes (producer-side bypass gate). */
+  int
+  run_file_multitape ()
+  {
+    writer_result t0 = build_writer_tape (1, { { 0, 1, 2 }, { 3, 4 } });		/* spill */
+    writer_result t1 = build_writer_tape (10, { { 5 } });				/* tiny */
+    writer_result t2 = build_writer_tape (1, { { 6, 7 }, { 8 }, { 9, 10 } });	/* spill */
+    if (t0.tape == NULL || t1.tape == NULL || t2.tape == NULL)
+      {
+	return 1;
+      }
+    if (!t0.spilled || t1.spilled || !t2.spilled)
+      {
+	return 2;
+      }
+    if (t0.producer_pgbuf_fixes != 0 || t2.producer_pgbuf_fixes != 0)
+      {
+	return 3;
+      }
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    ts.append_tape (t0.tape);
+    ts.append_tape (t1.tape);
+    ts.append_tape (t2.tape);
+
+    std::vector<int> expected = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    std::vector<int> got;
+    long scan_fixes = -1;
+    if (scan_forward_ids (ts, got, &scan_fixes) != 0 || got != expected || scan_fixes != 0)
+      {
+	return 4;
+      }
+    return 0;
   }
 
   struct testcase
@@ -445,6 +722,9 @@ main (int, char **)
     { "G5 QFILE_LIST_SCAN_ID bridge + mirror", run_bridge },
     { "G6 empty-only Tapeset", run_empty_only },
     { "G7 measurement hooks (pgbuf-bypass=0, op counters)", run_metrics },
+    { "G8 file-backed Tape robust parity (forward/backward/jump)", run_file_parity },
+    { "G9 tiny result stays in-memory (no spill)", run_tiny_no_spill },
+    { "G10 multi-Tape spill+tiny mix, producer pgbuf-bypass", run_file_multitape },
   };
 
   bool all_passed = true;
@@ -461,6 +741,9 @@ main (int, char **)
 	  all_passed = false;
 	}
     }
+
+  /* best-effort cleanup of the per-pid scratch dir (BufFiles already unlinked) */
+  (void) rmdir (test_scratch_dir ());
 
   if (all_passed)
     {

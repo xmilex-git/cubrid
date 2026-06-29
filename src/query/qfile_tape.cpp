@@ -87,6 +87,205 @@ namespace qfile
   }
 
   /* ------------------------------------------------------------------ */
+  /* buffile_tape                                                       */
+  /* ------------------------------------------------------------------ */
+
+  buffile_tape::buffile_tape (std::vector<char *> &&prefix_pages, bool owns_prefix, buffile *bf, bool owns_buffile)
+    : m_prefix (std::move (prefix_pages))
+    , m_owns_prefix (owns_prefix)
+    , m_buffile (bf)
+    , m_owns_buffile (owns_buffile)
+    , m_readbuf (NULL)
+  {
+    if (m_buffile != NULL)
+      {
+	m_readbuf = (char *) malloc (DB_PAGESIZE);
+      }
+  }
+
+  buffile_tape::~buffile_tape ()
+  {
+    if (m_owns_prefix)
+      {
+	for (char *page : m_prefix)
+	  {
+	    free (page);
+	  }
+      }
+    m_prefix.clear ();
+    if (m_owns_buffile)
+      {
+	delete m_buffile;	/* closes + unlinks */
+      }
+    m_buffile = NULL;
+    free (m_readbuf);
+    m_readbuf = NULL;
+  }
+
+  PAGE_PTR
+  buffile_tape::page_at (THREAD_ENTRY *thread_p, int page_offset)
+  {
+    const int prefix = (int) m_prefix.size ();
+    if (page_offset < 0 || page_offset >= total_page_count ())
+      {
+	return NULL;
+      }
+    if (page_offset < prefix)
+      {
+	return (PAGE_PTR) m_prefix[page_offset];
+      }
+    if (m_buffile == NULL || m_readbuf == NULL)
+      {
+	return NULL;
+      }
+    if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) m_readbuf) != NO_ERROR)
+      {
+	return NULL;
+      }
+    return (PAGE_PTR) m_readbuf;
+  }
+
+  void
+  buffile_tape::release_page (THREAD_ENTRY *thread_p, PAGE_PTR page)
+  {
+    /* RAM prefix: nothing to free.  File page: it lives in the reused scratch
+     * buffer, released implicitly by the next page_at.  No pgbuf unfix -- this
+     * backing never enters a pgbuf BCB. */
+    (void) thread_p;
+    (void) page;
+  }
+
+  int
+  buffile_tape::total_page_count () const
+  {
+    return (int) m_prefix.size () + (m_buffile != NULL ? m_buffile->page_count () : 0);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* tape_writer (membuf Option-A producer)                             */
+  /* ------------------------------------------------------------------ */
+
+  tape_writer::tape_writer (int prefix_budget_pages, TDE_ALGORITHM tde_algo, const std::string &dir,
+			    std::uint64_t seq, unsigned int worker_id)
+    : m_prefix_budget (prefix_budget_pages < 0 ? 0 : prefix_budget_pages)
+    , m_tde_algo (tde_algo)
+    , m_dir (dir)
+    , m_seq (seq)
+    , m_worker_id (worker_id)
+    , m_prefix ()
+    , m_buffile (NULL)
+    , m_frozen (false)
+  {
+  }
+
+  tape_writer::~tape_writer ()
+  {
+    /* Not frozen (error path): the writer still owns prefix pages + BufFile. */
+    for (char *page : m_prefix)
+      {
+	free (page);
+      }
+    m_prefix.clear ();
+    if (m_buffile != NULL)
+      {
+	delete m_buffile;	/* closes + unlinks the partial spill */
+	m_buffile = NULL;
+      }
+  }
+
+  int
+  tape_writer::ensure_buffile (THREAD_ENTRY *thread_p)
+  {
+    if (m_buffile != NULL)
+      {
+	return NO_ERROR;
+      }
+    int os_error = 0;
+    m_buffile = buffile::create (thread_p, m_dir.c_str (), m_seq, m_worker_id, m_tde_algo, &os_error);
+    if (m_buffile == NULL)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+    return NO_ERROR;
+  }
+
+  int
+  tape_writer::append_page (THREAD_ENTRY *thread_p, const PAGE_PTR list_page)
+  {
+    if (m_frozen || list_page == NULL)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+
+    if ((int) m_prefix.size () < m_prefix_budget)
+      {
+	char *copy = (char *) malloc (DB_PAGESIZE);
+	if (copy == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+	    return ER_OUT_OF_VIRTUAL_MEMORY;
+	  }
+	std::memcpy (copy, list_page, DB_PAGESIZE);
+	m_prefix.push_back (copy);
+	return NO_ERROR;
+      }
+
+    int rc = ensure_buffile (thread_p);
+    if (rc != NO_ERROR)
+      {
+	return rc;
+      }
+    return m_buffile->append_page (thread_p, list_page);
+  }
+
+  tape *
+  tape_writer::freeze (THREAD_ENTRY *thread_p)
+  {
+    if (m_frozen)
+      {
+	return NULL;
+      }
+
+    if (m_buffile == NULL)
+      {
+	/* tiny / no spill: an all-RAM Tape, no disk touch. */
+	memory_tape *mt = new memory_tape (true);
+	for (char *page : m_prefix)
+	  {
+	    mt->append_page (page);
+	  }
+	m_prefix.clear ();	/* ownership transferred to the memory_tape */
+	m_frozen = true;
+	return mt;
+      }
+
+    if (m_buffile->flush (thread_p) != NO_ERROR)
+      {
+	return NULL;
+      }
+    buffile *bf = m_buffile;
+    m_buffile = NULL;		/* ownership transfers to the buffile_tape */
+    buffile_tape *bt = new buffile_tape (std::move (m_prefix), true, bf, true);
+    m_prefix.clear ();
+    m_frozen = true;
+    return bt;
+  }
+
+  int
+  tape_writer::file_pages () const
+  {
+    return m_buffile != NULL ? m_buffile->page_count () : 0;
+  }
+
+  const buffile_metrics *
+  tape_writer::file_metrics () const
+  {
+    return m_buffile != NULL ? &m_buffile->metrics () : NULL;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* tapeset                                                            */
   /* ------------------------------------------------------------------ */
 

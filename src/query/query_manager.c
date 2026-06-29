@@ -40,6 +40,7 @@
 #include "query_executor.h"
 #include "query_hash_scan.h"
 #include "temp_page_store.hpp"
+#include "qfile_buffile.hpp"
 #include "stream_to_xasl.h"
 #include "session.h"
 #include "filter_pred_cache.h"
@@ -1171,6 +1172,12 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       int segpos_selftest_rc = qmgr_segment_position_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
       fprintf (stderr, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
+    }
+  if (getenv ("CUBRID_BUFFILE_SELFTEST") != NULL)
+    {
+      int buffile_selftest_rc = qfile_buffile_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
+      fprintf (stderr, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
     }
 #endif /* !NDEBUG */
 

@@ -304,6 +304,7 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/subquery_cache.c
   ${QUERY_DIR}/temp_page_store.cpp
   ${QUERY_DIR}/qfile_tape.cpp
+  ${QUERY_DIR}/qfile_buffile.cpp
   ${QUERY_DIR}/memoize.cpp
   ${QUERY_DIR}/stream_to_xasl.c
   ${QUERY_DIR}/string_opfunc.c
@@ -325,6 +326,7 @@ set(QUERY_HEADERS
   ${QUERY_DIR}/temp_page_store.hpp
   ${QUERY_DIR}/memoize.hpp
   ${QUERY_DIR}/qfile_tape.hpp
+  ${QUERY_DIR}/qfile_buffile.hpp
   )
 
 set(OBJECT_SOURCES

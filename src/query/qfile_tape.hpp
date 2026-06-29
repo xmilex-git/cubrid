@@ -43,8 +43,11 @@
 #include "query_list.h"		/* QFILE_LIST_ID / QFILE_LIST_SCAN_ID / QFILE_TUPLE_POSITION / page macros */
 #include "storage_common.h"	/* PAGE_PTR / SCAN_CODE / SCAN_POSITION / SCAN_STATUS */
 #include "thread_compat.hpp"	/* THREAD_ENTRY */
+#include "qfile_buffile.hpp"	/* qfile::buffile (1B private backing) + TDE_ALGORITHM */
 
 #include <vector>
+#include <cstdint>
+#include <string>
 
 namespace qfile
 {
@@ -113,6 +116,109 @@ namespace qfile
 
       memory_tape (const memory_tape &) = delete;
       memory_tape &operator= (const memory_tape &) = delete;
+  };
+
+  /*
+   * buffile_tape - a Tape whose logical page space is
+   *   [ membuf prefix (RAM, DB_PAGESIZE pages) ] ++ [ qfile::buffile (disk) ]
+   * resolved by pure offset arithmetic (ADR 0003): page N < prefix_count is the
+   * RAM prefix page N; otherwise it is buffile page (N - prefix_count).  The
+   * spilled (overflowed) Tape produced by membuf Option-A freeze; the tiny
+   * (no-spill) case stays a memory_tape with no file.
+   *
+   * Single-reader: file pages are read into one owned scratch buffer returned
+   * by page_at and reused on the next page_at (the scan releases the held page
+   * before advancing).  Parallel multi-reader (R2, offset-range work-stealing)
+   * gives each reader its own view and is Phase 2.
+   */
+  class buffile_tape : public tape
+  {
+    public:
+      /* Takes ownership of the prefix RAM pages (each DB_PAGESIZE; freed on
+       * destruction iff owns_prefix) and of the buffile (deleted -- which
+       * closes+unlinks -- iff owns_buffile). */
+      buffile_tape (std::vector<char *> &&prefix_pages, bool owns_prefix, buffile *bf, bool owns_buffile);
+      ~buffile_tape () override;
+
+      PAGE_PTR page_at (THREAD_ENTRY *thread_p, int page_offset) override;
+      void release_page (THREAD_ENTRY *thread_p, PAGE_PTR page) override;
+      int total_page_count () const override;
+      int prefix_page_count () const override
+      {
+	return (int) m_prefix.size ();
+      }
+
+      const buffile *backing () const
+      {
+	return m_buffile;
+      }
+
+    private:
+      std::vector<char *> m_prefix;
+      bool m_owns_prefix;
+      buffile *m_buffile;
+      bool m_owns_buffile;
+      char *m_readbuf;		/* DB_PAGESIZE scratch for file pages (single reader) */
+
+      buffile_tape (const buffile_tape &) = delete;
+      buffile_tape &operator= (const buffile_tape &) = delete;
+  };
+
+  /*
+   * tape_writer - membuf Option-A producer (SSOT #75 §2.2).
+   *
+   * The first `prefix_budget_pages` pages a worker produces stay in its
+   * work_mem buffer (RAM prefix); once that budget is full, overflow pages are
+   * appended to a lazily-created per-worker BufFile.  On freeze the run becomes
+   * an immutable Tape -- a memory_tape if it never spilled (tiny / no-spill), a
+   * buffile_tape otherwise -- with ZERO copy at freeze (the prefix vector and
+   * the BufFile handle are transferred to the Tape, matching ADR 0001's
+   * zero-copy ownership move).  TDE applies only to the BufFile; the RAM prefix
+   * is plaintext.
+   *
+   * Phase 1 builds and unit-verifies this mechanism; real operators feeding it
+   * is Phase 2.
+   */
+  class tape_writer
+  {
+    public:
+      tape_writer (int prefix_budget_pages, TDE_ALGORITHM tde_algo, const std::string &dir, std::uint64_t seq,
+		   unsigned int worker_id);
+      ~tape_writer ();
+
+      /* Append one produced DB_PAGESIZE list page (RAM prefix while under
+       * budget, else BufFile).  Returns NO_ERROR or an error code. */
+      int append_page (THREAD_ENTRY *thread_p, const PAGE_PTR list_page);
+
+      /* Freeze into a read-only Tape; ownership of prefix + BufFile transfers
+       * to it.  The writer is spent afterwards.  Returns NULL on error. */
+      tape *freeze (THREAD_ENTRY *thread_p);
+
+      bool spilled () const
+      {
+	return m_buffile != NULL;
+      }
+      int prefix_pages () const
+      {
+	return (int) m_prefix.size ();
+      }
+      int file_pages () const;
+      const buffile_metrics *file_metrics () const;
+
+    private:
+      int ensure_buffile (THREAD_ENTRY *thread_p);
+
+      int m_prefix_budget;
+      TDE_ALGORITHM m_tde_algo;
+      std::string m_dir;
+      std::uint64_t m_seq;
+      unsigned int m_worker_id;
+      std::vector<char *> m_prefix;	/* owned until freeze transfers */
+      buffile *m_buffile;		/* lazily created; owned until freeze transfers */
+      bool m_frozen;
+
+      tape_writer (const tape_writer &) = delete;
+      tape_writer &operator= (const tape_writer &) = delete;
   };
 
   /*
