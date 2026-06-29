@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -47,6 +48,11 @@ namespace
   /* Pages buffered before a batched pwrite (PostgreSQL BufFile batches its
    * buffer; here a small batch coalesces syscalls without holding much RAM). */
   constexpr int BUFFILE_BATCH_PAGES = 8;
+
+  /* Process-wide orphan-scan census (redesign G003 #68, 1C slice).  Only the
+   * new per-worker backing path touches these. */
+  std::atomic<long> g_census_open_files {0};
+  std::atomic<long> g_census_held_prefix_pages {0};
 
   bool
   full_pwrite (int fd, const void *buf, std::size_t len, off_t offset) noexcept
@@ -132,6 +138,49 @@ namespace
 
 namespace qfile
 {
+  /* ------------------------------------------------------------------ */
+  /* tape_backing_census (orphan-scan hook, redesign G003 #68 / 1C)     */
+  /* ------------------------------------------------------------------ */
+
+  tape_backing_census_snapshot
+  tape_backing_census ()
+  {
+    tape_backing_census_snapshot s;
+    s.open_files = g_census_open_files.load (std::memory_order_relaxed);
+    s.held_prefix_pages = g_census_held_prefix_pages.load (std::memory_order_relaxed);
+    return s;
+  }
+
+  void
+  tape_backing_census_file_opened ()
+  {
+    g_census_open_files.fetch_add (1, std::memory_order_relaxed);
+  }
+
+  void
+  tape_backing_census_file_closed ()
+  {
+    g_census_open_files.fetch_sub (1, std::memory_order_relaxed);
+  }
+
+  void
+  tape_backing_census_prefix_added (long pages)
+  {
+    if (pages > 0)
+      {
+	g_census_held_prefix_pages.fetch_add (pages, std::memory_order_relaxed);
+      }
+  }
+
+  void
+  tape_backing_census_prefix_removed (long pages)
+  {
+    if (pages > 0)
+      {
+	g_census_held_prefix_pages.fetch_sub (pages, std::memory_order_relaxed);
+      }
+  }
+
   buffile::buffile (int fd, const std::string &path, TDE_ALGORITHM tde_algo, int disk_pagesize)
     : m_fd (fd)
     , m_path (path)
@@ -147,12 +196,17 @@ namespace qfile
     , m_stored (NULL)
     , m_metrics ()
   {
+    if (m_fd >= 0)
+      {
+	tape_backing_census_file_opened ();
+      }
   }
 
   buffile::~buffile ()
   {
     if (m_fd >= 0)
       {
+	tape_backing_census_file_closed ();
 	::close (m_fd);
 	m_fd = -1;
       }

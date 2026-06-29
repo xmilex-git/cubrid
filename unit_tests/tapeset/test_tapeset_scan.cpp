@@ -709,6 +709,297 @@ namespace
     scan2.close (NULL);
     return 0;
   }
+
+  /* ---- Phase1 1C (issue #72) holdable-reparent helpers ------------- */
+  /*
+   * Bootless mirrors of qfile_copy_list_id's tapeset-ownership branches and
+   * qfile_clear_list_id's tapeset teardown.  The production functions call
+   * thread_get_thread_entry_info() (to bump an unrelated qlist counter) which
+   * asserts a thread-local entry a bootless test never sets up; the tapeset
+   * transfer itself is exactly the 2-4 lines mirrored here.  The REAL
+   * qfile_copy_list_id(MOVE)/qfile_clear_list_id wiring (and a real on-disk
+   * file + TDE) is exercised in-server by qfile_heldtape_selftest.
+   */
+  void
+  tapeset_reparent_move (QFILE_LIST_ID *dest, QFILE_LIST_ID *src)
+  {
+    /* mirrors qfile_copy_list_id memcpy + QFILE_MOVE_DEPENDENT branch */
+    QFILE_LIST_ID_TAPESET (dest) = QFILE_LIST_ID_TAPESET (src);
+    QFILE_LIST_ID_OWNS_TAPESET (dest) = QFILE_LIST_ID_OWNS_TAPESET (src);
+    QFILE_LIST_ID_TAPESET (src) = NULL;
+    QFILE_LIST_ID_OWNS_TAPESET (src) = false;
+  }
+
+  void
+  tapeset_borrow_skip (QFILE_LIST_ID *dest, QFILE_LIST_ID *src)
+  {
+    /* mirrors qfile_copy_list_id memcpy + QFILE_SKIP_DEPENDENT branch */
+    QFILE_LIST_ID_TAPESET (dest) = QFILE_LIST_ID_TAPESET (src);
+    QFILE_LIST_ID_OWNS_TAPESET (dest) = false;	/* borrow: do not own */
+  }
+
+  void
+  tapeset_teardown (QFILE_LIST_ID *lid)
+  {
+    /* mirrors qfile_clear_list_id's owned-tapeset destroy */
+    if (QFILE_LIST_ID_TAPESET (lid) != NULL && QFILE_LIST_ID_OWNS_TAPESET (lid))
+      {
+	qfile_tapeset_destroy (QFILE_LIST_ID_TAPESET (lid));
+      }
+    QFILE_LIST_ID_TAPESET (lid) = NULL;
+    QFILE_LIST_ID_OWNS_TAPESET (lid) = false;
+  }
+
+  /* G11: holdable reparent (MOVE) is a zero-copy ownership move tran->session,
+   * parity holds across the commit boundary, and session teardown is
+   * orphan-zero -- the private file handle AND the RAM prefix both return to
+   * baseline (SSOT #75 §5.5 (1) / §6, ADR 0001). */
+  int
+  run_reparent_orphan_zero ()
+  {
+    const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+
+    std::vector<std::vector<int> > pages = {
+      { 0, 1, 2 }, { 3, 4 }, { 5, 6, 7, 8 }, { 9 }, { 10, 11 }, { 12 }
+    };
+    std::vector<int> expected;
+    for (const std::vector<int> &p : pages)
+      {
+	for (int id : p)
+	  {
+	    expected.push_back (id);
+	  }
+      }
+
+    writer_result wr = build_writer_tape (/*budget*/ 2, pages);	/* 2 prefix + 4 file */
+    if (wr.tape == NULL || !wr.spilled)
+      {
+	return 1;
+      }
+
+    qfile::tapeset *ts = new qfile::tapeset ();
+    ts->set_owns_tapes (true);
+    ts->append_tape (wr.tape);
+
+    QFILE_LIST_ID producer;
+    std::memset (&producer, 0, sizeof (producer));
+    QFILE_CLEAR_LIST_ID (&producer);
+    QFILE_LIST_ID_TAPESET (&producer) = ts;
+    QFILE_LIST_ID_OWNS_TAPESET (&producer) = true;
+
+    /* one live file + 2 RAM prefix pages */
+    const qfile::tape_backing_census_snapshot produced = qfile::tape_backing_census ();
+    if (produced.open_files != base.open_files + 1 || produced.held_prefix_pages != base.held_prefix_pages + 2)
+      {
+	tapeset_teardown (&producer);
+	return 2;
+      }
+
+    /* read the first half (the "before commit" rows) */
+    std::vector<int> got;
+    qfile::tapeset_scan scan (ts);
+    QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+    SCAN_CODE code = S_SUCCESS;
+    const int half = (int) expected.size () / 2;
+    int read = 0;
+    while (read < half && (code = scan.forward (NULL, &tplrec, PEEK)) == S_SUCCESS)
+      {
+	got.push_back (tuple_id (tplrec.tpl));
+	read++;
+      }
+
+    /* COMMIT: reparent ownership transaction -> session (MOVE) */
+    QFILE_LIST_ID session;
+    std::memset (&session, 0, sizeof (session));
+    QFILE_CLEAR_LIST_ID (&session);
+    tapeset_reparent_move (&session, &producer);
+
+    /* zero copy: census unchanged, ownership transferred off the producer */
+    const qfile::tape_backing_census_snapshot moved = qfile::tape_backing_census ();
+    if (moved.open_files != produced.open_files || moved.held_prefix_pages != produced.held_prefix_pages
+	|| QFILE_LIST_ID_TAPESET (&producer) != NULL || QFILE_LIST_ID_TAPESET (&session) != ts
+	|| !QFILE_LIST_ID_OWNS_TAPESET (&session))
+      {
+	scan.close (NULL);
+	tapeset_teardown (&session);
+	tapeset_teardown (&producer);
+	return 4;
+      }
+
+    /* remaining rows across the boundary -- same backing, no copy */
+    while ((code = scan.forward (NULL, &tplrec, PEEK)) == S_SUCCESS)
+      {
+	got.push_back (tuple_id (tplrec.tpl));
+      }
+    scan.close (NULL);
+    if (code != S_END || got != expected)
+      {
+	tapeset_teardown (&session);
+	tapeset_teardown (&producer);
+	return 5;
+      }
+
+    /* session teardown frees the reparented backing (file + RAM) */
+    tapeset_teardown (&session);
+    const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+    if (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages)
+      {
+	tapeset_teardown (&producer);
+	return 6;
+      }
+
+    /* producer disowned at MOVE: tearing it down must not double-free */
+    tapeset_teardown (&producer);
+    const qfile::tape_backing_census_snapshot done = qfile::tape_backing_census ();
+    if (done.open_files != base.open_files || done.held_prefix_pages != base.held_prefix_pages)
+      {
+	return 7;
+      }
+    return 0;
+  }
+
+  /* G12: a tiny (all-RAM, no-spill) holdable result reparents with zero disk
+   * touch -- the RAM prefix moves by ownership and teardown frees it (RAM
+   * orphan-zero); open_files never moves. */
+  int
+  run_reparent_tiny ()
+  {
+    const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+
+    std::vector<std::vector<int> > pages = { { 0, 1 }, { 2 }, { 3, 4 } };	/* 3 pages */
+    std::vector<int> expected = { 0, 1, 2, 3, 4 };
+
+    writer_result wr = build_writer_tape (/*budget*/ 10, pages);
+    if (wr.tape == NULL || wr.spilled || wr.file_pages != 0)
+      {
+	if (wr.tape != NULL)
+	  {
+	    delete wr.tape;
+	  }
+	return 1;
+      }
+
+    qfile::tapeset *ts = new qfile::tapeset ();
+    ts->set_owns_tapes (true);
+    ts->append_tape (wr.tape);
+
+    QFILE_LIST_ID producer;
+    std::memset (&producer, 0, sizeof (producer));
+    QFILE_CLEAR_LIST_ID (&producer);
+    QFILE_LIST_ID_TAPESET (&producer) = ts;
+    QFILE_LIST_ID_OWNS_TAPESET (&producer) = true;
+
+    /* no file, 3 RAM prefix pages */
+    const qfile::tape_backing_census_snapshot produced = qfile::tape_backing_census ();
+    if (produced.open_files != base.open_files || produced.held_prefix_pages != base.held_prefix_pages + 3)
+      {
+	tapeset_teardown (&producer);
+	return 2;
+      }
+
+    QFILE_LIST_ID session;
+    std::memset (&session, 0, sizeof (session));
+    QFILE_CLEAR_LIST_ID (&session);
+    tapeset_reparent_move (&session, &producer);
+
+    const qfile::tape_backing_census_snapshot moved = qfile::tape_backing_census ();
+    if (moved.open_files != base.open_files || moved.held_prefix_pages != produced.held_prefix_pages
+	|| QFILE_LIST_ID_TAPESET (&producer) != NULL || !QFILE_LIST_ID_OWNS_TAPESET (&session))
+      {
+	tapeset_teardown (&session);
+	tapeset_teardown (&producer);
+	return 4;
+      }
+
+    /* parity over the session-held Tapeset */
+    std::vector<int> got;
+    long fixes = -1;
+    if (scan_forward_ids (*ts, got, &fixes) != 0 || got != expected || fixes != 0)
+      {
+	tapeset_teardown (&session);
+	tapeset_teardown (&producer);
+	return 5;
+      }
+
+    /* teardown -> RAM orphan-zero; open_files never moved */
+    tapeset_teardown (&session);
+    const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+    if (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages)
+      {
+	tapeset_teardown (&producer);
+	return 6;
+      }
+
+    tapeset_teardown (&producer);
+    return 0;
+  }
+
+  /* G13: a borrowing scan copy (SKIP) shares the producer's Tapes but owns
+   * none; tearing it down must NOT free them (single-owner invariant) -- only
+   * the owner's teardown is orphan-zero. */
+  int
+  run_borrow_no_free ()
+  {
+    const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+
+    writer_result wr = build_writer_tape (/*budget*/ 1, { { 0, 1, 2 }, { 3, 4 } });	/* spill */
+    if (wr.tape == NULL || !wr.spilled)
+      {
+	return 1;
+      }
+
+    qfile::tapeset *ts = new qfile::tapeset ();
+    ts->set_owns_tapes (true);
+    ts->append_tape (wr.tape);
+
+    QFILE_LIST_ID producer;
+    std::memset (&producer, 0, sizeof (producer));
+    QFILE_CLEAR_LIST_ID (&producer);
+    QFILE_LIST_ID_TAPESET (&producer) = ts;
+    QFILE_LIST_ID_OWNS_TAPESET (&producer) = true;
+
+    const qfile::tape_backing_census_snapshot produced = qfile::tape_backing_census ();
+
+    /* SKIP copy = borrow (the scan-open path) */
+    QFILE_LIST_ID borrow;
+    std::memset (&borrow, 0, sizeof (borrow));
+    QFILE_CLEAR_LIST_ID (&borrow);
+    tapeset_borrow_skip (&borrow, &producer);
+    if (QFILE_LIST_ID_TAPESET (&borrow) != ts || QFILE_LIST_ID_OWNS_TAPESET (&borrow)
+	|| QFILE_LIST_ID_TAPESET (&producer) != ts || !QFILE_LIST_ID_OWNS_TAPESET (&producer))
+      {
+	tapeset_teardown (&producer);
+	return 3;
+      }
+
+    /* tearing down the borrow must not free the Tapes */
+    tapeset_teardown (&borrow);
+    const qfile::tape_backing_census_snapshot after_borrow = qfile::tape_backing_census ();
+    if (after_borrow.open_files != produced.open_files || after_borrow.held_prefix_pages != produced.held_prefix_pages)
+      {
+	tapeset_teardown (&producer);
+	return 4;
+      }
+
+    /* producer's Tapes are still alive and scannable (not double-freed) */
+    std::vector<int> got;
+    long fixes = -1;
+    std::vector<int> expected = { 0, 1, 2, 3, 4 };
+    if (scan_forward_ids (*ts, got, &fixes) != 0 || got != expected || fixes != 0)
+      {
+	tapeset_teardown (&producer);
+	return 5;
+      }
+
+    /* only the owner's teardown frees -> orphan-zero */
+    tapeset_teardown (&producer);
+    const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+    if (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages)
+      {
+	return 6;
+      }
+    return 0;
+  }
 }
 
 int
@@ -725,6 +1016,9 @@ main (int, char **)
     { "G8 file-backed Tape robust parity (forward/backward/jump)", run_file_parity },
     { "G9 tiny result stays in-memory (no spill)", run_tiny_no_spill },
     { "G10 multi-Tape spill+tiny mix, producer pgbuf-bypass", run_file_multitape },
+    { "G11 holdable reparent (MOVE) zero-copy + parity + orphan-zero", run_reparent_orphan_zero },
+    { "G12 tiny all-RAM reparent (zero disk touch, RAM orphan-zero)", run_reparent_tiny },
+    { "G13 borrow (SKIP) does not free owner's Tapes", run_borrow_no_free },
   };
 
   bool all_passed = true;
@@ -744,6 +1038,16 @@ main (int, char **)
 
   /* best-effort cleanup of the per-pid scratch dir (BufFiles already unlinked) */
   (void) rmdir (test_scratch_dir ());
+
+  /* suite-wide orphan-zero: every gate must leave the backing census balanced
+   * (no leaked private file handle, no leaked RAM prefix page). */
+  const qfile::tape_backing_census_snapshot suite_census = qfile::tape_backing_census ();
+  if (suite_census.open_files != 0 || suite_census.held_prefix_pages != 0)
+    {
+      std::printf ("SUITE orphan-zero FAIL (open_files=%ld held_prefix_pages=%ld)\n",
+		   suite_census.open_files, suite_census.held_prefix_pages);
+      all_passed = false;
+    }
 
   if (all_passed)
     {

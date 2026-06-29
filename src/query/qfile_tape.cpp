@@ -26,10 +26,14 @@
 #include "error_manager.h"
 #include "memory_alloc.h"
 #include "object_representation.h"	/* OR_GET_INT used by the QFILE_GET_* page macros */
+#include "list_file.h"		/* qfile_copy_list_id / qfile_clear_list_id / QFILE_MOVE_DEPENDENT */
+#include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
+#include "file_io.h"		/* PEEK */
 
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <sys/stat.h>		/* stat (orphan-zero on-disk check) */
 
 #include "memory_wrapper.hpp"
 
@@ -53,6 +57,7 @@ namespace qfile
   {
     if (m_owns)
       {
+	tape_backing_census_prefix_removed ((long) m_pages.size ());
 	for (char *page : m_pages)
 	  {
 	    free (page);
@@ -65,6 +70,10 @@ namespace qfile
   memory_tape::append_page (char *page)
   {
     m_pages.push_back (page);
+    if (m_owns)
+      {
+	tape_backing_census_prefix_added (1);
+      }
   }
 
   PAGE_PTR
@@ -97,6 +106,10 @@ namespace qfile
     , m_owns_buffile (owns_buffile)
     , m_readbuf (NULL)
   {
+    if (m_owns_prefix)
+      {
+	tape_backing_census_prefix_added ((long) m_prefix.size ());
+      }
     if (m_buffile != NULL)
       {
 	m_readbuf = (char *) malloc (DB_PAGESIZE);
@@ -107,6 +120,7 @@ namespace qfile
   {
     if (m_owns_prefix)
       {
+	tape_backing_census_prefix_removed ((long) m_prefix.size ());
 	for (char *page : m_prefix)
 	  {
 	    free (page);
@@ -715,4 +729,228 @@ void
 qfile_tapeset_destroy (void *tapeset_ptr)
 {
   delete (qfile::tapeset *) tapeset_ptr;
+}
+
+/* ------------------------------------------------------------------ */
+/* In-server self-test: holdable reparent lifecycle (Phase1 1C, #72). */
+/* Gated by env CUBRID_HELDTAPE_SELFTEST (debug-only invocation).      */
+/* ------------------------------------------------------------------ */
+
+namespace
+{
+  /* One DB_PAGESIZE list page of 16-byte tuples [length|prev_length|id|pad],
+   * matching the unit-test layout so the scan reads back known ids. */
+  const int HELDTAPE_TUPLE_LEN = 16;
+  const int HELDTAPE_ID_OFFSET = 8;
+
+  char *
+  heldtape_make_page (const std::vector<int> &ids)
+  {
+    char *page = (char *) malloc (DB_PAGESIZE);
+    if (page == NULL)
+      {
+	return NULL;
+      }
+    std::memset (page, 0, DB_PAGESIZE);
+
+    int n = (int) ids.size ();
+    QFILE_PUT_TUPLE_COUNT (page, n);
+    QFILE_PUT_PREV_VPID_NULL (page);
+    QFILE_PUT_NEXT_VPID_NULL (page);
+    QFILE_PUT_OVERFLOW_VPID_NULL (page);
+
+    int off = QFILE_PAGE_HEADER_SIZE;
+    int prev_len = 0;
+    for (int i = 0; i < n; i++)
+      {
+	char *tpl = page + off;
+	QFILE_PUT_TUPLE_LENGTH (tpl, HELDTAPE_TUPLE_LEN);
+	QFILE_PUT_PREV_TUPLE_LENGTH (tpl, prev_len);
+	OR_PUT_INT (tpl + HELDTAPE_ID_OFFSET, ids[i]);
+	QFILE_PUT_LAST_TUPLE_OFFSET (page, off);
+	prev_len = HELDTAPE_TUPLE_LEN;
+	off += HELDTAPE_TUPLE_LEN;
+      }
+    return page;
+  }
+}				/* anonymous namespace */
+
+int
+qfile_heldtape_selftest (THREAD_ENTRY *thread_p)
+{
+  std::string dir;
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      return ER_FAILED;
+    }
+
+  /* Pick TDE iff a cipher is loaded so a TDE database exercises the reparent
+   * + teardown of an ENCRYPTED holdable backing. */
+  TDE_ALGORITHM algo = TDE_ALGORITHM_NONE;
+  if (tde_is_loaded ())
+    {
+      const TDE_ALGORITHM def = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+      if (def != TDE_ALGORITHM_NONE)
+	{
+	  algo = def;
+	}
+    }
+
+  const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+
+  /* 8 pages with prefix budget 2 -> 6 pages spill to a real on-disk file. */
+  const std::vector<std::vector<int> > pages = {
+    { 0, 1, 2 }, { 3, 4 }, { 5, 6 }, { 7, 8 }, { 9 }, { 10, 11 }, { 12, 13 }, { 14 }
+  };
+  std::vector<int> expected;
+  for (const std::vector<int> &p : pages)
+    {
+      for (int id : p)
+	{
+	  expected.push_back (id);
+	}
+    }
+
+  /* --- producer: build + freeze a spilled Tape (transaction-scoped) --- */
+  qfile::tape *frozen = NULL;
+  {
+    static std::uint64_t seq = 70000;
+    qfile::tape_writer w (2, algo, dir, seq++, 0);
+    int prc = NO_ERROR;
+    for (const std::vector<int> &ids : pages)
+      {
+	char *p = heldtape_make_page (ids);
+	if (p == NULL)
+	  {
+	    prc = ER_FAILED;
+	    break;
+	  }
+	prc = w.append_page (thread_p, (PAGE_PTR) p);
+	free (p);
+	if (prc != NO_ERROR)
+	  {
+	    break;
+	  }
+      }
+    if (prc != NO_ERROR || !w.spilled ())
+      {
+	return ER_FAILED;	/* writer dtor frees the partial spill */
+      }
+    frozen = w.freeze (thread_p);	/* ownership leaves the writer */
+    if (frozen == NULL)
+      {
+	return ER_FAILED;
+      }
+  }
+
+  /* the spilled file path, captured for the post-teardown unlink check */
+  std::string file_path;
+  {
+    qfile::buffile_tape *bt = static_cast<qfile::buffile_tape *> (frozen);
+    if (bt->backing () != NULL)
+      {
+	file_path = bt->backing ()->path ();
+      }
+  }
+
+  int rc = NO_ERROR;
+
+  /* wrap in a Tapeset owned by the transaction-scoped (producer) list_id */
+  qfile::tapeset *ts = new qfile::tapeset ();
+  ts->set_owns_tapes (true);
+  ts->append_tape (frozen);
+
+  QFILE_LIST_ID producer;
+  QFILE_CLEAR_LIST_ID (&producer);
+  QFILE_LIST_ID_TAPESET (&producer) = ts;
+  QFILE_LIST_ID_OWNS_TAPESET (&producer) = true;
+
+  const qfile::tape_backing_census_snapshot produced = qfile::tape_backing_census ();
+  if (produced.open_files != base.open_files + 1)
+    {
+      rc = ER_FAILED;
+    }
+
+  std::vector<int> got;
+  {
+    qfile::tapeset_scan scan (ts);
+    QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+    SCAN_CODE code = S_SUCCESS;
+
+    /* read the first half (the "before commit" rows) */
+    const int half = (int) expected.size () / 2;
+    int read = 0;
+    while (read < half && (code = scan.forward (thread_p, &tplrec, PEEK)) == S_SUCCESS)
+      {
+	got.push_back (OR_GET_INT ((char *) tplrec.tpl + HELDTAPE_ID_OFFSET));
+	read++;
+      }
+
+    /* --- COMMIT: reparent ownership transaction -> session (zero copy) --- */
+    QFILE_LIST_ID session;
+    QFILE_CLEAR_LIST_ID (&session);
+    if (rc == NO_ERROR && qfile_copy_list_id (&session, &producer, false, QFILE_MOVE_DEPENDENT) != NO_ERROR)
+      {
+	rc = ER_FAILED;
+      }
+
+    const qfile::tape_backing_census_snapshot moved = qfile::tape_backing_census ();
+    if (rc == NO_ERROR
+	&& (moved.open_files != produced.open_files || moved.held_prefix_pages != produced.held_prefix_pages
+	    || QFILE_LIST_ID_TAPESET (&producer) != NULL || QFILE_LIST_ID_TAPESET (&session) != ts
+	    || !QFILE_LIST_ID_OWNS_TAPESET (&session)))
+      {
+	rc = ER_FAILED;		/* not a zero-copy move */
+      }
+
+    /* read the remaining rows across the reparent boundary (same backing) */
+    if (rc == NO_ERROR)
+      {
+	while ((code = scan.forward (thread_p, &tplrec, PEEK)) == S_SUCCESS)
+	  {
+	    got.push_back (OR_GET_INT ((char *) tplrec.tpl + HELDTAPE_ID_OFFSET));
+	  }
+	if (code != S_END || got != expected)
+	  {
+	    rc = ER_FAILED;
+	  }
+      }
+    scan.close (thread_p);
+
+    /* the backing file must still exist before teardown */
+    if (rc == NO_ERROR && !file_path.empty ())
+      {
+	struct stat st;
+	if (stat (file_path.c_str (), &st) != 0)
+	  {
+	    rc = ER_FAILED;
+	  }
+      }
+
+    /* --- session teardown (== session_free_sentry_data) frees the backing --- */
+    qfile_clear_list_id (&session);
+  }
+
+  /* orphan-zero: census back to baseline (files + RAM) AND file unlinked */
+  const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+  if (rc == NO_ERROR && (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages))
+    {
+      rc = ER_FAILED;
+    }
+  if (rc == NO_ERROR && !file_path.empty ())
+    {
+      struct stat st;
+      if (stat (file_path.c_str (), &st) == 0)
+	{
+	  rc = ER_FAILED;	/* file still on disk -> orphan */
+	}
+    }
+
+  /* producer disowned the Tapeset at MOVE; clearing it must not double-free
+   * (on an error path where MOVE was skipped, this frees the backing). */
+  qfile_clear_list_id (&producer);
+
+  er_log_debug (ARG_FILE_LINE, "HELDTAPE_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
+  fprintf (stderr, "HELDTAPE_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
+  return rc;
 }

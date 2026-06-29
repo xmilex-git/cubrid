@@ -382,4 +382,17 @@ void qfile_tapeset_scan_save_position (QFILE_LIST_SCAN_ID *scan_id_p, QFILE_TUPL
 /* Destroy a tapeset owned by a QFILE_LIST_ID (used by qfile_clear_list_id). */
 void qfile_tapeset_destroy (void *tapeset_ptr);
 
+/*
+ * In-server self-test of the holdable-result lifecycle (Phase1 1C, redesign
+ * G007 #72): build a spilled Tapeset behind a QFILE_LIST_ID, reparent its
+ * ownership transaction -> session via qfile_copy_list_id(MOVE) with zero copy
+ * (census unchanged), read the remaining tuples post-reparent (robust parity),
+ * then tear the session list_id down via qfile_clear_list_id and assert
+ * orphan-zero -- the private file is unlinked AND the RAM prefix is freed
+ * (ADR 0001).  Exercises a real on-disk file (and the TDE-encrypted backing
+ * when a cipher is loaded), which the bootless unit test cannot.  Gated by env
+ * CUBRID_HELDTAPE_SELFTEST.  Returns 0 on PASS.
+ */
+int qfile_heldtape_selftest (THREAD_ENTRY *thread_p);
+
 #endif /* _QFILE_TAPE_HPP_ */

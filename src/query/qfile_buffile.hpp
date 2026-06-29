@@ -82,6 +82,35 @@ namespace qfile
   };
 
   /*
+   * tape_backing_census - process-wide orphan-scan hook (redesign G003, issue
+   * #68; the 1C slice, SSOT #75 §5.5 (1) / §6, ADR 0001).  Counts the two
+   * backing resources a holdable result owns: open private-file handles and
+   * RAM membuf-prefix pages held by frozen Tapes.  Two invariants are asserted
+   * against it:
+   *   - holdable reparent (a zero-copy ownership MOVE, tran -> session) leaves
+   *     BOTH counters unchanged (no copy, no flush);
+   *   - session teardown drives BOTH back to the pre-result baseline
+   *     (orphan-zero: file handles AND RAM prefix, not just files).
+   * Counters are atomic because per-worker backings open/close concurrently;
+   * they only move on the new-backing path, so legacy single-backing queries
+   * pay nothing.
+   */
+  struct tape_backing_census_snapshot
+  {
+    long open_files;		/* live private-file handles (buffile fds) */
+    long held_prefix_pages;	/* RAM membuf-prefix pages owned by frozen Tapes */
+  };
+
+  /* Read the current census (the orphan scan). */
+  tape_backing_census_snapshot tape_backing_census ();
+
+  /* Ownership-boundary hooks (called by buffile / tape ctors and dtors). */
+  void tape_backing_census_file_opened ();
+  void tape_backing_census_file_closed ();
+  void tape_backing_census_prefix_added (long pages);
+  void tape_backing_census_prefix_removed (long pages);
+
+  /*
    * buffile - one worker's private append-only temp file backing a Tape's
    * spilled pages.  Owner-only writes; addressed by page offset; pgbuf-bypassed.
    *

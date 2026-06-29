@@ -41,6 +41,7 @@
 #include "query_hash_scan.h"
 #include "temp_page_store.hpp"
 #include "qfile_buffile.hpp"
+#include "qfile_tape.hpp"
 #include "stream_to_xasl.h"
 #include "session.h"
 #include "filter_pred_cache.h"
@@ -1178,6 +1179,12 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       int buffile_selftest_rc = qfile_buffile_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
       fprintf (stderr, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
+    }
+  if (getenv ("CUBRID_HELDTAPE_SELFTEST") != NULL)
+    {
+      int heldtape_selftest_rc = qfile_heldtape_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "HELDTAPE_SELFTEST result=%d (0=PASS)\n", heldtape_selftest_rc);
+      fprintf (stderr, "HELDTAPE_SELFTEST result=%d (0=PASS)\n", heldtape_selftest_rc);
     }
 #endif /* !NDEBUG */
 
