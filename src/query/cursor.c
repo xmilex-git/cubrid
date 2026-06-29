@@ -951,7 +951,7 @@ cursor_buffer_last_page (CURSOR_ID * cursor_id_p, VPID * vpid_p)
       return ER_FAILED;
     }
 
-  if (cursor_id_p->list_id.last_pgptr && VPID_EQ (&(cursor_id_p->list_id.first_vpid), vpid_p))
+  if (cursor_id_p->list_id.last_pgptr && VPID_EQ (&(QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id))), vpid_p))
     {
       cursor_id_p->buffer = cursor_id_p->list_id.last_pgptr;
     }
@@ -1491,17 +1491,17 @@ cursor_next_tuple (CURSOR_ID * cursor_id_p)
 
   if (cursor_id_p->position == C_BEFORE)
     {
-      if (VPID_ISNULL (&(cursor_id_p->list_id.first_vpid)))
+      if (VPID_ISNULL (&(QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)))))
 	{
 	  return DB_CURSOR_END;
 	}
 
-      if (cursor_fetch_page_having_tuple (cursor_id_p, &cursor_id_p->list_id.first_vpid, FIRST_TPL, 0) != NO_ERROR)
+      if (cursor_fetch_page_having_tuple (cursor_id_p, &QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)), FIRST_TPL, 0) != NO_ERROR)
 	{
 	  return DB_CURSOR_ERROR;
 	}
 
-      QFILE_COPY_VPID (&cursor_id_p->current_vpid, &cursor_id_p->list_id.first_vpid);
+      QFILE_COPY_VPID (&cursor_id_p->current_vpid, &QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)));
       /*
        * Setup the cursor so that we can proceed through the next "if"
        * statement w/o code duplication.
@@ -1612,17 +1612,17 @@ cursor_prev_tuple (CURSOR_ID * cursor_id_p)
     }
   else if (cursor_id_p->position == C_AFTER)
     {
-      if (VPID_ISNULL (&(cursor_id_p->list_id.first_vpid)))
+      if (VPID_ISNULL (&(QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)))))
 	{
 	  return DB_CURSOR_END;
 	}
 
-      if (cursor_fetch_page_having_tuple (cursor_id_p, &cursor_id_p->list_id.last_vpid, LAST_TPL, 0) != NO_ERROR)
+      if (cursor_fetch_page_having_tuple (cursor_id_p, &QFILE_LIST_ID_LAST_VPID(&(cursor_id_p->list_id)), LAST_TPL, 0) != NO_ERROR)
 	{
 	  return DB_CURSOR_ERROR;
 	}
 
-      QFILE_COPY_VPID (&cursor_id_p->current_vpid, &cursor_id_p->list_id.last_vpid);
+      QFILE_COPY_VPID (&cursor_id_p->current_vpid, &QFILE_LIST_ID_LAST_VPID(&(cursor_id_p->list_id)));
       cursor_id_p->position = C_ON;
       cursor_id_p->tuple_no--;
     }
@@ -1657,17 +1657,17 @@ cursor_first_tuple (CURSOR_ID * cursor_id_p)
       return DB_CURSOR_ERROR;
     }
 
-  if (VPID_ISNULL (&(cursor_id_p->list_id.first_vpid)))
+  if (VPID_ISNULL (&(QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)))))
     {
       return DB_CURSOR_END;
     }
 
-  if (cursor_fetch_page_having_tuple (cursor_id_p, &cursor_id_p->list_id.first_vpid, FIRST_TPL, 0) != NO_ERROR)
+  if (cursor_fetch_page_having_tuple (cursor_id_p, &QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)), FIRST_TPL, 0) != NO_ERROR)
     {
       return DB_CURSOR_ERROR;
     }
 
-  QFILE_COPY_VPID (&cursor_id_p->current_vpid, &cursor_id_p->list_id.first_vpid);
+  QFILE_COPY_VPID (&cursor_id_p->current_vpid, &QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)));
   cursor_id_p->position = C_ON;
   cursor_id_p->tuple_no = 0;
 
@@ -1701,17 +1701,17 @@ cursor_last_tuple (CURSOR_ID * cursor_id_p)
       return DB_CURSOR_ERROR;
     }
 
-  if (VPID_ISNULL (&(cursor_id_p->list_id.first_vpid)))
+  if (VPID_ISNULL (&(QFILE_LIST_ID_FIRST_VPID(&(cursor_id_p->list_id)))))
     {
       return DB_CURSOR_END;
     }
 
-  if (cursor_fetch_page_having_tuple (cursor_id_p, &cursor_id_p->list_id.last_vpid, LAST_TPL, 0) != NO_ERROR)
+  if (cursor_fetch_page_having_tuple (cursor_id_p, &QFILE_LIST_ID_LAST_VPID(&(cursor_id_p->list_id)), LAST_TPL, 0) != NO_ERROR)
     {
       return DB_CURSOR_ERROR;
     }
 
-  QFILE_COPY_VPID (&cursor_id_p->current_vpid, &cursor_id_p->list_id.last_vpid);
+  QFILE_COPY_VPID (&cursor_id_p->current_vpid, &QFILE_LIST_ID_LAST_VPID(&(cursor_id_p->list_id)));
   cursor_id_p->position = C_ON;
   cursor_id_p->tuple_no = cursor_id_p->list_id.tuple_cnt - 1;
 

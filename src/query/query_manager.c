@@ -820,8 +820,8 @@ qmgr_dump_query_entry (QMGR_QUERY_ENTRY * query_p)
 	       "\t first_vpid: {%d, %d}, last_vpid: {%d, %d},\n"
 	       "\t last_pgptr: %p, last_offset: %d, lasttpl_len: %d}\n", list_id_p->type_list.type_cnt,
 	       (void *) list_id_p->type_list.domp, (long long) list_id_p->tuple_cnt, list_id_p->page_cnt,
-	       list_id_p->first_vpid.pageid, list_id_p->first_vpid.volid, list_id_p->last_vpid.pageid,
-	       list_id_p->last_vpid.volid, list_id_p->last_pgptr, list_id_p->last_offset, list_id_p->lasttpl_len);
+	       QFILE_LIST_ID_FIRST_VPID(list_id_p).pageid, QFILE_LIST_ID_FIRST_VPID(list_id_p).volid, QFILE_LIST_ID_LAST_VPID(list_id_p).pageid,
+	       QFILE_LIST_ID_LAST_VPID(list_id_p).volid, list_id_p->last_pgptr, list_id_p->last_offset, list_id_p->lasttpl_len);
     }
 
   if (query_p->temp_vfid)
@@ -1840,7 +1840,7 @@ xqmgr_execute_query (THREAD_ENTRY * thread_p, const XASL_ID * xasl_id_p, QUERY_I
 	    }
 
 	  /* the type of the result file should be FILE_QUERY_AREA in order not to deleted at the time of query_end */
-	  if (list_id_p->tfile_vfid != NULL && list_id_p->tfile_vfid->temp_file_type != FILE_QUERY_AREA)
+	  if (QFILE_LIST_ID_TFILE_VFID(list_id_p) != NULL && QFILE_LIST_ID_TFILE_VFID(list_id_p)->temp_file_type != FILE_QUERY_AREA)
 	    {
 	      /* duplicate the list file */
 	      tmp_list_id_p = qfile_duplicate_list (thread_p, list_id_p, QFILE_FLAG_RESULT_FILE);
@@ -3182,11 +3182,11 @@ qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p)
 bool
 qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
 {
-  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL; iter_p = iter_p->dependent_list_id)
+  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
     {
-      if (iter_p->tuple_cnt > 0 && iter_p->tfile_vfid != NULL
-	  && iter_p->tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-	  && iter_p->tfile_vfid->raw_fd_handle != NULL)
+      if (iter_p->tuple_cnt > 0 && QFILE_LIST_ID_TFILE_VFID(iter_p) != NULL
+	  && QFILE_LIST_ID_TFILE_VFID(iter_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+	  && QFILE_LIST_ID_TFILE_VFID(iter_p)->raw_fd_handle != NULL)
 	{
 	  return true;
 	}
@@ -3198,9 +3198,9 @@ qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
 int
 qmgr_segment_list_add_list_id (QMGR_SEGMENT_LIST * segment_list_p, const QFILE_LIST_ID * list_id_p)
 {
-  if (segment_list_p == NULL || list_id_p == NULL || list_id_p->tuple_cnt <= 0 || list_id_p->tfile_vfid == NULL
-      || list_id_p->tfile_vfid->backing != qmgr_temp_backing::RAW_FD_OVERFLOW
-      || list_id_p->tfile_vfid->raw_fd_handle == NULL)
+  if (segment_list_p == NULL || list_id_p == NULL || list_id_p->tuple_cnt <= 0 || QFILE_LIST_ID_TFILE_VFID(list_id_p) == NULL
+      || QFILE_LIST_ID_TFILE_VFID(list_id_p)->backing != qmgr_temp_backing::RAW_FD_OVERFLOW
+      || QFILE_LIST_ID_TFILE_VFID(list_id_p)->raw_fd_handle == NULL)
     {
       return NO_ERROR;
     }
@@ -3353,9 +3353,9 @@ qmgr_segment_list_append_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_
 static bool
 qmgr_list_is_private_spill_single_owner (const QFILE_LIST_ID * list_id_p)
 {
-  return list_id_p != NULL && list_id_p->dependent_list_id == NULL && list_id_p->tfile_vfid != NULL
-    && list_id_p->tfile_vfid->backing == qmgr_temp_backing::PRIVATE_SPILL_FALLBACK
-    && list_id_p->tfile_vfid->membuf == NULL;
+  return list_id_p != NULL && QFILE_LIST_ID_DEPENDENT(list_id_p) == NULL && QFILE_LIST_ID_TFILE_VFID(list_id_p) != NULL
+    && QFILE_LIST_ID_TFILE_VFID(list_id_p)->backing == qmgr_temp_backing::PRIVATE_SPILL_FALLBACK
+    && QFILE_LIST_ID_TFILE_VFID(list_id_p)->membuf == NULL;
 }
 
 static QFILE_LIST_ID *
@@ -3418,15 +3418,15 @@ qmgr_copy_list_tuples_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_lis
       return ER_FAILED;
     }
 
-  for (QFILE_LIST_ID * iter_p = src_list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = iter_p->dependent_list_id)
+  for (QFILE_LIST_ID * iter_p = src_list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
     {
       if (iter_p->tuple_cnt <= 0)
 	{
 	  continue;
 	}
 
-      if (iter_p->tfile_vfid != NULL && iter_p->tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-	  && iter_p->tfile_vfid->raw_fd_handle != NULL)
+      if (QFILE_LIST_ID_TFILE_VFID(iter_p) != NULL && QFILE_LIST_ID_TFILE_VFID(iter_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+	  && QFILE_LIST_ID_TFILE_VFID(iter_p)->raw_fd_handle != NULL)
 	{
 	  QMGR_SEGMENT_LIST segment_list;
 	  qmgr_segment_list_init (&segment_list);
@@ -3646,7 +3646,7 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 
   QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
   int error = NO_ERROR;
-  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = iter_p->dependent_list_id)
+  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
     {
       QFILE_LIST_SCAN_ID scan_id;
       if (qfile_open_list_scan_raw_fd_segments (const_cast < QFILE_LIST_ID * > (iter_p), &scan_id) != NO_ERROR)

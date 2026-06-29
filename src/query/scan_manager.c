@@ -728,9 +728,9 @@ scan_init_indx_coverage (THREAD_ENTRY * thread_p, int coverage_enabled, valptr_l
       err = ER_FAILED;
       goto exit_on_error;
     }
-  if (indx_cov->list_id != NULL && indx_cov->list_id->tfile_vfid != NULL)
+  if (indx_cov->list_id != NULL && QFILE_LIST_ID_TFILE_VFID(indx_cov->list_id) != NULL)
     {
-      assert (indx_cov->list_id->tfile_vfid != NULL);
+      assert (QFILE_LIST_ID_TFILE_VFID(indx_cov->list_id) != NULL);
       qfile_truncate_list (thread_p, indx_cov->list_id);
     }
   else
@@ -751,7 +751,7 @@ scan_init_indx_coverage (THREAD_ENTRY * thread_p, int coverage_enabled, valptr_l
 	}
     }
 
-  num_membuf_pages = qmgr_get_temp_file_membuf_pages (indx_cov->list_id->tfile_vfid);
+  num_membuf_pages = qmgr_get_temp_file_membuf_pages (QFILE_LIST_ID_TFILE_VFID(indx_cov->list_id));
   assert (num_membuf_pages > 0);
 
   if (max_key_len > 0 && num_membuf_pages > 0)
@@ -4960,7 +4960,7 @@ scan_reset_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
 	  if (indx_cov_p->list_id != NULL)
 	    {
 	      static int temp_cache_max_pages = prm_get_integer_value (PRM_ID_MAX_PAGES_IN_TEMP_FILE_CACHE);
-	      if (indx_cov_p->list_id->page_cnt - indx_cov_p->list_id->tfile_vfid->membuf_npages > temp_cache_max_pages)
+	      if (indx_cov_p->list_id->page_cnt - QFILE_LIST_ID_TFILE_VFID(indx_cov_p->list_id)->membuf_npages > temp_cache_max_pages)
 		{
 		  qfile_destroy_list (thread_p, indx_cov_p->list_id);
 
@@ -6627,7 +6627,7 @@ scan_next_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 
 			  qfile_close_scan (thread_p, indx_cov_p->lsid);
 
-			  if (indx_cov_p->list_id->page_cnt - indx_cov_p->list_id->tfile_vfid->membuf_npages >
+			  if (indx_cov_p->list_id->page_cnt - QFILE_LIST_ID_TFILE_VFID(indx_cov_p->list_id)->membuf_npages >
 			      temp_cache_max_pages)
 			    {
 			      /* close current list and start a new one */
@@ -9092,7 +9092,7 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	    {
 	      if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HYBRID)
 		{
-		  qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, scan_id_p->list_id.tfile_vfid);
+		  qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
 		}
 	      scan_id_p->position = S_AFTER;
 	      return S_END;
@@ -9131,7 +9131,7 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	      *tuple = tplrec.tpl;
 	      return S_SUCCESS;
 	    case EH_KEY_NOTFOUND:
-	      qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, scan_id_p->list_id.tfile_vfid);
+	      qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
 	      scan_id_p->position = S_AFTER;
 	      return S_END;
 	    case EH_ERROR_OCCURRED:

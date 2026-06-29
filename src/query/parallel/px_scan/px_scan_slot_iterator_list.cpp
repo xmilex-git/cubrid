@@ -123,7 +123,7 @@ namespace parallel_scan
 	  {
 	    /* qfile_get_tuple delegates to qfile_assemble_overflow_tuple at list_file.c:4673 when overflow page;
 	     * has_overflow_page guard above ensures equivalent path. */
-	    if (qfile_assemble_overflow_tuple (thread_p, m_curr_pgptr, &m_tplrec, m_list_id->tfile_vfid) != NO_ERROR)
+	    if (qfile_assemble_overflow_tuple (thread_p, m_curr_pgptr, &m_tplrec, QFILE_LIST_ID_TFILE_VFID(m_list_id)) != NO_ERROR)
 	      {
 		return S_ERROR;
 	      }

@@ -5607,14 +5607,14 @@ null_list:
   if (list_id != NULL)
     {
       /* get the first page of the list file */
-      if (VPID_ISNULL (& (list_id->first_vpid)))
+      if (VPID_ISNULL (& (QFILE_LIST_ID_FIRST_VPID(list_id))))
 	{
 	  // Note that not all list files have a page, for instance, insert.
 	  page_ptr = NULL;
 	}
       else
 	{
-	  page_ptr = qmgr_get_old_page (thread_p, & (list_id->first_vpid), list_id->tfile_vfid);
+	  page_ptr = qmgr_get_old_page (thread_p, & (QFILE_LIST_ID_FIRST_VPID(list_id)), QFILE_LIST_ID_TFILE_VFID(list_id));
 
 	  if (page_ptr != NULL)
 	    {
@@ -5632,7 +5632,7 @@ null_list:
 
 	      aligned_page_buf = (char *) malloc (page_size);
 	      memcpy (aligned_page_buf, page_ptr, page_size);
-	      qmgr_free_old_page_and_init (thread_p, page_ptr, list_id->tfile_vfid);
+	      qmgr_free_old_page_and_init (thread_p, page_ptr, QFILE_LIST_ID_TFILE_VFID(list_id));
 	      page_ptr = aligned_page_buf;
 
 	      /* for now, allow end query if there is only one page and more ... */
@@ -6115,13 +6115,13 @@ sqmgr_prepare_and_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char 
 
   if (listid_length)
     {
-      if (VPID_ISNULL (&q_result->first_vpid))
+      if (VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(q_result)))
 	{
 	  page_ptr = NULL;
 	}
       else
 	{
-	  page_ptr = qmgr_get_old_page (thread_p, &q_result->first_vpid, q_result->tfile_vfid);
+	  page_ptr = qmgr_get_old_page (thread_p, &QFILE_LIST_ID_FIRST_VPID(q_result), QFILE_LIST_ID_TFILE_VFID(q_result));
 	}
 
       if (page_ptr)
@@ -6140,7 +6140,7 @@ sqmgr_prepare_and_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char 
 	  /* to free page_ptr early */
 	  aligned_page_buf = (char *) malloc (page_size);
 	  memcpy (aligned_page_buf, page_ptr, page_size);
-	  qmgr_free_old_page_and_init (thread_p, page_ptr, q_result->tfile_vfid);
+	  qmgr_free_old_page_and_init (thread_p, page_ptr, QFILE_LIST_ID_TFILE_VFID(q_result));
 	}
       else
 	{

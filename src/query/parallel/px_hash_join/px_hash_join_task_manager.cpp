@@ -71,9 +71,9 @@ namespace parallel_query
 	    return false;
 	  }
 
-	for (QFILE_LIST_ID *current = list_id; current != nullptr; current = current->dependent_list_id)
+	for (QFILE_LIST_ID *current = list_id; current != nullptr; current = QFILE_LIST_ID_DEPENDENT(current))
 	  {
-	    QMGR_TEMP_FILE *current_tfile = current->tfile_vfid;
+	    QMGR_TEMP_FILE *current_tfile = QFILE_LIST_ID_TFILE_VFID(current);
 	    if (!has_raw_fd_overflow_pages (current_tfile))
 	      {
 		continue;
@@ -598,7 +598,7 @@ namespace parallel_query
 		}
 
 	      if (temp_part_list_id[part_id] != nullptr
-		  && (temp_part_list_id[part_id]->tfile_vfid->membuf_last == temp_part_list_id[part_id]->tfile_vfid->membuf_npages - 1)
+		  && (QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_last == QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_npages - 1)
 		  && (temp_part_list_id[part_id]->last_offset + QFILE_GET_TUPLE_LENGTH (tuple_record.tpl)) > DB_PAGESIZE)
 		{
 		  qfile_close_list (&thread_ref, temp_part_list_id[part_id]);	/* may be meaningless since only memory buffer is used */
@@ -658,7 +658,7 @@ namespace parallel_query
 		  has_error = true;
 		  break;
 		}
-	      assert (VFID_ISNULL (&temp_part_list_id[part_id]->tfile_vfid->temp_vfid));
+	      assert (VFID_ISNULL (&QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->temp_vfid));
 	    }
 	  while (true);		/* next tuple */
 

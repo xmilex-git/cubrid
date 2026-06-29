@@ -402,9 +402,9 @@ namespace parallel_scan
 		tl.list_id_header_p->m_type_list[i]->store ((TP_DOMAIN *)tl.list_id_header_p->m_list_id_p->type_list.domp[i],
 		    std::memory_order_release);
 	      }
-	    last_vpid.vpid = tl.list_id_header_p->m_list_id_p->last_vpid;
+	    last_vpid.vpid = QFILE_LIST_ID_LAST_VPID(tl.list_id_header_p->m_list_id_p);
 	    tl.list_id_header_p->m_last_vpid.store (last_vpid, std::memory_order_release);
-	    if (VPID_EQ (&tl.list_id_header_p->m_list_id_p->last_vpid, &tl.list_id_header_p->m_list_id_p->first_vpid))
+	    if (VPID_EQ (&QFILE_LIST_ID_LAST_VPID(tl.list_id_header_p->m_list_id_p), &QFILE_LIST_ID_FIRST_VPID(tl.list_id_header_p->m_list_id_p)))
 	      {
 		tl.list_id_header_p->m_first_vpid.store (last_vpid, std::memory_order_release);
 	      }
@@ -871,7 +871,7 @@ namespace parallel_scan
 	    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
 	    return false;
 	  }
-	old_last_vpid = tl_list_id_header->m_list_id_p->last_vpid;
+	old_last_vpid = QFILE_LIST_ID_LAST_VPID(tl_list_id_header->m_list_id_p);
 	err_code = qfile_add_tuple_to_list (thread_p, tl_list_id_header->m_list_id_p, tl_tpl_buf.tpl);
 	if (unlikely (err_code != NO_ERROR))
 	  {
@@ -888,17 +888,17 @@ namespace parallel_scan
 		    std::memory_order_release);
 	      }
 	  }
-	if (unlikely (!VPID_EQ (&old_last_vpid, &tl_list_id_header->m_list_id_p->last_vpid)
+	if (unlikely (!VPID_EQ (&old_last_vpid, &QFILE_LIST_ID_LAST_VPID(tl_list_id_header->m_list_id_p))
 		      && old_last_vpid.pageid != NULL_PAGEID))
 	  {
 	    VPID64_t vpid;
 	    /* last vpid changed, send it to reader */
 	    if (tl_list_id_header->m_first_vpid.load (std::memory_order_acquire).vpid.pageid == NULL_PAGEID)
 	      {
-		vpid.vpid = tl_list_id_header->m_list_id_p->first_vpid;
+		vpid.vpid = QFILE_LIST_ID_FIRST_VPID(tl_list_id_header->m_list_id_p);
 		tl_list_id_header->m_first_vpid.store (vpid, std::memory_order_release);
 	      }
-	    vpid.vpid = tl_list_id_header->m_list_id_p->last_vpid;
+	    vpid.vpid = QFILE_LIST_ID_LAST_VPID(tl_list_id_header->m_list_id_p);
 	    tl_list_id_header->m_last_vpid.store (vpid, std::memory_order_release);
 	    tl_list_id_header->m_valid.store (true, std::memory_order_release);
 	    m_result_cv.notify_all ();

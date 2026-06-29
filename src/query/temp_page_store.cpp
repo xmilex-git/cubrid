@@ -2496,12 +2496,12 @@ rawfd_write_success:
 
     QFILE_LIST_ID list_id;
     QFILE_CLEAR_LIST_ID (&list_id);
-    list_id.tfile_vfid = &tfile;
+    QFILE_LIST_ID_TFILE_VFID(&(list_id)) = &tfile;
     list_id.page_cnt = 1;
-    list_id.first_vpid.volid = NULL_VOLID;
-    list_id.first_vpid.pageid = 0;
-    list_id.last_vpid.volid = NULL_VOLID;
-    list_id.last_vpid.pageid = 0;
+    QFILE_LIST_ID_FIRST_VPID(&(list_id)).volid = NULL_VOLID;
+    QFILE_LIST_ID_FIRST_VPID(&(list_id)).pageid = 0;
+    QFILE_LIST_ID_LAST_VPID(&(list_id)).volid = NULL_VOLID;
+    QFILE_LIST_ID_LAST_VPID(&(list_id)).pageid = 0;
     list_id.last_offset = QFILE_PAGE_HEADER_SIZE;
     list_id.query_id = static_cast<QUERY_ID> (-6);
 
@@ -2664,13 +2664,13 @@ rawfd_write_success:
 
     QFILE_LIST_ID list_id;
     QFILE_CLEAR_LIST_ID (&list_id);
-    list_id.tfile_vfid = &tfile;
+    QFILE_LIST_ID_TFILE_VFID(&(list_id)) = &tfile;
     list_id.tuple_cnt = 1;
     list_id.page_cnt = 2;
-    list_id.first_vpid.volid = NULL_VOLID;
-    list_id.first_vpid.pageid = 0;
-    list_id.last_vpid.volid = NULL_VOLID;
-    list_id.last_vpid.pageid = 1;
+    QFILE_LIST_ID_FIRST_VPID(&(list_id)).volid = NULL_VOLID;
+    QFILE_LIST_ID_FIRST_VPID(&(list_id)).pageid = 0;
+    QFILE_LIST_ID_LAST_VPID(&(list_id)).volid = NULL_VOLID;
+    QFILE_LIST_ID_LAST_VPID(&(list_id)).pageid = 1;
     list_id.last_offset = QFILE_PAGE_HEADER_SIZE;
     list_id.query_id = static_cast<QUERY_ID> (-5);
 

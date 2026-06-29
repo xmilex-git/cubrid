@@ -45,7 +45,7 @@ namespace parallel_scan
     /* Idempotent close before re-open. */
     qfile_close_list_sector_scan (thread_p, &m_sector_scan);
 
-    if (parallelism <= 0 || list_id == nullptr || VPID_ISNULL (&list_id->first_vpid))
+    if (parallelism <= 0 || list_id == nullptr || VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(list_id)))
       {
 	m_list_id = nullptr;
 	return NO_ERROR;

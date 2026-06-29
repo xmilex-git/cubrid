@@ -5093,21 +5093,21 @@ or_pack_listid (char *ptr, void *listid_ptr)
 
   OR_PUT_PTR (ptr, listid->query_id);
   ptr += OR_PTR_SIZE;
-  OR_PUT_PTR (ptr, listid->tfile_vfid);
+  OR_PUT_PTR (ptr, QFILE_LIST_ID_TFILE_VFID(listid));
   ptr += OR_PTR_SIZE;
 
   ptr = or_pack_int64 (ptr, listid->tuple_cnt);
 
   OR_PUT_INT (ptr, listid->page_cnt);
   ptr += OR_INT_SIZE;
-  OR_PUT_INT (ptr, listid->first_vpid.pageid);
+  OR_PUT_INT (ptr, QFILE_LIST_ID_FIRST_VPID(listid).pageid);
   ptr += OR_INT_SIZE;
-  OR_PUT_INT (ptr, listid->first_vpid.volid);
+  OR_PUT_INT (ptr, QFILE_LIST_ID_FIRST_VPID(listid).volid);
   ptr += OR_INT_SIZE;
 
-  OR_PUT_INT (ptr, listid->last_vpid.pageid);
+  OR_PUT_INT (ptr, QFILE_LIST_ID_LAST_VPID(listid).pageid);
   ptr += OR_INT_SIZE;
-  OR_PUT_INT (ptr, listid->last_vpid.volid);
+  OR_PUT_INT (ptr, QFILE_LIST_ID_LAST_VPID(listid).volid);
   ptr += OR_INT_SIZE;
 
   OR_PUT_INT (ptr, listid->last_offset);
@@ -5180,7 +5180,7 @@ or_unpack_listid (char *ptr, void *listid_ptr)
   listid->query_id = OR_GET_PTR (ptr);
   ptr += OR_PTR_SIZE;
 
-  listid->tfile_vfid = (struct qmgr_temp_file *) OR_GET_PTR (ptr);
+  QFILE_LIST_ID_TFILE_VFID(listid) = (struct qmgr_temp_file *) OR_GET_PTR (ptr);
   ptr += OR_PTR_SIZE;
 
   ptr = or_unpack_int64 (ptr, &listid->tuple_cnt);
@@ -5188,14 +5188,14 @@ or_unpack_listid (char *ptr, void *listid_ptr)
   listid->page_cnt = OR_GET_INT (ptr);
   ptr += OR_INT_SIZE;
 
-  listid->first_vpid.pageid = OR_GET_INT (ptr);
+  QFILE_LIST_ID_FIRST_VPID(listid).pageid = OR_GET_INT (ptr);
   ptr += OR_INT_SIZE;
-  listid->first_vpid.volid = OR_GET_INT (ptr);
+  QFILE_LIST_ID_FIRST_VPID(listid).volid = OR_GET_INT (ptr);
   ptr += OR_INT_SIZE;
 
-  listid->last_vpid.pageid = OR_GET_INT (ptr);
+  QFILE_LIST_ID_LAST_VPID(listid).pageid = OR_GET_INT (ptr);
   ptr += OR_INT_SIZE;
-  listid->last_vpid.volid = OR_GET_INT (ptr);
+  QFILE_LIST_ID_LAST_VPID(listid).volid = OR_GET_INT (ptr);
   ptr += OR_INT_SIZE;
 
   listid->last_offset = OR_GET_INT (ptr);

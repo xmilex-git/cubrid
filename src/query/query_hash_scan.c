@@ -698,12 +698,12 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
     }
 
   /* save position */
-  if (scan_id_p->list_id.tfile_vfid != NULL
-      && scan_id_p->list_id.tfile_vfid->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-      && scan_id_p->list_id.tfile_vfid->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
-      && scan_id_p->curr_vpid.pageid > scan_id_p->list_id.tfile_vfid->membuf_last)
+  if (QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)) != NULL
+      && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+      && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
+      && scan_id_p->curr_vpid.pageid > QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->membuf_last)
     {
-      qfile_tuple_simple_pos_set_raw_fd (value->pos, scan_id_p->list_id.tfile_vfid->raw_fd_handle->segment_id (),
+      qfile_tuple_simple_pos_set_raw_fd (value->pos, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle->segment_id (),
 					 scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
     }
   else

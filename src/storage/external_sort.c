@@ -4483,11 +4483,11 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
 
   i = 0;
   is_first_vpid = false;
-  prev_vpid = sort_info_p->input_file->first_vpid;
+  prev_vpid = QFILE_LIST_ID_FIRST_VPID(sort_info_p->input_file);
   /* TO_DO : dont fix all pages to split. Consider using a numerable temporary file */
   while (true)
     {
-      page_p = qmgr_get_old_page (thread_p, &prev_vpid, sort_info_p->input_file->tfile_vfid);
+      page_p = qmgr_get_old_page (thread_p, &prev_vpid, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
       if (page_p == NULL)
 	{
 	  return ER_FAILED;
@@ -4495,19 +4495,19 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
       if (is_first_vpid)
 	{
 	  QFILE_PUT_PREV_VPID_NULL (page_p);
-	  qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
+	  qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
 	  is_first_vpid = false;
 	}
       QFILE_GET_NEXT_VPID (&next_vpid, page_p);
       if (VPID_ISNULL (&next_vpid))
 	{
-	  qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+	  qmgr_free_old_page_and_init (thread_p, page_p, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
 	  break;
 	}
       else if (++j >= splitted_num_page)
 	{
 	  QFILE_PUT_NEXT_VPID_NULL (page_p);
-	  qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
+	  qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
 	  is_first_vpid = true;
 	  first_vpid[i] = next_vpid;
 	  last_vpid[i] = prev_vpid;
@@ -4519,22 +4519,22 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
 	    }
 	  else
 	    {
-	      qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+	      qmgr_free_old_page_and_init (thread_p, page_p, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
 
 	      /* init prev page id */
-	      page_p = qmgr_get_old_page (thread_p, &next_vpid, sort_info_p->input_file->tfile_vfid);
+	      page_p = qmgr_get_old_page (thread_p, &next_vpid, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
 	      if (page_p == NULL)
 		{
 		  return ER_FAILED;
 		}
 	      QFILE_PUT_PREV_VPID_NULL (page_p);
-	      qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, sort_info_p->input_file->tfile_vfid);
-	      qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+	      qmgr_set_dirty_page (thread_p, page_p, DONT_FREE, NULL, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
+	      qmgr_free_old_page_and_init (thread_p, page_p, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
 	      break;
 	    }
 	}
       prev_vpid = next_vpid;
-      qmgr_free_old_page_and_init (thread_p, page_p, sort_info_p->input_file->tfile_vfid);
+      qmgr_free_old_page_and_init (thread_p, page_p, QFILE_LIST_ID_TFILE_VFID(sort_info_p->input_file));
     }
 
   /* add splitted file info */
@@ -4552,9 +4552,9 @@ sort_split_input_temp_file (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
       /* It can be put precisely from the page header, but not have to be precise for later process. */
       sort_info_p->input_file->tuple_cnt = org_sort_info_p->input_file->tuple_cnt / parallel_num;
       sort_info_p->input_file->page_cnt = splitted_num_page;
-      sort_info_p->input_file->first_vpid = (i == 0) ? org_sort_info_p->input_file->first_vpid : first_vpid[i - 1];
-      sort_info_p->input_file->last_vpid =
-	(i == parallel_num - 1) ? org_sort_info_p->input_file->last_vpid : last_vpid[i];
+      QFILE_LIST_ID_FIRST_VPID(sort_info_p->input_file) = (i == 0) ? QFILE_LIST_ID_FIRST_VPID(org_sort_info_p->input_file) : first_vpid[i - 1];
+      QFILE_LIST_ID_LAST_VPID(sort_info_p->input_file) =
+	(i == parallel_num - 1) ? QFILE_LIST_ID_LAST_VPID(org_sort_info_p->input_file) : last_vpid[i];
     }
 
   return error;
@@ -4672,14 +4672,14 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
     {
       sort_info_p = (SORT_INFO *) px_sort_param[i].put_arg;
       /* check NULL list id */
-      if (VPID_ISNULL (&sort_info_p->output_file->first_vpid))
+      if (VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(sort_info_p->output_file)))
 	{
 	  /* skip the empty list */
 	  continue;
 	}
 
       /* If QUERY_CACHE(FILE_QUERY_AREA), Merged list not possible. */
-      if (origin_list_id->tfile_vfid->temp_file_type == FILE_QUERY_AREA)
+      if (QFILE_LIST_ID_TFILE_VFID(origin_list_id)->temp_file_type == FILE_QUERY_AREA)
 	{
 	  error = qfile_append_list (thread_p, origin_list_id, sort_info_p->output_file);
 	  if (error != NO_ERROR)
