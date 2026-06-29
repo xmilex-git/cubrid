@@ -42,6 +42,7 @@
 #include "object_primitive.h"
 #include "object_representation.h"
 #include "query_manager.h"
+#include "qfile_tape.hpp"	/* Phase1 1A scan contract (redesign G005, issue #70) */
 #include "query_opfunc.h"
 #include "stream_to_xasl.h"
 #include "thread_entry.hpp"
@@ -545,6 +546,34 @@ qfile_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_li
       assert (QFILE_LIST_ID_DEPENDENT(dest_list_id_p) == NULL);
     }
 
+  /* Tapeset ownership (Phase1 1A, redesign G005 #70).  The struct memcpy above
+   * shallow-copied tapeset_/owns_tapeset_; resolve ownership per dependent
+   * mode (single-owner model, SSOT #75 §3.2 B1):
+   *   SKIP    (scan-open)     -> borrow: read the Tapes, never own/free them.
+   *   MOVE    (holdable)      -> transfer ownership; clear the source.
+   *   PROHIBIT (cached copy-out) -> tuples are copied out, the Tape handles are
+   *                                 not carried; the copy owns no Tapeset. */
+  if (QFILE_LIST_ID_TAPESET (src_list_id_p) != NULL)
+    {
+      switch (dep_mode)
+	{
+	case QFILE_SKIP_DEPENDENT:
+	  QFILE_LIST_ID_OWNS_TAPESET (dest_list_id_p) = false;
+	  break;
+
+	case QFILE_MOVE_DEPENDENT:
+	  QFILE_LIST_ID_TAPESET (const_cast < QFILE_LIST_ID * >(src_list_id_p)) = NULL;
+	  QFILE_LIST_ID_OWNS_TAPESET (const_cast < QFILE_LIST_ID * >(src_list_id_p)) = false;
+	  break;
+
+	case QFILE_PROHIBIT_DEPENDENT:
+	default:
+	  QFILE_LIST_ID_TAPESET (dest_list_id_p) = NULL;
+	  QFILE_LIST_ID_OWNS_TAPESET (dest_list_id_p) = false;
+	  break;
+	}
+    }
+
   qfile_update_qlist_count (thread_get_thread_entry_info (), dest_list_id_p, 1);
 
   return NO_ERROR;
@@ -606,6 +635,13 @@ qfile_clear_list_id (QFILE_LIST_ID * list_id_p)
     {
       qfile_clear_list_id (QFILE_LIST_ID_DEPENDENT(list_id_p));
       free_and_init (QFILE_LIST_ID_DEPENDENT(list_id_p));
+    }
+
+  /* Tapeset (Phase1 1A, redesign G005 #70): destroy it only if this list_id
+   * owns it (a borrowing scan copy must not free the producer's Tapes). */
+  if (QFILE_LIST_ID_TAPESET (list_id_p) != NULL && QFILE_LIST_ID_OWNS_TAPESET (list_id_p))
+    {
+      qfile_tapeset_destroy (QFILE_LIST_ID_TAPESET (list_id_p));
     }
 
   QFILE_CLEAR_LIST_ID (list_id_p);
@@ -5179,6 +5215,11 @@ qfile_scan_prev (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 void
 qfile_save_current_scan_tuple_position (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_POSITION * tuple_position_p)
 {
+  if (scan_id_p->tapeset_scan_ != NULL)
+    {
+      qfile_tapeset_scan_save_position (scan_id_p, tuple_position_p);
+      return;
+    }
   tuple_position_p->status = scan_id_p->status;
   tuple_position_p->position = scan_id_p->position;
   if (QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)) != NULL
@@ -5265,6 +5306,10 @@ qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * sc
 {
   PAGE_PTR page_p;
 
+  if (scan_id_p->tapeset_scan_ != NULL)
+    {
+      return qfile_tapeset_scan_jump (thread_p, scan_id_p, tuple_position_p, tuple_record_p, peek);
+    }
   if (qfile_tuple_position_is_raw_fd (tuple_position_p))
     {
       if (tuple_position_p->position == S_ON)
@@ -5395,6 +5440,12 @@ qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * sc
 int
 qfile_start_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
+  if (scan_id_p->tapeset_scan_ != NULL)
+    {
+      /* Tapeset scans (redesign G005 #70) hold their page inside the driver;
+       * there is nothing to (re)fix through a tfile. */
+      return NO_ERROR;
+    }
   if (scan_id_p->position == S_ON && !scan_id_p->curr_pgptr)
     {
       if (scan_id_p->is_read_only)
@@ -5448,6 +5499,20 @@ qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * s
 
   scan_id_p->tplrec.size = 0;
   scan_id_p->tplrec.tpl = NULL;
+
+  /* Phase1 1A scan contract (redesign G005 #70).  If the scanned list carries a
+   * Tapeset (offset-arithmetic multi-Tape connection structure), build the
+   * Tapeset scan driver; otherwise this stays NULL and the legacy
+   * single-backing scan path runs unchanged. */
+  scan_id_p->tapeset_scan_ = NULL;
+  if (QFILE_LIST_ID_TAPESET (&scan_id_p->list_id) != NULL)
+    {
+      if (qfile_tapeset_scan_open (scan_id_p) != NO_ERROR)
+	{
+	  qfile_clear_list_id (&scan_id_p->list_id);
+	  return ER_FAILED;
+	}
+    }
 
   return NO_ERROR;
 }
@@ -5513,6 +5578,10 @@ SCAN_CODE
 qfile_scan_list_next (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_RECORD * tuple_record_p,
 		      int peek)
 {
+  if (scan_id_p->tapeset_scan_ != NULL)
+    {
+      return qfile_tapeset_scan_forward (thread_p, scan_id_p, tuple_record_p, peek);
+    }
   return qfile_scan_list (thread_p, scan_id_p, qfile_scan_next, tuple_record_p, peek);
 }
 
@@ -5527,6 +5596,10 @@ SCAN_CODE
 qfile_scan_list_prev (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_RECORD * tuple_record_p,
 		      int peek)
 {
+  if (scan_id_p->tapeset_scan_ != NULL)
+    {
+      return qfile_tapeset_scan_backward (thread_p, scan_id_p, tuple_record_p, peek);
+    }
   return qfile_scan_list (thread_p, scan_id_p, qfile_scan_prev, tuple_record_p, peek);
 }
 
@@ -5540,6 +5613,12 @@ qfile_scan_list_prev (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p, Q
 void
 qfile_end_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
+  if (scan_id_p->tapeset_scan_ != NULL)
+    {
+      /* Tapeset scans (redesign G005 #70): the driver owns the page; do not
+       * touch the synthetic mirror via the legacy tfile path. */
+      return;
+    }
   if (scan_id_p->position == S_ON && scan_id_p->curr_pgptr)
     {
       qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
@@ -5567,7 +5646,18 @@ qfile_close_scan (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
       return;
     }
 
-  if ((scan_id_p->position == S_ON || (scan_id_p->position == S_AFTER && scan_id_p->keep_page_on_finish))
+  /* Phase1 1A scan contract (redesign G005 #70).  A Tapeset scan holds its page
+   * inside the Tapeset driver (curr_pgptr is only a mirror); release it through
+   * the driver, not via the legacy tfile page-free below. */
+  bool was_tapeset_scan = (scan_id_p->tapeset_scan_ != NULL);
+  if (was_tapeset_scan)
+    {
+      qfile_tapeset_scan_close (thread_p, scan_id_p);
+      scan_id_p->curr_pgptr = NULL;
+    }
+
+  if (!was_tapeset_scan
+      && (scan_id_p->position == S_ON || (scan_id_p->position == S_AFTER && scan_id_p->keep_page_on_finish))
       && scan_id_p->curr_pgptr)
     {
       qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));

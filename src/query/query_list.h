@@ -445,6 +445,13 @@ struct qfile_list_id
   bool is_domain_resolved;	/* domains for host var is resolved or not */
   bool is_result_cached;	/* for subquery result cache */
   QFILE_LIST_ID *dependent_list_id_;	/* Linked as dependent by qfile_connect_list; cleared together. (access via QFILE_LIST_ID_DEPENDENT) */
+  /* Phase1 1A scan contract (redesign G005, issue #70).  Ordered Tape vector
+   * (Tapeset) that replaces cross-file next_vpid linkage as the connection
+   * structure (SSOT #75 §3.2 B1, ADR 0002).  NULL = legacy single-backing list
+   * (no behavior change).  Opaque (qfile::tapeset *); access via the accessor
+   * macro below.  Not serialized (transient runtime structure). */
+  void *tapeset_;		/* (access via QFILE_LIST_ID_TAPESET) */
+  bool owns_tapeset_;		/* this list_id owns/free the tapeset (access via QFILE_LIST_ID_OWNS_TAPESET) */
 };
 
 #define QFILE_CLEAR_LIST_ID(list_id) \
@@ -479,6 +486,8 @@ struct qfile_list_id
       (list_id)->is_domain_resolved = false; \
       (list_id)->is_result_cached = false; \
       (list_id)->dependent_list_id_ = NULL; \
+      (list_id)->tapeset_ = NULL; \
+      (list_id)->owns_tapeset_ = false; \
     } \
   while (0)
 
@@ -501,12 +510,19 @@ struct qfile_list_id
 #define QFILE_LIST_ID_LAST_VPID(list_id)   ((list_id)->last_vpid_)
 #define QFILE_LIST_ID_TFILE_VFID(list_id)  ((list_id)->tfile_vfid_)
 #define QFILE_LIST_ID_DEPENDENT(list_id)   ((list_id)->dependent_list_id_)
+#define QFILE_LIST_ID_TAPESET(list_id)     ((list_id)->tapeset_)
+#define QFILE_LIST_ID_OWNS_TAPESET(list_id) ((list_id)->owns_tapeset_)
 
 /* Tuple position coordinate type */
 enum qfile_tuple_position_coordinate_type
 {
   QFILE_TUPLE_POSITION_COORD_VPID = 0,
-  QFILE_TUPLE_POSITION_COORD_RAW_FD = 1
+  QFILE_TUPLE_POSITION_COORD_RAW_FD = 1,
+  /* Tape-relative coordinate (redesign G005, issue #70 / ADR 0002): a tuple is
+   * addressed by (tape_idx, tape_page_offset, tape_byte_offset) + tplno, by
+   * pure offset arithmetic — no VPID, no raw-fd segment.  Intra-query only
+   * (never stored to QFILE_TUPLE_POSITION_DB; CONNECT BY does not serialize it). */
+  QFILE_TUPLE_POSITION_COORD_TAPE = 2
 };
 typedef enum qfile_tuple_position_coordinate_type QFILE_TUPLE_POSITION_COORDINATE_TYPE;
 
@@ -530,6 +546,12 @@ struct qfile_tuple_position
       UINT64 raw_fd_segment_id;	/* Raw-fd segment identifier */
       INT32 page_index;		/* Page index inside the raw-fd segment */
       INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
+    };
+    struct
+    {
+      INT32 tape_idx;		/* Tape index within the Tapeset (COORD_TAPE) */
+      INT32 tape_page_offset;	/* Logical page index within the Tape */
+      INT32 tape_byte_offset;	/* Tuple byte offset inside the page */
     };
   };
   QFILE_TUPLE tpl;		/* Tuple pointer inside the page */
@@ -587,6 +609,22 @@ qfile_tuple_position_set_raw_fd (QFILE_TUPLE_POSITION * tuple_position_p, UINT64
   tuple_position_p->tuple_offset = tuple_offset;
 }
 
+static inline bool
+qfile_tuple_position_is_tape (const QFILE_TUPLE_POSITION * tuple_position_p)
+{
+  return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_TAPE;
+}
+
+static inline void
+qfile_tuple_position_set_tape (QFILE_TUPLE_POSITION * tuple_position_p, INT32 tape_idx, INT32 tape_page_offset,
+			       INT32 tape_byte_offset)
+{
+  tuple_position_p->coord_type = QFILE_TUPLE_POSITION_COORD_TAPE;
+  tuple_position_p->tape_idx = tape_idx;
+  tuple_position_p->tape_page_offset = tape_page_offset;
+  tuple_position_p->tape_byte_offset = tape_byte_offset;
+}
+
 static inline void
 qfile_tuple_position_copy_coord (QFILE_TUPLE_POSITION * dst_p, const QFILE_TUPLE_POSITION * src_p)
 {
@@ -594,6 +632,10 @@ qfile_tuple_position_copy_coord (QFILE_TUPLE_POSITION * dst_p, const QFILE_TUPLE
   if (qfile_tuple_position_is_raw_fd (src_p))
     {
       qfile_tuple_position_set_raw_fd (dst_p, src_p->raw_fd_segment_id, src_p->page_index, src_p->tuple_offset);
+    }
+  else if (qfile_tuple_position_is_tape (src_p))
+    {
+      qfile_tuple_position_set_tape (dst_p, src_p->tape_idx, src_p->tape_page_offset, src_p->tape_byte_offset);
     }
   else
     {
@@ -666,6 +708,11 @@ struct qfile_list_scan_id
   int curr_tplno;		/* current tuple number */
   QFILE_TUPLE_RECORD tplrec;	/* used for overflow tuple peeking */
   QFILE_LIST_ID list_id;	/* list file identifier */
+  /* Phase1 1A scan contract (redesign G005, issue #70).  When the scanned
+   * list_id carries a Tapeset (QFILE_LIST_ID_TAPESET != NULL), this holds the
+   * offset-arithmetic multi-Tape scan driver (qfile::tapeset_scan *).  NULL =
+   * legacy single-backing scan (no behavior change). */
+  void *tapeset_scan_;
 };
 
 /* list file flag; denoting type and/or operation of the list file */
