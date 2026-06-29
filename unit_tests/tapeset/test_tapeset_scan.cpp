@@ -29,6 +29,7 @@
  */
 
 #include "qfile_tape.hpp"
+#include "qfile_chunk.hpp"
 #include "object_representation.h"
 #include "error_code.h"
 
@@ -37,6 +38,8 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <thread>
+#include <atomic>
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -1000,6 +1003,218 @@ namespace
       }
     return 0;
   }
+
+  /* ---- Phase2 MIGRATE (issue #73) R2 + no-mixed-backing gates --------- */
+
+  /* G14: R2 offset-range work-stealing (qfile::chunk_distributor, ADR 0003).
+   *  (a) coverage under REAL concurrency: over a skewed multi-Tape page space
+   *      (huge + tiny + empty Tapes), N reader threads claim chunks via the
+   *      shared atomic; every page is claimed exactly once -- no gap, no
+   *      double-claim (scheduling-independent: fetch_add hands each chunk to
+   *      exactly one reader).
+   *  (b) balance: a huge single Tape split among equal-rate readers stays
+   *      balanced -- chunk-skew CoV <= 15% and the per-reader spread is bounded
+   *      by one chunk (the work-stealing balance property, modelled by the
+   *      round-robin = equal-rate interleaving: deterministic, not flaky).
+   *  (c) the same balance holds for a huge Tape mixed with many tiny Tapes. */
+  int
+  run_r2_distribution ()
+  {
+    /* (a) concurrent coverage + no-double-claim over a skewed fixture. */
+    {
+      const std::vector<int> counts = { 200, 0, 5, 64, 1, 130, 0, 33 };
+      const int N = 6;
+      qfile::chunk_distributor d (counts, N, 64);
+
+      std::vector<std::vector<qfile::chunk_distributor::range> > claimed (N);
+      auto drain = [&d, &claimed] (int rid)
+      {
+	qfile::chunk_distributor::range r;
+	while (d.next_chunk (rid, r))
+	  {
+	    claimed[rid].push_back (r);
+	  }
+      };
+      std::vector<std::thread> threads;
+      for (int i = 0; i < N; i++)
+	{
+	  threads.emplace_back (drain, i);
+	}
+      for (std::thread &t : threads)
+	{
+	  t.join ();
+	}
+
+      std::vector<std::vector<char> > seen (counts.size ());
+      for (size_t t = 0; t < counts.size (); t++)
+	{
+	  seen[t].assign (counts[t] > 0 ? counts[t] : 0, 0);
+	}
+      long claimed_pages = 0;
+      for (int rid = 0; rid < N; rid++)
+	{
+	  for (const qfile::chunk_distributor::range &r : claimed[rid])
+	    {
+	      if (r.tape_idx < 0 || r.tape_idx >= (int) counts.size ())
+		{
+		  return 1;
+		}
+	      if (r.page_count <= 0 || r.page_count > 64)
+		{
+		  return 2;
+		}
+	      for (int p = r.start_page; p < r.start_page + r.page_count; p++)
+		{
+		  if (p < 0 || p >= counts[r.tape_idx])
+		    {
+		      return 3;
+		    }
+		  if (seen[r.tape_idx][p] != 0)
+		    {
+		      return 4;	/* double-claim */
+		    }
+		  seen[r.tape_idx][p] = 1;
+		  claimed_pages++;
+		}
+	    }
+	}
+      long total = 0;
+      for (int c : counts)
+	{
+	  total += (c > 0 ? c : 0);
+	}
+      if (claimed_pages != total || d.total_pages () != total)
+	{
+	  return 5;
+	}
+      for (size_t t = 0; t < counts.size (); t++)
+	{
+	  const int n = counts[t] > 0 ? counts[t] : 0;
+	  for (int p = 0; p < n; p++)
+	    {
+	      if (seen[t][p] != 1)
+		{
+		  return 6;	/* gap */
+		}
+	    }
+	}
+    }
+
+    /* (b) balance over a huge single Tape (equal-rate readers = round-robin). */
+    {
+      const int N = 8;
+      const int huge = 64 * 100 + 17;	/* 6417 pages -> 101 chunks (1 partial) */
+      qfile::chunk_distributor d (std::vector<int> { huge }, N, 64);
+      qfile::chunk_distributor::range r;
+      long covered = 0;
+      int rid = 0;
+      while (d.next_chunk (rid, r))
+	{
+	  covered += r.page_count;
+	  rid = (rid + 1) % N;
+	}
+      const qfile::r2_metrics m = d.metrics ();
+      if (covered != huge || m.total_pages != huge)
+	{
+	  return 10;
+	}
+      if (m.max_reader_pages - m.min_reader_pages > 64)	/* bounded by one chunk */
+	{
+	  return 11;
+	}
+      if (m.cov > 0.15)					/* chunk-skew CoV <= 15% */
+	{
+	  return 12;
+	}
+    }
+
+    /* (c) balance over a huge Tape mixed with many tiny Tapes. */
+    {
+      const int N = 8;
+      std::vector<int> counts;
+      counts.push_back (64 * 200);		/* 12800-page huge Tape */
+      for (int i = 0; i < 20; i++)
+	{
+	  counts.push_back (3);			/* tiny Tapes */
+	}
+      qfile::chunk_distributor d (counts, N, 64);
+      qfile::chunk_distributor::range r;
+      int rid = 0;
+      while (d.next_chunk (rid, r))
+	{
+	  rid = (rid + 1) % N;
+	}
+      if (d.coefficient_of_variation () > 0.15)
+	{
+	  return 20;
+	}
+    }
+    return 0;
+  }
+
+  /* G15: no-mixed-backing invariant (qfile_list_is_mixed_backing).  The check
+   * must DISCRIMINATE: pass a clean OLD list and a clean NEW list, catch a
+   * synthetic mixed list (the FAIL-03/06 shape).  We drive the predicate
+   * directly; qfile_check_no_mixed_backing wraps this same predicate in a
+   * debug assert, which a bootless run cannot trip without aborting. */
+  int
+  run_no_mixed_backing ()
+  {
+    QFILE_LIST_ID lst;
+    std::memset (&lst, 0, sizeof (lst));
+    QFILE_CLEAR_LIST_ID (&lst);
+
+    /* cleared: no backing committed -> not mixed */
+    if (qfile_list_has_old_backing (&lst) || qfile_list_has_new_backing (&lst)
+	|| qfile_list_is_mixed_backing (&lst) || QFILE_LIST_ID_BACKING_KIND (&lst) != QFILE_BACKING_NONE)
+      {
+	return 1;
+      }
+
+    /* clean OLD: real first-page VPID, no Tapeset */
+    QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
+    QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
+    QFILE_LIST_ID_BACKING_KIND (&lst) = QFILE_BACKING_OLD;
+    if (!qfile_list_has_old_backing (&lst) || qfile_list_has_new_backing (&lst) || qfile_list_is_mixed_backing (&lst))
+      {
+	return 2;
+      }
+
+    /* clean NEW: a Tapeset, no old identity */
+    qfile::tapeset ts_new;
+    QFILE_CLEAR_LIST_ID (&lst);
+    QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
+    QFILE_LIST_ID_BACKING_KIND (&lst) = QFILE_BACKING_NEW;
+    if (qfile_list_has_old_backing (&lst) || !qfile_list_has_new_backing (&lst) || qfile_list_is_mixed_backing (&lst))
+      {
+	return 3;
+      }
+
+    /* mixed (the violation): old VPID + Tapeset -> MUST be detected */
+    QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
+    QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
+    if (!qfile_list_is_mixed_backing (&lst))
+      {
+	return 4;
+      }
+
+    /* mixed via the other OLD signal (tfile_vfid) + Tapeset */
+    QFILE_CLEAR_LIST_ID (&lst);
+    QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
+    QFILE_LIST_ID_TFILE_VFID (&lst) = (struct qmgr_temp_file *) &lst;	/* non-null sentinel, never dereferenced */
+    if (!qfile_list_is_mixed_backing (&lst))
+      {
+	return 5;
+      }
+
+    /* drop the Tapeset -> clean OLD again (not mixed) */
+    QFILE_LIST_ID_TAPESET (&lst) = NULL;
+    if (qfile_list_is_mixed_backing (&lst) || !qfile_list_has_old_backing (&lst))
+      {
+	return 6;
+      }
+    return 0;
+  }
 }
 
 int
@@ -1019,6 +1234,8 @@ main (int, char **)
     { "G11 holdable reparent (MOVE) zero-copy + parity + orphan-zero", run_reparent_orphan_zero },
     { "G12 tiny all-RAM reparent (zero disk touch, RAM orphan-zero)", run_reparent_tiny },
     { "G13 borrow (SKIP) does not free owner's Tapes", run_borrow_no_free },
+    { "G14 R2 offset-range work-stealing (coverage + CoV <= 15%)", run_r2_distribution },
+    { "G15 migration no-mixed-backing discriminates (old+new shape)", run_no_mixed_backing },
   };
 
   bool all_passed = true;

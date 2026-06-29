@@ -33,6 +33,8 @@
 #include "storage_common.h"
 #include "object_domain.h"
 
+#include <assert.h>
+
 typedef enum
 {
   NO_JOIN = -1,
@@ -426,6 +428,23 @@ struct sort_list
  */
 
 typedef struct qfile_list_id QFILE_LIST_ID;
+
+/* Migration backing-kind tag (redesign G008, issue #73; Phase 2 MIGRATE).
+ * During expand->migrate the OLD backing (qfile_connect_list / raw-fd / pgbuf
+ * sector) and the NEW backing (Tapeset / per-worker private file / offset
+ * arithmetic) coexist, but a SINGLE list is produced wholly by one path --
+ * never a mix (operator-atomic switch).  This permanently avoids the
+ * mixed-backing scan that produced garbled results and the +209%/crash dead
+ * end (evidence FAIL-03 / FAIL-06).  The tag is the migration-limited dispatch
+ * discriminator; it is deleted at contract (Phase 3) with the OLD variants.
+ * NONE = not yet committed to a backing (a freshly cleared list). */
+enum qfile_backing_kind
+{
+  QFILE_BACKING_NONE = 0,
+  QFILE_BACKING_OLD = 1,	/* connect_list / raw-fd / pgbuf-sector */
+  QFILE_BACKING_NEW = 2		/* Tapeset / per-worker private file / offset */
+};
+typedef enum qfile_backing_kind QFILE_BACKING_KIND;
 struct qfile_list_id
 {
   QFILE_TUPLE_VALUE_TYPE_LIST type_list;	/* data type of each column */
@@ -452,6 +471,10 @@ struct qfile_list_id
    * macro below.  Not serialized (transient runtime structure). */
   void *tapeset_;		/* (access via QFILE_LIST_ID_TAPESET) */
   bool owns_tapeset_;		/* this list_id owns/free the tapeset (access via QFILE_LIST_ID_OWNS_TAPESET) */
+  /* Migration backing-kind tag (redesign G008, issue #73).  QFILE_BACKING_NONE
+   * on a cleared list; set OLD/NEW when a producer commits a backing.  Access
+   * via QFILE_LIST_ID_BACKING_KIND.  Not serialized (transient runtime tag). */
+  QFILE_BACKING_KIND backing_kind_;
 };
 
 #define QFILE_CLEAR_LIST_ID(list_id) \
@@ -488,6 +511,7 @@ struct qfile_list_id
       (list_id)->dependent_list_id_ = NULL; \
       (list_id)->tapeset_ = NULL; \
       (list_id)->owns_tapeset_ = false; \
+      (list_id)->backing_kind_ = QFILE_BACKING_NONE; \
     } \
   while (0)
 
@@ -512,6 +536,46 @@ struct qfile_list_id
 #define QFILE_LIST_ID_DEPENDENT(list_id)   ((list_id)->dependent_list_id_)
 #define QFILE_LIST_ID_TAPESET(list_id)     ((list_id)->tapeset_)
 #define QFILE_LIST_ID_OWNS_TAPESET(list_id) ((list_id)->owns_tapeset_)
+#define QFILE_LIST_ID_BACKING_KIND(list_id) ((list_id)->backing_kind_)
+
+/*
+ * No-mixed-backing invariant (redesign G008, issue #73; SSOT #75 §5.5 (7) /
+ * §6).  A list "has OLD backing" when it is physically backed the legacy way
+ * (a real first-page VPID, or an old temp-file handle); it "has NEW backing"
+ * when it carries a Tapeset.  The migration invariant: a single list never
+ * holds BOTH at once -- producers switch backing operator-atomically, so the
+ * mixed-backing scan (FAIL-03/06) can never recur.  qfile_list_is_mixed_backing
+ * returns true on a violation; producers assert it via
+ * qfile_check_no_mixed_backing (debug-only).
+ */
+static inline bool
+qfile_list_has_old_backing (const QFILE_LIST_ID * list_id)
+{
+  return list_id != NULL
+	 && (!VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID (list_id)) || QFILE_LIST_ID_TFILE_VFID (list_id) != NULL);
+}
+
+static inline bool
+qfile_list_has_new_backing (const QFILE_LIST_ID * list_id)
+{
+  return list_id != NULL && QFILE_LIST_ID_TAPESET (list_id) != NULL;
+}
+
+static inline bool
+qfile_list_is_mixed_backing (const QFILE_LIST_ID * list_id)
+{
+  return qfile_list_has_old_backing (list_id) && qfile_list_has_new_backing (list_id);
+}
+
+static inline void
+qfile_check_no_mixed_backing (const QFILE_LIST_ID * list_id)
+{
+  /* Debug-only.  Never fires today: real lists are still all OLD and the NEW
+   * backing is additive and disconnected.  Becomes load-bearing once Phase 2
+   * producers commit a NEW backing -- a single list staying one kind keeps the
+   * violation count at 0 (SSOT #75 §6 (7)). */
+  assert (!qfile_list_is_mixed_backing (list_id));
+}
 
 /* Tuple position coordinate type */
 enum qfile_tuple_position_coordinate_type
