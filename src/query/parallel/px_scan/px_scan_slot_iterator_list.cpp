@@ -21,6 +21,7 @@
  */
 
 #include "px_scan_slot_iterator_list.hpp"
+#include "px_scan_input_handler_list.hpp"
 #include "fetch.h"
 #include "list_file.h"
 #include "object_representation.h"
@@ -44,7 +45,8 @@ namespace parallel_scan
       m_val_list (nullptr),
       m_vd (nullptr),
       m_scan_stats (nullptr),
-      m_on_trace (false)
+      m_on_trace (false),
+      m_new_tuple_source (false)
   {
     m_scan_pred = { nullptr, nullptr, nullptr };
     m_tplrec.size = 0;
@@ -72,6 +74,7 @@ namespace parallel_scan
     m_curr_tpl = nullptr;
     m_curr_tplno = 0;
     m_tuple_count = 0;
+    m_new_tuple_source = false;
     return NO_ERROR;
   }
 
@@ -91,6 +94,7 @@ namespace parallel_scan
 	db_private_free_and_init (thread_p, m_tplrec.tpl);
 	m_tplrec.size = 0;
       }
+    m_new_tuple_source = false;
     return NO_ERROR;
   }
 
@@ -109,6 +113,17 @@ namespace parallel_scan
 	m_curr_pgptr = nullptr;
       }
 
+    m_new_tuple_source = qfile_list_has_new_backing (m_list_id);
+    if (m_new_tuple_source)
+      {
+	m_curr_pgptr = nullptr;
+	m_curr_tfile = nullptr;
+	m_curr_tpl = nullptr;
+	m_curr_tplno = 0;
+	m_tuple_count = 0;
+	return NO_ERROR;
+      }
+
     m_curr_pgptr = page;
     m_curr_tfile = tfile;
     m_curr_tpl = (char *) m_curr_pgptr + QFILE_PAGE_HEADER_SIZE;
@@ -121,29 +136,59 @@ namespace parallel_scan
   slot_iterator_list::next_qualified_slot_with_peek (THREAD_ENTRY *thread_p)
   {
     DB_LOGICAL ev_res;
-    bool has_overflow_page = (QFILE_GET_OVERFLOW_PAGE_ID (m_curr_pgptr) != NULL_PAGEID);
 
-    while (m_curr_tplno < m_tuple_count)
+    while (true)
       {
 	QFILE_TUPLE tpl;
 
-	if (has_overflow_page)
+	if (m_new_tuple_source)
 	  {
-	    /* qfile_get_tuple delegates to qfile_assemble_overflow_tuple at list_file.c:4673 when overflow page;
-	     * has_overflow_page guard above ensures equivalent path. */
-	    if (qfile_assemble_overflow_tuple (thread_p, m_curr_pgptr, &m_tplrec, QFILE_LIST_ID_TFILE_VFID(m_list_id)) != NO_ERROR)
+	    qfile::tapeset_reader *reader = input_handler_list::get_thread_new_reader ();
+	    if (reader == nullptr)
 	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 		return S_ERROR;
+	      }
+
+	    /* COPY (peek=0): m_tplrec.tpl is db_private-owned by this worker and
+	     * is released from finalize; PEEK would borrow the reader page scratch. */
+	    SCAN_CODE scan_code = reader->next (thread_p, &m_tplrec, 0);
+	    if (scan_code != S_SUCCESS)
+	      {
+		if (scan_code == S_END)
+		  {
+		    input_handler_list::mark_thread_new_reader_exhausted ();
+		  }
+		return scan_code;
 	      }
 	    tpl = m_tplrec.tpl;
 	  }
 	else
 	  {
-	    tpl = m_curr_tpl;
-	  }
+	    if (m_curr_tplno >= m_tuple_count)
+	      {
+		return S_END;
+	      }
 
-	m_curr_tpl += QFILE_GET_TUPLE_LENGTH (m_curr_tpl);
-	m_curr_tplno++;
+	    const bool has_overflow_page = (QFILE_GET_OVERFLOW_PAGE_ID (m_curr_pgptr) != NULL_PAGEID);
+	    if (has_overflow_page)
+	      {
+		/* OLD backing keeps VPID-chain overflow assembly on the page walker path. */
+		if (qfile_assemble_overflow_tuple (thread_p, m_curr_pgptr, &m_tplrec,
+						   QFILE_LIST_ID_TFILE_VFID (m_list_id)) != NO_ERROR)
+		  {
+		    return S_ERROR;
+		  }
+		tpl = m_tplrec.tpl;
+	      }
+	    else
+	      {
+		tpl = m_curr_tpl;
+	      }
+
+	    m_curr_tpl += QFILE_GET_TUPLE_LENGTH (m_curr_tpl);
+	    m_curr_tplno++;
+	  }
 
 	if (m_val_list)
 	  {
@@ -193,7 +238,5 @@ namespace parallel_scan
 
 	return S_SUCCESS;
       }
-
-    return S_END;
   }
 }

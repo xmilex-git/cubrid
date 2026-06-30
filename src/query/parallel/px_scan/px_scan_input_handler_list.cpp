@@ -39,12 +39,8 @@ namespace parallel_scan
   thread_local bool input_handler_list::m_tl_is_membuf_worker = false;
   thread_local int input_handler_list::m_tl_membuf_pageid = 0;
   thread_local int input_handler_list::m_tl_new_reader_id = -1;
-  thread_local qfile::chunk_distributor::range input_handler_list::m_tl_new_range = { 0, 0, 0 };
-  thread_local bool input_handler_list::m_tl_new_have_chunk = false;
-  thread_local int input_handler_list::m_tl_new_page_offset = 0;
-  thread_local char *input_handler_list::m_tl_new_page_raw = nullptr;
-  thread_local PAGE_PTR input_handler_list::m_tl_new_page_buf = nullptr;
-  thread_local qfile::tde_read_scratch *input_handler_list::m_tl_new_tde = nullptr;
+  thread_local qfile::tapeset_reader *input_handler_list::m_tl_new_reader = nullptr;
+  thread_local bool input_handler_list::m_tl_new_reader_exhausted = false;
 
 
   int
@@ -67,7 +63,7 @@ namespace parallel_scan
     if (qfile_list_has_new_backing (list_id))
       {
 	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (list_id);
-	if (ts == nullptr || QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (list_id))
+	if (ts == nullptr)
 	  {
 	    return ER_FAILED;
 	  }
@@ -112,8 +108,9 @@ namespace parallel_scan
     m_tl_is_membuf_worker = false;
     m_tl_membuf_pageid = 0;
     m_tl_new_reader_id = -1;
-    m_tl_new_have_chunk = false;
-    m_tl_new_page_offset = 0;
+    delete m_tl_new_reader;
+    m_tl_new_reader = nullptr;
+    m_tl_new_reader_exhausted = false;
 
     if (m_new_tapeset != nullptr)
       {
@@ -123,27 +120,13 @@ namespace parallel_scan
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	    return ER_FAILED;
 	  }
-	if (m_tl_new_page_raw == nullptr)
+
+	m_tl_new_reader = new qfile::tapeset_reader (m_new_tapeset, m_new_dist, m_tl_new_reader_id);
+	if (m_tl_new_reader == nullptr)
 	  {
-	    m_tl_new_page_raw = (char *) malloc (DB_PAGESIZE);
-	    if (m_tl_new_page_raw == nullptr)
-	      {
-		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, DB_PAGESIZE);
-		return ER_FAILED;
-	      }
-	    m_tl_new_page_buf = (PAGE_PTR) m_tl_new_page_raw;
-	  }
-	if (m_tl_new_tde == nullptr)
-	  {
-	    m_tl_new_tde = new qfile::tde_read_scratch ();
-	    if (m_tl_new_tde == nullptr)
-	      {
-		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (qfile::tde_read_scratch));
-		free (m_tl_new_page_raw);
-		m_tl_new_page_raw = nullptr;
-		m_tl_new_page_buf = nullptr;
-		return ER_FAILED;
-	      }
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		    sizeof (qfile::tapeset_reader));
+	    return ER_FAILED;
 	  }
       }
 
@@ -171,44 +154,14 @@ namespace parallel_scan
 
     if (m_new_tapeset != nullptr)
       {
-	while (true)
+	if (m_tl_new_reader == nullptr || m_tl_new_reader_exhausted)
 	  {
-	    if (!m_tl_new_have_chunk
-		|| m_tl_new_page_offset >= m_tl_new_range.start_page + m_tl_new_range.page_count)
-	      {
-		if (!m_new_dist->next_chunk (m_tl_new_reader_id, m_tl_new_range))
-		  {
-		    return S_END;
-		  }
-		m_tl_new_have_chunk = true;
-		m_tl_new_page_offset = m_tl_new_range.start_page;
-	      }
-
-	    qfile::tape *tape_p = m_new_tapeset->get_tape (m_tl_new_range.tape_idx);
-	    if (tape_p == nullptr)
-	      {
-		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-		return S_ERROR;
-	      }
-
-	    PAGE_PTR page_p = tape_p->read_page_into (thread_p, m_tl_new_page_offset,
-			       (char *) m_tl_new_page_buf, m_tl_new_tde);
-	    m_tl_new_page_offset++;
-	    if (page_p == nullptr)
-	      {
-		assert_release_error (er_errid () != NO_ERROR);
-		return S_ERROR;
-	      }
-
-	    if (QFILE_GET_TUPLE_COUNT (page_p) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG)
-	      {
-		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-		return S_ERROR;
-	      }
-	    out_page = page_p;
-	    out_tfile = nullptr;	/* NEW pages are borrowed RAM/scratch, never qmgr/pgbuf fixes. */
-	    return S_SUCCESS;
+	    return S_END;
 	  }
+
+	/* NEW Tapeset input is tuple-sourced by the worker's tapeset_reader; the
+	 * null page sentinel only drives the existing task set_page/drain loop. */
+	return S_SUCCESS;
       }
 
     while (true)
@@ -279,13 +232,9 @@ namespace parallel_scan
     m_tl_is_membuf_worker = false;
     m_tl_membuf_pageid = 0;
     m_tl_new_reader_id = -1;
-    m_tl_new_have_chunk = false;
-    m_tl_new_page_offset = 0;
-    free (m_tl_new_page_raw);
-    m_tl_new_page_raw = nullptr;
-    m_tl_new_page_buf = nullptr;
-    delete m_tl_new_tde;
-    m_tl_new_tde = nullptr;
+    delete m_tl_new_reader;
+    m_tl_new_reader = nullptr;
+    m_tl_new_reader_exhausted = false;
     return NO_ERROR;
   }
 

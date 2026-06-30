@@ -873,14 +873,6 @@ extern "C"
 	return NO_ERROR;
       }
 
-    /* Page-parallel NEW list input is safe only for ordinary in-page tuples.
-     * ADR0006 overflow runs cross page boundaries and are handled by the serial
-     * Tapeset tuple reader; keep those lists serial rather than risk page-local
-     * tuple walking. */
-    if (qfile_list_has_new_backing (list_id) && QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (list_id))
-      {
-	return NO_ERROR;
-      }
 
     /* XASL_TO_BE_CACHED kept blocked: caching main list_id would leak worker intermediate state. */
     if (XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED))

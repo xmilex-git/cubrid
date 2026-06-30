@@ -53,7 +53,10 @@ namespace parallel_scan
 
       int init_on_main (THREAD_ENTRY *thread_p, QFILE_LIST_ID *list_id, int parallelism);
 
-      /* single READ-latch fix; out_page ownership transfers to caller on S_SUCCESS. */
+      /*
+       * OLD backing: single READ-latch page fix, ownership transfers to caller on S_SUCCESS.
+       * NEW backing: arms this worker's thread-local tapeset_reader and returns a null page sentinel once.
+       */
       SCAN_CODE get_next_page_with_fix (THREAD_ENTRY *thread_p,
 					PAGE_PTR &out_page,
 					QMGR_TEMP_FILE *&out_tfile);
@@ -67,6 +70,16 @@ namespace parallel_scan
       QFILE_LIST_ID *get_list_id ()
       {
 	return m_list_id;
+      }
+
+      static qfile::tapeset_reader *get_thread_new_reader ()
+      {
+	return m_tl_new_reader;
+      }
+
+      static void mark_thread_new_reader_exhausted ()
+      {
+	m_tl_new_reader_exhausted = true;
       }
 
     private:
@@ -87,12 +100,8 @@ namespace parallel_scan
       thread_local static bool m_tl_is_membuf_worker;
       thread_local static int m_tl_membuf_pageid;
       thread_local static int m_tl_new_reader_id;
-      thread_local static qfile::chunk_distributor::range m_tl_new_range;
-      thread_local static bool m_tl_new_have_chunk;
-      thread_local static int m_tl_new_page_offset;
-      thread_local static char *m_tl_new_page_raw;
-      thread_local static PAGE_PTR m_tl_new_page_buf;
-      thread_local static qfile::tde_read_scratch *m_tl_new_tde;
+      thread_local static qfile::tapeset_reader *m_tl_new_reader;
+      thread_local static bool m_tl_new_reader_exhausted;
   };
 }
 
