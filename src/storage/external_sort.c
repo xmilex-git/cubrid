@@ -4873,6 +4873,7 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
   SORT_MERGE_QUEUE_CTX qctx;
   QFILE_LIST_ID *origin_list_id;
   SORT_INFO *sort_info_p;
+  SORT_INFO *origin_sort_info_p;
 
   if (parallel_num > SORT_MAX_PARALLEL)
     {

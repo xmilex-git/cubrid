@@ -3961,9 +3961,9 @@ qfile_sort_get_next_parallel (THREAD_ENTRY * thread_p, RECDES * recdes_p, void *
 	  QFILE_TUPLE tpl;
 	  if (QFILE_GET_OVERFLOW_PAGE_ID (state->curr_page) != NULL_PAGEID)
 	    {
-	      /* qfile_get_tuple uses input_file->tfile_vfid; redirect it to this page's tfile.
+	      /* qfile_get_tuple uses QFILE_LIST_ID_TFILE_VFID(input_file); redirect it to this page's tfile.
 	       * input_file is per-worker cloned, so this modification is thread-safe. */
-	      input_file->tfile_vfid = state->curr_tfile;
+	      QFILE_LIST_ID_TFILE_VFID(input_file) = state->curr_tfile;
 	      if (qfile_get_tuple (thread_p, state->curr_page, tuple_p, &state->tplrec, input_file) != NO_ERROR)
 		{
 		  qmgr_free_old_page_and_init (thread_p, state->curr_page, state->curr_tfile);

@@ -4951,10 +4951,10 @@ qexec_hash_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 	  if (qdata_load_agg_hentry_from_tuple (thread_p, data, context->temp_part_key, context->temp_part_value,
 						context->key_domains, context->accumulator_domains) != NO_ERROR)
 	    {
-	      qmgr_free_old_page_and_init (thread_p, page, list_idp->tfile_vfid);
+	      qmgr_free_old_page_and_init (thread_p, page, QFILE_LIST_ID_TFILE_VFID(list_idp));
 	      return ER_FAILED;
 	    }
-	  qmgr_free_old_page_and_init (thread_p, page, list_idp->tfile_vfid);
+	  qmgr_free_old_page_and_init (thread_p, page, QFILE_LIST_ID_TFILE_VFID(list_idp));
 	}
       else
 	{
@@ -5656,7 +5656,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 
   if (sort_listfile (thread_p, NULL_VOLID, estimated_pages, &qexec_gby_get_next, &gbstate, &qexec_gby_put_next,
 		     &gbstate, gbstate.cmp_fn, &gbstate.key_info, SORT_DUP, NO_SORT_LIMIT,
-		     gbstate.output_file->tfile_vfid->tde_encrypted, SORT_GROUP_BY, &gby_px) != NO_ERROR)
+		     QFILE_LIST_ID_TFILE_VFID(gbstate.output_file)->tde_encrypted, SORT_GROUP_BY, &gby_px) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -21537,7 +21537,7 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
 
   if (sort_listfile (thread_p, NULL_VOLID, estimated_pages, &qexec_analytic_get_next, &analytic_state,
 		     &qexec_analytic_put_next, &analytic_state, analytic_state.cmp_fn, &analytic_state.key_info,
-		     SORT_DUP, NO_SORT_LIMIT, analytic_state.output_file->tfile_vfid->tde_encrypted,
+		     SORT_DUP, NO_SORT_LIMIT, QFILE_LIST_ID_TFILE_VFID(analytic_state.output_file)->tde_encrypted,
 		     SORT_ANALYTIC, &anl_px) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
