@@ -2003,6 +2003,7 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
     {
       /* try single-thread hash join */
       assert (degree == 0);
+      manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);
       return HASHJOIN_STATUS_PARTITION;
     }
@@ -2112,6 +2113,7 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
     {
       /* try single-thread hash join */
       assert (degree == 0);
+      manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);
       return HASHJOIN_STATUS_SINGLE;
     }
