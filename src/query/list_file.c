@@ -4180,9 +4180,104 @@ qfile_sort_px_state_free (THREAD_ENTRY * thread_p, sort_px_list_state * state)
     {
       return;
     }
+  if (state->tapeset_reader != NULL)
+    {
+      delete (qfile::tapeset_reader *) state->tapeset_reader;
+      state->tapeset_reader = NULL;
+    }
   /* tplrec.tpl is freed by the worker thread in sort_listfile_execute */
   state->~sort_px_list_state ();
   db_private_free_and_init (thread_p, state);
+}
+
+/*
+ * qfile_sort_build_key_from_tuple () - build a sort key from an already-fetched tuple.
+ *   The OLD sector path supplies original_vpid/original_offset when partial sort keys
+ *   must retain the input tuple address; the NEW Tapeset path is used only for full-key
+ *   DISTINCT-style input and rejects partial-key original-address records.
+ */
+static SORT_STATUS
+qfile_sort_build_key_from_tuple (SORTKEY_INFO * key_info_p, RECDES * recdes_p, QFILE_TUPLE tpl,
+				 const VPID * original_vpid, int original_offset)
+{
+  int nkeys = key_info_p->nkeys;
+  SORT_REC *sort_record_p = (SORT_REC *) recdes_p->data;
+  sort_record_p->next = NULL;
+  char *data;
+  int length;
+
+  if (key_info_p->use_original)
+    {
+      if (original_vpid == NULL)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  return SORT_ERROR_OCCURRED;
+	}
+
+      data = &(sort_record_p->s.original.body[0]);
+      data = PTR_ALIGN (data, MAX_ALIGNMENT);
+      length = CAST_BUFLEN (data - recdes_p->data);
+
+      if (length <= recdes_p->area_size)
+	{
+	  sort_record_p->s.original.pageid = original_vpid->pageid;
+	  sort_record_p->s.original.volid = original_vpid->volid;
+	  sort_record_p->s.original.offset = original_offset;
+	}
+
+      for (int i = 0; i < nkeys; i++)
+	{
+	  char *field_data;
+	  int field_length;
+	  QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tpl, key_info_p->key[i].col, field_data);
+	  field_length =
+	    ((QFILE_GET_TUPLE_VALUE_FLAG (field_data) == V_BOUND)
+	     ? QFILE_GET_TUPLE_VALUE_LENGTH (field_data) : 0);
+	  length += QFILE_TUPLE_VALUE_HEADER_SIZE + field_length;
+	  if (length <= recdes_p->area_size)
+	    {
+	      memcpy (data, field_data, QFILE_TUPLE_VALUE_HEADER_SIZE + field_length);
+	    }
+	  data += QFILE_TUPLE_VALUE_HEADER_SIZE + field_length;
+	}
+    }
+  else
+    {
+      data = (char *) &sort_record_p->s.offset[nkeys];
+      data = PTR_ALIGN (data, MAX_ALIGNMENT);
+      length = CAST_BUFLEN (data - recdes_p->data);
+
+      for (int i = 0; i < nkeys; i++)
+	{
+	  char *field_data;
+	  int field_length, offset;
+	  QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tpl, key_info_p->key[i].col, field_data);
+	  field_length =
+	    ((QFILE_GET_TUPLE_VALUE_FLAG (field_data) == V_BOUND)
+	     ? QFILE_GET_TUPLE_VALUE_LENGTH (field_data) : 0);
+	  if (field_length)
+	    {
+	      offset = CAST_BUFLEN (data - recdes_p->data + QFILE_TUPLE_VALUE_HEADER_SIZE);
+	      length = offset + field_length;
+	      if (length <= recdes_p->area_size)
+		{
+		  sort_record_p->s.offset[i] = offset;
+		  memcpy (data, field_data, QFILE_TUPLE_VALUE_HEADER_SIZE + field_length);
+		}
+	      data += QFILE_TUPLE_VALUE_HEADER_SIZE + field_length;
+	    }
+	  else
+	    {
+	      if (length <= recdes_p->area_size)
+		{
+		  sort_record_p->s.offset[i] = 0;
+		}
+	    }
+	}
+    }
+
+  recdes_p->length = CAST_BUFLEN (data - recdes_p->data);
+  return (recdes_p->length <= recdes_p->area_size) ? SORT_SUCCESS : SORT_REC_DOESNT_FIT;
 }
 
 /*
@@ -4201,7 +4296,30 @@ qfile_sort_get_next_parallel (THREAD_ENTRY * thread_p, RECDES * recdes_p, void *
   sort_px_list_state *state = (sort_px_list_state *) sort_info_p->px_state;
   QFILE_LIST_ID *input_file = sort_info_p->input_file;
   SORTKEY_INFO *key_info_p = &sort_info_p->key_info;
+  if (state->tapeset_reader != NULL)
+    {
+      qfile::tapeset_reader *reader = (qfile::tapeset_reader *) state->tapeset_reader;
 
+      if (!state->has_tapeset_tuple)
+	{
+	  /* COPY (peek=0): own state->tplrec.tpl via db_private so the worker-thread
+	   * cleanup db_private_free is valid; PEEK would store a borrowed page pointer
+	   * (reader's m_page) and freeing it corrupts the heap (#78 2A-2). */
+	  SCAN_CODE scan_status = reader->next (thread_p, &state->tplrec, 0);
+	  if (scan_status != S_SUCCESS)
+	    {
+	      return ((scan_status == S_END) ? SORT_NOMORE_RECS : SORT_ERROR_OCCURRED);
+	    }
+	  state->has_tapeset_tuple = true;
+	}
+
+      SORT_STATUS status = qfile_sort_build_key_from_tuple (key_info_p, recdes_p, state->tplrec.tpl, NULL, 0);
+      if (status == SORT_SUCCESS)
+	{
+	  state->has_tapeset_tuple = false;
+	}
+      return status;
+    }
   while (true)
     {
       /* ---------------------------------------------------------------
@@ -4969,6 +5087,25 @@ qfile_sort_new_backing_enabled (void)
   if (cached < 0)
     {
       cached = (getenv ("CUBRID_WM_SORT_NEW") != NULL) ? 1 : 0;
+    }
+  return cached != 0;
+}
+
+/*
+ * qfile_scan_new_backing_enabled () - is parallel-scan per-worker output
+ *   migrated to the NEW (Tapeset) backing?  Migration toggle (redesign #78,
+ *   2A-2): opt-in via CUBRID_WM_SCAN_NEW.  Default OFF keeps the OLD raw-fd
+ *   path so a default server takes the unchanged parallel scan with no
+ *   regression.  Independent from CUBRID_WM_SORT_NEW so each producer can be
+ *   migrated and measured separately.
+ */
+bool
+qfile_scan_new_backing_enabled (void)
+{
+  static int cached = -1;
+  if (cached < 0)
+    {
+      cached = (getenv ("CUBRID_WM_SCAN_NEW") != NULL) ? 1 : 0;
     }
   return cached != 0;
 }

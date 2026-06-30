@@ -51,6 +51,8 @@
 #include "thread_entry_task.hpp"
 #include "thread_manager.hpp"	// for thread_get_thread_entry_info and thread_sleep
 #include "list_file.h"
+#include "qfile_chunk.hpp"
+#include "qfile_tape.hpp"
 #include "query_manager.h"
 #include "object_representation.h"
 #include "px_worker_manager.hpp"
@@ -187,6 +189,7 @@ struct sort_param
   void *px_extra_arg;		/* extra parallel context; for SORT_GROUP_BY/SORT_ANALYTIC: SORT_LISTFILE_PX_ARG* */
   bool px_output_is_new;	/* 2A-1b (#78): this SORT output migrated to NEW Tapeset backing */
   QFILE_LIST_SECTOR_SCAN_INFO *px_sector_scan;	/* shared sector scan for ORDER_BY/ORDER_WITH_LIMIT/GROUP_BY/ANALYTIC workers */
+  qfile::chunk_distributor *px_chunk_dist;	/* shared NEW (Tapeset) chunk distributor for ORDER_BY workers */
 #if defined(SERVER_MODE)
   pthread_mutex_t *px_mtx;	/* px_status mutex */
   pthread_cond_t *complete_cond;	/* complete condition */
@@ -1487,6 +1490,7 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->px_type = parallel_type;
   sort_param->px_extra_arg = px_extra_arg;
   sort_param->px_sector_scan = NULL;
+  sort_param->px_chunk_dist = NULL;
   /* 2A-1b (#78): capture whether this SORT output was converted to NEW (Tapeset)
    * backing -- stably, before the parallel workers run -- so each worker's
    * output matches the origin (a do_close=false sort leaves the origin OLD).
@@ -4259,6 +4263,11 @@ sort_return_used_resources (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, PA
 	  sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
 	  db_private_free_and_init (thread_p, sort_param->px_sector_scan);
 	}
+      if (sort_param->px_chunk_dist != NULL)
+	{
+	  delete sort_param->px_chunk_dist;
+	  sort_param->px_chunk_dist = NULL;
+	}
     }
 
   if (sort_param->multipage_file.volid != NULL_VOLID)
@@ -5406,22 +5415,36 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
       SORT_INFO *sort_info_p = (SORT_INFO *) sort_param->get_arg;
       QFILE_LIST_ID *input_file = sort_info_p->input_file;
 
-      /* open shared sector scan — all workers atomically steal sectors from this */
-      sort_param->px_sector_scan =
-	(QFILE_LIST_SECTOR_SCAN_INFO *) db_private_alloc (thread_p, sizeof (QFILE_LIST_SECTOR_SCAN_INFO));
-      if (sort_param->px_sector_scan == NULL)
+      if (qfile_list_has_new_backing (input_file))
 	{
-	  return ER_FAILED;
+	  qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_file);
+	  sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);
+	  if (sort_param->px_chunk_dist == NULL)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		      sizeof (qfile::chunk_distributor));
+	      return ER_FAILED;
+	    }
 	}
-      placement_new (sort_param->px_sector_scan);
-
-      error = qfile_open_list_sector_scan (thread_p, input_file, sort_param->px_sector_scan);
-      if (error != NO_ERROR)
+      else
 	{
-	  qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
-	  sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
-	  db_private_free_and_init (thread_p, sort_param->px_sector_scan);
-	  return ER_FAILED;
+	  /* open shared sector scan — all workers atomically steal sectors from this */
+	  sort_param->px_sector_scan =
+	    (QFILE_LIST_SECTOR_SCAN_INFO *) db_private_alloc (thread_p, sizeof (QFILE_LIST_SECTOR_SCAN_INFO));
+	  if (sort_param->px_sector_scan == NULL)
+	    {
+	      return ER_FAILED;
+	    }
+	  placement_new (sort_param->px_sector_scan);
+
+	  error = qfile_open_list_sector_scan (thread_p, input_file, sort_param->px_sector_scan);
+	  if (error != NO_ERROR)
+	    {
+	      qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
+	      sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
+	      db_private_free_and_init (thread_p, sort_param->px_sector_scan);
+	      return ER_FAILED;
+	    }
 	}
 
       /* null out get_arg/put_arg so cleanup skips workers not yet initialized */
@@ -5482,6 +5505,8 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 	  placement_new (state);
 
 	  state->sector_scan = sort_param->px_sector_scan;
+	  state->tapeset_reader = NULL;
+	  state->has_tapeset_tuple = false;
 	  state->curr_page = NULL;
 	  state->curr_tfile = NULL;
 	  VPID_SET_NULL (&state->curr_vpid);
@@ -5489,8 +5514,19 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 	  state->curr_offset = 0;
 	  state->tplrec.size = 0;
 	  state->tplrec.tpl = NULL;
-
 	  worker_info_p->px_state = state;
+
+	  if (sort_param->px_chunk_dist != NULL)
+	    {
+	      qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_file);
+	      state->tapeset_reader = new qfile::tapeset_reader (ts, sort_param->px_chunk_dist, i);
+	      if (state->tapeset_reader == NULL)
+		{
+		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+			  sizeof (qfile::tapeset_reader));
+		  return ER_FAILED;
+		}
+	    }
 	  px_sort_param[i].get_fn = &qfile_sort_get_next_parallel;
 	}
     }
@@ -5618,6 +5654,8 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 	  placement_new (state);
 
 	  state->sector_scan = sort_param->px_sector_scan;
+	  state->tapeset_reader = NULL;
+	  state->has_tapeset_tuple = false;
 	  state->curr_page = NULL;
 	  state->curr_tfile = NULL;
 	  VPID_SET_NULL (&state->curr_vpid);
@@ -5734,6 +5772,11 @@ sort_end_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
       qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
       sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
       db_private_free_and_init (thread_p, sort_param->px_sector_scan);
+    }
+  if (sort_param->px_chunk_dist != NULL)
+    {
+      delete sort_param->px_chunk_dist;
+      sort_param->px_chunk_dist = NULL;
     }
 
   if (sort_param->px_type == SORT_ORDER_BY || sort_param->px_type == SORT_ORDER_WITH_LIMIT)

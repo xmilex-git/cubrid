@@ -256,6 +256,23 @@ namespace parallel_scan
 	      db_private_free_and_init (thread_p, type_list.domp);
 	    }
 	}
+	/* 2A-2 (#78): opt-in (CUBRID_WM_SCAN_NEW) migration of this worker's
+	 * per-thread output list to the NEW per-worker Tapeset backing, so result
+	 * writes append to a private tape_writer instead of the shared raw-fd
+	 * registry (no per-page dirty-mark lock).  Per-worker list: no shared
+	 * lock needed.  On conversion failure the list stays fully OLD (atomic
+	 * drop) and the merge mixed-backing guard turns it into a clean error. */
+	if (qfile_scan_new_backing_enabled ())
+	  {
+	    bool ld_tde = (QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p) != nullptr)
+			  && QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p)->tde_encrypted;
+	    if (qfile_list_make_new_backed (thread_p, tl.writer_result_p, ld_tde) != NO_ERROR)
+	      {
+		m_err_messages_p->move_top_error_message_to_this();
+		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		return;
+	      }
+	  }
 	size = tl.writer_result_p->type_list.type_cnt * DB_SIZEOF (DB_VALUE *);
 	tl.writer_result_p->tpl_descr.f_valp = (DB_VALUE **) malloc (size);
 	if (tl.writer_result_p->tpl_descr.f_valp == NULL)
@@ -562,6 +579,48 @@ namespace parallel_scan
 	qfile_close_list (thread_p, dest);
       }
 
+    /* 2A-2 (#78) Option A: NEW (Tapeset) zero-copy fan-in for the per-worker
+     * scan output.  Make dest a NEW frozen Tapeset, then import each worker's
+     * frozen Tape(s) by ownership transfer (no re-read, no qmgr VPID append,
+     * hence no shared raw-fd registry lock).  The downstream parallel sort
+     * reads this NEW dest via chunk_distributor/tapeset_reader (see
+     * external_sort.c).  segment_native (hash-gby part lists) keeps OLD path. */
+    if (!segment_native && qfile_scan_new_backing_enabled ())
+      {
+	bool nf_failed = false;
+	bool dest_tde = (QFILE_LIST_ID_TFILE_VFID (dest) != nullptr)
+			&& QFILE_LIST_ID_TFILE_VFID (dest)->tde_encrypted;
+	if (qfile_list_make_new_backed (thread_p, dest, dest_tde) != NO_ERROR)
+	  {
+	    nf_failed = true;
+	  }
+	else
+	  {
+	    qfile_close_list (thread_p, dest);	/* freeze empty producer -> empty Tapeset */
+	  }
+	for (QFILE_LIST_ID *list_id : lists)
+	  {
+	    assert (list_id != nullptr);
+	    if (!nf_failed && list_id->tuple_cnt > 0)
+	      {
+		if (qfile_list_has_old_backing (list_id))
+		  {
+		    /* worker stayed OLD (conversion OOM) into a NEW dest: a
+		     * mixed-backing error, never a silent wrong result. */
+		    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		    nf_failed = true;
+		  }
+		else if (qfile_tapeset_import (thread_p, dest, list_id) != NO_ERROR)
+		  {
+		    nf_failed = true;
+		  }
+	      }
+	    qfile_destroy_list (thread_p, list_id);
+	    QFILE_FREE_AND_INIT_LIST_ID (list_id);
+	  }
+	lists.clear ();
+	return;
+      }
     bool merge_failed = false;
 
     for (QFILE_LIST_ID *list_id : lists)

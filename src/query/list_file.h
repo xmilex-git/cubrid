@@ -124,6 +124,9 @@ struct sort_px_list_state
   QFILE_LIST_SECTOR_SCAN_INFO *sector_scan;
   /* per-worker page iterator — encapsulates membuf CAS + atomic sector steal */
   sector_page_iterator page_iter;
+  /* per-worker NEW (Tapeset) reader — owned by this state; NULL keeps OLD sector path */
+  void *tapeset_reader;
+  bool has_tapeset_tuple;
   /* current active page — set when we land on a page, cleared after all tuples are consumed */
   PAGE_PTR curr_page;
   struct qmgr_temp_file *curr_tfile;	/* tfile for curr_page (membuf_tfile or disk tfile) */
@@ -215,6 +218,7 @@ extern int qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST
 /* redesign #78 2A-1b: NEW (Tapeset) SORT output migration. */
 extern bool qfile_sort_new_backing_enabled (void);
 extern int qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
+extern bool qfile_scan_new_backing_enabled (void);
 extern int qfile_tapeset_import (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest, QFILE_LIST_ID * src);
 extern int qfile_save_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, QFILE_TUPLE_TYPE tuple_type, char *page_p,
 			     int *tuple_length_p);
