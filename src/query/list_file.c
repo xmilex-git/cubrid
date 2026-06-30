@@ -3262,13 +3262,9 @@ qfile_connect_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE
   assert (base_list_id->last_pgptr == NULL);
   assert (append_list_id->last_pgptr == NULL);
 
-  assert (base_list_id->tuple_cnt > 0);
-  assert (!VPID_ISNULL (&QFILE_LIST_ID_LAST_VPID(base_list_id)));
-
-  assert (append_list_id->tuple_cnt > 0);
-  assert (!VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(append_list_id)));
-  /* backing-kind entry guard (production-hard) -- BEFORE the membuf assert below,
-   * which dereferences append_list_id's OLD temp-file handle (SSOT round-3 (d)). */
+  /* backing-kind entry guard (production-hard) -- BEFORE the VPID/membuf asserts
+   * below, so a NEW (Tapeset) list is rejected cleanly instead of tripping a
+   * debug assert on its NULL VPIDs (SSOT round-3 (d)/(e)). */
   {
     int guard_rc = QFILE_GUARD_OLD_MECHANISM (base_list_id);
     if (guard_rc == NO_ERROR)
@@ -3280,6 +3276,11 @@ qfile_connect_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE
 	return guard_rc;
       }
   }
+  assert (base_list_id->tuple_cnt > 0);
+  assert (!VPID_ISNULL (&QFILE_LIST_ID_LAST_VPID(base_list_id)));
+
+  assert (append_list_id->tuple_cnt > 0);
+  assert (!VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(append_list_id)));
   assert (QFILE_LIST_ID_TFILE_VFID(append_list_id)->membuf == NULL);
 
 #if !defined (NDEBUG)

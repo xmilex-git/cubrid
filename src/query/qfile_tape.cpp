@@ -319,8 +319,9 @@ namespace qfile
 	return NULL;
       }
     buffile *bf = m_buffile;
-    m_buffile = NULL;		/* ownership transfers to the buffile_tape */
     buffile_tape *bt = new buffile_tape (std::move (m_prefix), true, bf, true);
+    m_buffile = NULL;		/* allocation succeeded: ownership is now the Tape's
+				 * (reorder keeps bf owned by the writer if new throws) */
     m_prefix.clear ();
     m_frozen = true;
     return bt;
