@@ -226,6 +226,8 @@ static int qfile_allocate_new_page_if_need (THREAD_ENTRY * thread_p, QFILE_LIST_
 					    int tuple_length, bool is_ovf_page);
 static void qfile_add_tuple_to_list_id (QFILE_LIST_ID * list_id_p, PAGE_PTR page_p, int tuple_length,
 					int written_tuple_length);
+static int qfile_producer_add_overflow_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFILE_TUPLE tuple,
+					      int tuple_length);
 static int qfile_save_single_bound_item_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, char *page_p,
 					       int tuple_length);
 static int qfile_save_normal_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, char *page_p,
@@ -1555,10 +1557,8 @@ qfile_allocate_new_page (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, PAG
        * per-worker tape_writer and reuse the single scratch page for the next.
        * No qmgr page, no VPID chain (the Tapeset addresses by offset). */
       char *scratch = (char *) QFILE_LIST_ID_PRODUCER_PAGE (list_id_p);
-      if (is_ovf_page || scratch == NULL)
+      if (scratch == NULL)
 	{
-	  /* overflow on a NEW-backed producer is a 2A-1 follow-up; fail cleanly
-	   * rather than silently mis-write (no producer routes overflow here). */
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	  return NULL;
 	}
@@ -1711,6 +1711,95 @@ qfile_add_tuple_to_list_id (QFILE_LIST_ID * list_id_p, PAGE_PTR page_p, int tupl
 }
 
 /*
+ * qfile_producer_add_overflow_tuple () - NEW-backing (redesign #78) overflow
+ *   tuple stamping (ADR 0006).  A tuple longer than one page becomes a
+ *   CONTIGUOUS run of logical pages addressed by offset (no VPID chain): a
+ *   dedicated START page (overflow flag + OVERFLOW_PAGE_ID = its own logical
+ *   page offset) then continuation pages (overflow flag + OVERFLOW_PAGE_ID =
+ *   the start offset + LAST_TUPLE_OFFSET = the run-end offset).  Every page
+ *   carries up to QFILE_MAX_TUPLE_SIZE_IN_PAGE tuple bytes at
+ *   QFILE_PAGE_HEADER_SIZE -- exactly the layout the R1 tapeset_scan / R2
+ *   tapeset_reader reassembly reads back.  Pages route to the per-worker
+ *   tape_writer through the producer hook in qfile_allocate_new_page (no qmgr,
+ *   no pgbuf, no next_vpid).  Reached only when producer_writer_ != NULL.
+ *   return: int (NO_ERROR or ER_FAILED)
+ */
+static int
+qfile_producer_add_overflow_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFILE_TUPLE tuple,
+				   int tuple_length)
+{
+  PAGE_PTR cur_page_p;
+  const int per = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+  int run_pages, start_off, run_end, copied, i;
+
+  assert (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL);
+
+  run_pages = qfile_overflow_run_pages (tuple_length);
+  if (run_pages <= 0)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+      return ER_FAILED;
+    }
+
+  /* The START page must hold ONLY this overflow tuple: finalize a partly
+   * filled current page first; an empty fresh page is reused as the START. */
+  if (list_id_p->last_pgptr == NULL || list_id_p->last_offset > QFILE_PAGE_HEADER_SIZE)
+    {
+      cur_page_p = qfile_allocate_new_page (thread_p, list_id_p, list_id_p->last_pgptr, false);
+    }
+  else
+    {
+      cur_page_p = list_id_p->last_pgptr;
+    }
+  if (cur_page_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  /* the live (scratch) page's logical offset within the Tape is page_cnt - 1 */
+  start_off = list_id_p->page_cnt - 1;
+  run_end = start_off + run_pages - 1;
+
+  copied = 0;
+  for (i = 0; i < run_pages; i++)
+    {
+      int csz = tuple_length - copied;
+      if (csz > per)
+	{
+	  csz = per;
+	}
+      memcpy ((char *) cur_page_p + QFILE_PAGE_HEADER_SIZE, (char *) tuple + copied, csz);
+      if (i == 0)
+	{
+	  /* match OLD: stamp the running prev-tuple-length onto the start tuple */
+	  QFILE_PUT_PREV_TUPLE_LENGTH ((char *) cur_page_p + QFILE_PAGE_HEADER_SIZE, list_id_p->lasttpl_len);
+	  qfile_overflow_set_start (cur_page_p, start_off);
+	}
+      else
+	{
+	  qfile_overflow_set_continuation (cur_page_p, start_off, run_end);
+	}
+      copied += csz;
+      if (i < run_pages - 1)
+	{
+	  cur_page_p = qfile_allocate_new_page (thread_p, list_id_p, cur_page_p, true);
+	  if (cur_page_p == NULL)
+	    {
+	      return ER_FAILED;
+	    }
+	}
+    }
+
+  /* one logical tuple recorded; force a fresh page for the next tuple so it
+   * never writes into this finalized overflow run. */
+  list_id_p->tuple_cnt++;
+  list_id_p->lasttpl_len = tuple_length;
+  list_id_p->last_offset = DB_PAGESIZE;
+
+  return NO_ERROR;
+}
+
+/*
  * qfile_add_tuple_to_list () - The given tuple is added to the end of the list file
  *   return: int (NO_ERROR or ER_FAILED)
  *   list_id(in): List File Identifier
@@ -1736,10 +1825,9 @@ qfile_add_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFI
   tuple_length = QFILE_GET_TUPLE_LENGTH (tuple);
   if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL && tuple_length > qfile_Max_tuple_page_size)
     {
-      /* overflow on a NEW-backed producer is a 2A-1 follow-up (ADR0006
-       * producer stamping); fail cleanly until implemented. */
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-      return ER_FAILED;
+      /* NEW-backed overflow tuple: lay it out as a contiguous offset-addressed
+       * page run (ADR 0006 producer stamping), matching the R1/R2 reassembly. */
+      return qfile_producer_add_overflow_tuple (thread_p, list_id_p, tuple, tuple_length);
     }
 
   if (qfile_allocate_new_page_if_need (thread_p, list_id_p, &cur_page_p, tuple_length, false) != NO_ERROR)
@@ -2274,6 +2362,45 @@ qfile_add_overflow_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
   tuple = (char *) ovf_tuple_page_p + QFILE_PAGE_HEADER_SIZE;
   cur_page_p = list_id_p->last_pgptr;
   tuple_length = QFILE_GET_TUPLE_LENGTH (tuple);
+
+  if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
+    {
+      /* NEW-backed output (redesign #78): reassemble the input overflow tuple
+       * into one buffer and stamp it as an offset-addressed page run (ADR 0006);
+       * no qmgr output pages, no VPID chain. */
+      char *assembled;
+      int asm_off, asm_chunk, rc;
+      VPID in_vpid;
+      PAGE_PTR in_ovf_p;
+
+      assembled = (char *) db_private_alloc (thread_p, tuple_length);
+      if (assembled == NULL)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) tuple_length);
+	  return ER_FAILED;
+	}
+      asm_chunk = MIN (tuple_length, qfile_Max_tuple_page_size);
+      memcpy (assembled, tuple, asm_chunk);
+      asm_off = asm_chunk;
+      QFILE_GET_OVERFLOW_VPID (&in_vpid, ovf_tuple_page_p);
+      while (asm_off < tuple_length && in_vpid.pageid != NULL_PAGEID)
+	{
+	  in_ovf_p = qmgr_get_old_page (thread_p, &in_vpid, QFILE_LIST_ID_TFILE_VFID(input_list_id_p));
+	  if (in_ovf_p == NULL)
+	    {
+	      db_private_free_and_init (thread_p, assembled);
+	      return ER_FAILED;
+	    }
+	  QFILE_GET_OVERFLOW_VPID (&in_vpid, in_ovf_p);
+	  asm_chunk = MIN (tuple_length - asm_off, qfile_Max_tuple_page_size);
+	  memcpy (assembled + asm_off, (char *) in_ovf_p + QFILE_PAGE_HEADER_SIZE, asm_chunk);
+	  asm_off += asm_chunk;
+	  qmgr_free_old_page_and_init (thread_p, in_ovf_p, QFILE_LIST_ID_TFILE_VFID(input_list_id_p));
+	}
+      rc = qfile_producer_add_overflow_tuple (thread_p, list_id_p, (QFILE_TUPLE) assembled, tuple_length);
+      db_private_free_and_init (thread_p, assembled);
+      return rc;
+    }
 
   if (qfile_allocate_new_page_if_need (thread_p, list_id_p, &cur_page_p, tuple_length, true) != NO_ERROR)
     {

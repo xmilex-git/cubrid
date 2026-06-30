@@ -1545,6 +1545,129 @@ qfile_producer_destroy (void *writer)
   delete (qfile::tape_writer *) writer;	/* unfrozen: frees the partial spill */
 }
 
+/* In-server overflow round trip for the 2A-1 producer hook (ADR 0006):
+ * produce a mix of small and multi-page overflow tuples through
+ * qfile_add_tuple_to_list onto a NEW-backed list, freeze, then scan the
+ * frozen Tapeset back and verify every tuple's length, id, and payload bytes
+ * -- the producer-side overflow stamping matched against the scan-side
+ * reassembly (proves cross-page run layout, no VPID chain). */
+static int
+qfile_producer_overflow_roundtrip (THREAD_ENTRY *thread_p, TDE_ALGORITHM algo)
+{
+  const int OV_N = 60;
+  const int ID_OFFSET = 8;
+  const int SMALL_LEN = 16;
+  const int BIG_LEN = 2 * QFILE_MAX_TUPLE_SIZE_IN_PAGE + 100;	/* spans 3 pages */
+  QFILE_LIST_ID ov;
+  void *writer;
+  char *scratch;
+  char *big;
+  int rc = NO_ERROR;
+  int i;
+
+  QFILE_CLEAR_LIST_ID (&ov);
+  writer = qfile_producer_create (2, algo, 90001ULL, 0);
+  scratch = (char *) malloc (DB_PAGESIZE);
+  big = (char *) malloc (BIG_LEN);
+  if (writer == NULL || scratch == NULL || big == NULL)
+    {
+      qfile_producer_destroy (writer);
+      free (scratch);
+      free (big);
+      return ER_FAILED;
+    }
+  QFILE_LIST_ID_PRODUCER_WRITER (&ov) = writer;
+  QFILE_LIST_ID_PRODUCER_PAGE (&ov) = scratch;
+
+  for (i = 0; i < OV_N && rc == NO_ERROR; i++)
+    {
+      bool is_big = ((i % 7) == 3);
+      int len = is_big ? BIG_LEN : SMALL_LEN;
+      char small[16];
+      char *t = is_big ? big : small;
+      int j;
+
+      for (j = 0; j < len; j++)
+	{
+	  t[j] = (char) ((i * 31 + j) & 0xFF);
+	}
+      QFILE_PUT_TUPLE_LENGTH (t, len);
+      QFILE_PUT_PREV_TUPLE_LENGTH (t, 0);
+      OR_PUT_INT (t + ID_OFFSET, i);
+      rc = qfile_add_tuple_to_list (thread_p, &ov, (QFILE_TUPLE) t);
+    }
+
+  if (rc == NO_ERROR)
+    {
+      qfile_close_list (thread_p, &ov);	/* NEW branch: freeze -> tapeset, frees scratch */
+      if (QFILE_LIST_ID_TAPESET (&ov) == NULL || QFILE_LIST_ID_BACKING_KIND (&ov) != QFILE_BACKING_NEW
+	  || qfile_list_is_mixed_backing (&ov) || qfile_list_has_old_backing (&ov))
+	{
+	  rc = ER_FAILED;
+	}
+    }
+
+  if (rc == NO_ERROR)
+    {
+      QFILE_LIST_SCAN_ID sid;
+      QFILE_TUPLE_RECORD tr = { NULL, 0 };
+
+      std::memset (&sid, 0, sizeof (sid));
+      QFILE_CLEAR_LIST_ID (&sid.list_id);
+      QFILE_LIST_ID_TAPESET (&sid.list_id) = QFILE_LIST_ID_TAPESET (&ov);	/* borrow */
+      QFILE_LIST_ID_OWNS_TAPESET (&sid.list_id) = false;
+      sid.tapeset_scan_ = NULL;
+
+      if (qfile_tapeset_scan_open (&sid) != NO_ERROR)
+	{
+	  rc = ER_FAILED;
+	}
+      else
+	{
+	  int expected = 0;
+	  SCAN_CODE code;
+
+	  while (rc == NO_ERROR && (code = qfile_tapeset_scan_forward (thread_p, &sid, &tr, COPY)) == S_SUCCESS)
+	    {
+	      bool is_big = ((expected % 7) == 3);
+	      int want_len = is_big ? BIG_LEN : SMALL_LEN;
+	      int j;
+
+	      if (QFILE_GET_TUPLE_LENGTH (tr.tpl) != want_len
+		  || OR_GET_INT ((char *) tr.tpl + ID_OFFSET) != expected)
+		{
+		  rc = ER_FAILED;
+		  break;
+		}
+	      /* payload past the tuple header (0-7) and id slot (8-11) must match
+	       * the deterministic pattern, proving cross-page reassembly. */
+	      for (j = ID_OFFSET + 4; j < want_len; j++)
+		{
+		  if (((char *) tr.tpl)[j] != (char) ((expected * 31 + j) & 0xFF))
+		    {
+		      rc = ER_FAILED;
+		      break;
+		    }
+		}
+	      expected++;
+	    }
+	  if (rc == NO_ERROR && (code != S_END || expected != OV_N))
+	    {
+	      rc = ER_FAILED;
+	    }
+	  qfile_tapeset_scan_close (thread_p, &sid);
+	}
+      if (tr.tpl != NULL)
+	{
+	  db_private_free_and_init (thread_p, tr.tpl);
+	}
+    }
+
+  free (big);
+  qfile_clear_list_id (&ov);	/* frees owned Tapeset + any producer residue */
+  return rc;
+}
+
 /* ------------------------------------------------------------------ */
 /* In-server self-test: 2A-1 NEW-backing producer hook (redesign #78)  */
 /* Gated by env CUBRID_PRODUCER_SELFTEST (debug-only invocation).       */
@@ -1642,6 +1765,11 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
 	    }
 	  qfile_tapeset_scan_close (thread_p, &sid);
 	}
+    }
+
+  if (rc == NO_ERROR)
+    {
+      rc = qfile_producer_overflow_roundtrip (thread_p, algo);
     }
 
   qfile_clear_list_id (&lst);	/* frees the owned Tapeset + any producer residue */
