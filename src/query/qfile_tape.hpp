@@ -482,6 +482,17 @@ void qfile_tapeset_scan_save_position (QFILE_LIST_SCAN_ID *scan_id_p, QFILE_TUPL
 /* Destroy a tapeset owned by a QFILE_LIST_ID (used by qfile_clear_list_id). */
 void qfile_tapeset_destroy (void *tapeset_ptr);
 
+/* Phase2 2A-1 producer bridge (redesign #78): build a NEW-backed list by
+ * appending its completed list-pages to a tape_writer, then freezing into a
+ * single-Tape Tapeset.  Pairs with the qfile producer hook in list_file.c.
+ * The writer is created without a backing list (pgbuf-bypassed) and consumed
+ * (deleted) by freeze_tapeset / destroy. */
+void *qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned long long seq,
+			     unsigned int worker_id);
+int qfile_producer_append (THREAD_ENTRY *thread_p, void *writer, const PAGE_PTR full_page);
+void *qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer);
+void qfile_producer_destroy (void *writer);
+
 /*
  * In-server self-test of the holdable-result lifecycle (Phase1 1C, redesign
  * G007 #72): build a spilled Tapeset behind a QFILE_LIST_ID, reparent its
@@ -498,5 +509,11 @@ int qfile_heldtape_selftest (THREAD_ENTRY *thread_p);
 /* In-server self-test of N-reader concurrent read over a frozen (TDE) Tape
  * (ADR 0005, #78 2A-0).  Gated by env CUBRID_TAPEREAD_SELFTEST (debug). */
 int qfile_taperead_selftest (THREAD_ENTRY *thread_p);
+
+/* In-server self-test of the 2A-1 NEW-backing producer hook (redesign #78):
+ * produce a list via qfile_add_tuple_to_list onto a producer_writer_-attached
+ * QFILE_LIST_ID, close (freeze into a Tapeset), then scan via tapeset_scan and
+ * assert robust parity.  Gated by env CUBRID_PRODUCER_SELFTEST (debug). */
+int qfile_producer_selftest (THREAD_ENTRY *thread_p);
 
 #endif /* _QFILE_TAPE_HPP_ */

@@ -476,6 +476,13 @@ struct qfile_list_id
    * on a cleared list; set OLD/NEW when a producer commits a backing.  Access
    * via QFILE_LIST_ID_BACKING_KIND.  Not serialized (transient runtime tag). */
   QFILE_BACKING_KIND backing_kind_;
+  /* Phase2 2A-1 producer hook (redesign #78).  While a NEW-backed list is being
+   * PRODUCED, producer_writer_ holds the qfile::tape_writer that completed pages
+   * are appended to, and producer_page_ is the single reusable in-memory page
+   * being filled (== last_pgptr).  Both NULL for OLD production and after freeze.
+   * Opaque; access via the accessor macros.  Not serialized (transient). */
+  void *producer_writer_;	/* qfile::tape_writer * (QFILE_LIST_ID_PRODUCER_WRITER) */
+  void *producer_page_;		/* scratch page being filled (QFILE_LIST_ID_PRODUCER_PAGE) */
 };
 
 #define QFILE_CLEAR_LIST_ID(list_id) \
@@ -513,6 +520,8 @@ struct qfile_list_id
       (list_id)->tapeset_ = NULL; \
       (list_id)->owns_tapeset_ = false; \
       (list_id)->backing_kind_ = QFILE_BACKING_NONE; \
+      (list_id)->producer_writer_ = NULL; \
+      (list_id)->producer_page_ = NULL; \
     } \
   while (0)
 
@@ -538,6 +547,8 @@ struct qfile_list_id
 #define QFILE_LIST_ID_TAPESET(list_id)     ((list_id)->tapeset_)
 #define QFILE_LIST_ID_OWNS_TAPESET(list_id) ((list_id)->owns_tapeset_)
 #define QFILE_LIST_ID_BACKING_KIND(list_id) ((list_id)->backing_kind_)
+#define QFILE_LIST_ID_PRODUCER_WRITER(list_id) ((list_id)->producer_writer_)
+#define QFILE_LIST_ID_PRODUCER_PAGE(list_id)   ((list_id)->producer_page_)
 
 /*
  * No-mixed-backing invariant (redesign G008, issue #73; SSOT #75 §5.5 (7) /

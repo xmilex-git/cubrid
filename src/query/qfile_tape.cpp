@@ -1492,3 +1492,161 @@ qfile_taperead_selftest (THREAD_ENTRY *thread_p)
   fprintf (stderr, "TAPEREAD_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
   return rc;
 }
+
+/* ------------------------------------------------------------------ */
+/* Phase2 2A-1 producer bridge (redesign #78)                          */
+/* ------------------------------------------------------------------ */
+
+void *
+qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned long long seq, unsigned int worker_id)
+{
+  std::string dir;
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      return NULL;
+    }
+  return new qfile::tape_writer (prefix_budget_pages, tde_algo, dir, (std::uint64_t) seq, worker_id);
+}
+
+int
+qfile_producer_append (THREAD_ENTRY *thread_p, void *writer, const PAGE_PTR full_page)
+{
+  if (writer == NULL || full_page == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+      return ER_FAILED;
+    }
+  return ((qfile::tape_writer *) writer)->append_page (thread_p, full_page);
+}
+
+void *
+qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer)
+{
+  if (writer == NULL)
+    {
+      return NULL;
+    }
+  qfile::tape_writer *w = (qfile::tape_writer *) writer;
+  qfile::tape *t = w->freeze (thread_p);
+  delete w;			/* spent: prefix + buffile ownership moved to the Tape */
+  if (t == NULL)
+    {
+      return NULL;
+    }
+  qfile::tapeset *ts = new qfile::tapeset ();
+  ts->set_owns_tapes (true);
+  ts->append_tape (t);
+  return ts;
+}
+
+void
+qfile_producer_destroy (void *writer)
+{
+  delete (qfile::tape_writer *) writer;	/* unfrozen: frees the partial spill */
+}
+
+/* ------------------------------------------------------------------ */
+/* In-server self-test: 2A-1 NEW-backing producer hook (redesign #78)  */
+/* Gated by env CUBRID_PRODUCER_SELFTEST (debug-only invocation).       */
+/* ------------------------------------------------------------------ */
+
+int
+qfile_producer_selftest (THREAD_ENTRY *thread_p)
+{
+  TDE_ALGORITHM algo = TDE_ALGORITHM_NONE;
+  if (tde_is_loaded ())
+    {
+      const TDE_ALGORITHM def = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+      if (def != TDE_ALGORITHM_NONE)
+	{
+	  algo = def;
+	}
+    }
+
+  const int N = 5000;		/* 16B tuples -> several pages -> spills past budget */
+  const int TUPLE_LEN = 16;
+  const int ID_OFFSET = 8;
+
+  /* A NEW-backed list: no OLD temp-file (tfile_vfid NULL), producer_writer_ +
+   * scratch attached.  The qfile producer hook routes its completed pages to
+   * the tape_writer (no qmgr, no VPID). */
+  QFILE_LIST_ID lst;
+  QFILE_CLEAR_LIST_ID (&lst);
+  void *writer = qfile_producer_create (2, algo, 90000ULL, 0);
+  if (writer == NULL)
+    {
+      return ER_FAILED;
+    }
+  QFILE_LIST_ID_PRODUCER_WRITER (&lst) = writer;
+  char *scratch = (char *) malloc (DB_PAGESIZE);
+  if (scratch == NULL)
+    {
+      qfile_producer_destroy (writer);
+      return ER_FAILED;
+    }
+  QFILE_LIST_ID_PRODUCER_PAGE (&lst) = scratch;
+
+  int rc = NO_ERROR;
+  char tuple[TUPLE_LEN];
+  for (int i = 0; i < N && rc == NO_ERROR; i++)
+    {
+      std::memset (tuple, 0, TUPLE_LEN);
+      QFILE_PUT_TUPLE_LENGTH (tuple, TUPLE_LEN);
+      QFILE_PUT_PREV_TUPLE_LENGTH (tuple, (i == 0) ? 0 : TUPLE_LEN);
+      OR_PUT_INT (tuple + ID_OFFSET, i);
+      rc = qfile_add_tuple_to_list (thread_p, &lst, (QFILE_TUPLE) tuple);
+    }
+
+  if (rc == NO_ERROR)
+    {
+      qfile_close_list (thread_p, &lst);	/* NEW branch: freeze -> tapeset_, backing_kind=NEW */
+      if (QFILE_LIST_ID_TAPESET (&lst) == NULL || QFILE_LIST_ID_BACKING_KIND (&lst) != QFILE_BACKING_NEW
+	  || qfile_list_is_mixed_backing (&lst) || !qfile_list_has_new_backing (&lst)
+	  || qfile_list_has_old_backing (&lst))
+	{
+	  rc = ER_FAILED;
+	}
+    }
+
+  /* scan the frozen Tapeset back and verify ids 0..N-1 in order */
+  if (rc == NO_ERROR)
+    {
+      QFILE_LIST_SCAN_ID sid;
+      std::memset (&sid, 0, sizeof (sid));
+      QFILE_CLEAR_LIST_ID (&sid.list_id);
+      QFILE_LIST_ID_TAPESET (&sid.list_id) = QFILE_LIST_ID_TAPESET (&lst);	/* borrow */
+      QFILE_LIST_ID_OWNS_TAPESET (&sid.list_id) = false;
+      sid.tapeset_scan_ = NULL;
+
+      if (qfile_tapeset_scan_open (&sid) != NO_ERROR)
+	{
+	  rc = ER_FAILED;
+	}
+      else
+	{
+	  QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+	  int expected = 0;
+	  SCAN_CODE code;
+	  while ((code = qfile_tapeset_scan_forward (thread_p, &sid, &tplrec, PEEK)) == S_SUCCESS)
+	    {
+	      if (OR_GET_INT ((char *) tplrec.tpl + ID_OFFSET) != expected)
+		{
+		  rc = ER_FAILED;
+		  break;
+		}
+	      expected++;
+	    }
+	  if (rc == NO_ERROR && (code != S_END || expected != N))
+	    {
+	      rc = ER_FAILED;
+	    }
+	  qfile_tapeset_scan_close (thread_p, &sid);
+	}
+    }
+
+  qfile_clear_list_id (&lst);	/* frees the owned Tapeset + any producer residue */
+
+  er_log_debug (ARG_FILE_LINE, "PRODUCER_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
+  fprintf (stderr, "PRODUCER_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
+  return rc;
+}

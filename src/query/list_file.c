@@ -647,6 +647,14 @@ qfile_clear_list_id (QFILE_LIST_ID * list_id_p)
       qfile_tapeset_destroy (QFILE_LIST_ID_TAPESET (list_id_p));
     }
 
+  /* Aborted NEW production (close never reached): free the writer + scratch
+   * (redesign #78).  Normal close transfers these out before clear runs. */
+  if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
+    {
+      qfile_producer_destroy (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p));
+    }
+  free (QFILE_LIST_ID_PRODUCER_PAGE (list_id_p));
+
   QFILE_CLEAR_LIST_ID (list_id_p);
 }
 
@@ -1390,6 +1398,28 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 {
   if (list_id_p)
     {
+      if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
+	{
+	  /* NEW production (redesign #78): append the final page, freeze the
+	   * tape_writer into a single-Tape Tapeset, mark backing NEW.  No qmgr. */
+	  void *writer = QFILE_LIST_ID_PRODUCER_WRITER (list_id_p);
+	  if (list_id_p->last_pgptr != NULL)
+	    {
+	      (void) qfile_producer_append (thread_p, writer, list_id_p->last_pgptr);
+	    }
+	  void *ts = qfile_producer_freeze_tapeset (thread_p, writer);
+	  QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) = NULL;
+	  free (QFILE_LIST_ID_PRODUCER_PAGE (list_id_p));
+	  QFILE_LIST_ID_PRODUCER_PAGE (list_id_p) = NULL;
+	  list_id_p->last_pgptr = NULL;
+	  if (ts != NULL)
+	    {
+	      QFILE_LIST_ID_TAPESET (list_id_p) = ts;
+	      QFILE_LIST_ID_OWNS_TAPESET (list_id_p) = true;
+	      QFILE_LIST_ID_BACKING_KIND (list_id_p) = QFILE_BACKING_NEW;
+	    }
+	  return;
+	}
       if (list_id_p->last_pgptr != NULL)
 	{
 	  QFILE_PUT_NEXT_VPID_NULL (list_id_p->last_pgptr);
@@ -1476,6 +1506,12 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
 static bool
 qfile_is_first_tuple (QFILE_LIST_ID * list_id_p)
 {
+  if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
+    {
+      /* NEW production: first_vpid stays NULL for a Tapeset-backed list, so
+       * "first tuple" == no scratch page filled yet (redesign #78). */
+      return list_id_p->last_pgptr == NULL;
+    }
   return VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(list_id_p));
 }
 
@@ -1513,6 +1549,34 @@ qfile_allocate_new_page (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, PAG
 {
   PAGE_PTR new_page_p;
   VPID new_vpid;
+  if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
+    {
+      /* NEW production (redesign #78): append the just-completed page to the
+       * per-worker tape_writer and reuse the single scratch page for the next.
+       * No qmgr page, no VPID chain (the Tapeset addresses by offset). */
+      char *scratch = (char *) QFILE_LIST_ID_PRODUCER_PAGE (list_id_p);
+      if (is_ovf_page || scratch == NULL)
+	{
+	  /* overflow on a NEW-backed producer is a 2A-1 follow-up; fail cleanly
+	   * rather than silently mis-write (no producer routes overflow here). */
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  return NULL;
+	}
+      if (page_p != NULL && qfile_producer_append (thread_p, QFILE_LIST_ID_PRODUCER_WRITER (list_id_p), page_p) != NO_ERROR)
+	{
+	  return NULL;
+	}
+      memset (scratch, 0, DB_PAGESIZE);
+      QFILE_PUT_TUPLE_COUNT (scratch, 0);
+      QFILE_PUT_PREV_VPID_NULL (scratch);
+      QFILE_PUT_NEXT_VPID_NULL (scratch);
+      QFILE_PUT_LAST_TUPLE_OFFSET (scratch, QFILE_PAGE_HEADER_SIZE);
+      QFILE_PUT_OVERFLOW_VPID_NULL (scratch);
+      list_id_p->page_cnt++;
+      list_id_p->last_pgptr = (PAGE_PTR) scratch;
+      list_id_p->last_offset = QFILE_PAGE_HEADER_SIZE;
+      return (PAGE_PTR) scratch;
+    }
 
 #if defined (SERVER_MODE)
   if (qmgr_is_query_interrupted (thread_p, list_id_p->query_id) == true)
@@ -1670,6 +1734,13 @@ qfile_add_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFI
 
   cur_page_p = list_id_p->last_pgptr;
   tuple_length = QFILE_GET_TUPLE_LENGTH (tuple);
+  if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL && tuple_length > qfile_Max_tuple_page_size)
+    {
+      /* overflow on a NEW-backed producer is a 2A-1 follow-up (ADR0006
+       * producer stamping); fail cleanly until implemented. */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+      return ER_FAILED;
+    }
 
   if (qfile_allocate_new_page_if_need (thread_p, list_id_p, &cur_page_p, tuple_length, false) != NO_ERROR)
     {
@@ -1710,7 +1781,10 @@ qfile_add_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFI
       qfile_set_dirty_page (thread_p, prev_page_p, FREE, QFILE_LIST_ID_TFILE_VFID(list_id_p));
     }
 
-  qfile_set_dirty_page (thread_p, cur_page_p, DONT_FREE, QFILE_LIST_ID_TFILE_VFID(list_id_p));
+  if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) == NULL)
+    {
+      qfile_set_dirty_page (thread_p, cur_page_p, DONT_FREE, QFILE_LIST_ID_TFILE_VFID(list_id_p));
+    }
 
   return NO_ERROR;
 }
@@ -1934,7 +2008,10 @@ qfile_generate_tuple_into_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id
 
   qfile_add_tuple_to_list_id (list_id_p, page_p, tuple_length, tuple_length);
 
-  qfile_set_dirty_page (thread_p, cur_page_p, DONT_FREE, QFILE_LIST_ID_TFILE_VFID(list_id_p));
+  if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) == NULL)
+    {
+      qfile_set_dirty_page (thread_p, cur_page_p, DONT_FREE, QFILE_LIST_ID_TFILE_VFID(list_id_p));
+    }
   return NO_ERROR;
 }
 
