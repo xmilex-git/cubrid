@@ -212,6 +212,10 @@ extern QFILE_LIST_ID *qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALU
 				       SORT_LIST * sort_list, QUERY_ID query_id, int flag,
 				       QFILE_LIST_ID * existing_list_id);
 extern int qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
+/* redesign #78 2A-1b: NEW (Tapeset) SORT output migration. */
+extern bool qfile_sort_new_backing_enabled (void);
+extern int qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
+extern int qfile_tapeset_import (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest, QFILE_LIST_ID * src);
 extern int qfile_save_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, QFILE_TUPLE_TYPE tuple_type, char *page_p,
 			     int *tuple_length_p);
 extern int qfile_generate_tuple_into_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, QFILE_TUPLE_TYPE tpl_type);

@@ -228,8 +228,6 @@ static void qfile_add_tuple_to_list_id (QFILE_LIST_ID * list_id_p, PAGE_PTR page
 					int written_tuple_length);
 static int qfile_producer_add_overflow_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFILE_TUPLE tuple,
 					      int tuple_length);
-static bool qfile_sort_new_backing_enabled (void);
-static int qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
 static int qfile_save_single_bound_item_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, char *page_p,
 					       int tuple_length);
 static int qfile_save_normal_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, char *page_p,
@@ -4964,7 +4962,7 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
  *   per-worker import lands next).  Default OFF keeps OLD behavior, so a
  *   default server takes the unchanged parallel sort path with no regression.
  */
-static bool
+bool
 qfile_sort_new_backing_enabled (void)
 {
   static int cached = -1;
@@ -4985,19 +4983,15 @@ qfile_sort_new_backing_enabled (void)
  *   it into a single-Tape Tapeset.  The caller MUST close before scan/MOVE.
  *   return: int (NO_ERROR or ER_FAILED)
  */
-static int
+int
 qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted)
 {
   char *scratch;
   void *writer;
 
-  if (QFILE_LIST_ID_TFILE_VFID (list_id_p) != NULL)
-    {
-      qmgr_free_list_temp_file (thread_p, list_id_p->query_id, QFILE_LIST_ID_TFILE_VFID (list_id_p));
-      QFILE_LIST_ID_TFILE_VFID (list_id_p) = NULL;
-    }
-  VFID_SET_NULL (&list_id_p->temp_vfid);
-
+  /* Build the producer FIRST; only once it succeeds do we drop the OLD temp
+   * file.  This keeps the conversion atomic: on OOM the list stays wholly OLD
+   * (functional) rather than half-converted (no backing). */
   scratch = (char *) malloc (DB_PAGESIZE);
   if (scratch == NULL)
     {
@@ -5010,6 +5004,13 @@ qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, 
       free (scratch);
       return ER_FAILED;
     }
+
+  if (QFILE_LIST_ID_TFILE_VFID (list_id_p) != NULL)
+    {
+      qmgr_free_list_temp_file (thread_p, list_id_p->query_id, QFILE_LIST_ID_TFILE_VFID (list_id_p));
+      QFILE_LIST_ID_TFILE_VFID (list_id_p) = NULL;
+    }
+  VFID_SET_NULL (&list_id_p->temp_vfid);
   QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) = writer;
   QFILE_LIST_ID_PRODUCER_PAGE (list_id_p) = scratch;
   er_log_debug (ARG_FILE_LINE, "WM_SORT_NEW: query_id=%lld SORT output -> NEW Tapeset producer (tde=%d)\n",

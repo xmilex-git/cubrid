@@ -185,6 +185,7 @@ struct sort_param
   ORDERBY_STATS orderby_stats;
     cuberr::context * main_error_context;
   void *px_extra_arg;		/* extra parallel context; for SORT_GROUP_BY/SORT_ANALYTIC: SORT_LISTFILE_PX_ARG* */
+  bool px_output_is_new;	/* 2A-1b (#78): this SORT output migrated to NEW Tapeset backing */
   QFILE_LIST_SECTOR_SCAN_INFO *px_sector_scan;	/* shared sector scan for ORDER_BY/ORDER_WITH_LIMIT/GROUP_BY/ANALYTIC workers */
 #if defined(SERVER_MODE)
   pthread_mutex_t *px_mtx;	/* px_status mutex */
@@ -1486,6 +1487,13 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->px_type = parallel_type;
   sort_param->px_extra_arg = px_extra_arg;
   sort_param->px_sector_scan = NULL;
+  /* 2A-1b (#78): capture whether this SORT output was converted to NEW (Tapeset)
+   * backing -- stably, before the parallel workers run -- so each worker's
+   * output matches the origin (a do_close=false sort leaves the origin OLD).
+   * Only ORDER_BY/ORDER_WITH_LIMIT carry a SORT_INFO put_arg with a qfile out. */
+  sort_param->px_output_is_new =
+    ((parallel_type == SORT_ORDER_BY || parallel_type == SORT_ORDER_WITH_LIMIT)
+     && QFILE_LIST_ID_PRODUCER_WRITER (((SORT_INFO *) put_arg)->output_file) != NULL);
 
   tde_er_log ("sort_listfile(): tde_encrypted = %d\n", sort_param->tde_encrypted);
 
@@ -4914,6 +4922,32 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
   for (i = 1; i < parallel_num; i++)
     {
       sort_info_p = (SORT_INFO *) px_sort_param[i].put_arg;
+      if (qfile_list_has_new_backing (origin_list_id))
+	{
+	  /* 2A-1b (#78): NEW (Tapeset) fan-in -- import this worker's frozen
+	   * Tape(s) into the origin Tapeset in worker order (= globally sorted,
+	   * since sort_split_last_run partitioned the merged run in order). */
+	  if (sort_info_p->output_file == NULL)
+	    {
+	      continue;
+	    }
+	  if (qfile_list_has_old_backing (sort_info_p->output_file))
+	    {
+	      /* worker stayed OLD (conversion OOM) feeding a NEW origin: a
+	       * mixed-backing error, never a silent data loss. */
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	      error = ER_FAILED;
+	      goto cleanup;
+	    }
+	  error = qfile_tapeset_import (thread_p, origin_list_id, sort_info_p->output_file);
+	  if (error != NO_ERROR)
+	    {
+	      goto cleanup;
+	    }
+	  qfile_destroy_list (thread_p, sort_info_p->output_file);
+	  QFILE_FREE_AND_INIT_LIST_ID (sort_info_p->output_file);
+	  continue;
+	}
       /* check NULL list id */
       if (VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(sort_info_p->output_file)))
 	{
@@ -4944,11 +4978,15 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
 	  origin_sort_info_p->output_file = origin_list_id;
 	}
     }
-  /* reopen final output file */
-  error = qfile_reopen_list_as_append_mode (thread_p, origin_list_id);
-  if (error != NO_ERROR)
+  /* reopen final output file (OLD append mode only; a NEW origin is a frozen
+   * Tapeset that is never reopened for append). */
+  if (!qfile_list_has_new_backing (origin_list_id))
     {
-      goto cleanup;
+      error = qfile_reopen_list_as_append_mode (thread_p, origin_list_id);
+      if (error != NO_ERROR)
+	{
+	  goto cleanup;
+	}
     }
 
 cleanup:
@@ -5134,17 +5172,6 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
       /* get scan id of input file */
       sort_info_p = (SORT_INFO *) sort_param->get_arg;
 
-      /* 2A-1b (#78): a NEW (Tapeset) SORT output is produced by a single-Tape
-       * serial producer; the parallel per-worker Tape import is wired in a
-       * later step.  Force serial BEFORE reserving workers (so no
-       * worker_manager is reserved-then-leaked) and so a NEW worker-0 output is
-       * never mixed with OLD worker outputs.  get_arg == put_arg == &info, so
-       * output_file is the srlist_id being produced. */
-      if (QFILE_LIST_ID_PRODUCER_WRITER (sort_info_p->output_file) != NULL)
-	{
-	  return 1;
-	}
-
       parallel_num =
 	parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, sort_info_p->input_file->page_cnt,
 						 sort_info_p->parallelism /* hint */ );
@@ -5299,6 +5326,10 @@ sort_put_result_for_parallel (cubthread::entry & thread_ref, SORT_PARAM * sort_p
 	  sort_info_p->output_file =
 	    qfile_open_list (thread_p, &ori_sort_info_p->input_file->type_list, ori_sort_info_p->sort_list_p,
 			     ori_sort_info_p->input_file->query_id, ori_sort_info_p->flag, NULL);
+	  if (sort_info_p->output_file != NULL && sort_param->ori_sort_param->px_output_is_new)
+	    {
+	      (void) qfile_list_make_new_backed (thread_p, sort_info_p->output_file, sort_param->tde_encrypted);
+	    }
 	}
     }
 

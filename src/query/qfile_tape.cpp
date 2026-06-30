@@ -1532,6 +1532,36 @@ qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted)
   return qfile_producer_create (budget, algo, (unsigned long long) seq_gen.fetch_add (1), 0);
 }
 
+/* Import all Tapes of src's frozen Tapeset into dest's Tapeset, in order
+ * (redesign #78, 2A-1b parallel fan-in).  Ownership of the Tapes transfers to
+ * dest; src's Tapeset keeps the (now-unowned) vector so destroying src frees
+ * only its container, not the moved Tapes.  dest's tuple/page counts
+ * accumulate src's.  dest must be a NEW (frozen Tapeset) list. */
+int
+qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID *src)
+{
+  (void) thread_p;
+  qfile::tapeset *dts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (dest);
+  qfile::tapeset *sts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (src);
+  if (dts == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+      return ER_FAILED;
+    }
+  if (sts != NULL)
+    {
+      const int n = sts->tape_count ();
+      for (int i = 0; i < n; i++)
+	{
+	  dts->append_tape (sts->get_tape (i));
+	}
+      sts->set_owns_tapes (false);	/* dest owns the Tapes now; src frees only its container */
+    }
+  dest->tuple_cnt += src->tuple_cnt;
+  dest->page_cnt += src->page_cnt;
+  return NO_ERROR;
+}
+
 int
 qfile_producer_append (THREAD_ENTRY *thread_p, void *writer, const PAGE_PTR full_page)
 {
