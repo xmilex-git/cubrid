@@ -5134,6 +5134,17 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
       /* get scan id of input file */
       sort_info_p = (SORT_INFO *) sort_param->get_arg;
 
+      /* 2A-1b (#78): a NEW (Tapeset) SORT output is produced by a single-Tape
+       * serial producer; the parallel per-worker Tape import is wired in a
+       * later step.  Force serial BEFORE reserving workers (so no
+       * worker_manager is reserved-then-leaked) and so a NEW worker-0 output is
+       * never mixed with OLD worker outputs.  get_arg == put_arg == &info, so
+       * output_file is the srlist_id being produced. */
+      if (QFILE_LIST_ID_PRODUCER_WRITER (sort_info_p->output_file) != NULL)
+	{
+	  return 1;
+	}
+
       parallel_num =
 	parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, sort_info_p->input_file->page_cnt,
 						 sort_info_p->parallelism /* hint */ );

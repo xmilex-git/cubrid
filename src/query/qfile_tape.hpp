@@ -489,6 +489,11 @@ void qfile_tapeset_destroy (void *tapeset_ptr);
  * (deleted) by freeze_tapeset / destroy. */
 void *qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned long long seq,
 			     unsigned int worker_id);
+/* Create a NEW-backed producer for a SORT output list (redesign #78, 2A-1b):
+ * membuf prefix = work_mem pages, TDE algo from tde_encrypted, process-unique
+ * BufFile sequence.  Returns an opaque writer (NULL on failure), consumed by
+ * qfile_producer_freeze_tapeset / qfile_producer_destroy. */
+void *qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted);
 int qfile_producer_append (THREAD_ENTRY *thread_p, void *writer, const PAGE_PTR full_page);
 void *qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer);
 void qfile_producer_destroy (void *writer);

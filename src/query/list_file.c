@@ -228,6 +228,8 @@ static void qfile_add_tuple_to_list_id (QFILE_LIST_ID * list_id_p, PAGE_PTR page
 					int written_tuple_length);
 static int qfile_producer_add_overflow_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFILE_TUPLE tuple,
 					      int tuple_length);
+static bool qfile_sort_new_backing_enabled (void);
+static int qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
 static int qfile_save_single_bound_item_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, char *page_p,
 					       int tuple_length);
 static int qfile_save_normal_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p, char *page_p,
@@ -4956,6 +4958,66 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
 }
 
 /*
+ * qfile_sort_new_backing_enabled () - is SORT output migrated to the NEW
+ *   (Tapeset) backing?  Migration toggle (redesign #78, 2A-1b): opt-in via
+ *   CUBRID_WM_SORT_NEW while only the serial path is wired (the parallel
+ *   per-worker import lands next).  Default OFF keeps OLD behavior, so a
+ *   default server takes the unchanged parallel sort path with no regression.
+ */
+static bool
+qfile_sort_new_backing_enabled (void)
+{
+  static int cached = -1;
+  if (cached < 0)
+    {
+      cached = (getenv ("CUBRID_WM_SORT_NEW") != NULL) ? 1 : 0;
+    }
+  return cached != 0;
+}
+
+/*
+ * qfile_list_make_new_backed () - convert a freshly-opened (empty) OLD list
+ *   into a NEW Tapeset-backed producer list (redesign #78, 2A-1b).  Drop the
+ *   empty temp file so the list carries no OLD backing (tfile_vfid/first_vpid
+ *   stay NULL), then attach a tape_writer (membuf prefix = work_mem; TDE per
+ *   the captured flag).  Tuples produced into it route to the tape_writer via
+ *   the producer hook (no qmgr, no pgbuf, no VPID); qfile_close_list freezes
+ *   it into a single-Tape Tapeset.  The caller MUST close before scan/MOVE.
+ *   return: int (NO_ERROR or ER_FAILED)
+ */
+static int
+qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted)
+{
+  char *scratch;
+  void *writer;
+
+  if (QFILE_LIST_ID_TFILE_VFID (list_id_p) != NULL)
+    {
+      qmgr_free_list_temp_file (thread_p, list_id_p->query_id, QFILE_LIST_ID_TFILE_VFID (list_id_p));
+      QFILE_LIST_ID_TFILE_VFID (list_id_p) = NULL;
+    }
+  VFID_SET_NULL (&list_id_p->temp_vfid);
+
+  scratch = (char *) malloc (DB_PAGESIZE);
+  if (scratch == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+      return ER_FAILED;
+    }
+  writer = qfile_producer_create_for_list (thread_p, tde_encrypted);
+  if (writer == NULL)
+    {
+      free (scratch);
+      return ER_FAILED;
+    }
+  QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) = writer;
+  QFILE_LIST_ID_PRODUCER_PAGE (list_id_p) = scratch;
+  er_log_debug (ARG_FILE_LINE, "WM_SORT_NEW: query_id=%lld SORT output -> NEW Tapeset producer (tde=%d)\n",
+		(long long) list_id_p->query_id, (int) tde_encrypted);
+  return NO_ERROR;
+}
+
+/*
  * qfile_sort_list_with_func () -
  *   return: QFILE_LIST_ID *, or NULL
  *   list_id(in): Source list file identifier
@@ -4991,6 +5053,19 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
   srlist_id = qfile_open_list (thread_p, &list_id_p->type_list, sort_list_p, list_id_p->query_id, flag, NULL);
   if (srlist_id == NULL)
     {
+      return NULL;
+    }
+
+  /* 2A-1b (#78): migrate a finalized (do_close) SORT output to NEW Tapeset
+   * backing when enabled.  Capture tde_encrypted before dropping the OLD temp
+   * file (the producer's BufFile re-applies TDE); the parallel path is forced
+   * serial while the output is NEW (see sort_listfile) until per-worker import
+   * is wired.  do_close gating keeps an open producer from being MOVE'd. */
+  bool srlist_tde = (QFILE_LIST_ID_TFILE_VFID (srlist_id)->tde_encrypted);
+  if (do_close && qfile_sort_new_backing_enabled ()
+      && qfile_list_make_new_backed (thread_p, srlist_id, srlist_tde) != NO_ERROR)
+    {
+      qfile_close_and_free_list_file (thread_p, srlist_id);
       return NULL;
     }
 
@@ -5059,7 +5134,7 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
 
   sort_result =
     sort_listfile (thread_p, NULL_VOLID, estimated_pages, get_func, &info, put_func, &info, cmp_func, &info.key_info,
-		   dup_option, limit, QFILE_LIST_ID_TFILE_VFID(srlist_id)->tde_encrypted, parallel_type);
+		   dup_option, limit, srlist_tde, parallel_type);
 
   if (sort_result < 0)
     {

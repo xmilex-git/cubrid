@@ -36,6 +36,7 @@
 #include <sys/stat.h>		/* stat (orphan-zero on-disk check) */
 #include <thread>		/* N-reader concurrent selftest (ADR 0005) */
 #include <algorithm>		/* std::sort (coverage check) */
+#include <atomic>		/* process-unique producer BufFile sequence */
 
 #include "memory_wrapper.hpp"
 
@@ -1506,6 +1507,29 @@ qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned
       return NULL;
     }
   return new qfile::tape_writer (prefix_budget_pages, tde_algo, dir, (std::uint64_t) seq, worker_id);
+}
+
+void *
+qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted)
+{
+  /* process-unique sequence so concurrent producers never collide on a BufFile
+   * name (open is O_EXCL); base well above the selftest's fixed seqs. */
+  static std::atomic<unsigned long long> seq_gen { 0x100000000ULL };
+  TDE_ALGORITHM algo = TDE_ALGORITHM_NONE;
+  int budget;
+
+  (void) thread_p;
+  if (tde_encrypted)
+    {
+      algo = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+    }
+  /* membuf prefix budget = work_mem in pages (tiny sorts stay in RAM, no spill) */
+  budget = (int) (prm_get_bigint_value (PRM_ID_WORK_MEM) / DB_PAGESIZE);
+  if (budget < 4)
+    {
+      budget = 4;
+    }
+  return qfile_producer_create (budget, algo, (unsigned long long) seq_gen.fetch_add (1), 0);
 }
 
 int
