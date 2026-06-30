@@ -27,6 +27,9 @@
 #include "query_list.h"
 #include "query_manager.h"
 #include "scan_manager.h"
+#include "qfile_tape.hpp"
+
+#include <atomic>
 
 namespace parallel_scan
 {
@@ -38,6 +41,10 @@ namespace parallel_scan
     public:
       input_handler_list (interrupt *interrupt_p, err_messages_with_lock *err_messages_p)
 	: m_sector_scan (),
+	  m_new_dist (nullptr),
+	  m_new_tapeset (nullptr),
+	  m_new_parallelism (0),
+	  m_next_new_reader_id (0),
 	  m_list_id (nullptr),
 	  m_interrupt_p (interrupt_p),
 	  m_err_messages_p (err_messages_p)
@@ -64,6 +71,11 @@ namespace parallel_scan
 
     private:
       QFILE_LIST_SECTOR_SCAN_INFO m_sector_scan;
+      qfile::chunk_distributor *m_new_dist;
+      qfile::tapeset *m_new_tapeset;
+      int m_new_parallelism;
+      std::atomic<int> m_next_new_reader_id;
+
 
       QFILE_LIST_ID *m_list_id;
       interrupt *m_interrupt_p;
@@ -74,6 +86,13 @@ namespace parallel_scan
       thread_local static QMGR_TEMP_FILE *m_tl_current_tfile;
       thread_local static bool m_tl_is_membuf_worker;
       thread_local static int m_tl_membuf_pageid;
+      thread_local static int m_tl_new_reader_id;
+      thread_local static qfile::chunk_distributor::range m_tl_new_range;
+      thread_local static bool m_tl_new_have_chunk;
+      thread_local static int m_tl_new_page_offset;
+      thread_local static char *m_tl_new_page_raw;
+      thread_local static PAGE_PTR m_tl_new_page_buf;
+      thread_local static qfile::tde_read_scratch *m_tl_new_tde;
   };
 }
 

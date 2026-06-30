@@ -38,16 +38,56 @@ namespace parallel_scan
   thread_local QMGR_TEMP_FILE *input_handler_list::m_tl_current_tfile = nullptr;
   thread_local bool input_handler_list::m_tl_is_membuf_worker = false;
   thread_local int input_handler_list::m_tl_membuf_pageid = 0;
+  thread_local int input_handler_list::m_tl_new_reader_id = -1;
+  thread_local qfile::chunk_distributor::range input_handler_list::m_tl_new_range = { 0, 0, 0 };
+  thread_local bool input_handler_list::m_tl_new_have_chunk = false;
+  thread_local int input_handler_list::m_tl_new_page_offset = 0;
+  thread_local char *input_handler_list::m_tl_new_page_raw = nullptr;
+  thread_local PAGE_PTR input_handler_list::m_tl_new_page_buf = nullptr;
+  thread_local qfile::tde_read_scratch *input_handler_list::m_tl_new_tde = nullptr;
+
 
   int
   input_handler_list::init_on_main (THREAD_ENTRY *thread_p, QFILE_LIST_ID *list_id, int parallelism)
   {
     /* Idempotent close before re-open. */
     qfile_close_list_sector_scan (thread_p, &m_sector_scan);
+    delete m_new_dist;
+    m_new_dist = nullptr;
+    m_new_tapeset = nullptr;
+    m_new_parallelism = 0;
+    m_next_new_reader_id.store (0, std::memory_order_relaxed);
+    m_list_id = nullptr;
 
-    if (parallelism <= 0 || list_id == nullptr || VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(list_id)))
+    if (parallelism <= 0 || list_id == nullptr)
       {
-	m_list_id = nullptr;
+	return NO_ERROR;
+      }
+
+    if (qfile_list_has_new_backing (list_id))
+      {
+	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (list_id);
+	if (ts == nullptr || QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (list_id))
+	  {
+	    return ER_FAILED;
+	  }
+
+	m_new_dist = new qfile::chunk_distributor (ts, parallelism);
+	if (m_new_dist == nullptr)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		    sizeof (qfile::chunk_distributor));
+	    return ER_FAILED;
+	  }
+
+	m_new_tapeset = ts;
+	m_new_parallelism = parallelism;
+	m_list_id = list_id;
+	return NO_ERROR;
+      }
+
+    if (VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(list_id)))
+      {
 	return NO_ERROR;
       }
 
@@ -55,11 +95,9 @@ namespace parallel_scan
     int error_code = qfile_open_list_sector_scan (thread_p, list_id, &m_sector_scan);
     if (error_code != NO_ERROR)
       {
-	m_list_id = nullptr;
 	return error_code;
       }
     m_list_id = list_id;
-    (void) parallelism;
     return NO_ERROR;
   }
 
@@ -73,6 +111,42 @@ namespace parallel_scan
     /* first live worker wins membuf — cf. sector_page_iterator (px_hash_join_task_manager.cpp:225) */
     m_tl_is_membuf_worker = false;
     m_tl_membuf_pageid = 0;
+    m_tl_new_reader_id = -1;
+    m_tl_new_have_chunk = false;
+    m_tl_new_page_offset = 0;
+
+    if (m_new_tapeset != nullptr)
+      {
+	m_tl_new_reader_id = m_next_new_reader_id.fetch_add (1, std::memory_order_relaxed);
+	if (m_tl_new_reader_id < 0 || m_tl_new_reader_id >= m_new_parallelism)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    return ER_FAILED;
+	  }
+	if (m_tl_new_page_raw == nullptr)
+	  {
+	    m_tl_new_page_raw = (char *) malloc (DB_PAGESIZE);
+	    if (m_tl_new_page_raw == nullptr)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, DB_PAGESIZE);
+		return ER_FAILED;
+	      }
+	    m_tl_new_page_buf = (PAGE_PTR) m_tl_new_page_raw;
+	  }
+	if (m_tl_new_tde == nullptr)
+	  {
+	    m_tl_new_tde = new qfile::tde_read_scratch ();
+	    if (m_tl_new_tde == nullptr)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (qfile::tde_read_scratch));
+		free (m_tl_new_page_raw);
+		m_tl_new_page_raw = nullptr;
+		m_tl_new_page_buf = nullptr;
+		return ER_FAILED;
+	      }
+	  }
+      }
+
     if (m_sector_scan.sector_info.membuf_tfile != nullptr)
       {
 	bool expected = false;
@@ -94,6 +168,48 @@ namespace parallel_scan
   {
     out_page = nullptr;
     out_tfile = nullptr;
+
+    if (m_new_tapeset != nullptr)
+      {
+	while (true)
+	  {
+	    if (!m_tl_new_have_chunk
+		|| m_tl_new_page_offset >= m_tl_new_range.start_page + m_tl_new_range.page_count)
+	      {
+		if (!m_new_dist->next_chunk (m_tl_new_reader_id, m_tl_new_range))
+		  {
+		    return S_END;
+		  }
+		m_tl_new_have_chunk = true;
+		m_tl_new_page_offset = m_tl_new_range.start_page;
+	      }
+
+	    qfile::tape *tape_p = m_new_tapeset->get_tape (m_tl_new_range.tape_idx);
+	    if (tape_p == nullptr)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		return S_ERROR;
+	      }
+
+	    PAGE_PTR page_p = tape_p->read_page_into (thread_p, m_tl_new_page_offset,
+			       (char *) m_tl_new_page_buf, m_tl_new_tde);
+	    m_tl_new_page_offset++;
+	    if (page_p == nullptr)
+	      {
+		assert_release_error (er_errid () != NO_ERROR);
+		return S_ERROR;
+	      }
+
+	    if (QFILE_GET_TUPLE_COUNT (page_p) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		return S_ERROR;
+	      }
+	    out_page = page_p;
+	    out_tfile = nullptr;	/* NEW pages are borrowed RAM/scratch, never qmgr/pgbuf fixes. */
+	    return S_SUCCESS;
+	  }
+      }
 
     while (true)
       {
@@ -162,6 +278,14 @@ namespace parallel_scan
     m_tl_current_tfile = nullptr;
     m_tl_is_membuf_worker = false;
     m_tl_membuf_pageid = 0;
+    m_tl_new_reader_id = -1;
+    m_tl_new_have_chunk = false;
+    m_tl_new_page_offset = 0;
+    free (m_tl_new_page_raw);
+    m_tl_new_page_raw = nullptr;
+    m_tl_new_page_buf = nullptr;
+    delete m_tl_new_tde;
+    m_tl_new_tde = nullptr;
     return NO_ERROR;
   }
 
@@ -169,6 +293,11 @@ namespace parallel_scan
   input_handler_list::cleanup_on_main (THREAD_ENTRY *thread_p)
   {
     qfile_close_list_sector_scan (thread_p, &m_sector_scan);
+    delete m_new_dist;
+    m_new_dist = nullptr;
+    m_new_tapeset = nullptr;
+    m_new_parallelism = 0;
+    m_next_new_reader_id.store (0, std::memory_order_relaxed);
     m_list_id = nullptr;
   }
 }

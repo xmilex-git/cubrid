@@ -1733,6 +1733,7 @@ qfile_producer_add_overflow_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list
   int run_pages, start_off, run_end, copied, i;
 
   assert (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL);
+  QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (list_id_p) = true;
 
   run_pages = qfile_overflow_run_pages (tuple_length);
   if (run_pages <= 0)

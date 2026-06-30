@@ -472,6 +472,7 @@ struct qfile_list_id
    * macro below.  Not serialized (transient runtime structure). */
   void *tapeset_;		/* (access via QFILE_LIST_ID_TAPESET) */
   bool owns_tapeset_;		/* this list_id owns/free the tapeset (access via QFILE_LIST_ID_OWNS_TAPESET) */
+  bool new_contains_overflow_;	/* NEW Tapeset has ADR0006 overflow tuple pages; page-parallel list scan must avoid it. */
   /* Migration backing-kind tag (redesign G008, issue #73).  QFILE_BACKING_NONE
    * on a cleared list; set OLD/NEW when a producer commits a backing.  Access
    * via QFILE_LIST_ID_BACKING_KIND.  Not serialized (transient runtime tag). */
@@ -520,6 +521,7 @@ struct qfile_list_id
       (list_id)->tapeset_ = NULL; \
       (list_id)->owns_tapeset_ = false; \
       (list_id)->backing_kind_ = QFILE_BACKING_NONE; \
+      (list_id)->new_contains_overflow_ = false; \
       (list_id)->producer_writer_ = NULL; \
       (list_id)->producer_page_ = NULL; \
     } \
@@ -549,6 +551,7 @@ struct qfile_list_id
 #define QFILE_LIST_ID_BACKING_KIND(list_id) ((list_id)->backing_kind_)
 #define QFILE_LIST_ID_PRODUCER_WRITER(list_id) ((list_id)->producer_writer_)
 #define QFILE_LIST_ID_PRODUCER_PAGE(list_id)   ((list_id)->producer_page_)
+#define QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW(list_id) ((list_id)->new_contains_overflow_)
 
 /*
  * No-mixed-backing invariant (redesign G008, issue #73; SSOT #75 §5.5 (7) /

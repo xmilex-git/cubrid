@@ -80,7 +80,10 @@ namespace parallel_scan
   {
     if (m_curr_pgptr != nullptr)
       {
-	qmgr_free_old_page (thread_p, m_curr_pgptr, m_curr_tfile);
+	if (m_curr_tfile != nullptr)
+	  {
+	    qmgr_free_old_page (thread_p, m_curr_pgptr, m_curr_tfile);
+	  }
 	m_curr_pgptr = nullptr;
       }
     if (m_tplrec.tpl != nullptr)
@@ -94,10 +97,15 @@ namespace parallel_scan
   int
   slot_iterator_list::set_page (THREAD_ENTRY *thread_p, PAGE_PTR page, QMGR_TEMP_FILE *tfile)
   {
-    /* Free previous page with its own tfile, then adopt the new fix. */
+    /* Free previous OLD page with its own tfile, then adopt the new page.
+     * NEW Tapeset pages arrive with tfile == nullptr and are borrowed RAM or
+     * per-worker scratch, so qmgr_free_old_page must not see them. */
     if (m_curr_pgptr != nullptr)
       {
-	qmgr_free_old_page (thread_p, m_curr_pgptr, m_curr_tfile);
+	if (m_curr_tfile != nullptr)
+	  {
+	    qmgr_free_old_page (thread_p, m_curr_pgptr, m_curr_tfile);
+	  }
 	m_curr_pgptr = nullptr;
       }
 

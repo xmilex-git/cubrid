@@ -873,9 +873,11 @@ extern "C"
 	return NO_ERROR;
       }
 
-    /* input_handler_list is an OLD sector-scan reader; keep NEW Tapeset input serial until
-     * parallel NEW list input is implemented. */
-    if (qfile_list_has_new_backing (list_id))
+    /* Page-parallel NEW list input is safe only for ordinary in-page tuples.
+     * ADR0006 overflow runs cross page boundaries and are handled by the serial
+     * Tapeset tuple reader; keep those lists serial rather than risk page-local
+     * tuple walking. */
+    if (qfile_list_has_new_backing (list_id) && QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (list_id))
       {
 	return NO_ERROR;
       }

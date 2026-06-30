@@ -1556,6 +1556,10 @@ qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID
 	  dts->append_tape (sts->get_tape (i));
 	}
       sts->set_owns_tapes (false);	/* dest owns the Tapes now; src frees only its container */
+      if (QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (src))
+	{
+	  QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (dest) = true;
+	}
     }
   dest->tuple_cnt += src->tuple_cnt;
   dest->page_cnt += src->page_cnt;
