@@ -5445,6 +5445,17 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 	db_private_free_and_init (thread_p, output_type_list.domp);
       }
 
+    if (qfile_sort_new_backing_enabled ())
+      {
+	bool out_tde = (QFILE_LIST_ID_TFILE_VFID (output_list_id)->tde_encrypted);
+	if (qfile_list_make_new_backed (thread_p, output_list_id, out_tde) != NO_ERROR)
+	  {
+	    qfile_close_list (thread_p, output_list_id);
+	    QFILE_FREE_AND_INIT_LIST_ID (output_list_id);
+	    GOTO_EXIT_ON_ERROR;
+	  }
+      }
+
     gbstate.output_file = output_list_id;
   }
 
@@ -5456,7 +5467,9 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 	  /* no tuples hash aggregated and empty unsorted list; no reason to continue */
 	  qfile_destroy_list (thread_p, list_id);
 	  qfile_close_list (thread_p, gbstate.output_file);
-	  qfile_copy_list_id (list_id, gbstate.output_file, true, QFILE_PROHIBIT_DEPENDENT);
+	  qfile_copy_list_id (list_id, gbstate.output_file, true,
+			      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
+			      QFILE_PROHIBIT_DEPENDENT);
 	  qexec_clear_groupby_state (thread_p, &gbstate);
 
 	  return NO_ERROR;
@@ -5502,7 +5515,9 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 	  /* output generated; finalize */
 	  qfile_destroy_list (thread_p, list_id);
 	  qfile_close_list (thread_p, gbstate.output_file);
-	  qfile_copy_list_id (list_id, gbstate.output_file, true, QFILE_PROHIBIT_DEPENDENT);
+	  qfile_copy_list_id (list_id, gbstate.output_file, true,
+			      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
+			      QFILE_PROHIBIT_DEPENDENT);
 
 	  goto wrapup;
 	}
@@ -5684,7 +5699,8 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
     }
 #endif
   qfile_destroy_list (thread_p, list_id);
-  qfile_copy_list_id (list_id, gbstate.output_file, true, QFILE_PROHIBIT_DEPENDENT);
+  qfile_copy_list_id (list_id, gbstate.output_file, true,
+		      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT : QFILE_PROHIBIT_DEPENDENT);
   /* qexec_clear_groupby_state() will free gbstate.output_file */
 
 wrapup:
@@ -20934,6 +20950,16 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
 	GOTO_EXIT_ON_ERROR;
       }
 
+    if (qfile_sort_new_backing_enabled ())
+      {
+	bool out_tde = (QFILE_LIST_ID_TFILE_VFID (output_list_id)->tde_encrypted);
+	if (qfile_list_make_new_backed (thread_p, output_list_id, out_tde) != NO_ERROR)
+	  {
+	    qfile_close_list (thread_p, output_list_id);
+	    QFILE_FREE_AND_INIT_LIST_ID (output_list_id);
+	    GOTO_EXIT_ON_ERROR;
+	  }
+      }
     gbstate.output_file = output_list_id;
   }
 
@@ -20942,7 +20968,9 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
       /* empty unsorted list file, no need to proceed */
       qfile_destroy_list (thread_p, list_id);
       qfile_close_list (thread_p, gbstate.output_file);
-      qfile_copy_list_id (list_id, gbstate.output_file, true, QFILE_PROHIBIT_DEPENDENT);
+      qfile_copy_list_id (list_id, gbstate.output_file, true,
+			  qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
+			  QFILE_PROHIBIT_DEPENDENT);
       qexec_clear_groupby_state (thread_p, &gbstate);	/* will free gbstate.output_file */
 
       return NO_ERROR;
@@ -21080,7 +21108,8 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
       gbstate.input_scan = NULL;
     }
   qfile_destroy_list (thread_p, list_id);
-  qfile_copy_list_id (list_id, gbstate.output_file, true, QFILE_PROHIBIT_DEPENDENT);
+  qfile_copy_list_id (list_id, gbstate.output_file, true,
+		      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT : QFILE_PROHIBIT_DEPENDENT);
 
   if (XASL_IS_FLAGED (xasl, XASL_IS_MERGE_QUERY) && list_id->tuple_cnt != tuple_cnt)
     {
