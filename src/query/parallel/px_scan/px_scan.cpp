@@ -867,8 +867,15 @@ extern "C"
 
     const bool is_mergeable_list = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST);
     const bool is_buildvalue_opt = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT);
+    const bool is_new_backing = qfile_list_has_new_backing (list_id);
 
-    if (temp_page_store::raw_fd_master_enabled () && !is_mergeable_list && !is_buildvalue_opt)
+    /* The OLD raw-fd parallel sector input path (input_handler_list / sector_page_iterator) is
+     * correct for MERGEABLE_LIST (the parallel-scan producer's OWN output) but DROPS ROWS on an
+     * arbitrary derived-table list -- e.g. a GROUP BY output scanned as a BUILDVALUE_OPT outer
+     * aggregate returned 349006 / 15000000 rows (#78 2A-2f).  Restrict BUILDVALUE_OPT parallelism
+     * to NEW (Tapeset) input, which the 2A-2e tuple-level tapeset_reader reads correctly; OLD /
+     * raw-fd BUILDVALUE_OPT stays SERIAL until the OLD sector reader is fixed (Phase3). */
+    if (temp_page_store::raw_fd_master_enabled () && !is_mergeable_list && !(is_buildvalue_opt && is_new_backing))
       {
 	return NO_ERROR;
       }
