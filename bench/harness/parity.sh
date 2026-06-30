@@ -22,6 +22,7 @@ write_query_sql()
   local output=$1
   {
     echo ";plan detail"
+    echo ";trace on"
     cat "${query}"
   } >"${output}"
 }
@@ -66,6 +67,17 @@ set_server_conf_param max_parallel_workers 8
 restart_server
 prove_param parallel
 csql_file "${parallel_sql}" >"${parallel}" 2>&1
+
+# Passthrough-tautology guard (evidence I-2/I-11): the parallel run MUST actually
+# engage parallel workers (>=2), else serial==parallel is trivially serial==serial
+# and proves nothing. Parallelism shows ONLY in ;trace on, never in ;plan detail.
+if ! grep -qE 'parallel workers: ([2-9]|[0-9]{2,})' "${parallel}"; then
+  echo "PARITY GUARD FAIL: parallel run engaged NO parallel workers (>=2)" | tee -a "${proof}"
+  echo "  query shape (e.g. aggregate-wrapped DISTINCT) may have serialized the operator;" | tee -a "${proof}"
+  echo "  inspect ;trace on output: ${parallel}" | tee -a "${proof}"
+  exit 1
+fi
+echo "parallel_engaged=$(grep -oE 'parallel workers: [0-9]+' "${parallel}" | sort -u | paste -sd, -)" | tee -a "${proof}"
 
 result_rows "${serial}" | sort >"${serial_sorted}"
 result_rows "${parallel}" | sort >"${parallel_sorted}"
