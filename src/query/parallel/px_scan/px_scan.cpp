@@ -865,7 +865,17 @@ extern "C"
 	return NO_ERROR;
       }
 
-    if (temp_page_store::raw_fd_master_enabled () && !ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST))
+    const bool is_mergeable_list = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST);
+    const bool is_buildvalue_opt = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT);
+
+    if (temp_page_store::raw_fd_master_enabled () && !is_mergeable_list && !is_buildvalue_opt)
+      {
+	return NO_ERROR;
+      }
+
+    /* input_handler_list is an OLD sector-scan reader; keep NEW Tapeset input serial until
+     * parallel NEW list input is implemented. */
+    if (qfile_list_has_new_backing (list_id))
       {
 	return NO_ERROR;
       }
@@ -901,11 +911,11 @@ extern "C"
 
     /* local result type: pllsid_parallel overlaps llsid; keep llsid intact until open() succeeds. */
     parallel_scan::RESULT_TYPE local_result_type;
-    if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST))
+    if (is_mergeable_list)
       {
 	local_result_type = parallel_scan::RESULT_TYPE::MERGEABLE_LIST;
       }
-    else if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT))
+    else if (is_buildvalue_opt)
       {
 	local_result_type = parallel_scan::RESULT_TYPE::BUILDVALUE_OPT;
       }
