@@ -112,6 +112,14 @@ namespace qfile
        * false when the whole page space is exhausted. */
       bool next_chunk (int reader_id, range &out);
 
+      /* Bump the shared chunk cursor forward past every chunk of `tape_idx`
+       * that lies ENTIRELY within [0 .. run_end_page] (ADR 0006).  Called by a
+       * reader that consumed (or skipped) an overflow run so its continuation-
+       * only chunks are not separately claimed and re-read.  A boundary chunk
+       * that also holds post-run tuple starts is left claimable.  Forward-only
+       * and lock-free (CAS); safe under concurrent readers. */
+      void skip_to_after (int tape_idx, int run_end_page);
+
       long total_pages () const
       {
 	return m_total_pages;

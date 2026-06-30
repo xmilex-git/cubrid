@@ -40,6 +40,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -1215,6 +1216,378 @@ namespace
       }
     return 0;
   }
+
+  /* ---- 2A-0 overflow + concurrent-read + backing-guard (ADR 0005/0006) ---- */
+
+  static char
+  overflow_byte (int id, int i)
+  {
+    return (char) ((id * 7 + i) & 0xff);
+  }
+
+  /* Build the contiguous page run of one overflow tuple: `tuple_len` bytes laid
+   * out starting at logical offset `start`, carrying `id` at TEST_ID_OFFSET and
+   * a body byte pattern so a reader can verify the full reassembly.  Caller frees
+   * each page (or hands them to a memory_tape created owns==true). */
+  std::vector<char *>
+  make_overflow_run (int start, int tuple_len, int id)
+  {
+    const int per = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+    const int run_pages = (tuple_len + per - 1) / per;
+    const int run_end = start + run_pages - 1;
+
+    std::vector<char> tup ((size_t) tuple_len, 0);
+    QFILE_PUT_TUPLE_LENGTH (tup.data (), tuple_len);
+    QFILE_PUT_PREV_TUPLE_LENGTH (tup.data (), 0);
+    OR_PUT_INT (tup.data () + TEST_ID_OFFSET, id);
+    for (int i = 16; i < tuple_len; i++)
+      {
+	tup[i] = overflow_byte (id, i);
+      }
+
+    std::vector<char *> pages;
+    int copied = 0;
+    for (int p = 0; p < run_pages; p++)
+      {
+	char *page = (char *) malloc (DB_PAGESIZE);
+	std::memset (page, 0, DB_PAGESIZE);
+	QFILE_PUT_PREV_VPID_NULL (page);
+	QFILE_PUT_NEXT_VPID_NULL (page);
+	if (p == 0)
+	  {
+	    qfile_overflow_set_start (page, start);
+	  }
+	else
+	  {
+	    qfile_overflow_set_continuation (page, start, run_end);
+	  }
+	int csz = tuple_len - copied;
+	if (csz > per)
+	  {
+	    csz = per;
+	  }
+	std::memcpy (page + QFILE_PAGE_HEADER_SIZE, tup.data () + copied, csz);
+	copied += csz;
+	pages.push_back (page);
+      }
+    return pages;
+  }
+
+  /* G16: backing-kind ENTRY guard discriminates + A~E counter plumbing.
+   * Uses the pure (er_set-free) predicate so it stays bootless-safe. */
+  int
+  run_backing_guard ()
+  {
+    QFILE_LIST_ID lst;
+    std::memset (&lst, 0, sizeof (lst));
+    QFILE_CLEAR_LIST_ID (&lst);
+    qfile::tapeset ts_new;
+
+    /* clean OLD: OK into an OLD mechanism, REJECTED by a NEW mechanism. */
+    QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
+    QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
+    if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_OLD))
+      {
+	return 1;
+      }
+    if (!qfile_backing_mechanism_violation (&lst, QFILE_BACKING_NEW))
+      {
+	return 2;
+      }
+
+    /* clean NEW: OK into a NEW mechanism, REJECTED by an OLD mechanism. */
+    QFILE_CLEAR_LIST_ID (&lst);
+    QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
+    if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_NEW))
+      {
+	return 3;
+      }
+    if (!qfile_backing_mechanism_violation (&lst, QFILE_BACKING_OLD))
+      {
+	return 4;
+      }
+
+    /* NULL list is never a violation. */
+    if (qfile_backing_mechanism_violation (NULL, QFILE_BACKING_OLD)
+	|| qfile_backing_mechanism_violation (NULL, QFILE_BACKING_NEW))
+      {
+	return 5;
+      }
+
+    /* A~E counter: starts/returns to 0, increments. */
+    qfile_ae_reset_old_touch_count ();
+    if (qfile_ae_old_touch_count () != 0)
+      {
+	return 6;
+      }
+    qfile_ae_record_old_touch ();
+    qfile_ae_record_old_touch ();
+    if (qfile_ae_old_touch_count () != 2)
+      {
+	return 7;
+      }
+    qfile_ae_reset_old_touch_count ();
+    if (qfile_ae_old_touch_count () != 0)
+      {
+	return 8;
+      }
+    return 0;
+  }
+
+  /* G17: overflow-continuation run reassembled across a Chunk boundary (ADR
+   * 0006).  Layout (memory tape): off0 {0,1} | off1..3 overflow(99) | off4 {2,3}.
+   * R1 forward/backward/jump reassemble the run as one tuple; R2 readers
+   * (chunk_pages=2 so the run crosses chunk[0,1]->chunk[2,3]) read it exactly
+   * once -- the first-page owner reassembles, the others skip. */
+  int
+  run_overflow_crosschunk ()
+  {
+    const int big_id = 99;
+    const int tuple_len = 2 * QFILE_MAX_TUPLE_SIZE_IN_PAGE + 100;	/* spans 3 pages */
+    const int cap = tuple_len + 4096;
+    char *buf = (char *) malloc (cap);
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    qfile::memory_tape *t = new qfile::memory_tape (true);
+    t->append_page (make_db_page ({ 0, 1 }));
+    std::vector<char *> run = make_overflow_run (1, tuple_len, big_id);
+    for (char *pg : run)
+      {
+	t->append_page (pg);
+      }
+    t->append_page (make_db_page ({ 2, 3 }));
+    ts.append_tape (t);
+
+    int rc = 0;
+#define BIG_OK(tpl) (QFILE_GET_TUPLE_LENGTH (tpl) == tuple_len && tuple_id (tpl) == big_id \
+		     && (tpl)[16] == overflow_byte (big_id, 16) \
+		     && (tpl)[tuple_len - 1] == overflow_byte (big_id, tuple_len - 1))
+
+    /* R1 forward (copy). */
+    {
+      qfile::tapeset_scan scan (&ts);
+      QFILE_TUPLE_RECORD tr = { buf, cap };
+      std::vector<int> ids;
+      bool big_ok = false;
+      SCAN_CODE code;
+      while ((code = scan.forward (NULL, &tr, 0)) == S_SUCCESS)
+	{
+	  ids.push_back (tuple_id (tr.tpl));
+	  if (tuple_id (tr.tpl) == big_id)
+	    {
+	      big_ok = BIG_OK (tr.tpl);
+	    }
+	}
+      scan.close (NULL);
+      std::vector<int> exp = { 0, 1, big_id, 2, 3 };
+      if (code != S_END || ids != exp || !big_ok)
+	{
+	  rc = 1;
+	}
+    }
+
+    /* R1 backward from S_AFTER. */
+    if (rc == 0)
+      {
+	qfile::tapeset_scan scan (&ts);
+	QFILE_TUPLE_RECORD tr = { buf, cap };
+	while (scan.forward (NULL, &tr, 0) == S_SUCCESS)	/* advance to S_AFTER first */
+	  {
+	    ;
+	  }
+	std::vector<int> ids;
+	bool big_ok = false;
+	SCAN_CODE code;
+	while ((code = scan.backward (NULL, &tr, 0)) == S_SUCCESS)
+	  {
+	    ids.push_back (tuple_id (tr.tpl));
+	    if (tuple_id (tr.tpl) == big_id)
+	      {
+		big_ok = BIG_OK (tr.tpl);
+	      }
+	  }
+	scan.close (NULL);
+	std::vector<int> exp = { 3, 2, big_id, 1, 0 };
+	if (code != S_END || ids != exp || !big_ok)
+	  {
+	    rc = 2;
+	  }
+      }
+
+    /* R1 jump: save at the overflow tuple, step away, jump back, resume. */
+    if (rc == 0)
+      {
+	qfile::tapeset_scan scan (&ts);
+	QFILE_TUPLE_RECORD tr = { buf, cap };
+	QFILE_TUPLE_POSITION pos;
+	std::memset (&pos, 0, sizeof (pos));
+	if (scan.forward (NULL, &tr, 0) != S_SUCCESS	/* 0 */
+	    || scan.forward (NULL, &tr, 0) != S_SUCCESS	/* 1 */
+	    || scan.forward (NULL, &tr, 0) != S_SUCCESS || tuple_id (tr.tpl) != big_id)
+	  {
+	    rc = 3;
+	  }
+	if (rc == 0)
+	  {
+	    scan.save_position (&pos);
+	    if (scan.forward (NULL, &tr, 0) != S_SUCCESS || tuple_id (tr.tpl) != 2
+		|| scan.jump (NULL, &pos, &tr, 0) != S_SUCCESS || !BIG_OK (tr.tpl)
+		|| scan.forward (NULL, &tr, 0) != S_SUCCESS || tuple_id (tr.tpl) != 2)
+	      {
+		rc = 4;
+	      }
+	  }
+	scan.close (NULL);
+      }
+
+    /* R2: chunk_pages=2, N readers; run [1..3] crosses chunk[0,1]->chunk[2,3]. */
+    if (rc == 0)
+      {
+	const int N = 4;
+	qfile::chunk_distributor d (&ts, N, 2);
+	std::vector<std::vector<int> > got (N);
+	std::vector<int> big_count (N, 0);
+	std::vector<int> ok (N, 1);
+	std::vector<std::thread> th;
+	for (int r = 0; r < N; r++)
+	  {
+	    th.emplace_back ([&, r] ()
+	    {
+	      int lcap = tuple_len + 4096;
+	      char *lbuf = (char *) malloc (lcap);
+	      qfile::tapeset_reader rd (&ts, &d, r);
+	      QFILE_TUPLE_RECORD tr = { lbuf, lcap };
+	      SCAN_CODE c;
+	      while ((c = rd.next (NULL, &tr, 0)) == S_SUCCESS)
+		{
+		  int tid = tuple_id (tr.tpl);
+		  got[r].push_back (tid);
+		  if (tid == big_id)
+		    {
+		      big_count[r]++;
+		      if (!BIG_OK (tr.tpl))
+			{
+			  ok[r] = 0;
+			}
+		    }
+		}
+	      free (lbuf);
+	    });
+	  }
+	for (auto &x : th)
+	  {
+	    x.join ();
+	  }
+	std::vector<int> merged;
+	int total_big = 0;
+	for (int r = 0; r < N; r++)
+	  {
+	    for (int v : got[r])
+	      {
+		merged.push_back (v);
+	      }
+	    total_big += big_count[r];
+	    if (!ok[r])
+	      {
+		rc = 5;
+	      }
+	  }
+	std::sort (merged.begin (), merged.end ());
+	std::vector<int> exp = { 0, 1, 2, 3, big_id };
+	std::sort (exp.begin (), exp.end ());
+	if (rc == 0 && merged != exp)
+	  {
+	    rc = 6;	/* every tuple exactly once */
+	  }
+	if (rc == 0 && total_big != 1)
+	  {
+	    rc = 7;	/* overflow read exactly once (first-page owner) */
+	  }
+      }
+#undef BIG_OK
+    free (buf);
+    return rc;
+  }
+
+  /* G18: N reader threads read the SAME spilled (file-backed) Tapeset
+   * concurrently via tapeset_reader.  A non-re-entrant read (shared scratch)
+   * would corrupt pages -> wrong/missing/dup tuple ids; we assert exact
+   * coverage and scan-side pgbuf-bypass (ADR 0005). */
+  int
+  run_concurrent_file_readers ()
+  {
+    const int NPAGES = 200;
+    const int PER_PAGE = 5;
+    std::vector<std::vector<int> > pages;
+    std::vector<int> expected;
+    int next = 0;
+    for (int p = 0; p < NPAGES; p++)
+      {
+	std::vector<int> ids;
+	for (int k = 0; k < PER_PAGE; k++)
+	  {
+	    ids.push_back (next);
+	    expected.push_back (next);
+	    next++;
+	  }
+	pages.push_back (ids);
+      }
+    writer_result wr = build_writer_tape (0, pages);	/* budget 0 -> all spilled */
+    if (wr.tape == NULL || !wr.spilled || wr.producer_pgbuf_fixes != 0)
+      {
+	delete wr.tape;
+	return 1;
+      }
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    ts.append_tape (wr.tape);
+
+    const int N = 8;
+    qfile::chunk_distributor d (&ts, N, 4);
+    std::vector<std::vector<int> > got (N);
+    std::vector<long> pgbuf (N, -1);
+    std::vector<std::thread> th;
+    for (int r = 0; r < N; r++)
+      {
+	th.emplace_back ([&, r] ()
+	{
+	  char buf[64];
+	  qfile::tapeset_reader rd (&ts, &d, r);
+	  QFILE_TUPLE_RECORD tr = { buf, (int) sizeof (buf) };
+	  SCAN_CODE c;
+	  while ((c = rd.next (NULL, &tr, 0)) == S_SUCCESS)
+	    {
+	      got[r].push_back (tuple_id (tr.tpl));
+	    }
+	  pgbuf[r] = rd.metrics ().pgbuf_fixes;
+	});
+      }
+    for (auto &x : th)
+      {
+	x.join ();
+      }
+    std::vector<int> merged;
+    for (int r = 0; r < N; r++)
+      {
+	for (int v : got[r])
+	  {
+	    merged.push_back (v);
+	  }
+	if (pgbuf[r] != 0)
+	  {
+	    return 2;	/* scan-side pgbuf-bypass (ADR 0005/0003) */
+	  }
+      }
+    std::sort (merged.begin (), merged.end ());
+    std::sort (expected.begin (), expected.end ());
+    if (merged != expected)
+      {
+	return 3;	/* every tuple exactly once, no race loss/dup/corruption */
+      }
+    return 0;
+  }
 }
 
 int
@@ -1236,6 +1609,9 @@ main (int, char **)
     { "G13 borrow (SKIP) does not free owner's Tapes", run_borrow_no_free },
     { "G14 R2 offset-range work-stealing (coverage + CoV <= 15%)", run_r2_distribution },
     { "G15 migration no-mixed-backing discriminates (old+new shape)", run_no_mixed_backing },
+    { "G16 backing-kind entry guard discriminates + A~E counter", run_backing_guard },
+    { "G17 overflow run reassembly across a Chunk boundary (R1+R2)", run_overflow_crosschunk },
+    { "G18 N-reader concurrent file read (re-entrant, pgbuf-bypass)", run_concurrent_file_readers },
   };
 
   bool all_passed = true;

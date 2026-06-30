@@ -1186,6 +1186,12 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       er_log_debug (ARG_FILE_LINE, "HELDTAPE_SELFTEST result=%d (0=PASS)\n", heldtape_selftest_rc);
       fprintf (stderr, "HELDTAPE_SELFTEST result=%d (0=PASS)\n", heldtape_selftest_rc);
     }
+  if (getenv ("CUBRID_TAPEREAD_SELFTEST") != NULL)
+    {
+      int taperead_selftest_rc = qfile_taperead_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "TAPEREAD_SELFTEST result=%d (0=PASS)\n", taperead_selftest_rc);
+      fprintf (stderr, "TAPEREAD_SELFTEST result=%d (0=PASS)\n", taperead_selftest_rc);
+    }
 #endif /* !NDEBUG */
 
   return scan_initialize ();

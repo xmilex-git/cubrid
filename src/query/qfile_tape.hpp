@@ -44,6 +44,7 @@
 #include "storage_common.h"	/* PAGE_PTR / SCAN_CODE / SCAN_POSITION / SCAN_STATUS */
 #include "thread_compat.hpp"	/* THREAD_ENTRY */
 #include "qfile_buffile.hpp"	/* qfile::buffile (1B private backing) + TDE_ALGORITHM */
+#include "qfile_chunk.hpp"	/* qfile::chunk_distributor (R2 distribution) */
 
 #include <vector>
 #include <cstdint>
@@ -71,6 +72,14 @@ namespace qfile
 
       /* Release a page handed out by page_at (no-op for RAM, unfix for file). */
       virtual void release_page (THREAD_ENTRY *thread_p, PAGE_PTR page) = 0;
+
+      /* Re-entrant read of logical page N into caller scratch (ADR 0005), used
+       * by concurrent R2 readers.  RAM prefix pages are returned directly
+       * (page_dest unused); a file page is read into `page_dest` (DB_PAGESIZE)
+       * and returned.  `tde` carries the per-reader cipher/plain scratch
+       * (non-NULL iff the backing is TDE).  nullptr on out-of-range / I/O error. */
+      virtual PAGE_PTR read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest,
+				       tde_read_scratch *tde) = 0;
 
       virtual int total_page_count () const = 0;
       virtual int prefix_page_count () const = 0;
@@ -101,6 +110,8 @@ namespace qfile
 
       PAGE_PTR page_at (THREAD_ENTRY *thread_p, int page_offset) override;
       void release_page (THREAD_ENTRY *thread_p, PAGE_PTR page) override;
+      PAGE_PTR read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest,
+			       tde_read_scratch *tde) override;
       int total_page_count () const override
       {
 	return (int) m_pages.size ();
@@ -142,6 +153,8 @@ namespace qfile
 
       PAGE_PTR page_at (THREAD_ENTRY *thread_p, int page_offset) override;
       void release_page (THREAD_ENTRY *thread_p, PAGE_PTR page) override;
+      PAGE_PTR read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest,
+			       tde_read_scratch *tde) override;
       int total_page_count () const override;
       int prefix_page_count () const override
       {
@@ -158,7 +171,8 @@ namespace qfile
       bool m_owns_prefix;
       buffile *m_buffile;
       bool m_owns_buffile;
-      char *m_readbuf;		/* DB_PAGESIZE scratch for file pages (single reader) */
+      char *m_readbuf;		/* DB_PAGESIZE scratch for file pages (single reader R1) */
+      tde_read_scratch m_read_scratch;	/* per-tape R1 TDE decrypt scratch (single reader) */
 
       buffile_tape (const buffile_tape &) = delete;
       buffile_tape &operator= (const buffile_tape &) = delete;
@@ -356,12 +370,98 @@ namespace qfile
       int m_offset;		/* byte offset of current tuple within m_page */
       int m_tplno;		/* tuple number within the page */
       QFILE_TUPLE m_curr_tpl;	/* == m_page + m_offset */
+      bool m_curr_overflow;	/* current tuple is a reassembled overflow run (ADR 0006) */
+      int m_overflow_run_end;	/* last logical page of that run (forward O(1) skip) */
+      char *m_reasm_raw;	/* reassembly read scratch (file continuation pages) */
+      PAGE_PTR m_reasm;
+      tde_read_scratch m_reasm_tde;
       tapeset_scan_metrics m_metrics;
 
       tapeset_scan (const tapeset_scan &) = delete;
       tapeset_scan &operator= (const tapeset_scan &) = delete;
   };
+
+  /*
+   * tapeset_reader - one participant's view of a frozen Tapeset for R2 parallel
+   * read (ADR 0005/0006).  Claims 64-page Chunks from a shared chunk_distributor
+   * and returns the tuples it owns.  All mutable read state is per-reader (own
+   * page scratch + own TDE scratch); the only shared mutable state is the
+   * distributor's atomic chunk cursor.  An overflow tuple is reassembled by the
+   * reader that owns its first page; a reader landing on a continuation page
+   * whose start precedes its chunk skips the run in O(1) and bumps the shared
+   * cursor past it (so a giant run is read once, not once per skipper).
+   */
+  class tapeset_reader
+  {
+    public:
+      tapeset_reader (tapeset *ts, chunk_distributor *dist, int reader_id);
+      ~tapeset_reader ();
+
+      /* Next tuple this reader owns; S_END when its share is drained. */
+      SCAN_CODE next (THREAD_ENTRY *thread_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek);
+
+      const tapeset_scan_metrics &metrics () const
+      {
+	return m_metrics;
+      }
+
+    private:
+      SCAN_CODE emit_in_page (THREAD_ENTRY *thread_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek);
+      SCAN_CODE reassemble (THREAD_ENTRY *thread_p, tape *tp, int first_page, int run_end, int tuple_len,
+			    QFILE_TUPLE_RECORD *tuple_record_p);
+
+      tapeset *m_tapeset;	/* borrowed */
+      chunk_distributor *m_dist;	/* borrowed (shared across readers) */
+      int m_reader_id;
+
+      chunk_distributor::range m_range;	/* current claimed chunk */
+      bool m_have_chunk;
+      int m_cur_page;		/* next page to inspect within m_range's Tape */
+
+      /* tuple walk within the current normal page */
+      PAGE_PTR m_page;
+      int m_count;
+      int m_offset;
+      int m_tplno;
+
+      char *m_page_raw;		/* DB_PAGESIZE scratch for file pages */
+      PAGE_PTR m_page_buf;
+      tde_read_scratch m_tde;
+
+      tapeset_scan_metrics m_metrics;
+
+      tapeset_reader (const tapeset_reader &) = delete;
+      tapeset_reader &operator= (const tapeset_reader &) = delete;
+  };
 }				/* namespace qfile */
+
+/* ------------------------------------------------------------------ */
+/* Overflow-continuation page-header helpers (ADR 0006).              */
+/*                                                                    */
+/* The NEW per-worker flat backing lays an overflow tuple out as a    */
+/* CONTIGUOUS run of logical pages addressed by offset (no VPID        */
+/* chain).  Both the start and continuation pages carry the existing  */
+/* QFILE_OVERFLOW_TUPLE_COUNT_FLAG count; they are told apart by the   */
+/* first-page offset stored in the field vacated by the old overflow  */
+/* VPID: a start page stores its OWN logical offset, a continuation    */
+/* stores the start's offset (always < its own) plus the run-end       */
+/* offset.  A reader thus learns the whole run from any one page.      */
+/* ------------------------------------------------------------------ */
+
+/* Mark `page` (at logical offset `self_page_offset`) the START of an overflow
+ * run.  The total tuple length is read from the page's first tuple header. */
+void qfile_overflow_set_start (PAGE_PTR page, int self_page_offset);
+/* Mark `page` a CONTINUATION of the run starting at `first_page_offset` and
+ * ending at `run_end_offset` (both Tape-relative logical page offsets). */
+void qfile_overflow_set_continuation (PAGE_PTR page, int first_page_offset, int run_end_offset);
+/* True iff `page` is an overflow page (start or continuation). */
+bool qfile_overflow_is_overflow_page (const PAGE_PTR page);
+/* The run's first (start) logical page offset stored on `page`. */
+int qfile_overflow_first_page (const PAGE_PTR page);
+/* The run's last logical page offset stored on a continuation `page`. */
+int qfile_overflow_run_end (const PAGE_PTR page);
+/* Number of contiguous pages a `tuple_length`-byte overflow tuple occupies. */
+int qfile_overflow_run_pages (int tuple_length);
 
 /*
  * C++-linkage bridge used by list_file.c (compiled as C++) and exercised
@@ -394,5 +494,9 @@ void qfile_tapeset_destroy (void *tapeset_ptr);
  * CUBRID_HELDTAPE_SELFTEST.  Returns 0 on PASS.
  */
 int qfile_heldtape_selftest (THREAD_ENTRY *thread_p);
+
+/* In-server self-test of N-reader concurrent read over a frozen (TDE) Tape
+ * (ADR 0005, #78 2A-0).  Gated by env CUBRID_TAPEREAD_SELFTEST (debug). */
+int qfile_taperead_selftest (THREAD_ENTRY *thread_p);
 
 #endif /* _QFILE_TAPE_HPP_ */

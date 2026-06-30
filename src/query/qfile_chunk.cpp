@@ -131,6 +131,36 @@ namespace qfile
     return true;
   }
 
+  void
+  chunk_distributor::skip_to_after (int tape_idx, int run_end_page)
+  {
+    if (tape_idx < 0 || tape_idx >= (int) m_tape_pages.size () || run_end_page < 0)
+      {
+	return;
+      }
+    /* Chunks of this Tape fully covered by [0 .. run_end_page]: the largest
+     * local chunk c with (c+1)*chunk_pages-1 <= run_end_page, count = (c+1) =
+     * (run_end_page+1)/chunk_pages.  A boundary chunk that also holds post-run
+     * pages is NOT counted, so it stays claimable. */
+    long full_local = (long) (run_end_page + 1) / (long) m_chunk_pages;
+    const long tape_chunks = m_tape_chunk_start[tape_idx + 1] - m_tape_chunk_start[tape_idx];
+    if (full_local > tape_chunks)
+      {
+	full_local = tape_chunks;
+      }
+    const long target = m_tape_chunk_start[tape_idx] + full_local;
+
+    /* forward-only bump: never rewind the cursor (other readers may be ahead). */
+    long cur = m_next.load (std::memory_order_relaxed);
+    while (cur < target)
+      {
+	if (m_next.compare_exchange_weak (cur, target, std::memory_order_relaxed))
+	  {
+	    break;
+	  }
+      }
+  }
+
   long
   chunk_distributor::reader_pages (int reader_id) const
   {

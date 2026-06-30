@@ -34,6 +34,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>		/* stat (orphan-zero on-disk check) */
+#include <thread>		/* N-reader concurrent selftest (ADR 0005) */
+#include <algorithm>		/* std::sort (coverage check) */
 
 #include "memory_wrapper.hpp"
 
@@ -95,6 +97,20 @@ namespace qfile
     (void) page;
   }
 
+  PAGE_PTR
+  memory_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde)
+  {
+    /* All pages are RAM; return them directly (caller scratch unused). */
+    (void) thread_p;
+    (void) page_dest;
+    (void) tde;
+    if (page_offset < 0 || page_offset >= (int) m_pages.size ())
+      {
+	return NULL;
+      }
+    return (PAGE_PTR) m_pages[page_offset];
+  }
+
   /* ------------------------------------------------------------------ */
   /* buffile_tape                                                       */
   /* ------------------------------------------------------------------ */
@@ -152,7 +168,7 @@ namespace qfile
       {
 	return NULL;
       }
-    if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) m_readbuf) != NO_ERROR)
+    if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) m_readbuf, &m_read_scratch) != NO_ERROR)
       {
 	return NULL;
       }
@@ -167,6 +183,29 @@ namespace qfile
      * backing never enters a pgbuf BCB. */
     (void) thread_p;
     (void) page;
+  }
+
+  PAGE_PTR
+  buffile_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde)
+  {
+    const int prefix = (int) m_prefix.size ();
+    if (page_offset < 0 || page_offset >= total_page_count ())
+      {
+	return NULL;
+      }
+    if (page_offset < prefix)
+      {
+	return (PAGE_PTR) m_prefix[page_offset];	/* RAM prefix: direct, scratch unused */
+      }
+    if (m_buffile == NULL || page_dest == NULL)
+      {
+	return NULL;
+      }
+    if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) page_dest, tde) != NO_ERROR)
+      {
+	return NULL;
+      }
+    return (PAGE_PTR) page_dest;
   }
 
   int
@@ -340,6 +379,10 @@ namespace qfile
     , m_offset (0)
     , m_tplno (0)
     , m_curr_tpl (NULL)
+    , m_curr_overflow (false)
+    , m_overflow_run_end (-1)
+    , m_reasm_raw (NULL)
+    , m_reasm (NULL)
   {
   }
 
@@ -347,6 +390,9 @@ namespace qfile
   {
     /* The held page (if any) is released by close() before destruction; the
      * destructor has no THREAD_ENTRY to unfix a file-backed page. */
+    free (m_reasm_raw);
+    m_reasm_raw = NULL;
+    m_reasm = NULL;
   }
 
   void
@@ -384,15 +430,76 @@ namespace qfile
   SCAN_CODE
   tapeset_scan::retrieve (THREAD_ENTRY *thread_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek)
   {
-    if (QFILE_GET_OVERFLOW_PAGE_ID (m_page) != NULL_PAGEID)
+    /* Overflow START page: reassemble the contiguous run as one tuple
+     * (ADR 0006).  We must be positioned ON the run's first page (forward /
+     * backward / jump all land there); a continuation page here is a bug. */
+    if (qfile_overflow_is_overflow_page (m_page))
       {
-	/* Overflow-tuple reassembly in the new consecutive-page model is defined
-	 * by the producer (Phase1 1B / migration), not by the 1A scan contract.
-	 * Never hand back a silently-wrong tuple. */
-	assert (false);
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
-	return S_ERROR;
+	if (qfile_overflow_first_page (m_page) != m_page_offset)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+	    return S_ERROR;
+	  }
+	const int tuple_len = QFILE_GET_TUPLE_LENGTH ((char *) m_page + QFILE_PAGE_HEADER_SIZE);
+	tape *tape_p = m_tapeset->get_tape (m_tape_idx);
+	if (tape_p == NULL || tuple_len <= 0)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+	    return S_ERROR;
+	  }
+	const int run_pages = qfile_overflow_run_pages (tuple_len);
+	const int run_end = m_page_offset + run_pages - 1;
+	if (m_reasm == NULL)
+	  {
+	    m_reasm_raw = (char *) malloc (DB_PAGESIZE);
+	    if (m_reasm_raw == NULL)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+		return S_ERROR;
+	      }
+	    m_reasm = (PAGE_PTR) m_reasm_raw;
+	  }
+	if (tuple_record_p->size < tuple_len)
+	  {
+	    char *area = (char *) db_private_realloc (thread_p, tuple_record_p->tpl, tuple_len);
+	    if (area == NULL)
+	      {
+		return S_ERROR;
+	      }
+	    tuple_record_p->tpl = area;
+	    tuple_record_p->size = tuple_len;
+	  }
+	int copied = 0;
+	for (int p = m_page_offset; p <= run_end && copied < tuple_len; p++)
+	  {
+	    PAGE_PTR pg = tape_p->read_page_into (thread_p, p, (char *) m_reasm, &m_reasm_tde);
+	    if (pg == NULL)
+	      {
+		return S_ERROR;
+	      }
+	    int csz = tuple_len - copied;
+	    if (csz > QFILE_MAX_TUPLE_SIZE_IN_PAGE)
+	      {
+		csz = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+	      }
+	    std::memcpy (tuple_record_p->tpl + copied, (char *) pg + QFILE_PAGE_HEADER_SIZE, csz);
+	    copied += csz;
+	  }
+	m_curr_overflow = true;
+	m_overflow_run_end = run_end;
+	m_curr_tpl = tuple_record_p->tpl;	/* peek points at the assembled buffer */
+	m_metrics.tuple_reads++;
+	if (peek)
+	  {
+	    m_metrics.peeks++;
+	  }
+	else
+	  {
+	    m_metrics.copies++;
+	  }
+	return S_SUCCESS;
       }
+    m_curr_overflow = false;
 
     if (peek)
       {
@@ -442,18 +549,27 @@ namespace qfile
       }
     else if (m_position == S_ON)
       {
-	int count = QFILE_GET_TUPLE_COUNT (m_page);
-	if (m_tplno < count - 1)
+	if (m_curr_overflow)
 	  {
-	    int len = QFILE_GET_TUPLE_LENGTH (m_curr_tpl);
-	    m_offset += len;
-	    m_curr_tpl += len;
-	    m_tplno++;
-	    return retrieve (thread_p, tuple_record_p, peek);
+	    start_tape = m_tape_idx;
+	    start_page = m_overflow_run_end + 1;
+	    release_page (thread_p);
 	  }
-	start_tape = m_tape_idx;
-	start_page = m_page_offset + 1;
-	release_page (thread_p);
+	else
+	  {
+	    int count = QFILE_GET_TUPLE_COUNT (m_page);
+	    if (m_tplno < count - 1)
+	      {
+		int len = QFILE_GET_TUPLE_LENGTH (m_curr_tpl);
+		m_offset += len;
+		m_curr_tpl += len;
+		m_tplno++;
+		return retrieve (thread_p, tuple_record_p, peek);
+	      }
+	    start_tape = m_tape_idx;
+	    start_page = m_page_offset + 1;
+	    release_page (thread_p);
+	  }
       }
     else if (m_position == S_AFTER)
       {
@@ -483,11 +599,20 @@ namespace qfile
 		return S_ERROR;
 	      }
 	    m_metrics.page_reads++;
-	    if (QFILE_GET_TUPLE_COUNT (page) > 0)
+	    int count = QFILE_GET_TUPLE_COUNT (page);
+	    if (count > 0)
 	      {
 		set_on (ti, page_offset, page, QFILE_PAGE_HEADER_SIZE, 0);
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
+	    if (qfile_overflow_is_overflow_page (page) && qfile_overflow_first_page (page) == page_offset)
+	      {
+		/* overflow START -- this page owns the run; retrieve reassembles. */
+		set_on (ti, page_offset, page, QFILE_PAGE_HEADER_SIZE, 0);
+		return retrieve (thread_p, tuple_record_p, peek);
+	      }
+	    /* zero-tuple page or overflow continuation (start already consumed in
+	     * sequential R1) -- skip. */
 	    tape_p->release_page (thread_p, page);
 	  }
       }
@@ -567,6 +692,22 @@ namespace qfile
 		set_on (ti, page_offset, page, QFILE_GET_LAST_TUPLE_OFFSET (page), count - 1);
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
+	    if (qfile_overflow_is_overflow_page (page))
+	      {
+		/* Backward reaches the run's last (continuation) page first;
+		 * reposition to its START page and reassemble the whole run as one
+		 * tuple (ADR 0006).  The next backward step then skips to start-1. */
+		const int first = qfile_overflow_first_page (page);
+		tape_p->release_page (thread_p, page);
+		PAGE_PTR start_pg = tape_p->page_at (thread_p, first);
+		if (start_pg == NULL)
+		  {
+		    return S_ERROR;
+		  }
+		m_metrics.page_reads++;
+		set_on (ti, first, start_pg, QFILE_PAGE_HEADER_SIZE, 0);
+		return retrieve (thread_p, tuple_record_p, peek);
+	      }
 	    tape_p->release_page (thread_p, page);
 	  }
       }
@@ -635,7 +776,259 @@ namespace qfile
   {
     release_page (thread_p);
   }
+
+  /* ------------------------------------------------------------------ */
+  /* tapeset_reader (R2 per-participant concurrent read, ADR 0005/0006) */
+  /* ------------------------------------------------------------------ */
+
+  tapeset_reader::tapeset_reader (tapeset *ts, chunk_distributor *dist, int reader_id)
+    : m_tapeset (ts)
+    , m_dist (dist)
+    , m_reader_id (reader_id)
+    , m_range ()
+    , m_have_chunk (false)
+    , m_cur_page (0)
+    , m_page (NULL)
+    , m_count (0)
+    , m_offset (0)
+    , m_tplno (0)
+    , m_page_raw (NULL)
+    , m_page_buf (NULL)
+    , m_tde ()
+    , m_metrics ()
+  {
+    m_page_raw = (char *) malloc (DB_PAGESIZE);
+    m_page_buf = (PAGE_PTR) m_page_raw;
+  }
+
+  tapeset_reader::~tapeset_reader ()
+  {
+    free (m_page_raw);
+    m_page_raw = NULL;
+    m_page_buf = NULL;
+  }
+
+  SCAN_CODE
+  tapeset_reader::emit_in_page (THREAD_ENTRY *thread_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek)
+  {
+    m_metrics.tuple_reads++;
+    if (peek)
+      {
+	tuple_record_p->tpl = (QFILE_TUPLE) (m_page + m_offset);
+	m_metrics.peeks++;
+	return S_SUCCESS;
+      }
+    int tuple_size = QFILE_GET_TUPLE_LENGTH (m_page + m_offset);
+    if (tuple_record_p->size < tuple_size)
+      {
+	char *area = (char *) db_private_realloc (thread_p, tuple_record_p->tpl, tuple_size);
+	if (area == NULL)
+	  {
+	    return S_ERROR;
+	  }
+	tuple_record_p->tpl = area;
+	tuple_record_p->size = tuple_size;
+      }
+    std::memcpy (tuple_record_p->tpl, m_page + m_offset, tuple_size);
+    m_metrics.copies++;
+    return S_SUCCESS;
+  }
+
+  SCAN_CODE
+  tapeset_reader::reassemble (THREAD_ENTRY *thread_p, tape *tp, int first_page, int run_end, int tuple_len,
+			     QFILE_TUPLE_RECORD *tuple_record_p)
+  {
+    if (tuple_record_p->size < tuple_len)
+      {
+	char *area = (char *) db_private_realloc (thread_p, tuple_record_p->tpl, tuple_len);
+	if (area == NULL)
+	  {
+	    return S_ERROR;
+	  }
+	tuple_record_p->tpl = area;
+	tuple_record_p->size = tuple_len;
+      }
+    int copied = 0;
+    for (int p = first_page; p <= run_end && copied < tuple_len; p++)
+      {
+	/* reuse m_page_buf as read scratch -- `page` is no longer needed once we
+	 * commit to reassembling, and the frozen Tape is read by offset pread. */
+	PAGE_PTR pg = tp->read_page_into (thread_p, p, (char *) m_page_buf, &m_tde);
+	if (pg == NULL)
+	  {
+	    return S_ERROR;
+	  }
+	int csz = tuple_len - copied;
+	if (csz > QFILE_MAX_TUPLE_SIZE_IN_PAGE)
+	  {
+	    csz = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+	  }
+	std::memcpy (tuple_record_p->tpl + copied, (char *) pg + QFILE_PAGE_HEADER_SIZE, csz);
+	copied += csz;
+      }
+    return S_SUCCESS;
+  }
+
+  SCAN_CODE
+  tapeset_reader::next (THREAD_ENTRY *thread_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek)
+  {
+    if (m_tapeset == NULL || m_dist == NULL)
+      {
+	return S_END;
+      }
+
+    for (;;)
+      {
+	/* still walking tuples within the current normal page? */
+	if (m_page != NULL && m_tplno + 1 < m_count)
+	  {
+	    int len = QFILE_GET_TUPLE_LENGTH (m_page + m_offset);
+	    m_offset += len;
+	    m_tplno++;
+	    return emit_in_page (thread_p, tuple_record_p, peek);
+	  }
+	m_page = NULL;
+
+	if (!m_have_chunk)
+	  {
+	    if (!m_dist->next_chunk (m_reader_id, m_range))
+	      {
+		return S_END;
+	      }
+	    m_have_chunk = true;
+	    m_cur_page = m_range.start_page;
+	  }
+	if (m_cur_page >= m_range.start_page + m_range.page_count)
+	  {
+	    m_have_chunk = false;
+	    continue;
+	  }
+
+	tape *tp = m_tapeset->get_tape (m_range.tape_idx);
+	if (tp == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+	    return S_ERROR;
+	  }
+	const int this_page = m_cur_page;
+	PAGE_PTR page = tp->read_page_into (thread_p, this_page, (char *) m_page_buf, &m_tde);
+	if (page == NULL)
+	  {
+	    return S_ERROR;
+	  }
+	m_metrics.page_reads++;
+	int count = QFILE_GET_TUPLE_COUNT (page);
+
+	if (count > 0)
+	  {
+	    m_page = page;
+	    m_count = count;
+	    m_offset = QFILE_PAGE_HEADER_SIZE;
+	    m_tplno = 0;
+	    m_cur_page = this_page + 1;
+	    return emit_in_page (thread_p, tuple_record_p, peek);
+	  }
+
+	if (qfile_overflow_is_overflow_page (page))
+	  {
+	    const int first = qfile_overflow_first_page (page);
+	    if (first == this_page)
+	      {
+		/* first-page owner: reassemble the run forward past my chunk. */
+		int tuple_len = QFILE_GET_TUPLE_LENGTH ((char *) page + QFILE_PAGE_HEADER_SIZE);
+		if (tuple_len <= 0)
+		  {
+		    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+		    return S_ERROR;
+		  }
+		const int run_pages = qfile_overflow_run_pages (tuple_len);
+		const int run_end = first + run_pages - 1;
+		SCAN_CODE rc = reassemble (thread_p, tp, first, run_end, tuple_len, tuple_record_p);
+		if (rc != S_SUCCESS)
+		  {
+		    return rc;
+		  }
+		m_cur_page = run_end + 1;
+		m_dist->skip_to_after (m_range.tape_idx, run_end);
+		m_metrics.tuple_reads++;
+		if (peek)
+		  {
+		    m_metrics.peeks++;
+		  }
+		else
+		  {
+		    m_metrics.copies++;
+		  }
+		return S_SUCCESS;
+	      }
+	    /* continuation whose start precedes my chunk: skip the run O(1) and
+	     * bump the shared cursor past it. */
+	    int run_end = qfile_overflow_run_end (page);
+	    if (run_end < this_page)
+	      {
+		run_end = this_page;	/* defensive */
+	      }
+	    m_cur_page = run_end + 1;
+	    m_dist->skip_to_after (m_range.tape_idx, run_end);
+	    continue;
+	  }
+
+	/* zero-tuple page -- skip. */
+	m_cur_page = this_page + 1;
+      }
+  }
 }				/* namespace qfile */
+
+/* ------------------------------------------------------------------ */
+/* Overflow-continuation page-header helpers (ADR 0006)               */
+/* ------------------------------------------------------------------ */
+
+void
+qfile_overflow_set_start (PAGE_PTR page, int self_page_offset)
+{
+  QFILE_PUT_TUPLE_COUNT (page, QFILE_OVERFLOW_TUPLE_COUNT_FLAG);
+  /* first-page offset == self marks the START; stored where the old overflow
+   * page-id VPID field used to live (now a logical offset, never a VPID). */
+  OR_PUT_INT ((char *) page + QFILE_OVERFLOW_PAGE_ID_OFFSET, self_page_offset);
+}
+
+void
+qfile_overflow_set_continuation (PAGE_PTR page, int first_page_offset, int run_end_offset)
+{
+  QFILE_PUT_TUPLE_COUNT (page, QFILE_OVERFLOW_TUPLE_COUNT_FLAG);
+  OR_PUT_INT ((char *) page + QFILE_OVERFLOW_PAGE_ID_OFFSET, first_page_offset);
+  /* run-end stored in the last-tuple-offset field (free on a continuation). */
+  OR_PUT_INT ((char *) page + QFILE_LAST_TUPLE_OFFSET, run_end_offset);
+}
+
+bool
+qfile_overflow_is_overflow_page (const PAGE_PTR page)
+{
+  return QFILE_GET_TUPLE_COUNT (page) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG;
+}
+
+int
+qfile_overflow_first_page (const PAGE_PTR page)
+{
+  return (int) OR_GET_INT ((char *) page + QFILE_OVERFLOW_PAGE_ID_OFFSET);
+}
+
+int
+qfile_overflow_run_end (const PAGE_PTR page)
+{
+  return (int) OR_GET_INT ((char *) page + QFILE_LAST_TUPLE_OFFSET);
+}
+
+int
+qfile_overflow_run_pages (int tuple_length)
+{
+  if (tuple_length <= 0)
+    {
+      return 0;
+    }
+  const int per = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+  return (tuple_length + per - 1) / per;
+}
 
 /* ------------------------------------------------------------------ */
 /* C++-linkage bridge (list_file.c + unit test)                       */
@@ -667,6 +1060,15 @@ qfile_tapeset_scan_open (QFILE_LIST_SCAN_ID *scan_id_p)
       scan_id_p->tapeset_scan_ = NULL;
       return NO_ERROR;
     }
+  /* backing-kind entry guard (production-hard): a NEW (Tapeset) scan never runs
+   * over a list that also carries OLD backing (SSOT #75 round-3 (d)/(e)). */
+  {
+    int guard_rc = QFILE_GUARD_NEW_MECHANISM (&scan_id_p->list_id);
+    if (guard_rc != NO_ERROR)
+      {
+	return guard_rc;
+      }
+  }
   qfile::tapeset_scan *scan = new qfile::tapeset_scan (ts);
   scan_id_p->tapeset_scan_ = scan;
   return NO_ERROR;
@@ -952,5 +1354,140 @@ qfile_heldtape_selftest (THREAD_ENTRY *thread_p)
 
   er_log_debug (ARG_FILE_LINE, "HELDTAPE_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
   fprintf (stderr, "HELDTAPE_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
+  return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* In-server self-test: N-reader CONCURRENT read of a frozen TDE Tape  */
+/* (ADR 0005, #78 2A-0).  Gated by env CUBRID_TAPEREAD_SELFTEST.        */
+/* A non-re-entrant decrypt (shared member scratch) would corrupt pages */
+/* under concurrent readers -> wrong tuples; this proves per-reader     */
+/* scratch + shared fd + pread is safe on an ENCRYPTED backing.         */
+/* ------------------------------------------------------------------ */
+
+int
+qfile_taperead_selftest (THREAD_ENTRY *thread_p)
+{
+  std::string dir;
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      return ER_FAILED;
+    }
+
+  TDE_ALGORITHM algo = TDE_ALGORITHM_NONE;
+  if (tde_is_loaded ())
+    {
+      const TDE_ALGORITHM def = (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+      if (def != TDE_ALGORITHM_NONE)
+	{
+	  algo = def;
+	}
+    }
+
+  const int NPAGES = 40;
+  const int PER_PAGE = 6;
+  std::vector<int> expected;
+  std::vector<std::vector<int> > pages;
+  int next = 0;
+  for (int p = 0; p < NPAGES; p++)
+    {
+      std::vector<int> ids;
+      for (int k = 0; k < PER_PAGE; k++)
+	{
+	  ids.push_back (next);
+	  expected.push_back (next);
+	  next++;
+	}
+      pages.push_back (ids);
+    }
+
+  /* produce + freeze a spilled (all-on-disk, budget 0) Tape */
+  qfile::tape *frozen = NULL;
+  {
+    static std::uint64_t seq = 80000;
+    qfile::tape_writer w (0, algo, dir, seq++, 0);
+    int prc = NO_ERROR;
+    for (const std::vector<int> &ids : pages)
+      {
+	char *pg = heldtape_make_page (ids);
+	if (pg == NULL)
+	  {
+	    prc = ER_FAILED;
+	    break;
+	  }
+	prc = w.append_page (thread_p, (PAGE_PTR) pg);
+	free (pg);
+	if (prc != NO_ERROR)
+	  {
+	    break;
+	  }
+      }
+    if (prc != NO_ERROR || !w.spilled ())
+      {
+	return ER_FAILED;
+      }
+    frozen = w.freeze (thread_p);
+    if (frozen == NULL)
+      {
+	return ER_FAILED;
+      }
+  }
+
+  qfile::tapeset ts;
+  ts.set_owns_tapes (true);
+  ts.append_tape (frozen);
+
+  const int N = 6;
+  qfile::chunk_distributor d (&ts, N, 8);
+  std::vector<std::vector<int> > got ((size_t) N);
+  std::vector<int> ok ((size_t) N, 1);
+  std::vector<long> pgbuf ((size_t) N, -1);
+  std::vector<std::thread> th;
+  for (int r = 0; r < N; r++)
+    {
+      th.emplace_back ([&, r] ()
+      {
+	char buf[64];
+	qfile::tapeset_reader rd (&ts, &d, r);
+	QFILE_TUPLE_RECORD tr = { buf, (int) sizeof (buf) };
+	SCAN_CODE c;
+	while ((c = rd.next (NULL, &tr, 0)) == S_SUCCESS)
+	  {
+	    if (QFILE_GET_TUPLE_LENGTH (tr.tpl) != HELDTAPE_TUPLE_LEN)
+	      {
+		ok[r] = 0;
+	      }
+	    got[r].push_back (OR_GET_INT ((char *) tr.tpl + HELDTAPE_ID_OFFSET));
+	  }
+	pgbuf[r] = rd.metrics ().pgbuf_fixes;
+      });
+    }
+  for (std::thread &x : th)
+    {
+      x.join ();
+    }
+
+  int rc = NO_ERROR;
+  std::vector<int> merged;
+  for (int r = 0; r < N; r++)
+    {
+      for (int v : got[r])
+	{
+	  merged.push_back (v);
+	}
+      if (!ok[r] || pgbuf[r] != 0)
+	{
+	  rc = ER_FAILED;
+	}
+    }
+  std::sort (merged.begin (), merged.end ());
+  std::sort (expected.begin (), expected.end ());
+  if (rc == NO_ERROR && merged != expected)
+    {
+      rc = ER_FAILED;
+    }
+
+  er_log_debug (ARG_FILE_LINE, "TAPEREAD_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
+  fprintf (stderr, "TAPEREAD_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
   return rc;
 }

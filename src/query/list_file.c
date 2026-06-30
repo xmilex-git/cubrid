@@ -3012,6 +3012,47 @@ error:
   goto success;
 }
 
+/* ------------------------------------------------------------------ */
+/* Backing-kind ENTRY guard + A~E counter (SSOT #75 round-3 (d)/(e))  */
+/* ------------------------------------------------------------------ */
+
+static std::atomic<long> qfile_Ae_old_touch (0);
+
+void
+qfile_ae_record_old_touch (void)
+{
+  qfile_Ae_old_touch.fetch_add (1, std::memory_order_relaxed);
+}
+
+long
+qfile_ae_old_touch_count (void)
+{
+  return qfile_Ae_old_touch.load (std::memory_order_relaxed);
+}
+
+void
+qfile_ae_reset_old_touch_count (void)
+{
+  qfile_Ae_old_touch.store (0, std::memory_order_relaxed);
+}
+
+int
+qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism, const char *file, int line)
+{
+  if (!qfile_backing_mechanism_violation (list_id, mechanism))
+    {
+      return NO_ERROR;
+    }
+  /* An OLD mechanism reaching a NEW (Tapeset) list is exactly an "A~E NEW-backed
+   * list touched by an OLD scan-bypass path" event; record it (SSOT #75 §6). */
+  if (mechanism == QFILE_BACKING_OLD)
+    {
+      qfile_ae_record_old_touch ();
+    }
+  er_set (ER_ERROR_SEVERITY, file, line, ER_QPROC_INVALID_XASLNODE, 0);
+  return ER_QPROC_INVALID_XASLNODE;
+}
+
 int
 qfile_append_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_LIST_ID * append_list_id)
 {
@@ -3024,6 +3065,19 @@ qfile_append_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_
   assert (base_list_id != NULL);
   assert (append_list_id != NULL);
 
+  /* backing-kind entry guard (production-hard): an OLD combine never takes a NEW
+   * (Tapeset) operand (SSOT #75 round-3 (d)/(e)). */
+  {
+    int guard_rc = QFILE_GUARD_OLD_MECHANISM (base_list_id);
+    if (guard_rc == NO_ERROR)
+      {
+	guard_rc = QFILE_GUARD_OLD_MECHANISM (append_list_id);
+      }
+    if (guard_rc != NO_ERROR)
+      {
+	return guard_rc;
+      }
+  }
   assert (base_list_id->last_pgptr == NULL);
   assert (append_list_id->last_pgptr == NULL);
 
@@ -3213,6 +3267,19 @@ qfile_connect_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE
 
   assert (append_list_id->tuple_cnt > 0);
   assert (!VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(append_list_id)));
+  /* backing-kind entry guard (production-hard) -- BEFORE the membuf assert below,
+   * which dereferences append_list_id's OLD temp-file handle (SSOT round-3 (d)). */
+  {
+    int guard_rc = QFILE_GUARD_OLD_MECHANISM (base_list_id);
+    if (guard_rc == NO_ERROR)
+      {
+	guard_rc = QFILE_GUARD_OLD_MECHANISM (append_list_id);
+      }
+    if (guard_rc != NO_ERROR)
+      {
+	return guard_rc;
+      }
+  }
   assert (QFILE_LIST_ID_TFILE_VFID(append_list_id)->membuf == NULL);
 
 #if !defined (NDEBUG)
@@ -7954,6 +8021,15 @@ qfile_open_list_sector_scan (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
   assert (thread_p != NULL);
   assert (list_id != NULL);
   assert (sector_scan != NULL);
+  /* backing-kind entry guard (production-hard): the OLD sector-scan input
+   * mechanism never takes a NEW (Tapeset) list (SSOT #75 round-3 (d)). */
+  {
+    int guard_rc = QFILE_GUARD_OLD_MECHANISM (list_id);
+    if (guard_rc != NO_ERROR)
+      {
+	return guard_rc;
+      }
+  }
 
   error = qfile_collect_list_sector_info (thread_p, list_id, &sector_scan->sector_info);
   if (error != NO_ERROR)

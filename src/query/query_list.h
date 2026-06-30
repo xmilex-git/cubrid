@@ -578,6 +578,66 @@ qfile_check_no_mixed_backing (const QFILE_LIST_ID * list_id)
   assert (!qfile_list_is_mixed_backing (list_id));
 }
 
+/*
+ * Backing-kind ENTRY guard (SSOT #75 round-3 (d)/(e); ADR 0002/0003/0005).
+ *
+ * Generalizes the no-mixed-backing invariant from a per-list debug assert to a
+ * production-hard check at every backing-SENSITIVE consume boundary: an OLD
+ * mechanism (qfile_connect_list / qfile_append_list / qfile_open_list_sector_scan
+ * + sector_page_iterator input) must reject a NEW (Tapeset) list, and a NEW
+ * mechanism (chunk_distributor / tapeset_scan) must reject an OLD list.  The
+ * entry boundary is the cheapest place (one check per operator open) to stop the
+ * worst failure class (silent wrong result, FAIL-03/06) before any garbage read,
+ * so it is hardened in release builds (er_set + error), unlike the per-tuple /
+ * per-page checks which stay debug-only asserts.  combine_two_list is EXEMPT
+ * (scan-based, not a VPID-header bypass -- IR-8).
+ *
+ * qfile_backing_mechanism_violation is the pure (er_set-free) detector so a
+ * bootless unit test can exercise it; qfile_backing_guard (list_file.c) is the
+ * production-hard wrapper that er_sets, bumps the A~E counter and returns an
+ * error code.
+ */
+static inline bool
+qfile_backing_mechanism_violation (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism)
+{
+  if (list_id == NULL)
+    {
+      return false;
+    }
+  if (mechanism == QFILE_BACKING_OLD)
+    {
+      return qfile_list_has_new_backing (list_id);
+    }
+  if (mechanism == QFILE_BACKING_NEW)
+    {
+      return qfile_list_has_old_backing (list_id);
+    }
+  return false;
+}
+
+#if defined(__cplusplus)
+extern "C"
+{
+#endif
+/* Production-hard entry guard: returns NO_ERROR or an error code (er_set on
+ * violation; an OLD mechanism touching a NEW list also bumps the A~E counter). */
+extern int qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism, const char *file,
+				int line);
+
+/* A~E runtime counter: "a NEW-backed list was touched by an OLD scan-bypass
+ * path" (evidence §H-3 inventory A~E).  MUST read 0 on a migrated NEW operator
+ * (SSOT #75 §6).  Process-wide; reset is for tests. */
+extern void qfile_ae_record_old_touch (void);
+extern long qfile_ae_old_touch_count (void);
+extern void qfile_ae_reset_old_touch_count (void);
+#if defined(__cplusplus)
+}
+#endif
+
+/* Call-site macros carrying ARG_FILE_LINE (error_manager.h must be in scope). */
+#define QFILE_GUARD_OLD_MECHANISM(list_id) qfile_backing_guard ((list_id), QFILE_BACKING_OLD, ARG_FILE_LINE)
+#define QFILE_GUARD_NEW_MECHANISM(list_id) qfile_backing_guard ((list_id), QFILE_BACKING_NEW, ARG_FILE_LINE)
+
 /* Tuple position coordinate type */
 enum qfile_tuple_position_coordinate_type
 {

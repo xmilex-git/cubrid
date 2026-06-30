@@ -52,6 +52,7 @@
 
 #include <cstdint>
 #include <string>
+#include <atomic>
 
 struct fileio_page;
 typedef struct fileio_page FILEIO_PAGE;
@@ -111,6 +112,27 @@ namespace qfile
   void tape_backing_census_prefix_removed (long pages);
 
   /*
+   * tde_read_scratch - per-reader cipher/plain page buffers for the re-entrant
+   * read path (ADR 0005).  A concurrent reader owns one of these so two threads
+   * reading the same frozen TDE BufFile never share decrypt state -- the member
+   * scratch leaves buffile::read_page.  Never allocated on the plaintext path.
+   */
+  struct tde_read_scratch
+  {
+    char *cipher_raw;
+    FILEIO_PAGE *cipher;	/* IO_PAGESIZE ciphertext read buffer */
+    char *plain_raw;
+    FILEIO_PAGE *plain;		/* IO_PAGESIZE decrypt-output buffer */
+
+    tde_read_scratch ();
+    ~tde_read_scratch ();
+    int ensure ();		/* lazily allocate both buffers; NO_ERROR or error */
+
+    tde_read_scratch (const tde_read_scratch &) = delete;
+    tde_read_scratch &operator= (const tde_read_scratch &) = delete;
+  };
+
+  /*
    * buffile - one worker's private append-only temp file backing a Tape's
    * spilled pages.  Owner-only writes; addressed by page offset; pgbuf-bypassed.
    *
@@ -141,9 +163,14 @@ namespace qfile
       /* Force any buffered pages to disk. */
       int flush (THREAD_ENTRY *thread_p);
 
-      /* Read logical file page `page_offset` into `dest` (DB_PAGESIZE buffer),
-       * decrypting if TDE.  Returns NO_ERROR or an error code. */
-      int read_page (THREAD_ENTRY *thread_p, int page_offset, PAGE_PTR dest);
+      /* Re-entrant read of logical file page `page_offset` into `dest`
+       * (DB_PAGESIZE), decrypting if TDE.  After freeze the backing is
+       * immutable, so a shared fd + pread is concurrency-safe and all mutable
+       * read state is caller-supplied: `scratch` MUST be non-NULL for a TDE
+       * BufFile (its cipher/plain buffers carry the pread + decrypt) and is
+       * ignored when plaintext.  const + safe for N concurrent readers
+       * (ADR 0005).  Pages must already be flushed (append-all-then-freeze). */
+      int read_page (THREAD_ENTRY *thread_p, int page_offset, PAGE_PTR dest, tde_read_scratch *scratch) const;
 
       int page_count () const
       {
@@ -165,7 +192,7 @@ namespace qfile
     private:
       buffile (int fd, const std::string &path, TDE_ALGORITHM tde_algo, int disk_pagesize);
 
-      int ensure_tde_scratch ();
+      int ensure_write_scratch ();
       int stage_plaintext (const PAGE_PTR list_page, char *slot);
       int stage_tde (const PAGE_PTR list_page, char *slot, int page_index);
 
@@ -179,11 +206,14 @@ namespace qfile
       char *m_batch;
       int m_batch_pages;	/* pages currently staged in m_batch (unflushed) */
 
-      /* TDE scratch (allocated lazily; NULL when plaintext) */
+      /* TDE write-staging scratch (encrypt path only; allocated lazily, NULL
+       * when plaintext).  The read path no longer keeps a member scratch -- it
+       * is caller-supplied (tde_read_scratch) so N readers stay re-entrant
+       * (ADR 0005). */
       char *m_plain_raw;
-      FILEIO_PAGE *m_plain;	/* wrap buffer for encrypt; decrypt output */
-      char *m_stored_raw;
-      FILEIO_PAGE *m_stored;	/* read buffer for ciphertext */
+      FILEIO_PAGE *m_plain;	/* encrypt staging wrap buffer (write path only) */
+
+      mutable std::atomic<long> m_reads;	/* re-entrant reads served (atomic; read path) */
 
       buffile_metrics m_metrics;
 

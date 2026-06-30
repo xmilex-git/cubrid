@@ -181,6 +181,51 @@ namespace qfile
       }
   }
 
+  /* ------------------------------------------------------------------ */
+  /* tde_read_scratch (per-reader read scratch, ADR 0005)               */
+  /* ------------------------------------------------------------------ */
+
+  tde_read_scratch::tde_read_scratch ()
+    : cipher_raw (NULL), cipher (NULL), plain_raw (NULL), plain (NULL)
+  {
+  }
+
+  tde_read_scratch::~tde_read_scratch ()
+  {
+    free (cipher_raw);
+    free (plain_raw);
+  }
+
+  int
+  tde_read_scratch::ensure ()
+  {
+    if (cipher != NULL && plain != NULL)
+      {
+	return NO_ERROR;
+      }
+    if (cipher_raw == NULL)
+      {
+	cipher_raw = static_cast<char *> (malloc ((std::size_t) IO_PAGESIZE + MAX_ALIGNMENT));
+	if (cipher_raw == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	    return ER_OUT_OF_VIRTUAL_MEMORY;
+	  }
+	cipher = reinterpret_cast<FILEIO_PAGE *> (PTR_ALIGN (cipher_raw, MAX_ALIGNMENT));
+      }
+    if (plain_raw == NULL)
+      {
+	plain_raw = static_cast<char *> (malloc ((std::size_t) IO_PAGESIZE + MAX_ALIGNMENT));
+	if (plain_raw == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	    return ER_OUT_OF_VIRTUAL_MEMORY;
+	  }
+	plain = reinterpret_cast<FILEIO_PAGE *> (PTR_ALIGN (plain_raw, MAX_ALIGNMENT));
+      }
+    return NO_ERROR;
+  }
+
   buffile::buffile (int fd, const std::string &path, TDE_ALGORITHM tde_algo, int disk_pagesize)
     : m_fd (fd)
     , m_path (path)
@@ -192,8 +237,7 @@ namespace qfile
     , m_batch_pages (0)
     , m_plain_raw (NULL)
     , m_plain (NULL)
-    , m_stored_raw (NULL)
-    , m_stored (NULL)
+    , m_reads (0)
     , m_metrics ()
   {
     if (m_fd >= 0)
@@ -216,7 +260,6 @@ namespace qfile
       }
     free (m_batch_raw);
     free (m_plain_raw);
-    free (m_stored_raw);
   }
 
   bool
@@ -324,32 +367,19 @@ namespace qfile
   }
 
   int
-  buffile::ensure_tde_scratch ()
+  buffile::ensure_write_scratch ()
   {
-    if (m_plain != NULL && m_stored != NULL)
+    if (m_plain != NULL)
       {
 	return NO_ERROR;
       }
+    m_plain_raw = static_cast<char *> (malloc ((std::size_t) IO_PAGESIZE + MAX_ALIGNMENT));
     if (m_plain_raw == NULL)
       {
-	m_plain_raw = static_cast<char *> (malloc ((std::size_t) IO_PAGESIZE + MAX_ALIGNMENT));
-	if (m_plain_raw == NULL)
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
-	    return ER_OUT_OF_VIRTUAL_MEMORY;
-	  }
-	m_plain = reinterpret_cast<FILEIO_PAGE *> (PTR_ALIGN (m_plain_raw, MAX_ALIGNMENT));
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
+	return ER_OUT_OF_VIRTUAL_MEMORY;
       }
-    if (m_stored_raw == NULL)
-      {
-	m_stored_raw = static_cast<char *> (malloc ((std::size_t) IO_PAGESIZE + MAX_ALIGNMENT));
-	if (m_stored_raw == NULL)
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) IO_PAGESIZE);
-	    return ER_OUT_OF_VIRTUAL_MEMORY;
-	  }
-	m_stored = reinterpret_cast<FILEIO_PAGE *> (PTR_ALIGN (m_stored_raw, MAX_ALIGNMENT));
-      }
+    m_plain = reinterpret_cast<FILEIO_PAGE *> (PTR_ALIGN (m_plain_raw, MAX_ALIGNMENT));
     return NO_ERROR;
   }
 
@@ -363,7 +393,7 @@ namespace qfile
   int
   buffile::stage_tde (const PAGE_PTR list_page, char *slot, int page_index)
   {
-    int rc = ensure_tde_scratch ();
+    int rc = ensure_write_scratch ();
     if (rc != NO_ERROR)
       {
 	return rc;
@@ -456,23 +486,13 @@ namespace qfile
   }
 
   int
-  buffile::read_page (THREAD_ENTRY *thread_p, int page_offset, PAGE_PTR dest)
+  buffile::read_page (THREAD_ENTRY *thread_p, int page_offset, PAGE_PTR dest, tde_read_scratch *scratch) const
   {
-    if (m_fd < 0 || dest == NULL || page_offset < 0)
-      {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	return ER_FAILED;
-      }
-    /* defensive: never miss an unflushed tail */
-    if (m_batch_pages > 0)
-      {
-	int rc = flush (thread_p);
-	if (rc != NO_ERROR)
-	  {
-	    return rc;
-	  }
-      }
-    if (page_offset >= m_pages_on_disk)
+    (void) thread_p;
+    /* Re-entrant + const: no flush here.  Pages must already be on disk
+     * (append-all-then-freeze); the frozen backing is immutable so a shared fd
+     * + pread serves N concurrent readers safely (ADR 0005). */
+    if (m_fd < 0 || dest == NULL || page_offset < 0 || page_offset >= m_pages_on_disk)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return ER_FAILED;
@@ -486,33 +506,40 @@ namespace qfile
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	    return ER_FAILED;
 	  }
-	m_metrics.pages_read++;
+	m_reads.fetch_add (1, std::memory_order_relaxed);
 	return NO_ERROR;
       }
 
-    int rc = ensure_tde_scratch ();
-    if (rc != NO_ERROR)
-      {
-	return rc;
-      }
-    const off_t offset = (off_t) page_offset * (off_t) IO_PAGESIZE;
-    if (!full_pread (m_fd, m_stored, IO_PAGESIZE, offset))
+    /* TDE: the caller's scratch (not a member) carries the ciphertext read +
+     * decrypt output, so two threads decrypting the same page never collide. */
+    if (scratch == NULL)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return ER_FAILED;
+      }
+    int rc = scratch->ensure ();
+    if (rc != NO_ERROR)
+      {
+	return rc;
       }
     if (!tde_is_loaded ())
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
 	return ER_TDE_CIPHER_IS_NOT_LOADED;
       }
-    const int error = tde_decrypt_data_page (m_stored, m_tde_algo, true, m_plain);
+    const off_t offset = (off_t) page_offset * (off_t) IO_PAGESIZE;
+    if (!full_pread (m_fd, scratch->cipher, IO_PAGESIZE, offset))
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+    const int error = tde_decrypt_data_page (scratch->cipher, m_tde_algo, true, scratch->plain);
     if (error != NO_ERROR)
       {
 	return error;
       }
-    std::memcpy (dest, m_plain->page, DB_PAGESIZE);
-    m_metrics.pages_read++;
+    std::memcpy (dest, scratch->plain->page, DB_PAGESIZE);
+    m_reads.fetch_add (1, std::memory_order_relaxed);
     return NO_ERROR;
   }
 }				/* namespace qfile */
@@ -577,10 +604,11 @@ qfile_buffile_selftest (THREAD_ENTRY *thread_p)
     }
 
   /* read back forward + a couple of random offsets; verify byte-identity */
+  qfile::tde_read_scratch rscratch;
   for (int i = 0; i < NPAGES && rc == NO_ERROR; i++)
     {
       std::memset (back, 0xee, DB_PAGESIZE);
-      rc = bf->read_page (thread_p, i, (PAGE_PTR) back);
+      rc = bf->read_page (thread_p, i, (PAGE_PTR) back, &rscratch);
       if (rc != NO_ERROR)
 	{
 	  break;
