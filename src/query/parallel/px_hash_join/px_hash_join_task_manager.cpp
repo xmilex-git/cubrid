@@ -34,7 +34,6 @@
 #include "query_hash_scan.h"
 #include "query_manager.h"		/* qmgr_get_old_page, qmgr_free_old_page_and_init, ... */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
-#include <unordered_map>
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -43,81 +42,6 @@ namespace parallel_query
 {
   namespace hash_join
   {
-    namespace
-    {
-      std::mutex sector_scan_list_id_mutex;
-      std::unordered_map<QFILE_LIST_SECTOR_SCAN_INFO *, QFILE_LIST_ID *> sector_scan_list_ids;
-
-      bool
-      has_raw_fd_overflow_pages (const QMGR_TEMP_FILE *tfile)
-      {
-	return tfile != nullptr && tfile->backing == qmgr_temp_backing::RAW_FD_OVERFLOW && tfile->raw_fd_handle != nullptr
-	  && tfile->raw_fd_next_pageid > tfile->membuf_last + 1;
-      }
-
-      QFILE_LIST_ID *
-      get_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan)
-      {
-	std::lock_guard<std::mutex> lock (sector_scan_list_id_mutex);
-	auto iter = sector_scan_list_ids.find (&sector_scan);
-	return iter == sector_scan_list_ids.end () ? nullptr : iter->second;
-      }
-
-      bool
-      get_raw_fd_overflow_page (QFILE_LIST_ID *list_id, int raw_fd_index, VPID &vpid, QMGR_TEMP_FILE *&tfile)
-      {
-	if (raw_fd_index < 0)
-	  {
-	    return false;
-	  }
-
-	for (QFILE_LIST_ID *current = list_id; current != nullptr; current = QFILE_LIST_ID_DEPENDENT(current))
-	  {
-	    QMGR_TEMP_FILE *current_tfile = QFILE_LIST_ID_TFILE_VFID(current);
-	    if (!has_raw_fd_overflow_pages (current_tfile))
-	      {
-		continue;
-	      }
-
-	    const int first_pageid = current_tfile->membuf_last + 1;
-	    const int page_cnt = current_tfile->raw_fd_next_pageid - first_pageid;
-	    assert (page_cnt > 0);
-
-	    if (raw_fd_index < page_cnt)
-	      {
-		vpid.volid = NULL_VOLID;
-		vpid.pageid = first_pageid + raw_fd_index;
-		tfile = current_tfile;
-		return true;
-	      }
-
-	    raw_fd_index -= page_cnt;
-	  }
-
-	return false;
-      }
-    } // namespace
-
-    void
-    register_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan, QFILE_LIST_ID *list_id)
-    {
-      std::lock_guard<std::mutex> lock (sector_scan_list_id_mutex);
-      if (list_id == nullptr)
-	{
-	  sector_scan_list_ids.erase (&sector_scan);
-	}
-      else
-	{
-	  sector_scan_list_ids[&sector_scan] = list_id;
-	}
-    }
-
-    void
-    unregister_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan)
-    {
-      std::lock_guard<std::mutex> lock (sector_scan_list_id_mutex);
-      sector_scan_list_ids.erase (&sector_scan);
-    }
 
     /*
      * task_manager

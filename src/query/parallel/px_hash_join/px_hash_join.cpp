@@ -36,8 +36,6 @@ namespace parallel_query
 {
   namespace hash_join
   {
-    void register_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan, QFILE_LIST_ID *list_id);
-    void unregister_sector_scan_list_id (QFILE_LIST_SECTOR_SCAN_INFO &sector_scan);
 
     /*
      * build_partitions
@@ -84,8 +82,6 @@ namespace parallel_query
 	{
 	  goto error_exit;
 	}
-      register_sector_scan_list_id (shared_info.sector_scan, outer->fetch_info->list_id);
-
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -118,8 +114,6 @@ namespace parallel_query
 	{
 	  goto error_exit;
 	}
-      register_sector_scan_list_id (shared_info.sector_scan, inner->fetch_info->list_id);
-
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -143,8 +137,6 @@ namespace parallel_query
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
 cleanup:
-      unregister_sector_scan_list_id (shared_info.sector_scan);
-
       hjoin_clear_shared_split_info (&thread_ref, manager, &shared_info);
 
       return error;
@@ -524,8 +516,6 @@ error_exit:
 	{
 	  goto error_exit;
 	}
-      register_sector_scan_list_id (shared_info.sector_scan, manager->single_context.probe->list_id);
-
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -602,7 +592,6 @@ error_exit:
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
 cleanup:
-      unregister_sector_scan_list_id (shared_info.sector_scan);
       qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
 
       return error;
