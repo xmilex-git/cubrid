@@ -2118,12 +2118,12 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
   /* redesign #78 2A-3: a NEW (Tapeset) probe input cannot be read by the OLD
    * sector reader (the backing guard rejects it: ER_QPROC_INVALID_XASLNODE).
    * The NEW-input parallel probe path (chunk_distributor + per-worker
-   * tapeset_reader) is wired for the INNER-join probe worker only, and only when
-   * CUBRID_WM_HASHJOIN_NEW is on.  In every other NEW-input case fall back to
+   * tapeset_reader) is wired for both INNER- and OUTER-join probe workers when
+   * CUBRID_WM_HASHJOIN_NEW is on.  Without the gate, fall back to
    * single-threaded PHJ, which reads the NEW input correctly through the unified
-   * list scan.  (Outer-join probe workers are migrated in a follow slice.) */
+   * list scan. */
   if (qfile_list_has_new_backing (single_context->probe->list_id)
-      && (!qfile_hashjoin_new_backing_enabled () || IS_OUTER_JOIN_TYPE (manager->join_type)))
+      && !qfile_hashjoin_new_backing_enabled ())
     {
       manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);
