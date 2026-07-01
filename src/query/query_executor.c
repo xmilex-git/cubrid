@@ -15798,8 +15798,17 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 		  else
 		    {
 #if SERVER_MODE && !WINDOWS
+		      /* redesign #78 2A-3: skip the subquery parallel executor when the
+		       * parent is a hash/merge join (merge_infop != NULL).  Hash join aptr
+		       * entries (outer/inner scans) each need the full worker pool for their
+		       * own parallel heap scan; the subquery executor steals 1+ workers
+		       * from the pool, causing the inner scan to fall back to serial
+		       * (OLD-backed output, lost NEW backing → wrong-result via the buggy
+		       * sector_page_iterator).  Sequential aptr execution avoids the
+		       * worker exhaustion while keeping each scan fully parallel. */
 		      if (!XASL_IS_FLAGED (xasl, XASL_NO_PARALLEL_SUBQUERY) && XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL)
-			  && xasl->px_executor == nullptr)
+			  && xasl->px_executor == nullptr
+			  && merge_infop == NULL)
 			{
 			  int n_workers_to_reserve = 0;
 			  n_workers_to_reserve =
@@ -15832,7 +15841,7 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 			      xasl->executed_parallelism = 0;
 			    }
 			}
-		      if (xasl->px_executor)
+		      if (xasl->px_executor && merge_infop == NULL)
 			{
 			  if (!xasl->px_executor->add_job (thread_p, xptr2, xasl_state))
 			    {

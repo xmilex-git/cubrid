@@ -2107,15 +2107,25 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
   assert (false);
 #endif /* defined (SERVER_MODE) */
 
-  /* redesign #78 2A-3: a NEW (Tapeset) probe input cannot be read by the OLD
-   * sector reader (the backing guard rejects it: ER_QPROC_INVALID_XASLNODE).
-   * The NEW-input parallel probe path (chunk_distributor + per-worker
-   * tapeset_reader) is wired for both INNER- and OUTER-join probe workers when
-   * CUBRID_WM_HASHJOIN_NEW is on.  Without the gate, fall back to
-   * single-threaded PHJ, which reads the NEW input correctly through the unified
-   * list scan. */
-  if (qfile_list_has_new_backing (single_context->probe->list_id)
-      && !qfile_hashjoin_new_backing_enabled ())
+  /* redesign #78 2A-3: the parallel probe path uses chunk_distributor (NEW) or
+   * sector_page_iterator (OLD).  The OLD sector reader has a known row-loss bug
+   * on arbitrary derived-list inputs (#78 evidence (k)/(q): pre-existing in the
+   * #7173 sector machinery, develop is immune because it never hits PARALLEL_PROBE
+   * at work_mem=1G).  The NEW path (chunk_distributor + tapeset_reader) is correct.
+   *
+   * Decision matrix:
+   *   NEW input + HASHJOIN_NEW gate ON  -> parallel probe via chunk_distributor (correct)
+   *   NEW input + HASHJOIN_NEW gate OFF -> serial (unified list scan reads NEW correctly)
+   *   OLD input                         -> serial (avoids the buggy sector_page_iterator)
+   *
+   * The OLD-input serial fallback is the fix for the "session state corruption"
+   * symptom: on re-execution the parallel worker pool can be exhausted (by the
+   * subquery parallel executor or a concurrent aptr scan), causing the probe
+   * input to lose its NEW backing and fall back to OLD.  Without this guard the
+   * hash join would use the row-losing sector reader, producing wrong results
+   * (e.g. count=407 instead of 200360). */
+  if (!qfile_list_has_new_backing (single_context->probe->list_id)
+      || !qfile_hashjoin_new_backing_enabled ())
     {
       manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);
