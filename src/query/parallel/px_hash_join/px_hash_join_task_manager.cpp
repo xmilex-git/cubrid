@@ -242,7 +242,163 @@ namespace parallel_query
 	  assert (thread_ref.m_px_stats == nullptr);
 	}
 
-      /* next page */
+      /* redesign #78 2A-3: per-tuple partition assignment and buffered write.
+       * Shared by OLD sector page walk and NEW tapeset_reader paths.
+       * Assumes tuple_record.tpl points to the current tuple.
+       * Returns true to advance to the next tuple, false on error. */
+      auto process_split_tuple = [&] () -> bool
+      {
+	error = hjoin_fetch_key (&thread_ref, m_split_info->fetch_info, &tuple_record, temp_key,
+				 nullptr /* compare_key */, &need_skip_next);
+	if (error != NO_ERROR)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    m_task_manager.handle_error (thread_ref);
+	    has_error = true;
+	    return false;
+	  }
+	else if (need_skip_next)
+	  {
+	    need_skip_next = false;
+
+	    if (is_outer_join)
+	      {
+		/* In outer joins, tuples with NULL in any join column are placed in the last partition. */
+		part_id = part_cnt - 1;
+	      }
+	    else
+	      {
+		return true;	/* next tuple */
+	      }
+	  }
+	else
+	  {
+	    hash_key = qdata_hash_scan_key (temp_key, UINT_MAX, HASH_METH_IN_MEM);
+	    part_id = (is_outer_join) ? hash_key % (part_cnt - 1) : hash_key % (part_cnt);
+
+	    hjoin_update_tuple_hash_key (&thread_ref, &tuple_record, hash_key);
+	  }
+
+	/* buffered write to partition */
+	if (temp_part_list_id[part_id] != nullptr
+	    && (QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_last == QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_npages - 1)
+	    && (temp_part_list_id[part_id]->last_offset + QFILE_GET_TUPLE_LENGTH (tuple_record.tpl)) > DB_PAGESIZE)
+	  {
+	    qfile_close_list (&thread_ref, temp_part_list_id[part_id]);
+
+	    {
+	      std::unique_lock lock (m_shared_info->part_mutexes[part_id]);
+
+	      assert (part_list_id[part_id]->last_pgptr == nullptr);
+
+	      if (part_list_id[part_id]->tuple_cnt > 0)
+		{
+		  error = qfile_append_list (&thread_ref, part_list_id[part_id], temp_part_list_id[part_id]);
+		  if (error != NO_ERROR)
+		    {
+		      assert_release_error (er_errid () != NO_ERROR);
+		      m_task_manager.handle_error (thread_ref);
+		      has_error = true;
+		      return false;
+		    }
+
+		  error = qfile_truncate_list (&thread_ref, temp_part_list_id[part_id]);
+		  if (error != NO_ERROR)
+		    {
+		      assert_release_error (er_errid () != NO_ERROR);
+		      m_task_manager.handle_error (thread_ref);
+		      has_error = true;
+		      return false;
+		    }
+		}
+	      else
+		{
+		  qfile_destroy_list (&thread_ref, part_list_id[part_id]);
+		  qfile_copy_list_id (part_list_id[part_id], temp_part_list_id[part_id], false, QFILE_PROHIBIT_DEPENDENT);
+		  QFILE_FREE_AND_INIT_LIST_ID (temp_part_list_id[part_id]);
+		}
+	    }
+	  }
+
+	if (temp_part_list_id[part_id] == nullptr)
+	  {
+	    temp_part_list_id[part_id] =
+		    qfile_open_list (&thread_ref, &list_id->type_list, nullptr, list_id->query_id, QFILE_FLAG_ALL, nullptr);
+	    if (temp_part_list_id[part_id] == nullptr)
+	      {
+		assert_release_error (er_errid () != NO_ERROR);
+		m_task_manager.handle_error (thread_ref);
+		has_error = true;
+		return false;
+	      }
+	  }
+
+	error = qfile_add_tuple_to_list (&thread_ref, temp_part_list_id[part_id], tuple_record.tpl);
+	if (error != NO_ERROR)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    m_task_manager.handle_error (thread_ref);
+	    has_error = true;
+	    return false;
+	  }
+	assert (VFID_ISNULL (&QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->temp_vfid));
+	return true;
+      };
+
+      if (m_shared_info->new_dist != nullptr)
+	{
+	  /* NEW (Tapeset) split input: per-worker tapeset_reader over shared
+	   * chunk_distributor.  Overflow reassembly handled by the reader
+	   * (ADR 0005/0006), so the OLD sector page walk is bypassed. */
+	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
+	  qfile::tapeset_reader *reader =
+		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);
+	  if (reader == nullptr)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		      sizeof (qfile::tapeset_reader));
+	      m_task_manager.handle_error (thread_ref);
+	      has_error = true;
+	    }
+
+	  while (!has_error)
+	    {
+	      if (m_task_manager.has_error () || m_task_manager.check_interrupt (thread_ref))
+		{
+		  has_error = true;
+		  break;
+		}
+
+	      SCAN_CODE sc = reader->next (&thread_ref, &new_trec, 0 /* COPY */);
+	      if (sc == S_END)
+		{
+		  break;
+		}
+	      if (sc != S_SUCCESS)
+		{
+		  assert_release_error (er_errid () != NO_ERROR);
+		  m_task_manager.handle_error (thread_ref);
+		  has_error = true;
+		  break;
+		}
+
+	      tuple_record.tpl = new_trec.tpl;
+
+	      if (!process_split_tuple ())
+		{
+		  break;
+		}
+	    }
+
+	  delete reader;
+	  if (new_trec.tpl != nullptr)
+	    {
+	      db_private_free_and_init (&thread_ref, new_trec.tpl);
+	    }
+	}
+      else
+	{
+      /* next page (OLD sector walk) */
       do
 	{
 	  if (m_task_manager.has_error () || m_task_manager.check_interrupt (thread_ref))
@@ -317,42 +473,31 @@ namespace parallel_query
 
 	      tuple_index++;
 
-	      error = hjoin_fetch_key (&thread_ref, m_split_info->fetch_info, &tuple_record, temp_key, nullptr /* compare_key */,
-				       &need_skip_next);
-	      if (error != NO_ERROR)
+	      /* overflow page — direct write to partition (bypasses local buffer) */
+	      if (QFILE_GET_OVERFLOW_PAGE_ID (page) != NULL_PAGEID)
 		{
-		  assert_release_error (er_errid () != NO_ERROR);
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		  break;		/* error_exit */
-		}
-	      else if (need_skip_next)
-		{
-		  need_skip_next = false;	/* init */
-
-		  if (is_outer_join)
+		  error = hjoin_fetch_key (&thread_ref, m_split_info->fetch_info, &tuple_record, temp_key,
+					   nullptr /* compare_key */, &need_skip_next);
+		  if (error != NO_ERROR)
 		    {
-		      /* In outer joins, tuples with NULL in any join column are placed in the last partition.
-		      * HASHJOIN_STATUS_FILL_NULL_VALUES is triggered for all tuples in that partition. */
-		      part_id = part_cnt - 1;
+		      assert_release_error (er_errid () != NO_ERROR);
+		      m_task_manager.handle_error (thread_ref);
+		      has_error = true;
+		      break;
+		    }
+		  else if (need_skip_next)
+		    {
+		      need_skip_next = false;
+		      part_id = (is_outer_join) ? (part_cnt - 1) : 0; /* null partition or skip */
+		      if (!is_outer_join) { break; /* skip tuple entirely for non-outer */ }
 		    }
 		  else
 		    {
-		      /* next tuple */
-		      continue;
+		      hash_key = qdata_hash_scan_key (temp_key, UINT_MAX, HASH_METH_IN_MEM);
+		      part_id = (is_outer_join) ? hash_key % (part_cnt - 1) : hash_key % (part_cnt);
+		      hjoin_update_tuple_hash_key (&thread_ref, &tuple_record, hash_key);
 		    }
-		}			/* else if (need_skip_next) */
-	      else
-		{
-		  hash_key = qdata_hash_scan_key (temp_key, UINT_MAX, HASH_METH_IN_MEM);
-		  part_id = (is_outer_join) ? hash_key % (part_cnt - 1) : hash_key % (part_cnt);
 
-		  hjoin_update_tuple_hash_key (&thread_ref, &tuple_record, hash_key);
-		}
-
-	      /* overflow page */
-	      if (QFILE_GET_OVERFLOW_PAGE_ID (page) != NULL_PAGEID)
-		{
 		  std::unique_lock lock (m_shared_info->part_mutexes[part_id]);
 
 		  assert (part_list_id[part_id]->last_pgptr == nullptr);
@@ -374,68 +519,10 @@ namespace parallel_query
 		  break;
 		}
 
-	      if (temp_part_list_id[part_id] != nullptr
-		  && (QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_last == QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_npages - 1)
-		  && (temp_part_list_id[part_id]->last_offset + QFILE_GET_TUPLE_LENGTH (tuple_record.tpl)) > DB_PAGESIZE)
+	      if (!process_split_tuple ())
 		{
-		  qfile_close_list (&thread_ref, temp_part_list_id[part_id]);	/* may be meaningless since only memory buffer is used */
-
-		  {
-		    std::unique_lock lock (m_shared_info->part_mutexes[part_id]);
-
-		    assert (part_list_id[part_id]->last_pgptr == nullptr);
-
-		    if (part_list_id[part_id]->tuple_cnt > 0)
-		      {
-			error = qfile_append_list (&thread_ref, part_list_id[part_id], temp_part_list_id[part_id]);
-			if (error != NO_ERROR)
-			  {
-			    assert_release_error (er_errid () != NO_ERROR);
-			    m_task_manager.handle_error (thread_ref);
-			    has_error = true;
-			    break;
-			  }
-
-			error = qfile_truncate_list (&thread_ref, temp_part_list_id[part_id]);
-			if (error != NO_ERROR)
-			  {
-			    assert_release_error (er_errid () != NO_ERROR);
-			    m_task_manager.handle_error (thread_ref);
-			    has_error = true;
-			    break;
-			  }
-		      }
-		    else
-		      {
-			qfile_destroy_list (&thread_ref, part_list_id[part_id]);
-			qfile_copy_list_id (part_list_id[part_id], temp_part_list_id[part_id], false, QFILE_PROHIBIT_DEPENDENT);
-			QFILE_FREE_AND_INIT_LIST_ID (temp_part_list_id[part_id]);
-		      }
-		  }
-		}
-
-	      if (temp_part_list_id[part_id] == nullptr)
-		{
-		  temp_part_list_id[part_id] =
-			  qfile_open_list (&thread_ref, &list_id->type_list, nullptr, list_id->query_id, QFILE_FLAG_ALL, nullptr);
-		  if (temp_part_list_id[part_id] == nullptr)
-		    {
-		      assert_release_error (er_errid () != NO_ERROR);
-		      m_task_manager.handle_error (thread_ref);
-		      has_error = true;
-		      break;
-		    }
-		}
-
-	      error = qfile_add_tuple_to_list (&thread_ref, temp_part_list_id[part_id], tuple_record.tpl);
-	      if (error != NO_ERROR)
-		{
-		  assert_release_error (er_errid () != NO_ERROR);
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
 		  break;
 		}
-	      assert (VFID_ISNULL (&QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->temp_vfid));
 	    }
 	  while (true);		/* next tuple */
 
@@ -450,6 +537,7 @@ namespace parallel_query
 	    }
 	}
       while (true);	/* next page */
+	}		/* end OLD-backing page walk */
 
       if (page != nullptr)
 	{

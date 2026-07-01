@@ -79,12 +79,32 @@ namespace parallel_query
 	  hjoin_trace_start (&thread_ref, &start_stats);
 	}
 
-      /* collect data page sectors for outer relation */
-      error = qfile_open_list_sector_scan (&thread_ref, outer->fetch_info->list_id, &shared_info.sector_scan);
-      if (error != NO_ERROR)
-	{
-	  goto error_exit;
-	}
+      /* ---- outer relation split ---- */
+      {
+	QFILE_LIST_ID *outer_list_id = outer->fetch_info->list_id;
+
+	if (qfile_list_has_new_backing (outer_list_id))
+	  {
+	    /* NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
+	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (outer_list_id);
+	    if (shared_info.new_tapeset == nullptr)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		error = ER_FAILED;
+		goto error_exit;
+	      }
+	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
+	  }
+	else
+	  {
+	    /* OLD: sector page scan. */
+	    error = qfile_open_list_sector_scan (&thread_ref, outer_list_id, &shared_info.sector_scan);
+	    if (error != NO_ERROR)
+	      {
+		goto error_exit;
+	      }
+	  }
+      }
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -105,18 +125,43 @@ namespace parallel_query
 	  goto error_exit;
 	}
 
+      /* Release outer split resources before inner run. */
+      qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
+      delete shared_info.new_dist;
+      shared_info.new_dist = nullptr;
+      shared_info.new_tapeset = nullptr;
+
       if (thread_is_on_trace (&thread_ref))
 	{
 	  hjoin_trace_start (&thread_ref, &start_stats);
 	}
 
-      /* collect data page sectors for inner relation
-       * (outer's sector_info is freed internally by qfile_collect_list_sector_info) */
-      error = qfile_open_list_sector_scan (&thread_ref, inner->fetch_info->list_id, &shared_info.sector_scan);
-      if (error != NO_ERROR)
-	{
-	  goto error_exit;
-	}
+      /* ---- inner relation split ---- */
+      {
+	QFILE_LIST_ID *inner_list_id = inner->fetch_info->list_id;
+
+	if (qfile_list_has_new_backing (inner_list_id))
+	  {
+	    /* NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
+	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (inner_list_id);
+	    if (shared_info.new_tapeset == nullptr)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		error = ER_FAILED;
+		goto error_exit;
+	      }
+	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
+	  }
+	else
+	  {
+	    /* OLD: sector page scan. */
+	    error = qfile_open_list_sector_scan (&thread_ref, inner_list_id, &shared_info.sector_scan);
+	    if (error != NO_ERROR)
+	      {
+		goto error_exit;
+	      }
+	  }
+      }
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -140,6 +185,12 @@ namespace parallel_query
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
 cleanup:
+      qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
+
+      /* redesign #78 2A-3: release the NEW-input distributor (nullptr on OLD path). */
+      delete shared_info.new_dist;
+      shared_info.new_dist = nullptr;
+
       hjoin_clear_shared_split_info (&thread_ref, manager, &shared_info);
 
       return error;

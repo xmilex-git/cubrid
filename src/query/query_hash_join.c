@@ -1989,17 +1989,9 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
   assert (outer_list_id != NULL);
   assert (inner_list_id != NULL);
 
-  /* redesign #78 2A-3: the parallel partition split still reads its input via the
-   * OLD sector reader, which the backing guard rejects for a NEW (Tapeset) input
-   * (ER_QPROC_INVALID_XASLNODE).  Until the split path is migrated to
-   * chunk_distributor, force serial partition -- which reads a NEW input correctly
-   * through the unified list scan -- whenever either input is NEW-backed. */
-  if (qfile_list_has_new_backing (outer_list_id) || qfile_list_has_new_backing (inner_list_id))
-    {
-      manager->num_parallel_threads = 0;
-      assert (manager->px_worker_manager == NULL);
-      return HASHJOIN_STATUS_PARTITION;
-    }
+  /* redesign #78 2A-3: the parallel partition split now reads NEW (Tapeset) input
+   * via chunk_distributor + per-worker tapeset_reader (mirroring the probe path).
+   * The OLD sector reader path is preserved for OLD-backed input. */
 
   /* immutable */
   static const size_t stats_size = perfmon_get_number_of_statistic_values () * sizeof (UINT64);

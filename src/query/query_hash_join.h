@@ -307,9 +307,18 @@ typedef struct hashjoin_shared_split_info
 
   std::mutex *part_mutexes;
 
+  /* redesign #78 2A-3: NEW (Tapeset) split input read via chunk_distributor +
+   * per-worker tapeset_reader, mirroring the probe path (HASHJOIN_SHARED_PROBE_INFO).
+   * new_dist != NULL selects the NEW read path; sector_scan stays unused then.
+   * Created/destroyed per split-run (outer, then inner) in build_partitions. */
+  qfile::tapeset *new_tapeset;
+  qfile::chunk_distributor *new_dist;
+
   hashjoin_shared_split_info ()
     : sector_scan ()
     , part_mutexes (nullptr)
+    , new_tapeset (nullptr)
+    , new_dist (nullptr)
   {
     //
   }
