@@ -34,6 +34,9 @@
 #include "query_hash_scan.h"
 #include "query_manager.h"		/* qmgr_get_old_page, qmgr_free_old_page_and_init, ... */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
+#include "query_list.h"			/* QFILE_LIST_ID_TAPESET, qfile_list_has_new_backing */
+#include "qfile_tape.hpp"		/* qfile::tapeset, qfile::tapeset_reader */
+#include "qfile_chunk.hpp"		/* qfile::chunk_distributor */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -946,6 +949,163 @@ cleanup:
 	  hjoin_trace_start (&thread_ref, &start_stats);
 	}
 
+      /* redesign #78 2A-3: per-probe-tuple processing (fetch key -> hash -> probe
+       * build hash table -> merge matched tuple).  Shared by the OLD sector page
+       * walk and the NEW (Tapeset) tapeset_reader path.  Returns true to advance to
+       * the next tuple, false on error (has_error set). */
+      auto process_probe_tuple = [&] () -> bool
+      {
+	if (thread_is_on_trace (&thread_ref))
+	  {
+	    stats->probe.read_rows++;
+	  }
+
+	HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_FETCH);
+	error = hjoin_fetch_key (&thread_ref, probe, &probe->tuple_record, key,
+				 nullptr /* compare_key */, &need_skip_next);
+	HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_FETCH);
+	if (error != NO_ERROR)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    m_task_manager.handle_error (thread_ref);
+	    has_error = true;
+	    return false;		/* error_exit */
+	  }
+	else if (need_skip_next)
+	  {
+	    need_skip_next = false;	/* init */
+	    return true;		/* next tuple */
+	  }
+	else
+	  {
+	    /* fall through */
+	  }
+
+	HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_HASH);
+	hash_scan->curr_hash_key = qdata_hash_scan_key (key, UINT_MAX, hash_method);
+	HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_HASH);
+
+	do
+	  {
+	    HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_SEARCH);
+	    error = hjoin_probe_key (&thread_ref, hash_scan, &build->list_scan_id, &build->tuple_record);
+	    HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_SEARCH);
+	    if (error != NO_ERROR)
+	      {
+		break;		/* error_exit */
+	      }
+	    if (build->tuple_record.tpl == nullptr)
+	      {
+		break;		/* not found */
+	      }
+
+	    if (thread_is_on_trace (&thread_ref))
+	      {
+		stats->probe.read_keys++;	/* found */
+	      }
+
+	    HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_MATCH);
+	    error = hjoin_fetch_key (&thread_ref, build, &build->tuple_record, found_key,
+				     key /* compare_key */, &need_skip_next);
+	    HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_MATCH);
+
+	    if (error != NO_ERROR)
+	      {
+		break;		/* error_exit */
+	      }
+	    else if (need_skip_next)
+	      {
+		HJOIN_PRINT_TUPLE (build->list_id, build->tuple_record.tpl, HASHJOIN_PRINT_NOT_MATCHED_KEY);
+
+		need_skip_next = false;	/* init */
+		continue;
+	      }
+	    else
+	      {
+		/* fall through */
+	      }
+
+	    HJOIN_PRINT_TUPLE (build->list_id, build->tuple_record.tpl, HASHJOIN_PRINT_QUALIFIED_KEY);
+
+	    HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
+	    error = hjoin_merge_tuple_to_list_id (&thread_ref, list_id,
+						  &outer->tuple_record, &inner->tuple_record,
+						  m_manager->merge_info, &overflow_record);
+	    HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
+
+	    if (error != NO_ERROR)
+	      {
+		break;		/* error_exit */
+	      }
+	  }
+	while (true);
+
+	if (error != NO_ERROR)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    m_task_manager.handle_error (thread_ref);
+	    has_error = true;
+	    return false;		/* error_exit */
+	  }
+
+	return true;		/* next tuple */
+      };
+
+      if (m_shared_info->new_dist != nullptr)
+	{
+	  /* NEW (Tapeset) probe input: this worker reads its share of tuples via a
+	   * per-worker tapeset_reader over the shared chunk_distributor (reader id =
+	   * worker index).  Overflow reassembly and offset-based page reads happen
+	   * inside the reader (ADR 0005/0006), so the OLD sector page walk (and its
+	   * backing guard) is bypassed. */
+	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
+	  qfile::tapeset_reader *reader =
+		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);
+	  if (reader == nullptr)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		      sizeof (qfile::tapeset_reader));
+	      m_task_manager.handle_error (thread_ref);
+	      has_error = true;
+	    }
+
+	  while (!has_error)
+	    {
+	      if (m_task_manager.has_error () || m_task_manager.check_interrupt (thread_ref))
+		{
+		  has_error = true;
+		  break;		/* error_exit */
+		}
+
+	      SCAN_CODE sc = reader->next (&thread_ref, &new_trec, 0 /* COPY */);
+	      if (sc == S_END)
+		{
+		  break;		/* this worker's share drained */
+		}
+	      if (sc != S_SUCCESS)
+		{
+		  assert_release_error (er_errid () != NO_ERROR);
+		  m_task_manager.handle_error (thread_ref);
+		  has_error = true;
+		  break;		/* error_exit */
+		}
+
+	      probe->tuple_record.tpl = new_trec.tpl;
+
+	      if (!process_probe_tuple ())
+		{
+		  break;		/* error_exit */
+		}
+	    }
+
+	  delete reader;
+	  if (new_trec.tpl != nullptr)
+	    {
+	      db_private_free_and_init (&thread_ref, new_trec.tpl);
+	    }
+	}
+      else
+	{
       /* next page */
       do
 	{
@@ -1020,96 +1180,8 @@ cleanup:
 
 	      tuple_index++;
 
-	      if (thread_is_on_trace (&thread_ref))
+	      if (!process_probe_tuple ())
 		{
-		  stats->probe.read_rows++;
-		}
-
-	      HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_FETCH);
-	      error = hjoin_fetch_key (&thread_ref, probe, &probe->tuple_record, key,
-				       nullptr /* compare_key */, &need_skip_next);
-	      HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_FETCH);
-	      if (error != NO_ERROR)
-		{
-		  assert_release_error (er_errid () != NO_ERROR);
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		  break;		/* error_exit */
-		}
-	      else if (need_skip_next)
-		{
-		  need_skip_next = false;	/* init */
-		  continue;
-		}
-	      else
-		{
-		  /* fall through */
-		}
-
-	      HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_HASH);
-	      hash_scan->curr_hash_key = qdata_hash_scan_key (key, UINT_MAX, hash_method);
-	      HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_HASH);
-
-	      do
-		{
-		  HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_SEARCH);
-		  error = hjoin_probe_key (&thread_ref, hash_scan, &build->list_scan_id, &build->tuple_record);
-		  HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_SEARCH);
-		  if (error != NO_ERROR)
-		    {
-		      break;		/* error_exit */
-		    }
-		  if (build->tuple_record.tpl == nullptr)
-		    {
-		      break;		/* not found */
-		    }
-
-		  if (thread_is_on_trace (&thread_ref))
-		    {
-		      stats->probe.read_keys++;	/* found */
-		    }
-
-		  HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_MATCH);
-		  error = hjoin_fetch_key (&thread_ref, build, &build->tuple_record, found_key,
-					   key /* compare_key */, &need_skip_next);
-		  HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_MATCH);
-
-		  if (error != NO_ERROR)
-		    {
-		      break;		/* error_exit */
-		    }
-		  else if (need_skip_next)
-		    {
-		      HJOIN_PRINT_TUPLE (build->list_id, build->tuple_record.tpl, HASHJOIN_PRINT_NOT_MATCHED_KEY);
-
-		      need_skip_next = false;	/* init */
-		      continue;
-		    }
-		  else
-		    {
-		      /* fall through */
-		    }
-
-		  HJOIN_PRINT_TUPLE (build->list_id, build->tuple_record.tpl, HASHJOIN_PRINT_QUALIFIED_KEY);
-
-		  HJOIN_PROFILE_START (&thread_ref, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-		  error = hjoin_merge_tuple_to_list_id (&thread_ref, list_id,
-							&outer->tuple_record, &inner->tuple_record,
-							m_manager->merge_info, &overflow_record);
-		  HJOIN_PROFILE_END (&thread_ref, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-
-		  if (error != NO_ERROR)
-		    {
-		      break;		/* error_exit */
-		    }
-		}
-	      while (true);
-
-	      if (error != NO_ERROR)
-		{
-		  assert_release_error (er_errid () != NO_ERROR);
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
 		  break;		/* error_exit */
 		}
 	    }
@@ -1125,7 +1197,8 @@ cleanup:
 	      break;
 	    }
 	}
-      while (true);	/* next tuple */
+      while (true);	/* next page */
+	}		/* end OLD-backing page walk */
 
       if (page != nullptr)
 	{

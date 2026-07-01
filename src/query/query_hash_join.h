@@ -53,6 +53,12 @@ namespace parallel_query
   class worker_manager;
 }
 
+namespace qfile
+{
+  class chunk_distributor;
+  class tapeset;
+}
+
 struct xasl_node;
 struct tp_domain;
 
@@ -319,10 +325,19 @@ typedef struct hashjoin_shared_probe_info
   std::mutex stats_mutex;
   HASHJOIN_RANGE_STATS probe_range;
 
+  /* redesign #78 2A-3: NEW (Tapeset) probe input read via chunk_distributor +
+   * per-worker tapeset_reader (ADR 0003/0005/0006).  new_dist != NULL selects
+   * the NEW read path (built on the coordinating thread, freed at cleanup);
+   * sector_scan stays unused then.  Only meaningful under CUBRID_WM_HASHJOIN_NEW. */
+  qfile::tapeset *new_tapeset;
+  qfile::chunk_distributor *new_dist;
+
   hashjoin_shared_probe_info ()
     : sector_scan ()
     , stats_mutex ()
     , probe_range HASHJOIN_RANGE_STATS_INITIALIZER
+    , new_tapeset (nullptr)
+    , new_dist (nullptr)
   {
     //
   }

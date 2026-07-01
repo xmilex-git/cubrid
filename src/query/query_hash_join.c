@@ -1989,6 +1989,18 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
   assert (outer_list_id != NULL);
   assert (inner_list_id != NULL);
 
+  /* redesign #78 2A-3: the parallel partition split still reads its input via the
+   * OLD sector reader, which the backing guard rejects for a NEW (Tapeset) input
+   * (ER_QPROC_INVALID_XASLNODE).  Until the split path is migrated to
+   * chunk_distributor, force serial partition -- which reads a NEW input correctly
+   * through the unified list scan -- whenever either input is NEW-backed. */
+  if (qfile_list_has_new_backing (outer_list_id) || qfile_list_has_new_backing (inner_list_id))
+    {
+      manager->num_parallel_threads = 0;
+      assert (manager->px_worker_manager == NULL);
+      return HASHJOIN_STATUS_PARTITION;
+    }
+
   /* immutable */
   static const size_t stats_size = perfmon_get_number_of_statistic_values () * sizeof (UINT64);
 
@@ -2102,6 +2114,21 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
 #if !defined (SERVER_MODE)
   assert (false);
 #endif /* defined (SERVER_MODE) */
+
+  /* redesign #78 2A-3: a NEW (Tapeset) probe input cannot be read by the OLD
+   * sector reader (the backing guard rejects it: ER_QPROC_INVALID_XASLNODE).
+   * The NEW-input parallel probe path (chunk_distributor + per-worker
+   * tapeset_reader) is wired for the INNER-join probe worker only, and only when
+   * CUBRID_WM_HASHJOIN_NEW is on.  In every other NEW-input case fall back to
+   * single-threaded PHJ, which reads the NEW input correctly through the unified
+   * list scan.  (Outer-join probe workers are migrated in a follow slice.) */
+  if (qfile_list_has_new_backing (single_context->probe->list_id)
+      && (!qfile_hashjoin_new_backing_enabled () || IS_OUTER_JOIN_TYPE (manager->join_type)))
+    {
+      manager->num_parallel_threads = 0;
+      assert (manager->px_worker_manager == NULL);
+      return HASHJOIN_STATUS_SINGLE;
+    }
 
   /* immutable */
   static const size_t stats_size = perfmon_get_number_of_statistic_values () * sizeof (UINT64);

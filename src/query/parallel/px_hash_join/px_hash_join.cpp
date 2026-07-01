@@ -28,6 +28,9 @@
 #include "query_manager.h"		/* QMGR_TEMP_FILE (qmgr_temp_file) */
 #include "memory_alloc.h"		/* db_private_alloc, db_private_free_and_init */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
+#include "query_list.h"			/* QFILE_LIST_ID_TAPESET, qfile_list_has_new_backing */
+#include "qfile_tape.hpp"		/* qfile::tapeset */
+#include "qfile_chunk.hpp"		/* qfile::chunk_distributor */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -510,12 +513,43 @@ error_exit:
 	  hjoin_trace_start (&thread_ref, &start_stats);
 	}
 
-      /* collect data page sectors for probe relation */
-      error = qfile_open_list_sector_scan (&thread_ref, manager->single_context.probe->list_id, &shared_info.sector_scan);
-      if (error != NO_ERROR)
-	{
-	  goto error_exit;
-	}
+      {
+	QFILE_LIST_ID *probe_list_id = manager->single_context.probe->list_id;
+
+	if (qfile_list_has_new_backing (probe_list_id))
+	  {
+	    /* redesign #78 2A-3: NEW (Tapeset) probe input -> shared chunk_distributor
+	     * + per-worker tapeset_reader (ADR 0003/0005/0006).  Reached only when
+	     * CUBRID_WM_HASHJOIN_NEW is on (hjoin_try_parallel_probe forces SINGLE for
+	     * a NEW input otherwise), so the OLD sector reader (and its backing guard)
+	     * is bypassed for NEW input. */
+	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (probe_list_id);
+	    if (shared_info.new_tapeset == nullptr)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+		error = ER_FAILED;
+		goto error_exit;
+	      }
+
+	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
+	    if (shared_info.new_dist == nullptr)
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+			sizeof (qfile::chunk_distributor));
+		error = ER_OUT_OF_VIRTUAL_MEMORY;
+		goto error_exit;
+	      }
+	  }
+	else
+	  {
+	    /* collect data page sectors for probe relation (OLD backing) */
+	    error = qfile_open_list_sector_scan (&thread_ref, probe_list_id, &shared_info.sector_scan);
+	    if (error != NO_ERROR)
+	      {
+		goto error_exit;
+	      }
+	  }
+      }
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -593,6 +627,10 @@ error_exit:
 
 cleanup:
       qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
+
+      /* redesign #78 2A-3: release the NEW-input distributor (nullptr on OLD path). */
+      delete shared_info.new_dist;
+      shared_info.new_dist = nullptr;
 
       return error;
 
