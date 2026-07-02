@@ -368,6 +368,27 @@ namespace qfile
     m_tapes.push_back (tape_p);
   }
 
+  void
+  tapeset::transfer_tapes_from (tapeset *src)
+  {
+    if (src == NULL || src == this)
+      {
+	return;
+      }
+    const size_t n = src->m_tapes.size ();
+    m_tapes.reserve (m_tapes.size () + n);	/* may throw; nothing moved yet */
+    for (size_t i = 0; i < n; i++)
+      {
+	tape *tape_p = src->m_tapes[i];
+	src->m_tapes[i] = nullptr;	/* transfer ownership immediately */
+	if (tape_p != NULL)
+	  {
+	    m_tapes.push_back (tape_p);	/* reserve()'d above: cannot throw/realloc */
+	  }
+      }
+    src->m_tapes.clear ();
+  }
+
   /* ------------------------------------------------------------------ */
   /* tapeset_scan                                                       */
   /* ------------------------------------------------------------------ */
@@ -1622,6 +1643,11 @@ int
 qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID *src)
 {
   (void) thread_p;
+  if (dest == src)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+      return ER_FAILED;
+    }
   qfile::tapeset *dts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (dest);
   qfile::tapeset *sts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (src);
   if (dts == NULL)
@@ -1631,12 +1657,7 @@ qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID
     }
   if (sts != NULL)
     {
-      const int n = sts->tape_count ();
-      for (int i = 0; i < n; i++)
-	{
-	  dts->append_tape (sts->get_tape (i));
-	}
-      sts->set_owns_tapes (false);	/* dest owns the Tapes now; src frees only its container */
+      dts->transfer_tapes_from (sts);	/* per-tape move-and-null; src left empty */
       if (QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (src))
 	{
 	  QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (dest) = true;

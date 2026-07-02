@@ -261,6 +261,13 @@ namespace qfile
 	return (idx >= 0 && idx < (int) m_tapes.size ()) ? m_tapes[idx] : nullptr;
       }
 
+      /* Move all Tapes from src into this Tapeset (redesign #78 2A-1b import).
+       * Ownership transfers per-tape as it moves (src's slot is NULLed the
+       * instant a Tape leaves it), so a mid-transfer allocation failure can
+       * never leave a Tape referenced by both sides.  src is left empty
+       * (tape_count () == 0) and must not be used as a Tape source again. */
+      void transfer_tapes_from (tapeset *src);
+
     private:
       std::vector<tape *> m_tapes;
       bool m_owns_tapes;
