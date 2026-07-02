@@ -1183,6 +1183,12 @@ qfile_tapeset_scan_open (QFILE_LIST_SCAN_ID *scan_id_p)
       }
   }
   qfile::tapeset_scan *scan = new qfile::tapeset_scan (ts);
+  if (scan == NULL)
+    {
+      scan_id_p->tapeset_scan_ = NULL;
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (qfile::tapeset_scan));
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
   scan_id_p->tapeset_scan_ = scan;
   return NO_ERROR;
 }
@@ -1703,6 +1709,12 @@ qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer)
       return NULL;
     }
   qfile::tapeset *ts = new qfile::tapeset ();
+  if (ts == NULL)
+    {
+      delete t;		/* nothing else references the freshly-frozen Tape */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (qfile::tapeset));
+      return NULL;
+    }
   ts->set_owns_tapes (true);
   ts->append_tape (t);
   return ts;
