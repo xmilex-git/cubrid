@@ -211,6 +211,7 @@ extern void qmgr_segment_list_init (QMGR_SEGMENT_LIST * segment_list_p);
 extern void qmgr_segment_list_clear (QMGR_SEGMENT_LIST * segment_list_p);
 extern bool qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p);
 extern bool qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p);
+extern bool qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p);
 extern int qmgr_segment_list_add_list_id (QMGR_SEGMENT_LIST * segment_list_p, const QFILE_LIST_ID * list_id_p);
 extern int qmgr_segment_list_open_scan (const QMGR_SEGMENT_LIST * segment_list_p, QMGR_SEGMENT_LIST_SCAN * scan_p);
 extern SCAN_CODE qmgr_segment_list_scan_next (THREAD_ENTRY * thread_p, QMGR_SEGMENT_LIST_SCAN * scan_p,

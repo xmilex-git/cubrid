@@ -1495,9 +1495,8 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
 
   assert (query_p->list_id != NULL);
   /* Class-B sink: before returning a client-fetchable result, ensure the VPID-wire page chain is backed by real
-   * pgbuf pages. Raw-fd overflow segments do not maintain the next_vpid chain consumed by
-   * xqfile_get_list_file_page(). With the raw-fd write guard disabled, qmgr_list_has_raw_fd_segments() is false
-   * and this is a no-op. */
+   * pgbuf pages. Raw-fd overflow segments and NEW (Tapeset) backings do not maintain the next_vpid chain consumed
+   * by xqfile_get_list_file_page(). For plain VPID-backed lists this is a no-op. */
   if (qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
     {
       goto exit_on_error;
@@ -3221,6 +3220,26 @@ qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
   return false;
 }
 
+/* Class-B materialize predicate (#94): a list needs pgbuf materialization at a
+ * Class-B sink (client fetch / list-cache publish / holdable commit) when its
+ * tuples live outside the VPID-wire page chain -- either raw-fd overflow
+ * segments (legacy) or a NEW (Tapeset) backing whose first_vpid is NULL.
+ * qmgr_list_has_raw_fd_segments stays as-is: its other caller
+ * (qfile_append_list) guards a raw-fd-specific append path. */
+bool
+qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p)
+{
+  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
+    {
+      if (iter_p->tuple_cnt > 0 && qfile_list_has_new_backing (iter_p))
+	{
+	  return true;
+	}
+    }
+
+  return qmgr_list_has_raw_fd_segments (list_id_p);
+}
+
 int
 qmgr_segment_list_add_list_id (QMGR_SEGMENT_LIST * segment_list_p, const QFILE_LIST_ID * list_id_p)
 {
@@ -3658,7 +3677,7 @@ qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
 int
 qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 {
-  if (list_id_p == NULL || !qmgr_list_has_raw_fd_segments (list_id_p))
+  if (list_id_p == NULL || !qmgr_list_needs_pgbuf_materialize (list_id_p))
     {
       return NO_ERROR;
     }
