@@ -580,6 +580,19 @@ qfile_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_li
 	}
     }
 
+  /* Producer (redesign #78 NEW production): a live (unfrozen) producer must
+   * never be copied -- it belongs to exactly one in-flight production and is
+   * torn down by freeze()/close(), never by a copy.  The struct memcpy above
+   * also shallow-copied producer_writer_/producer_page_; SKIP (scan-open,
+   * borrow) and PROHIBIT (cached copy-out) must not carry it, or teardown of
+   * both src and dest would double-destroy the writer. */
+  assert (QFILE_LIST_ID_PRODUCER_WRITER (src_list_id_p) == NULL);
+  if (dep_mode == QFILE_SKIP_DEPENDENT || dep_mode == QFILE_PROHIBIT_DEPENDENT)
+    {
+      QFILE_LIST_ID_PRODUCER_WRITER (dest_list_id_p) = NULL;
+      QFILE_LIST_ID_PRODUCER_PAGE (dest_list_id_p) = NULL;
+    }
+
   qfile_update_qlist_count (thread_get_thread_entry_info (), dest_list_id_p, 1);
 
   return NO_ERROR;
