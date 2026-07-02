@@ -565,24 +565,19 @@ namespace parallel_query
 	  if (use_per_worker_output)
 	    {
 	      /* redesign #78 per-worker OUTPUT tape (ADR0004): transfer ownership
-	       * of temp partition lists to the shared worker_part_lists array.
-	       * The leader will merge them after all workers complete — no mutex. */
-	      QFILE_LIST_ID **slot =
-		      (QFILE_LIST_ID **) db_private_alloc (&thread_ref, part_cnt * sizeof (QFILE_LIST_ID *));
-	      if (slot == nullptr)
+	       * of temp partition lists to this worker's slot array.  The leader
+	       * will merge them after all workers complete — no mutex.
+	       * #109: the slot array was allocated by the LEADER in
+	       * build_partitions — db_private_alloc is per-thread (per-entry lea
+	       * mspace), so a worker-side allocation could not be freed by the
+	       * leader at merge time (mspace_free USAGE_ERROR abort in release,
+	       * leftover alloc-tracker entry assert in debug).  Only fill it here. */
+	      QFILE_LIST_ID **slot = m_shared_info->worker_part_lists[m_index];
+	      assert (slot != nullptr);
+	      for (part_index = 0; part_index < part_cnt; part_index++)
 		{
-		  assert_release_error (er_errid () != NO_ERROR);
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		}
-	      else
-		{
-		  for (part_index = 0; part_index < part_cnt; part_index++)
-		    {
-		      slot[part_index] = temp_part_list_id[part_index];
-		      temp_part_list_id[part_index] = nullptr;	/* transfer ownership */
-		    }
-		  m_shared_info->worker_part_lists[m_index] = slot;
+		  slot[part_index] = temp_part_list_id[part_index];
+		  temp_part_list_id[part_index] = nullptr;	/* transfer ownership */
 		}
 	    }
 	  else

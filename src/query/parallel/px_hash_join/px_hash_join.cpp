@@ -99,7 +99,12 @@ namespace parallel_query
 	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
 
 	    /* redesign #78 per-worker OUTPUT tape (ADR0004): allocate per-worker
-	     * partition list slots so workers write without part_mutexes. */
+	     * partition list slots so workers write without part_mutexes.
+	     * #109: the per-worker slot arrays are allocated HERE, on the leader,
+	     * and only filled by the workers — db_private_alloc is per-thread
+	     * (each entry owns its own lea mspace), so a worker-side allocation
+	     * would make the leader's db_private_free at merge time free a
+	     * foreign-mspace chunk (mspace_free USAGE_ERROR abort). */
 	    shared_info.worker_count = task_cnt;
 	    shared_info.worker_part_lists =
 		    (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
@@ -109,6 +114,19 @@ namespace parallel_query
 		goto error_exit;
 	      }
 	    memset (shared_info.worker_part_lists, 0, task_cnt * sizeof (QFILE_LIST_ID **));
+
+	    for (UINT32 wi = 0; wi < task_cnt; wi++)
+	      {
+		shared_info.worker_part_lists[wi] =
+			(QFILE_LIST_ID **) db_private_alloc (&thread_ref,
+							     manager->context_cnt * sizeof (QFILE_LIST_ID *));
+		if (shared_info.worker_part_lists[wi] == nullptr)
+		  {
+		    error = er_errid ();
+		    goto error_exit;
+		  }
+		memset (shared_info.worker_part_lists[wi], 0, manager->context_cnt * sizeof (QFILE_LIST_ID *));
+	      }
 	  }
 	else
 	  {
@@ -223,7 +241,8 @@ namespace parallel_query
 	      }
 	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
 
-	    /* redesign #78 per-worker OUTPUT tape (ADR0004): same as outer. */
+	    /* redesign #78 per-worker OUTPUT tape (ADR0004): same as outer,
+	     * including the #109 leader-side slot array allocation. */
 	    shared_info.worker_count = task_cnt;
 	    shared_info.worker_part_lists =
 		    (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
@@ -233,6 +252,19 @@ namespace parallel_query
 		goto error_exit;
 	      }
 	    memset (shared_info.worker_part_lists, 0, task_cnt * sizeof (QFILE_LIST_ID **));
+
+	    for (UINT32 wi = 0; wi < task_cnt; wi++)
+	      {
+		shared_info.worker_part_lists[wi] =
+			(QFILE_LIST_ID **) db_private_alloc (&thread_ref,
+							     manager->context_cnt * sizeof (QFILE_LIST_ID *));
+		if (shared_info.worker_part_lists[wi] == nullptr)
+		  {
+		    error = er_errid ();
+		    goto error_exit;
+		  }
+		memset (shared_info.worker_part_lists[wi], 0, manager->context_cnt * sizeof (QFILE_LIST_ID *));
+	      }
 	  }
 	else
 	  {
