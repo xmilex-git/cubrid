@@ -1898,7 +1898,8 @@ hjoin_merge_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 	bool use_connect =
 	  QFILE_LIST_ID_TFILE_VFID(single_context->list_id) != NULL && QFILE_LIST_ID_TFILE_VFID(single_context->list_id)->membuf == NULL
 	  && QFILE_LIST_ID_TFILE_VFID(context->list_id) != NULL && QFILE_LIST_ID_TFILE_VFID(context->list_id)->membuf == NULL
-	  && !qmgr_list_has_raw_fd_segments (single_context->list_id) && !qmgr_list_has_raw_fd_segments (context->list_id);
+	  && !qmgr_list_has_raw_fd_segments (single_context->list_id) && !qmgr_list_has_raw_fd_segments (context->list_id)
+	  && !qfile_list_has_new_backing (single_context->list_id) && !qfile_list_has_new_backing (context->list_id);
 
 #if !defined (NDEBUG)
 	QFILE_LIST_ID *single_list_id = single_context->list_id;
