@@ -3772,12 +3772,12 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 static QMGR_TEMP_FILE *
 qmgr_allocate_tempfile_with_buffer (int num_buffer_pages)
 {
-  size_t size;
+  size_t size, header_size;
   QMGR_TEMP_FILE *tempfile_p;
 
-  size = DB_ALIGN (sizeof (QMGR_TEMP_FILE), MAX_ALIGNMENT);
-  size += DB_ALIGN (sizeof (PAGE_PTR) * num_buffer_pages, MAX_ALIGNMENT);
-  size += DB_PAGESIZE * num_buffer_pages;
+  header_size = DB_ALIGN (sizeof (QMGR_TEMP_FILE), MAX_ALIGNMENT);
+  header_size += DB_ALIGN (sizeof (PAGE_PTR) * num_buffer_pages, MAX_ALIGNMENT);
+  size = header_size + DB_PAGESIZE * num_buffer_pages;
 
   tempfile_p = (QMGR_TEMP_FILE *) malloc (size);
   if (tempfile_p == NULL)
@@ -3785,7 +3785,13 @@ qmgr_allocate_tempfile_with_buffer (int num_buffer_pages)
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, size);
       return NULL;
     }
-  memset (tempfile_p, 0x00, size);
+  /* Zero only the header (struct + membuf pointer array), not the page
+   * payload: a full memset would commit work_mem of RSS up front, pure
+   * waste for a list that is immediately converted to NEW backing (#91).
+   * Page content needs no zeroing -- the pool-reuse path already hands
+   * out dirty pages, and every page header is written before it is read
+   * (qmgr_put_page_header). */
+  memset (tempfile_p, 0x00, header_size);
   tempfile_p->membuf_capacity_pages = num_buffer_pages;
   tempfile_p->wm_reserved_shard = -1;
 
