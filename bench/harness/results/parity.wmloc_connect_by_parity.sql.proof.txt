@@ -1,0 +1,8 @@
+===== serial =====
+cubrid_rel=CUBRID 11.5.0 (11.5.0.2437-0f85fd6) (64bit debug build for Linux) (Jul  2 2026 20:09:31)
+data_buffer_size=512.0M (512.0M)
+parallelism=1 (4)
+max_parallel_workers=1 (100)
+CUBRID_WM_SCAN_NEW=1
+CUBRID_WM_SORT_NEW=1
+CUBRID_WM_HASHJOIN_NEW=1
