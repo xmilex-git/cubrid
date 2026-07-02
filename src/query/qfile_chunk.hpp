@@ -33,10 +33,10 @@
  * list) and the backing is a private flat file, so a chunk is pure offset
  * arithmetic.  The membuf prefix is simply the low offsets, range-distributed
  * like any other pages (RAM is immutable and shared-address-space, so any
- * reader reads it directly via tape::page_at).
+ * reader reads it directly via tape::read_page_into).
  *
  * A claimed range is (tape_idx, start_page, page_count).  The reader resolves
- * each page via tape::page_at and reassembles an overflow tuple whose first
+ * each page via tape::read_page_into and reassembles an overflow tuple whose first
  * page it owns; continuation pages are skipped by every reader that does not
  * own the tuple's first page.
  *

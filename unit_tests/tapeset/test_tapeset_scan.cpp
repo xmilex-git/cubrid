@@ -710,7 +710,7 @@ namespace
 	return 2;
       }
     /* every tuple-bearing page (5) plus skipped empty/zero-tuple pages were
-     * fetched only via tape::page_at -- at least one per tuple-bearing page. */
+     * fetched only via tape::read_page_into -- at least one per tuple-bearing page. */
     if (m.page_reads < 5)
       {
 	return 3;
@@ -1892,6 +1892,119 @@ namespace
     tapeset_teardown (&src);	/* src's now-empty Tapeset container is still owned; freed once here */
     return 0;
   }
+
+  /* G22 (#87): two tapeset_scans interleaved over the SAME spilled Tapeset
+   * must each see their own exact tuple sequence.  Before per-scan scratch,
+   * the file-page read buffer was tape-owned (one per buffile_tape): scan B's
+   * page fetch overwrote the page scan A was positioned ON, so A's next
+   * forward read tuple count/length from B's page -- silent wrong ids.  Spill
+   * is mandatory for the repro: RAM prefix pages are stable per-page
+   * allocations and never clobber (a prefix-only fixture is a tautology).
+   * A is staggered 3 tuples ahead so the two scans sit on DIFFERENT file
+   * pages while alternating. */
+  int
+  run_interleaved_dual_scan ()
+  {
+    const std::vector<std::vector<int> > pages = {
+      { 0, 1, 2 }, { 10, 11 }, { 20, 21, 22, 23 }, { 30 }, { 40, 41 }, { 50, 51, 52 }
+    };
+    std::vector<int> expected;
+    for (const std::vector<int> &p : pages)
+      {
+	for (int id : p)
+	  {
+	    expected.push_back (id);
+	  }
+      }
+
+    /* budget 1 -> page 0 stays in the RAM prefix, pages 1..5 spill to disk. */
+    writer_result wr = build_writer_tape (/*budget*/ 1, pages);
+    if (wr.tape == NULL)
+      {
+	return 1;
+      }
+    if (!wr.spilled || wr.file_pages != 5)
+      {
+	delete wr.tape;
+	return 2;
+      }
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    ts.append_tape (wr.tape);
+
+    qfile::tapeset_scan a (&ts);
+    qfile::tapeset_scan b (&ts);
+    QFILE_TUPLE_RECORD ra = { NULL, 0 };
+    QFILE_TUPLE_RECORD rb = { NULL, 0 };
+    std::vector<int> got_a;
+    std::vector<int> got_b;
+
+    /* stagger A ahead of B so they hold different file pages */
+    for (int i = 0; i < 3; i++)
+      {
+	if (a.forward (NULL, &ra, PEEK) != S_SUCCESS)
+	  {
+	    return 3;
+	  }
+	got_a.push_back (tuple_id (ra.tpl));
+      }
+
+    /* strict alternation until both streams end */
+    bool a_end = false;
+    bool b_end = false;
+    while (!a_end || !b_end)
+      {
+	if (!b_end)
+	  {
+	    SCAN_CODE c = b.forward (NULL, &rb, PEEK);
+	    if (c == S_SUCCESS)
+	      {
+		got_b.push_back (tuple_id (rb.tpl));
+	      }
+	    else if (c == S_END)
+	      {
+		b_end = true;
+	      }
+	    else
+	      {
+		return 4;
+	      }
+	  }
+	if (!a_end)
+	  {
+	    SCAN_CODE c = a.forward (NULL, &ra, PEEK);
+	    if (c == S_SUCCESS)
+	      {
+		got_a.push_back (tuple_id (ra.tpl));
+	      }
+	    else if (c == S_END)
+	      {
+		a_end = true;
+	      }
+	    else
+	      {
+		return 5;
+	      }
+	  }
+      }
+    a.close (NULL);
+    b.close (NULL);
+
+    if (got_a != expected)
+      {
+	return 6;
+      }
+    if (got_b != expected)
+      {
+	return 7;
+      }
+    if (a.metrics ().pgbuf_fixes != 0 || b.metrics ().pgbuf_fixes != 0)
+      {
+	return 8;
+      }
+    return 0;
+  }
 }
 
 int
@@ -1919,6 +2032,7 @@ main (int, char **)
     { "G19 PEEK x overflow: no realloc-on-borrowed-pointer, no caller alloc (#83)", run_overflow_peek },
     { "G20 pgbuf_fixes anti-tautology: reacts to an injected fix (#93)", run_pgbuf_fixes_anti_tautology },
     { "G21 qfile_tapeset_import: move-and-null transfer, src reuse prohibited (#90)", run_tapeset_import },
+    { "G22 interleaved dual scan on one spilled Tapeset (per-scan scratch, #87)", run_interleaved_dual_scan },
   };
 
   bool all_passed = true;

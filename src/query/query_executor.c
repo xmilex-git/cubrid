@@ -21616,11 +21616,25 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
 
   estimated_pages = qfile_get_estimated_pages_for_sorting (list_id, &analytic_state.key_info);
 
-  /* number of sort keys is always less than list file column count, as sort columns are included.
-   * However, when the input list is NEW-backed (Tapeset), page-level back-references (VPID) are
-   * invalid — the pages are not in qmgr's temp file registry.  Force use_original=0 so the sort
-   * copies the full tuple into the sort record instead of storing a VPID back-pointer (#80). */
-  analytic_state.key_info.use_original = qfile_list_has_new_backing (list_id) ? 0 : 1;
+  /* number of sort keys is always less than list file column count, as sort columns are included */
+  analytic_state.key_info.use_original = 1;
+  /* When the input list is NEW-backed (Tapeset), page-level back-references (VPID) are invalid —
+   * the pages are not in qmgr's temp file registry.  Carry the non-key columns inside the sort
+   * records instead of just dropping use_original — a plain A_sort_key materializes only the sort
+   * key columns and qexec_analytic_put_next would then read past a truncated tuple (#100 class
+   * bug; #103). */
+  if (analytic_state.key_info.use_original == 1 && qfile_list_has_new_backing (list_id))
+    {
+      bool all_columns_carried = false;
+
+      if (qfile_sort_key_info_extend_all_columns (&analytic_state.key_info, &list_id->type_list,
+						  &all_columns_carried) != NO_ERROR)
+	{
+	  GOTO_EXIT_ON_ERROR;
+	}
+      /* !all_columns_carried leaves use_original set: the sort then fails loudly on the
+       * unresolvable back-reference instead of corrupting data. */
+    }
   analytic_state.cmp_fn = (analytic_state.key_info.use_original
 			    ? &qfile_compare_partial_sort_record : &qfile_compare_all_sort_record);
 
@@ -22230,64 +22244,79 @@ qexec_analytic_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 	  goto exit_on_error;
 	}
 
-      /*
-       * Retrieve the original tuple.  This will be the case if the
-       * original tuple had more fields than we were sorting on.
-       */
-      vpid.pageid = key->s.original.pageid;
-      vpid.volid = key->s.original.volid;
-
-      if (analytic_state->curr_sort_page.vpid.pageid != vpid.pageid
-	  || analytic_state->curr_sort_page.vpid.volid != vpid.volid)
+      if (analytic_state->key_info.use_original)
 	{
-	  if (analytic_state->curr_sort_page.page_p != NULL)
+	  /*
+	   * Retrieve the original tuple.  This will be the case if the
+	   * original tuple had more fields than we were sorting on.
+	   */
+	  vpid.pageid = key->s.original.pageid;
+	  vpid.volid = key->s.original.volid;
+
+	  if (analytic_state->curr_sort_page.vpid.pageid != vpid.pageid
+	      || analytic_state->curr_sort_page.vpid.volid != vpid.volid)
 	    {
-	      qmgr_free_old_page_and_init (thread_p, analytic_state->curr_sort_page.page_p, QFILE_LIST_ID_TFILE_VFID(list_idp));
+	      if (analytic_state->curr_sort_page.page_p != NULL)
+		{
+		  qmgr_free_old_page_and_init (thread_p, analytic_state->curr_sort_page.page_p, QFILE_LIST_ID_TFILE_VFID(list_idp));
+		}
+
+	      analytic_state->curr_sort_page.page_p = qmgr_get_old_page (thread_p, &vpid, QFILE_LIST_ID_TFILE_VFID(list_idp));
+	      if (analytic_state->curr_sort_page.page_p == NULL)
+		{
+		  goto exit_on_error;
+		}
+	      else
+		{
+		  analytic_state->curr_sort_page.vpid = vpid;
+		}
 	    }
 
-	  analytic_state->curr_sort_page.page_p = qmgr_get_old_page (thread_p, &vpid, QFILE_LIST_ID_TFILE_VFID(list_idp));
-	  if (analytic_state->curr_sort_page.page_p == NULL)
+	  QFILE_GET_OVERFLOW_VPID (&vpid, analytic_state->curr_sort_page.page_p);
+	  data = analytic_state->curr_sort_page.page_p + key->s.original.offset;
+	  if (vpid.pageid != NULL_PAGEID)
 	    {
-	      goto exit_on_error;
+	      /*
+	       * This sucks; why do we need two different structures to
+	       * accomplish exactly the same goal?
+	       */
+	      dummy.size = analytic_state->analytic_rec.area_size;
+	      dummy.tpl = analytic_state->analytic_rec.data;
+	      status = qfile_get_tuple (thread_p, analytic_state->curr_sort_page.page_p, data, &dummy, list_idp);
+
+	      if (dummy.tpl != analytic_state->analytic_rec.data)
+		{
+		  /*
+		   * DON'T FREE THE BUFFER!  qfile_get_tuple() already did
+		   * that, and what you have here in gby_rec is a dangling
+		   * pointer.
+		   */
+		  analytic_state->analytic_rec.area_size = dummy.size;
+		  analytic_state->analytic_rec.data = dummy.tpl;
+		}
+	      if (status != NO_ERROR)
+		{
+		  goto exit_on_error;
+		}
+
+	      data = analytic_state->analytic_rec.data;
 	    }
 	  else
 	    {
-	      analytic_state->curr_sort_page.vpid = vpid;
+	      peek = PEEK;		/* avoid unnecessary COPY */
 	    }
-	}
-
-      QFILE_GET_OVERFLOW_VPID (&vpid, analytic_state->curr_sort_page.page_p);
-      data = analytic_state->curr_sort_page.page_p + key->s.original.offset;
-      if (vpid.pageid != NULL_PAGEID)
-	{
-	  /*
-	   * This sucks; why do we need two different structures to
-	   * accomplish exactly the same goal?
-	   */
-	  dummy.size = analytic_state->analytic_rec.area_size;
-	  dummy.tpl = analytic_state->analytic_rec.data;
-	  status = qfile_get_tuple (thread_p, analytic_state->curr_sort_page.page_p, data, &dummy, list_idp);
-
-	  if (dummy.tpl != analytic_state->analytic_rec.data)
-	    {
-	      /*
-	       * DON'T FREE THE BUFFER!  qfile_get_tuple() already did
-	       * that, and what you have here in gby_rec is a dangling
-	       * pointer.
-	       */
-	      analytic_state->analytic_rec.area_size = dummy.size;
-	      analytic_state->analytic_rec.data = dummy.tpl;
-	    }
-	  if (status != NO_ERROR)
-	    {
-	      goto exit_on_error;
-	    }
-
-	  data = analytic_state->analytic_rec.data;
 	}
       else
 	{
-	  peek = PEEK;		/* avoid unnecessary COPY */
+	  /* A_sort_key: NEW(Tapeset)-backed input has no valid VPID back-reference (#80, #103).
+	   * qexec_execute_analytic() carried the non-key columns as sort-record payload
+	   * (qfile_sort_key_info_extend_all_columns), so reconstruct the full-width tuple from
+	   * the sort key itself instead of following key->s.original as a page pointer. */
+	  if (qfile_generate_sort_tuple (&analytic_state->key_info, key, &analytic_state->analytic_rec) == NULL)
+	    {
+	      goto exit_on_error;
+	    }
+	  data = analytic_state->analytic_rec.data;
 	}
 
       /*

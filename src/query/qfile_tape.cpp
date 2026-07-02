@@ -30,6 +30,7 @@
 #include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "file_io.h"		/* PEEK */
+#include "temp_page_store.hpp"	/* work_mem accountant: reserve_held / release_held (#91) */
 
 #include <cassert>
 #include <cerrno>		/* ENOSPC/EDQUOT (ensure_buffile os_error mapping) */
@@ -44,6 +45,25 @@
 
 namespace qfile
 {
+  /* ------------------------------------------------------------------ */
+  /* tape (work_mem charge lifetime, #91)                               */
+  /* ------------------------------------------------------------------ */
+
+  tape::~tape ()
+  {
+    for (const std::pair<std::size_t, int> &charge : m_wm_charges)
+      {
+	temp_page_store::release_held (charge.first, charge.second);
+      }
+  }
+
+  void
+  tape::adopt_wm_charges (std::vector<std::pair<std::size_t, int>> &&charges)
+  {
+    assert (m_wm_charges.empty ());
+    m_wm_charges = std::move (charges);
+  }
+
   /* ------------------------------------------------------------------ */
   /* memory_tape                                                        */
   /* ------------------------------------------------------------------ */
@@ -82,26 +102,7 @@ namespace qfile
   }
 
   PAGE_PTR
-  memory_tape::page_at (THREAD_ENTRY *thread_p, int page_offset)
-  {
-    (void) thread_p;
-    if (page_offset < 0 || page_offset >= (int) m_pages.size ())
-      {
-	return NULL;
-      }
-    return (PAGE_PTR) m_pages[page_offset];
-  }
-
-  void
-  memory_tape::release_page (THREAD_ENTRY *thread_p, PAGE_PTR page)
-  {
-    /* RAM-resident: nothing to unfix. */
-    (void) thread_p;
-    (void) page;
-  }
-
-  PAGE_PTR
-  memory_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde)
+  memory_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde) const
   {
     /* All pages are RAM; return them directly (caller scratch unused). */
     (void) thread_p;
@@ -123,15 +124,10 @@ namespace qfile
     , m_owns_prefix (owns_prefix)
     , m_buffile (bf)
     , m_owns_buffile (owns_buffile)
-    , m_readbuf (NULL)
   {
     if (m_owns_prefix)
       {
 	tape_backing_census_prefix_added ((long) m_prefix.size ());
-      }
-    if (m_buffile != NULL)
-      {
-	m_readbuf = (char *) malloc (DB_PAGESIZE);
       }
   }
 
@@ -151,46 +147,10 @@ namespace qfile
 	delete m_buffile;	/* closes + unlinks */
       }
     m_buffile = NULL;
-    free (m_readbuf);
-    m_readbuf = NULL;
   }
 
   PAGE_PTR
-  buffile_tape::page_at (THREAD_ENTRY *thread_p, int page_offset)
-  {
-    const int prefix = (int) m_prefix.size ();
-    if (page_offset < 0 || page_offset >= total_page_count ())
-      {
-	return NULL;
-      }
-    if (page_offset < prefix)
-      {
-	return (PAGE_PTR) m_prefix[page_offset];
-      }
-    if (m_buffile == NULL || m_readbuf == NULL)
-      {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	return NULL;
-      }
-    if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) m_readbuf, &m_read_scratch) != NO_ERROR)
-      {
-	return NULL;
-      }
-    return (PAGE_PTR) m_readbuf;
-  }
-
-  void
-  buffile_tape::release_page (THREAD_ENTRY *thread_p, PAGE_PTR page)
-  {
-    /* RAM prefix: nothing to free.  File page: it lives in the reused scratch
-     * buffer, released implicitly by the next page_at.  No pgbuf unfix -- this
-     * backing never enters a pgbuf BCB. */
-    (void) thread_p;
-    (void) page;
-  }
-
-  PAGE_PTR
-  buffile_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde)
+  buffile_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde) const
   {
     const int prefix = (int) m_prefix.size ();
     if (page_offset < 0 || page_offset >= total_page_count ())
@@ -203,6 +163,9 @@ namespace qfile
       }
     if (m_buffile == NULL || page_dest == NULL)
       {
+	/* a spilled offset with no backing / no caller scratch is a caller bug,
+	 * not a silent S_END (#90) */
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return NULL;
       }
     if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) page_dest, tde) != NO_ERROR)
@@ -232,6 +195,8 @@ namespace qfile
     , m_prefix ()
     , m_buffile (NULL)
     , m_frozen (false)
+    , m_wm_charges ()
+    , m_wm_reserved_pages (0)
   {
   }
 
@@ -243,11 +208,81 @@ namespace qfile
 	free (page);
       }
     m_prefix.clear ();
+    wm_release_all ();
     if (m_buffile != NULL)
       {
 	delete m_buffile;	/* closes + unlinks the partial spill */
 	m_buffile = NULL;
       }
+  }
+
+  /* Prefix pages are charged to the work_mem accountant in batches (one
+   * atomic reservation per WM_PREFIX_RESERVE_BATCH_PAGES pages, not per
+   * page).  A failed reservation is a soft degrade, never a hard OOM: the
+   * prefix budget shrinks to what is already reserved and subsequent pages
+   * spill to the BufFile early (#91). */
+  static const int WM_PREFIX_RESERVE_BATCH_PAGES = 64;
+
+  bool
+  tape_writer::wm_reserve_batch ()
+  {
+    int want = m_prefix_budget - m_wm_reserved_pages;
+    if (want > WM_PREFIX_RESERVE_BATCH_PAGES)
+      {
+	want = WM_PREFIX_RESERVE_BATCH_PAGES;
+      }
+    if (want <= 0)
+      {
+	return false;
+      }
+    const std::size_t bytes = (std::size_t) want * DB_PAGESIZE;
+    int shard = -1;
+    if (!temp_page_store::reserve_held (bytes, &shard))
+      {
+	/* cap reached: shrink the budget to what is reserved so the writer
+	 * spills from here on (degrade once, no per-page retry). */
+	m_prefix_budget = (int) m_prefix.size ();
+	temp_page_store::record_degrade ();
+	return false;
+      }
+    m_wm_charges.emplace_back (bytes, shard);
+    m_wm_reserved_pages += want;
+    return true;
+  }
+
+  void
+  tape_writer::wm_trim_excess ()
+  {
+    /* Give back the unused tail of the last batch so steady-state accounting
+     * is exact (reserved == actual prefix pages). */
+    int excess = m_wm_reserved_pages - (int) m_prefix.size ();
+    if (excess <= 0 || m_wm_charges.empty ())
+      {
+	return;
+      }
+    std::size_t bytes = (std::size_t) excess * DB_PAGESIZE;
+    if (bytes > m_wm_charges.back ().first)
+      {
+	bytes = m_wm_charges.back ().first;	/* excess never spans batches */
+      }
+    temp_page_store::release_held (bytes, m_wm_charges.back ().second);
+    m_wm_charges.back ().first -= bytes;
+    m_wm_reserved_pages = (int) m_prefix.size ();
+    if (m_wm_charges.back ().first == 0)
+      {
+	m_wm_charges.pop_back ();
+      }
+  }
+
+  void
+  tape_writer::wm_release_all ()
+  {
+    for (const std::pair<std::size_t, int> &charge : m_wm_charges)
+      {
+	temp_page_store::release_held (charge.first, charge.second);
+      }
+    m_wm_charges.clear ();
+    m_wm_reserved_pages = 0;
   }
 
   int
@@ -283,7 +318,8 @@ namespace qfile
 	return ER_FAILED;
       }
 
-    if ((int) m_prefix.size () < m_prefix_budget)
+    if ((int) m_prefix.size () < m_prefix_budget
+	&& ((int) m_prefix.size () < m_wm_reserved_pages || wm_reserve_batch ()))
       {
 	char *copy = (char *) malloc (DB_PAGESIZE);
 	if (copy == NULL)
@@ -312,6 +348,8 @@ namespace qfile
 	return NULL;
       }
 
+    wm_trim_excess ();
+
     if (m_buffile == NULL)
       {
 	/* tiny / no spill: an all-RAM Tape, no disk touch. */
@@ -321,6 +359,9 @@ namespace qfile
 	    mt->append_page (page);
 	  }
 	m_prefix.clear ();	/* ownership transferred to the memory_tape */
+	mt->adopt_wm_charges (std::move (m_wm_charges));
+	m_wm_charges.clear ();
+	m_wm_reserved_pages = 0;
 	m_frozen = true;
 	return mt;
       }
@@ -334,6 +375,9 @@ namespace qfile
     m_buffile = NULL;		/* allocation succeeded: ownership is now the Tape's
 				 * (reorder keeps bf owned by the writer if new throws) */
     m_prefix.clear ();
+    bt->adopt_wm_charges (std::move (m_wm_charges));
+    m_wm_charges.clear ();
+    m_wm_reserved_pages = 0;
     m_frozen = true;
     return bt;
   }
@@ -403,7 +447,7 @@ namespace qfile
   /* ------------------------------------------------------------------ */
 
   /* Scan-side pgbuf-bypass gate (issue #93): tapeset_scan/tapeset_reader read
-   * pages only via tape::page_at / tape::read_page_into and must never fix a
+   * pages only via tape::read_page_into and must never fix a
    * pgbuf BCB.  Snapshot-diffing the boot-independent debug counter replaces
    * the old always-zero field with a real measurement. */
   static void
@@ -426,6 +470,7 @@ namespace qfile
     , m_curr_tpl (NULL)
     , m_curr_overflow (false)
     , m_overflow_run_end (-1)
+    , m_readbuf (NULL)
     , m_reasm_raw (NULL)
     , m_reasm (NULL)
     , m_peek_reasm_raw (NULL)
@@ -440,8 +485,10 @@ namespace qfile
 
   tapeset_scan::~tapeset_scan ()
   {
-    /* The held page (if any) is released by close() before destruction; the
-     * destructor has no THREAD_ENTRY to unfix a file-backed page. */
+    /* A held page needs no release call (#87): a file page lives in the
+     * scan-owned m_readbuf freed here, a prefix page is Tape-owned RAM. */
+    free (m_readbuf);
+    m_readbuf = NULL;
     free (m_reasm_raw);
     m_reasm_raw = NULL;
     m_reasm = NULL;
@@ -453,16 +500,28 @@ namespace qfile
   void
   tapeset_scan::release_page (THREAD_ENTRY *thread_p)
   {
-    if (m_page != NULL && m_tapeset != NULL)
-      {
-	tape *tape_p = m_tapeset->get_tape (m_tape_idx);
-	if (tape_p != NULL)
-	  {
-	    tape_p->release_page (thread_p, m_page);
-	  }
-      }
+    /* Per-scan scratch (#87): a held file page lives in the scan-owned
+     * m_readbuf and a prefix page is Tape-owned RAM -- dropping the reference
+     * needs no Tape call, so close() does not depend on the Tapeset (or its
+     * Tapes) being alive (#89). */
+    (void) thread_p;
     m_page = NULL;
     m_curr_tpl = NULL;
+  }
+
+  PAGE_PTR
+  tapeset_scan::fetch_page (THREAD_ENTRY *thread_p, tape *tape_p, int page_offset)
+  {
+    if (m_readbuf == NULL && page_offset >= tape_p->prefix_page_count ())
+      {
+	m_readbuf = (char *) malloc (DB_PAGESIZE);
+	if (m_readbuf == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+	    return NULL;
+	  }
+      }
+    return tape_p->read_page_into (thread_p, page_offset, m_readbuf, &m_read_scratch);
   }
 
   void
@@ -671,7 +730,7 @@ namespace qfile
 	int npages = tape_p->total_page_count ();
 	for (; page_offset < npages; page_offset++)
 	  {
-	    PAGE_PTR page = tape_p->page_at (thread_p, page_offset);
+	    PAGE_PTR page = fetch_page (thread_p, tape_p, page_offset);
 	    if (page == NULL)
 	      {
 		return S_ERROR;
@@ -691,8 +750,7 @@ namespace qfile
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
 	    /* zero-tuple page or overflow continuation (start already consumed in
-	     * sequential R1) -- skip. */
-	    tape_p->release_page (thread_p, page);
+	     * sequential R1) -- skip; nothing to release (scan-owned scratch). */
 	  }
       }
 
@@ -759,7 +817,7 @@ namespace qfile
 	int page_offset = (ti == start_tape) ? start_page : tape_p->total_page_count () - 1;
 	for (; page_offset >= 0; page_offset--)
 	  {
-	    PAGE_PTR page = tape_p->page_at (thread_p, page_offset);
+	    PAGE_PTR page = fetch_page (thread_p, tape_p, page_offset);
 	    if (page == NULL)
 	      {
 		return S_ERROR;
@@ -778,8 +836,7 @@ namespace qfile
 		 * reposition to its START page and reassemble the whole run as one
 		 * tuple (ADR 0006).  The next backward step then skips to start-1. */
 		const int first = qfile_overflow_first_page (page);
-		tape_p->release_page (thread_p, page);
-		PAGE_PTR start_pg = tape_p->page_at (thread_p, first);
+		PAGE_PTR start_pg = fetch_page (thread_p, tape_p, first);
 		if (start_pg == NULL)
 		  {
 		    return S_ERROR;
@@ -789,7 +846,6 @@ namespace qfile
 		set_on (ti, first, start_pg, QFILE_PAGE_HEADER_SIZE, 0);
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
-	    tape_p->release_page (thread_p, page);
 	  }
       }
 
@@ -827,7 +883,7 @@ namespace qfile
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
 	    return S_ERROR;
 	  }
-	PAGE_PTR page = tape_p->page_at (thread_p, tuple_position_p->tape_page_offset);
+	PAGE_PTR page = fetch_page (thread_p, tape_p, tuple_position_p->tape_page_offset);
 	if (page == NULL)
 	  {
 	    return S_ERROR;
