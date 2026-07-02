@@ -1990,9 +1990,23 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
   assert (outer_list_id != NULL);
   assert (inner_list_id != NULL);
 
+  /* #84: mirror hjoin_try_parallel_probe's OLD-input guard.  The OLD
+   * sector_page_iterator has a confirmed row-loss bug on derived-list
+   * inputs (#78 evidence (k); bug2 149510 vs 200360).  If either side of
+   * the split lacks NEW (Tapeset) backing (e.g. worker pool exhaustion
+   * forced a serial OLD-backed scan upstream) or the HASHJOIN_NEW gate is
+   * off, force serial partitioning (HASHJOIN_STATUS_PARTITION) rather than
+   * letting build_partitions() reach the buggy OLD reader in parallel. */
+  if (!qfile_list_has_new_backing (outer_list_id) || !qfile_list_has_new_backing (inner_list_id)
+      || !qfile_hashjoin_new_backing_enabled ())
+    {
+      manager->num_parallel_threads = 0;
+      assert (manager->px_worker_manager == NULL);
+      return HASHJOIN_STATUS_PARTITION;
+    }
+
   /* redesign #78 2A-3: the parallel partition split now reads NEW (Tapeset) input
-   * via chunk_distributor + per-worker tapeset_reader (mirroring the probe path).
-   * The OLD sector reader path is preserved for OLD-backed input. */
+   * via chunk_distributor + per-worker tapeset_reader (mirroring the probe path). */
 
   /* immutable */
   static const size_t stats_size = perfmon_get_number_of_statistic_values () * sizeof (UINT64);

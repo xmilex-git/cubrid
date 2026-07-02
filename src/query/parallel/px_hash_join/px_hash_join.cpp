@@ -85,7 +85,10 @@ namespace parallel_query
 
 	if (qfile_list_has_new_backing (outer_list_id))
 	  {
-	    /* NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
+	    /* #84: reached only when both split inputs are NEW-backed AND the
+	     * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
+	     * HASHJOIN_STATUS_PARTITION otherwise), mirroring the probe path.
+	     * NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
 	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (outer_list_id);
 	    if (shared_info.new_tapeset == nullptr)
 	      {
@@ -203,7 +206,10 @@ namespace parallel_query
 
 	if (qfile_list_has_new_backing (inner_list_id))
 	  {
-	    /* NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
+	    /* #84: reached only when both split inputs are NEW-backed AND the
+	     * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
+	     * HASHJOIN_STATUS_PARTITION otherwise), mirroring the probe path.
+	     * NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
 	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (inner_list_id);
 	    if (shared_info.new_tapeset == nullptr)
 	      {
