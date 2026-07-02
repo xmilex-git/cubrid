@@ -5087,8 +5087,11 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
 /*
  * qfile_sort_new_backing_enabled () - is SORT output migrated to the NEW
  *   (Tapeset) backing?  Migration toggle (redesign #78/#80, 2A-1b).
- *   Default ON — a default server takes the NEW Tapeset sort path.
- *   Set CUBRID_WM_SORT_NEW=0 to force OLD behavior for diagnosis.
+ *   Default OFF (rollback, #82) — top-level SORT/DISTINCT/GROUP BY output
+ *   sent straight to the client showed as 0 rows fetched despite a correct
+ *   server-side row count (client fetch is VPID-only; a NEW list's
+ *   first_vpid stays NULL, so the cursor hits DB_CURSOR_END immediately).
+ *   Opt in via CUBRID_WM_SORT_NEW=1 for diagnosis only.
  */
 bool
 qfile_sort_new_backing_enabled (void)
@@ -5097,7 +5100,7 @@ qfile_sort_new_backing_enabled (void)
   if (cached < 0)
     {
       const char *env = getenv ("CUBRID_WM_SORT_NEW");
-      cached = (env != NULL && env[0] == '0') ? 0 : 1;
+      cached = (env != NULL && env[0] == '1') ? 1 : 0;
     }
   return cached != 0;
 }
@@ -5105,8 +5108,9 @@ qfile_sort_new_backing_enabled (void)
 /*
  * qfile_scan_new_backing_enabled () - is parallel-scan per-worker output
  *   migrated to the NEW (Tapeset) backing?  Migration toggle (redesign #78/#80,
- *   2A-2).  Default ON — a default server takes the NEW per-worker Tapeset
- *   scan path.  Set CUBRID_WM_SCAN_NEW=0 to force OLD behavior for diagnosis.
+ *   2A-2).  Default OFF (rollback, #82) — see qfile_sort_new_backing_enabled()
+ *   for the confirmed top-level client-fetch 0-row regression.  Opt in via
+ *   CUBRID_WM_SCAN_NEW=1 for diagnosis only.
  */
 bool
 qfile_scan_new_backing_enabled (void)
@@ -5115,7 +5119,7 @@ qfile_scan_new_backing_enabled (void)
   if (cached < 0)
     {
       const char *env = getenv ("CUBRID_WM_SCAN_NEW");
-      cached = (env != NULL && env[0] == '0') ? 0 : 1;
+      cached = (env != NULL && env[0] == '1') ? 1 : 0;
     }
   return cached != 0;
 }
@@ -5123,9 +5127,9 @@ qfile_scan_new_backing_enabled (void)
 /*
  * qfile_hashjoin_new_backing_enabled () - is parallel HASH JOIN allowed to read
  *   a NEW (Tapeset) input via chunk_distributor/tapeset_reader?  Migration
- *   toggle (redesign #78/#80, 2A-3).  Default ON — a default server uses the
- *   NEW chunk_distributor path for parallel PHJ probe/split.
- *   Set CUBRID_WM_HASHJOIN_NEW=0 to force OLD behavior for diagnosis.
+ *   toggle (redesign #78/#80, 2A-3).  Default OFF (rollback, #82) — see
+ *   qfile_sort_new_backing_enabled() for the confirmed top-level client-fetch
+ *   0-row regression.  Opt in via CUBRID_WM_HASHJOIN_NEW=1 for diagnosis only.
  */
 bool
 qfile_hashjoin_new_backing_enabled (void)
@@ -5134,7 +5138,7 @@ qfile_hashjoin_new_backing_enabled (void)
   if (cached < 0)
     {
       const char *env = getenv ("CUBRID_WM_HASHJOIN_NEW");
-      cached = (env != NULL && env[0] == '0') ? 0 : 1;
+      cached = (env != NULL && env[0] == '1') ? 1 : 0;
     }
   return cached != 0;
 }
