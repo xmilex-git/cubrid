@@ -5614,7 +5614,10 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       /* sort and aggregate partial results */
       if (sort_listfile (thread_p, NULL_VOLID, estimated_pages, &qexec_hash_gby_get_next, &gbstate,
 			 &qexec_hash_gby_put_next, &gbstate, cmp_fn, &gbstate.agg_hash_context->sort_key, SORT_DUP,
-			 NO_SORT_LIMIT, QFILE_LIST_ID_TFILE_VFID(gbstate.output_file)->tde_encrypted, SORT_GROUP_BY) != NO_ERROR)
+			 NO_SORT_LIMIT,
+			 (QFILE_LIST_ID_TFILE_VFID (gbstate.output_file) != NULL
+			  ? QFILE_LIST_ID_TFILE_VFID (gbstate.output_file)->tde_encrypted : false),
+			 SORT_GROUP_BY) != NO_ERROR)
 	{
 	  GOTO_EXIT_ON_ERROR;
 	}
@@ -5675,6 +5678,11 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
    * Now load up the sort module and set it off...
    */
   gbstate.key_info.use_original = (gbstate.key_info.nkeys != list_id->type_list.type_cnt);
+  /* When the input list is NEW-backed, VPID back-references are invalid (#80). */
+  if (qfile_list_has_new_backing (list_id))
+    {
+      gbstate.key_info.use_original = 0;
+    }
   gbstate.cmp_fn =
     (gbstate.key_info.use_original == 1 ? &qfile_compare_partial_sort_record : &qfile_compare_all_sort_record);
 
@@ -5704,7 +5712,9 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 
   if (sort_listfile (thread_p, NULL_VOLID, estimated_pages, &qexec_gby_get_next, &gbstate, &qexec_gby_put_next,
 		     &gbstate, gbstate.cmp_fn, &gbstate.key_info, SORT_DUP, NO_SORT_LIMIT,
-		     QFILE_LIST_ID_TFILE_VFID(gbstate.output_file)->tde_encrypted, SORT_GROUP_BY, &gby_px) != NO_ERROR)
+		     (QFILE_LIST_ID_TFILE_VFID (gbstate.output_file) != NULL
+		      ? QFILE_LIST_ID_TFILE_VFID (gbstate.output_file)->tde_encrypted : false),
+		     SORT_GROUP_BY, &gby_px) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -21595,9 +21605,13 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
 
   estimated_pages = qfile_get_estimated_pages_for_sorting (list_id, &analytic_state.key_info);
 
-  /* number of sort keys is always less than list file column count, as sort columns are included */
-  analytic_state.key_info.use_original = 1;
-  analytic_state.cmp_fn = &qfile_compare_partial_sort_record;
+  /* number of sort keys is always less than list file column count, as sort columns are included.
+   * However, when the input list is NEW-backed (Tapeset), page-level back-references (VPID) are
+   * invalid — the pages are not in qmgr's temp file registry.  Force use_original=0 so the sort
+   * copies the full tuple into the sort record instead of storing a VPID back-pointer (#80). */
+  analytic_state.key_info.use_original = qfile_list_has_new_backing (list_id) ? 0 : 1;
+  analytic_state.cmp_fn = (analytic_state.key_info.use_original
+			    ? &qfile_compare_partial_sort_record : &qfile_compare_all_sort_record);
 
   SORT_LISTFILE_PX_ARG anl_px;
   anl_px.key_info = &analytic_state.key_info;
@@ -21608,7 +21622,9 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
 
   if (sort_listfile (thread_p, NULL_VOLID, estimated_pages, &qexec_analytic_get_next, &analytic_state,
 		     &qexec_analytic_put_next, &analytic_state, analytic_state.cmp_fn, &analytic_state.key_info,
-		     SORT_DUP, NO_SORT_LIMIT, QFILE_LIST_ID_TFILE_VFID(analytic_state.output_file)->tde_encrypted,
+		     SORT_DUP, NO_SORT_LIMIT,
+		     (QFILE_LIST_ID_TFILE_VFID (analytic_state.output_file) != NULL
+		      ? QFILE_LIST_ID_TFILE_VFID (analytic_state.output_file)->tde_encrypted : false),
 		     SORT_ANALYTIC, &anl_px) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;

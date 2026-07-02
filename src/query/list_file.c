@@ -5086,10 +5086,9 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
 
 /*
  * qfile_sort_new_backing_enabled () - is SORT output migrated to the NEW
- *   (Tapeset) backing?  Migration toggle (redesign #78, 2A-1b): opt-in via
- *   CUBRID_WM_SORT_NEW while only the serial path is wired (the parallel
- *   per-worker import lands next).  Default OFF keeps OLD behavior, so a
- *   default server takes the unchanged parallel sort path with no regression.
+ *   (Tapeset) backing?  Migration toggle (redesign #78/#80, 2A-1b).
+ *   Default ON — a default server takes the NEW Tapeset sort path.
+ *   Set CUBRID_WM_SORT_NEW=0 to force OLD behavior for diagnosis.
  */
 bool
 qfile_sort_new_backing_enabled (void)
@@ -5097,18 +5096,17 @@ qfile_sort_new_backing_enabled (void)
   static int cached = -1;
   if (cached < 0)
     {
-      cached = (getenv ("CUBRID_WM_SORT_NEW") != NULL) ? 1 : 0;
+      const char *env = getenv ("CUBRID_WM_SORT_NEW");
+      cached = (env != NULL && env[0] == '0') ? 0 : 1;
     }
   return cached != 0;
 }
 
 /*
  * qfile_scan_new_backing_enabled () - is parallel-scan per-worker output
- *   migrated to the NEW (Tapeset) backing?  Migration toggle (redesign #78,
- *   2A-2): opt-in via CUBRID_WM_SCAN_NEW.  Default OFF keeps the OLD raw-fd
- *   path so a default server takes the unchanged parallel scan with no
- *   regression.  Independent from CUBRID_WM_SORT_NEW so each producer can be
- *   migrated and measured separately.
+ *   migrated to the NEW (Tapeset) backing?  Migration toggle (redesign #78/#80,
+ *   2A-2).  Default ON — a default server takes the NEW per-worker Tapeset
+ *   scan path.  Set CUBRID_WM_SCAN_NEW=0 to force OLD behavior for diagnosis.
  */
 bool
 qfile_scan_new_backing_enabled (void)
@@ -5116,7 +5114,8 @@ qfile_scan_new_backing_enabled (void)
   static int cached = -1;
   if (cached < 0)
     {
-      cached = (getenv ("CUBRID_WM_SCAN_NEW") != NULL) ? 1 : 0;
+      const char *env = getenv ("CUBRID_WM_SCAN_NEW");
+      cached = (env != NULL && env[0] == '0') ? 0 : 1;
     }
   return cached != 0;
 }
@@ -5124,11 +5123,9 @@ qfile_scan_new_backing_enabled (void)
 /*
  * qfile_hashjoin_new_backing_enabled () - is parallel HASH JOIN allowed to read
  *   a NEW (Tapeset) input via chunk_distributor/tapeset_reader?  Migration
- *   toggle (redesign #78, 2A-3): opt-in via CUBRID_WM_HASHJOIN_NEW.  Default OFF
- *   keeps parallel PHJ off the NEW input path; a NEW-backed input then falls
- *   back to single-threaded PHJ (which reads NEW correctly via the unified list
- *   scan) instead of the OLD sector reader that the backing guard rejects.
- *   Independent from CUBRID_WM_SCAN_NEW/SORT_NEW so PHJ can be measured alone.
+ *   toggle (redesign #78/#80, 2A-3).  Default ON — a default server uses the
+ *   NEW chunk_distributor path for parallel PHJ probe/split.
+ *   Set CUBRID_WM_HASHJOIN_NEW=0 to force OLD behavior for diagnosis.
  */
 bool
 qfile_hashjoin_new_backing_enabled (void)
@@ -5136,7 +5133,8 @@ qfile_hashjoin_new_backing_enabled (void)
   static int cached = -1;
   if (cached < 0)
     {
-      cached = (getenv ("CUBRID_WM_HASHJOIN_NEW") != NULL) ? 1 : 0;
+      const char *env = getenv ("CUBRID_WM_HASHJOIN_NEW");
+      cached = (env != NULL && env[0] == '0') ? 0 : 1;
     }
   return cached != 0;
 }
