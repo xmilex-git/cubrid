@@ -11,14 +11,15 @@ set -euo pipefail
 HARNESS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${HARNESS_DIR}/../.." && pwd)
 
-# binary_is_stale <mode: debug|release> [source_file ...]
-# Prints a warning and returns 1 if the installed cub_server predates any of
-# the given source files (defaults to the qfile_buffile/qfile_tape/
-# query_manager sources this issue's counters live in); returns 0 if fresh or
-# if the binary can't be found (nothing to compare against).
-binary_is_stale()
+# binary_is_stale_at <install_root> [source_file ...]
+# Same check as binary_is_stale below, but against an explicit install root
+# instead of one derived from HOME/<mode>/CUBRID-11.5.develop -- used by
+# lib.sh (issue #106) to freshness-check whatever binary the harness
+# resolved ($CUBRID or an opt-in worktree _install), not just the fixed
+# debug/release layout preflight.sh checks.
+binary_is_stale_at()
 {
-  local mode=$1
+  local install_root=$1
   shift
   local sources=("$@")
   if [[ ${#sources[@]} -eq 0 ]]; then
@@ -33,10 +34,9 @@ binary_is_stale()
     )
   fi
 
-  local install_root="${HOME}/${mode}/CUBRID-11.5.develop"
   local server_bin="${install_root}/bin/cub_server"
   if [[ ! -x "${server_bin}" ]]; then
-    echo "lib_build: no ${mode} cub_server installed at ${server_bin} -- nothing to compare" >&2
+    echo "lib_build: no cub_server installed at ${server_bin} -- nothing to compare" >&2
     return 0
   fi
 
@@ -50,8 +50,20 @@ binary_is_stale()
   done
 
   if [[ "${stale}" -ne 0 ]]; then
-    echo "lib_build: rebuild with: WORKSPACE=${REPO_ROOT} just build ${mode}  (cubrid-build skill, run from the tooling repo)" >&2
+    echo "lib_build: rebuild with: WORKSPACE=${REPO_ROOT} just build <mode>  (cubrid-build skill, run from the tooling repo)" >&2
     return 1
   fi
   return 0
+}
+
+# binary_is_stale <mode: debug|release> [source_file ...]
+# Prints a warning and returns 1 if the installed cub_server predates any of
+# the given source files (defaults to the qfile_buffile/qfile_tape/
+# query_manager sources this issue's counters live in); returns 0 if fresh or
+# if the binary can't be found (nothing to compare against).
+binary_is_stale()
+{
+  local mode=$1
+  shift
+  binary_is_stale_at "${HOME}/${mode}/CUBRID-11.5.develop" "$@"
 }

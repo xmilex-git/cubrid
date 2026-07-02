@@ -32,6 +32,7 @@ prove_param()
   local label=$1
   {
     echo "===== ${label} ====="
+    echo "cubrid_rel=${CUBRID_REL:-<unknown>}"
     echo "data_buffer_size=$(paramdump_value data_buffer_size || true)"
     echo "parallelism=$(paramdump_value parallelism || true)"
     echo "max_parallel_workers=$(paramdump_value max_parallel_workers || true)"

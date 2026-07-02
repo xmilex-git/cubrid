@@ -10,6 +10,12 @@ RESULTS_DIR=${RESULTS_DIR:-"${HARNESS_DIR}/results"}
 BASELINES_DIR=${BASELINES_DIR:-"${HARNESS_DIR}/baselines"}
 mkdir -p "${RESULTS_DIR}" "${BASELINES_DIR}"
 
+# issue #106: whether the caller explicitly opted into a worktree build must
+# be captured before the case below fills in a BUILD_NAME-derived default --
+# otherwise every run "explicitly" sets BUILD_WORKTREE and the worktree
+# _install is preferred unconditionally (the #91 stale-binary false FAIL).
+BUILD_WORKTREE_EXPLICIT=${BUILD_WORKTREE+x}
+
 case "${BUILD_NAME:-redesign}" in
   baseline) BUILD_WORKTREE=${BUILD_WORKTREE:-"${HOME}/dev/cubrid-wm-baseline"} ;;
   asbuilt) BUILD_WORKTREE=${BUILD_WORKTREE:-"${HOME}/dev/cubrid-wm-asbuilt"} ;;
@@ -29,12 +35,33 @@ if [[ ! -x "${SERVER_CTL}" ]]; then
 fi
 
 export CUBRID_DATABASES="${DB_PATH}"
-if [[ -x "${BUILD_WORKTREE}/build_x86_64_release/_install/CUBRID/bin/csql" ]]; then
+# issue #106: the active install ($CUBRID, default ~/CUBRID) wins by default.
+# A worktree's build_x86_64_release/_install is only used when the caller
+# explicitly opted in via BUILD_WORKTREE=... -- an unset BUILD_WORKTREE must
+# never silently pick up a stale worktree binary over the just-built active
+# one.
+if [[ -n "${BUILD_WORKTREE_EXPLICIT}" && -x "${BUILD_WORKTREE}/build_x86_64_release/_install/CUBRID/bin/csql" ]]; then
   export CUBRID="${BUILD_WORKTREE}/build_x86_64_release/_install/CUBRID"
 else
   export CUBRID=${CUBRID:-"${HOME}/CUBRID"}
 fi
 export PATH="${CUBRID}/bin:${PATH}"
+
+# issue #106: record which binary this run actually resolved to, and warn
+# (never hard-fail -- #98 is running this harness concurrently elsewhere and
+# must not be broken by a false staleness read) if it looks older than the
+# source tree. CUBRID_REL is exported so callers (e.g. parity.sh's proof)
+# can stamp the exact binary identity they tested against.
+CUBRID_REL=$(cubrid_rel 2>/dev/null | grep -m1 .) || CUBRID_REL="<cubrid_rel unavailable>"
+export CUBRID_REL
+LIB_BUILD_SH="${HARNESS_DIR}/lib_build.sh"
+if [[ -f "${LIB_BUILD_SH}" ]]; then
+  # shellcheck source=lib_build.sh
+  source "${LIB_BUILD_SH}"
+  if declare -f binary_is_stale_at >/dev/null; then
+    binary_is_stale_at "${CUBRID}" >&2 || true
+  fi
+fi
 
 csql_cmd()
 {
