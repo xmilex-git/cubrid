@@ -375,6 +375,8 @@ namespace qfile
       char *m_reasm_raw;	/* reassembly read scratch (file continuation pages) */
       PAGE_PTR m_reasm;
       tde_read_scratch m_reasm_tde;
+      char *m_peek_reasm_raw;	/* scan-owned overflow-PEEK result buffer (#83); freed here, never by caller */
+      int m_peek_reasm_cap;
       tapeset_scan_metrics m_metrics;
 
       tapeset_scan (const tapeset_scan &) = delete;
@@ -408,7 +410,7 @@ namespace qfile
     private:
       SCAN_CODE emit_in_page (THREAD_ENTRY *thread_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek);
       SCAN_CODE reassemble (THREAD_ENTRY *thread_p, tape *tp, int first_page, int run_end, int tuple_len,
-			    QFILE_TUPLE_RECORD *tuple_record_p);
+			    QFILE_TUPLE_RECORD *tuple_record_p, int peek);
 
       tapeset *m_tapeset;	/* borrowed */
       chunk_distributor *m_dist;	/* borrowed (shared across readers) */
@@ -427,6 +429,9 @@ namespace qfile
       char *m_page_raw;		/* DB_PAGESIZE scratch for file pages */
       PAGE_PTR m_page_buf;
       tde_read_scratch m_tde;
+
+      char *m_peek_reasm_raw;	/* reader-owned overflow-PEEK result buffer (#83); freed here, never by caller */
+      int m_peek_reasm_cap;
 
       tapeset_scan_metrics m_metrics;
 

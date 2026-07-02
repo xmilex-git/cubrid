@@ -1510,6 +1510,140 @@ namespace
     return rc;
   }
 
+  /* G19: PEEK x overflow -- a normal-tuple PEEK immediately followed by an
+   * overflow-tuple PEEK must not db_private_realloc() the borrowed page
+   * pointer a PEEK leaves in tuple_record_p (CBRD #83).  The caller record
+   * starts {NULL,0} exactly like the real scan_id_p->tplrec convention;
+   * PEEK must never grow it (tr.size stays 0 throughout) and the caller
+   * never frees tr.tpl.  Run under ASAN so the "freed once, by scan/reader
+   * close, never by caller" contract is enforced by LeakSanitizer too. */
+  int
+  run_overflow_peek ()
+  {
+    const int big_id = 99;
+    const int tuple_len = 2 * QFILE_MAX_TUPLE_SIZE_IN_PAGE + 100;	/* spans 3 pages */
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    qfile::memory_tape *t = new qfile::memory_tape (true);
+    t->append_page (make_db_page ({ 0, 1 }));
+    std::vector<char *> run = make_overflow_run (1, tuple_len, big_id);
+    for (char *pg : run)
+      {
+	t->append_page (pg);
+      }
+    t->append_page (make_db_page ({ 2, 3 }));
+    ts.append_tape (t);
+
+    int rc = 0;
+#define BIG_OK(tpl) (QFILE_GET_TUPLE_LENGTH (tpl) == tuple_len && tuple_id (tpl) == big_id \
+		     && (tpl)[16] == overflow_byte (big_id, 16) \
+		     && (tpl)[tuple_len - 1] == overflow_byte (big_id, tuple_len - 1))
+
+    /* R1 forward, PEEK throughout: normal PEEK(0), PEEK(1), then overflow PEEK. */
+    {
+      qfile::tapeset_scan scan (&ts);
+      QFILE_TUPLE_RECORD tr = { NULL, 0 };
+      std::vector<int> ids;
+      bool big_ok = false;
+      SCAN_CODE code;
+      while ((code = scan.forward (NULL, &tr, PEEK)) == S_SUCCESS)
+	{
+	  if (tr.size != 0)
+	    {
+	      rc = 1;	/* PEEK must never allocate into the caller's record */
+	      break;
+	    }
+	  ids.push_back (tuple_id (tr.tpl));
+	  if (tuple_id (tr.tpl) == big_id)
+	    {
+	      big_ok = BIG_OK (tr.tpl);
+	    }
+	}
+      scan.close (NULL);
+      /* tr.tpl is a borrowed pointer (page memory or the scan-owned overflow
+       * reassembly buffer) -- per the PEEK contract the caller does not free
+       * it; scan.close() above already released the scan-owned buffer. */
+      std::vector<int> exp = { 0, 1, big_id, 2, 3 };
+      if (rc == 0 && (code != S_END || ids != exp || !big_ok))
+	{
+	  rc = 2;
+	}
+    }
+
+    /* R2: reader-side PEEK; chunk_pages=2 crosses the overflow run so the
+     * first-page-owner reader reassembles via tapeset_reader::reassemble(). */
+    if (rc == 0)
+      {
+	const int N = 4;
+	qfile::chunk_distributor d (&ts, N, 2);
+	std::vector<std::vector<int> > got (N);
+	std::vector<int> big_count (N, 0);
+	std::vector<int> ok (N, 1);
+	std::vector<std::thread> th;
+	for (int r = 0; r < N; r++)
+	  {
+	    th.emplace_back ([&, r] ()
+	    {
+	      qfile::tapeset_reader rd (&ts, &d, r);
+	      QFILE_TUPLE_RECORD tr = { NULL, 0 };
+	      SCAN_CODE c;
+	      while ((c = rd.next (NULL, &tr, PEEK)) == S_SUCCESS)
+		{
+		  if (tr.size != 0)
+		    {
+		      ok[r] = 0;	/* PEEK must never allocate into the caller's record */
+		      break;
+		    }
+		  int tid = tuple_id (tr.tpl);
+		  got[r].push_back (tid);
+		  if (tid == big_id)
+		    {
+		      big_count[r]++;
+		      if (!BIG_OK (tr.tpl))
+			{
+			  ok[r] = 0;
+			}
+		    }
+		}
+	      /* PEEK contract: never free tr.tpl -- rd's destructor frees the
+	       * reader-owned overflow buffer, if any, when rd goes out of scope. */
+	    });
+	  }
+	for (auto &x : th)
+	  {
+	    x.join ();
+	  }
+	std::vector<int> merged;
+	int total_big = 0;
+	for (int r = 0; r < N; r++)
+	  {
+	    for (int v : got[r])
+	      {
+		merged.push_back (v);
+	      }
+	    total_big += big_count[r];
+	    if (!ok[r])
+	      {
+		rc = 3;
+	      }
+	  }
+	std::sort (merged.begin (), merged.end ());
+	std::vector<int> exp = { 0, 1, 2, 3, big_id };
+	std::sort (exp.begin (), exp.end ());
+	if (rc == 0 && merged != exp)
+	  {
+	    rc = 4;	/* every tuple exactly once */
+	  }
+	if (rc == 0 && total_big != 1)
+	  {
+	    rc = 5;	/* overflow read exactly once (first-page owner) */
+	  }
+      }
+#undef BIG_OK
+    return rc;
+  }
+
   /* G18: N reader threads read the SAME spilled (file-backed) Tapeset
    * concurrently via tapeset_reader.  A non-re-entrant read (shared scratch)
    * would corrupt pages -> wrong/missing/dup tuple ids; we assert exact
@@ -1612,6 +1746,7 @@ main (int, char **)
     { "G16 backing-kind entry guard discriminates + A~E counter", run_backing_guard },
     { "G17 overflow run reassembly across a Chunk boundary (R1+R2)", run_overflow_crosschunk },
     { "G18 N-reader concurrent file read (re-entrant, pgbuf-bypass)", run_concurrent_file_readers },
+    { "G19 PEEK x overflow: no realloc-on-borrowed-pointer, no caller alloc (#83)", run_overflow_peek },
   };
 
   bool all_passed = true;

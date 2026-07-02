@@ -385,6 +385,8 @@ namespace qfile
     , m_overflow_run_end (-1)
     , m_reasm_raw (NULL)
     , m_reasm (NULL)
+    , m_peek_reasm_raw (NULL)
+    , m_peek_reasm_cap (0)
   {
   }
 
@@ -395,6 +397,9 @@ namespace qfile
     free (m_reasm_raw);
     m_reasm_raw = NULL;
     m_reasm = NULL;
+    free (m_peek_reasm_raw);
+    m_peek_reasm_raw = NULL;
+    m_peek_reasm_cap = 0;
   }
 
   void
@@ -461,15 +466,37 @@ namespace qfile
 	      }
 	    m_reasm = (PAGE_PTR) m_reasm_raw;
 	  }
-	if (tuple_record_p->size < tuple_len)
+	char *dest;
+	if (peek)
 	  {
-	    char *area = (char *) db_private_realloc (thread_p, tuple_record_p->tpl, tuple_len);
-	    if (area == NULL)
+	    /* Overflow-PEEK reassembles into a scan-owned buffer (freed by
+	     * close()/~tapeset_scan()), never into the caller's record: PEEK
+	     * callers don't free tuple_record_p->tpl, and a prior normal-tuple
+	     * PEEK may have left tuple_record_p->tpl pointing at borrowed page
+	     * memory with size == 0 -- reallocating THAT would corrupt the
+	     * private heap (#83). */
+	    if (tuple_len > m_peek_reasm_cap)
 	      {
-		return S_ERROR;
+		char *area = (char *) realloc (m_peek_reasm_raw, tuple_len);
+		if (area == NULL)
+		  {
+		    return S_ERROR;
+		  }
+		m_peek_reasm_raw = area;
+		m_peek_reasm_cap = tuple_len;
 	      }
-	    tuple_record_p->tpl = area;
-	    tuple_record_p->size = tuple_len;
+	    dest = m_peek_reasm_raw;
+	  }
+	else
+	  {
+	    if (tuple_record_p->size < tuple_len)
+	      {
+		if (qfile_reallocate_tuple (tuple_record_p, tuple_len) != NO_ERROR)
+		  {
+		    return S_ERROR;
+		  }
+	      }
+	    dest = tuple_record_p->tpl;
 	  }
 	int copied = 0;
 	for (int p = m_page_offset; p <= run_end && copied < tuple_len; p++)
@@ -484,12 +511,16 @@ namespace qfile
 	      {
 		csz = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
 	      }
-	    std::memcpy (tuple_record_p->tpl + copied, (char *) pg + QFILE_PAGE_HEADER_SIZE, csz);
+	    std::memcpy (dest + copied, (char *) pg + QFILE_PAGE_HEADER_SIZE, csz);
 	    copied += csz;
 	  }
 	m_curr_overflow = true;
 	m_overflow_run_end = run_end;
-	m_curr_tpl = tuple_record_p->tpl;	/* peek points at the assembled buffer */
+	if (peek)
+	  {
+	    tuple_record_p->tpl = dest;	/* borrowed; scan-owned, size left untouched */
+	  }
+	m_curr_tpl = dest;	/* peek points at the assembled buffer */
 	m_metrics.tuple_reads++;
 	if (peek)
 	  {
@@ -514,13 +545,10 @@ namespace qfile
     int tuple_size = QFILE_GET_TUPLE_LENGTH (m_curr_tpl);
     if (tuple_record_p->size < tuple_size)
       {
-	char *area = (char *) db_private_realloc (thread_p, tuple_record_p->tpl, tuple_size);
-	if (area == NULL)
+	if (qfile_reallocate_tuple (tuple_record_p, tuple_size) != NO_ERROR)
 	  {
 	    return S_ERROR;
 	  }
-	tuple_record_p->tpl = area;
-	tuple_record_p->size = tuple_size;
       }
     std::memcpy (tuple_record_p->tpl, m_curr_tpl, tuple_size);
     m_metrics.copies++;
@@ -797,6 +825,8 @@ namespace qfile
     , m_page_raw (NULL)
     , m_page_buf (NULL)
     , m_tde ()
+    , m_peek_reasm_raw (NULL)
+    , m_peek_reasm_cap (0)
     , m_metrics ()
   {
     m_page_raw = (char *) malloc (DB_PAGESIZE);
@@ -808,6 +838,9 @@ namespace qfile
     free (m_page_raw);
     m_page_raw = NULL;
     m_page_buf = NULL;
+    free (m_peek_reasm_raw);
+    m_peek_reasm_raw = NULL;
+    m_peek_reasm_cap = 0;
   }
 
   SCAN_CODE
@@ -823,13 +856,10 @@ namespace qfile
     int tuple_size = QFILE_GET_TUPLE_LENGTH (m_page + m_offset);
     if (tuple_record_p->size < tuple_size)
       {
-	char *area = (char *) db_private_realloc (thread_p, tuple_record_p->tpl, tuple_size);
-	if (area == NULL)
+	if (qfile_reallocate_tuple (tuple_record_p, tuple_size) != NO_ERROR)
 	  {
 	    return S_ERROR;
 	  }
-	tuple_record_p->tpl = area;
-	tuple_record_p->size = tuple_size;
       }
     std::memcpy (tuple_record_p->tpl, m_page + m_offset, tuple_size);
     m_metrics.copies++;
@@ -838,17 +868,36 @@ namespace qfile
 
   SCAN_CODE
   tapeset_reader::reassemble (THREAD_ENTRY *thread_p, tape *tp, int first_page, int run_end, int tuple_len,
-			     QFILE_TUPLE_RECORD *tuple_record_p)
+			     QFILE_TUPLE_RECORD *tuple_record_p, int peek)
   {
-    if (tuple_record_p->size < tuple_len)
+    char *dest;
+    if (peek)
       {
-	char *area = (char *) db_private_realloc (thread_p, tuple_record_p->tpl, tuple_len);
-	if (area == NULL)
+	/* Overflow-PEEK reassembles into a reader-owned buffer (freed by
+	 * ~tapeset_reader()), never into the caller's record -- same rationale
+	 * as tapeset_scan::retrieve's overflow-PEEK branch (#83). */
+	if (tuple_len > m_peek_reasm_cap)
 	  {
-	    return S_ERROR;
+	    char *area = (char *) realloc (m_peek_reasm_raw, tuple_len);
+	    if (area == NULL)
+	      {
+		return S_ERROR;
+	      }
+	    m_peek_reasm_raw = area;
+	    m_peek_reasm_cap = tuple_len;
 	  }
-	tuple_record_p->tpl = area;
-	tuple_record_p->size = tuple_len;
+	dest = m_peek_reasm_raw;
+      }
+    else
+      {
+	if (tuple_record_p->size < tuple_len)
+	  {
+	    if (qfile_reallocate_tuple (tuple_record_p, tuple_len) != NO_ERROR)
+	      {
+		return S_ERROR;
+	      }
+	  }
+	dest = tuple_record_p->tpl;
       }
     int copied = 0;
     for (int p = first_page; p <= run_end && copied < tuple_len; p++)
@@ -865,8 +914,12 @@ namespace qfile
 	  {
 	    csz = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
 	  }
-	std::memcpy (tuple_record_p->tpl + copied, (char *) pg + QFILE_PAGE_HEADER_SIZE, csz);
+	std::memcpy (dest + copied, (char *) pg + QFILE_PAGE_HEADER_SIZE, csz);
 	copied += csz;
+      }
+    if (peek)
+      {
+	tuple_record_p->tpl = dest;	/* borrowed; reader-owned, size left untouched */
       }
     return S_SUCCESS;
   }
@@ -945,7 +998,7 @@ namespace qfile
 		  }
 		const int run_pages = qfile_overflow_run_pages (tuple_len);
 		const int run_end = first + run_pages - 1;
-		SCAN_CODE rc = reassemble (thread_p, tp, first, run_end, tuple_len, tuple_record_p);
+		SCAN_CODE rc = reassemble (thread_p, tp, first, run_end, tuple_len, tuple_record_p, peek);
 		if (rc != S_SUCCESS)
 		  {
 		    return rc;
