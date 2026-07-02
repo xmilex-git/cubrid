@@ -32,6 +32,7 @@
 #include "file_io.h"		/* PEEK */
 
 #include <cassert>
+#include <cerrno>		/* ENOSPC/EDQUOT (ensure_buffile os_error mapping) */
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>		/* stat (orphan-zero on-disk check) */
@@ -168,6 +169,7 @@ namespace qfile
       }
     if (m_buffile == NULL || m_readbuf == NULL)
       {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return NULL;
       }
     if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) m_readbuf, &m_read_scratch) != NO_ERROR)
@@ -259,7 +261,14 @@ namespace qfile
     m_buffile = buffile::create (thread_p, m_dir.c_str (), m_seq, m_worker_id, m_tde_algo, &os_error);
     if (m_buffile == NULL)
       {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	if (os_error == ENOSPC || os_error == EDQUOT)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	  }
+	else
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  }
 	return ER_FAILED;
       }
     return NO_ERROR;
