@@ -1557,6 +1557,13 @@ qfile_allocate_new_page (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, PAG
       /* NEW production (redesign #78): append the just-completed page to the
        * per-worker tape_writer and reuse the single scratch page for the next.
        * No qmgr page, no VPID chain (the Tapeset addresses by offset). */
+#if defined (SERVER_MODE)
+      if (qmgr_is_query_interrupted (thread_p, list_id_p->query_id) == true)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+	  return NULL;
+	}
+#endif /* SERVER_MODE */
       char *scratch = (char *) QFILE_LIST_ID_PRODUCER_PAGE (list_id_p);
       if (scratch == NULL)
 	{
