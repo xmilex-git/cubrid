@@ -661,6 +661,11 @@ typedef enum
   PSTAT_REGU_NUM_IOREADS,
   PSTAT_REGU_NUM_CALL_EVALS,
 
+  /* temp-workmem redesign backing-kind census (#78/#92): NEW(Tapeset)-backed
+   * list creation count, and OLD-mechanism-touched-a-NEW-list count. */
+  PSTAT_QF_NEW_BACKED_CREATE,
+  PSTAT_QF_OLD_TOUCH_ON_NEW,
+
   /* Complex statistics */
   PSTAT_PBX_FIX_COUNTERS,
   PSTAT_PBX_PROMOTE_COUNTERS,

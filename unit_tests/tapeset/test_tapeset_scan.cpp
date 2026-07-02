@@ -30,6 +30,7 @@
 
 #include "qfile_tape.hpp"
 #include "qfile_chunk.hpp"
+#include "list_file.h"
 #include "object_representation.h"
 #include "error_code.h"
 #include "page_buffer.h"	/* pgbuf_get_fix_debug_count / pgbuf_test_bump_fix_debug_count (issue #93) */
@@ -709,7 +710,7 @@ namespace
 	return 2;
       }
     /* every tuple-bearing page (5) plus skipped empty/zero-tuple pages were
-     * fetched only via tape::page_at -- at least one per tuple-bearing page. */
+     * fetched only via tape::read_page_into -- at least one per tuple-bearing page. */
     if (m.page_reads < 5)
       {
 	return 3;
@@ -1788,6 +1789,222 @@ namespace
       }
     return 0;
   }
+
+  /* G21: qfile_tapeset_import (issue #90/#78 R10) -- normal per-tape
+   * move-and-null transfer appends src's Tapes after dest's existing ones,
+   * accumulates tuple_cnt/page_cnt and propagates new_contains_overflow_, and
+   * leaves src's Tapeset structurally empty: the "do not reuse src as a Tape
+   * source" contract this fix establishes (previously src kept unowned
+   * dangling Tape pointers after import).  Also covers the dest==src
+   * self-import guard. */
+  int
+  run_tapeset_import ()
+  {
+    qfile::tapeset *dts = new qfile::tapeset ();
+    dts->set_owns_tapes (true);
+    qfile::memory_tape *d0 = new qfile::memory_tape (true);
+    d0->append_page (make_page ({ 0, 1 }));
+    dts->append_tape (d0);
+
+    qfile::tapeset *sts = new qfile::tapeset ();
+    sts->set_owns_tapes (true);
+    qfile::memory_tape *s0 = new qfile::memory_tape (true);
+    s0->append_page (make_page ({ 2, 3 }));
+    qfile::memory_tape *s1 = new qfile::memory_tape (true);
+    s1->append_page (make_page ({ 4 }));
+    sts->append_tape (s0);
+    sts->append_tape (s1);
+
+    QFILE_LIST_ID dest, src;
+    std::memset (&dest, 0, sizeof (dest));
+    std::memset (&src, 0, sizeof (src));
+    QFILE_CLEAR_LIST_ID (&dest);
+    QFILE_CLEAR_LIST_ID (&src);
+    QFILE_LIST_ID_TAPESET (&dest) = dts;
+    QFILE_LIST_ID_OWNS_TAPESET (&dest) = true;
+    QFILE_LIST_ID_TAPESET (&src) = sts;
+    QFILE_LIST_ID_OWNS_TAPESET (&src) = true;
+    dest.tuple_cnt = 2;
+    dest.page_cnt = 1;
+    src.tuple_cnt = 3;
+    src.page_cnt = 2;
+    QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (&src) = true;
+
+    if (qfile_tapeset_import (NULL, &dest, &src) != NO_ERROR)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 1;
+      }
+
+    /* counts accumulate, overflow flag propagates */
+    if (dest.tuple_cnt != 5 || dest.page_cnt != 3 || !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (&dest))
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 2;
+      }
+
+    /* src reuse-prohibited contract: structurally empty, no dangling Tapes. */
+    if (sts->tape_count () != 0)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 3;
+      }
+
+    /* dest holds all 3 Tapes, combined data intact. */
+    if (dts->tape_count () != 3)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 4;
+      }
+    std::vector<int> got;
+    long fixes = -1;
+    if (scan_forward_ids (*dts, got, &fixes) != 0 || fixes != 0)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 5;
+      }
+    std::vector<int> expected = { 0, 1, 2, 3, 4 };
+    if (got != expected)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 6;
+      }
+
+    /* self-transfer is a safe no-op, not silent corruption.  Drives the
+     * tapeset-level guard directly (not qfile_tapeset_import's dest==src
+     * check): that one er_set()s on rejection, which asserts in this
+     * bootless harness (no er_init()). */
+    dts->transfer_tapes_from (dts);
+    if (dts->tape_count () != 3)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 7;
+      }
+
+    tapeset_teardown (&dest);
+    tapeset_teardown (&src);	/* src's now-empty Tapeset container is still owned; freed once here */
+    return 0;
+  }
+
+  /* G22 (#87): two tapeset_scans interleaved over the SAME spilled Tapeset
+   * must each see their own exact tuple sequence.  Before per-scan scratch,
+   * the file-page read buffer was tape-owned (one per buffile_tape): scan B's
+   * page fetch overwrote the page scan A was positioned ON, so A's next
+   * forward read tuple count/length from B's page -- silent wrong ids.  Spill
+   * is mandatory for the repro: RAM prefix pages are stable per-page
+   * allocations and never clobber (a prefix-only fixture is a tautology).
+   * A is staggered 3 tuples ahead so the two scans sit on DIFFERENT file
+   * pages while alternating. */
+  int
+  run_interleaved_dual_scan ()
+  {
+    const std::vector<std::vector<int> > pages = {
+      { 0, 1, 2 }, { 10, 11 }, { 20, 21, 22, 23 }, { 30 }, { 40, 41 }, { 50, 51, 52 }
+    };
+    std::vector<int> expected;
+    for (const std::vector<int> &p : pages)
+      {
+	for (int id : p)
+	  {
+	    expected.push_back (id);
+	  }
+      }
+
+    /* budget 1 -> page 0 stays in the RAM prefix, pages 1..5 spill to disk. */
+    writer_result wr = build_writer_tape (/*budget*/ 1, pages);
+    if (wr.tape == NULL)
+      {
+	return 1;
+      }
+    if (!wr.spilled || wr.file_pages != 5)
+      {
+	delete wr.tape;
+	return 2;
+      }
+
+    qfile::tapeset ts;
+    ts.set_owns_tapes (true);
+    ts.append_tape (wr.tape);
+
+    qfile::tapeset_scan a (&ts);
+    qfile::tapeset_scan b (&ts);
+    QFILE_TUPLE_RECORD ra = { NULL, 0 };
+    QFILE_TUPLE_RECORD rb = { NULL, 0 };
+    std::vector<int> got_a;
+    std::vector<int> got_b;
+
+    /* stagger A ahead of B so they hold different file pages */
+    for (int i = 0; i < 3; i++)
+      {
+	if (a.forward (NULL, &ra, PEEK) != S_SUCCESS)
+	  {
+	    return 3;
+	  }
+	got_a.push_back (tuple_id (ra.tpl));
+      }
+
+    /* strict alternation until both streams end */
+    bool a_end = false;
+    bool b_end = false;
+    while (!a_end || !b_end)
+      {
+	if (!b_end)
+	  {
+	    SCAN_CODE c = b.forward (NULL, &rb, PEEK);
+	    if (c == S_SUCCESS)
+	      {
+		got_b.push_back (tuple_id (rb.tpl));
+	      }
+	    else if (c == S_END)
+	      {
+		b_end = true;
+	      }
+	    else
+	      {
+		return 4;
+	      }
+	  }
+	if (!a_end)
+	  {
+	    SCAN_CODE c = a.forward (NULL, &ra, PEEK);
+	    if (c == S_SUCCESS)
+	      {
+		got_a.push_back (tuple_id (ra.tpl));
+	      }
+	    else if (c == S_END)
+	      {
+		a_end = true;
+	      }
+	    else
+	      {
+		return 5;
+	      }
+	  }
+      }
+    a.close (NULL);
+    b.close (NULL);
+
+    if (got_a != expected)
+      {
+	return 6;
+      }
+    if (got_b != expected)
+      {
+	return 7;
+      }
+    if (a.metrics ().pgbuf_fixes != 0 || b.metrics ().pgbuf_fixes != 0)
+      {
+	return 8;
+      }
+    return 0;
+  }
 }
 
 int
@@ -1814,6 +2031,8 @@ main (int, char **)
     { "G18 N-reader concurrent file read (re-entrant, pgbuf-bypass)", run_concurrent_file_readers },
     { "G19 PEEK x overflow: no realloc-on-borrowed-pointer, no caller alloc (#83)", run_overflow_peek },
     { "G20 pgbuf_fixes anti-tautology: reacts to an injected fix (#93)", run_pgbuf_fixes_anti_tautology },
+    { "G21 qfile_tapeset_import: move-and-null transfer, src reuse prohibited (#90)", run_tapeset_import },
+    { "G22 interleaved dual scan on one spilled Tapeset (per-scan scratch, #87)", run_interleaved_dual_scan },
   };
 
   bool all_passed = true;

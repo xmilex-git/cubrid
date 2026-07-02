@@ -41,6 +41,7 @@
 #include "log_append.hpp"
 #include "object_primitive.h"
 #include "object_representation.h"
+#include "perf_monitor.h"
 #include "query_manager.h"
 #include "qfile_tape.hpp"	/* Phase1 1A scan contract (redesign G005, issue #70) */
 #include "query_opfunc.h"
@@ -577,6 +578,19 @@ qfile_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_li
 	  QFILE_LIST_ID_OWNS_TAPESET (dest_list_id_p) = false;
 	  break;
 	}
+    }
+
+  /* Producer (redesign #78 NEW production): a live (unfrozen) producer must
+   * never be copied -- it belongs to exactly one in-flight production and is
+   * torn down by freeze()/close(), never by a copy.  The struct memcpy above
+   * also shallow-copied producer_writer_/producer_page_; SKIP (scan-open,
+   * borrow) and PROHIBIT (cached copy-out) must not carry it, or teardown of
+   * both src and dest would double-destroy the writer. */
+  assert (QFILE_LIST_ID_PRODUCER_WRITER (src_list_id_p) == NULL);
+  if (dep_mode == QFILE_SKIP_DEPENDENT || dep_mode == QFILE_PROHIBIT_DEPENDENT)
+    {
+      QFILE_LIST_ID_PRODUCER_WRITER (dest_list_id_p) = NULL;
+      QFILE_LIST_ID_PRODUCER_PAGE (dest_list_id_p) = NULL;
     }
 
   qfile_update_qlist_count (thread_get_thread_entry_info (), dest_list_id_p, 1);
@@ -1556,6 +1570,13 @@ qfile_allocate_new_page (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, PAG
       /* NEW production (redesign #78): append the just-completed page to the
        * per-worker tape_writer and reuse the single scratch page for the next.
        * No qmgr page, no VPID chain (the Tapeset addresses by offset). */
+#if defined (SERVER_MODE)
+      if (qmgr_is_query_interrupted (thread_p, list_id_p->query_id) == true)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+	  return NULL;
+	}
+#endif /* SERVER_MODE */
       char *scratch = (char *) QFILE_LIST_ID_PRODUCER_PAGE (list_id_p);
       if (scratch == NULL)
 	{
@@ -3232,11 +3253,13 @@ error:
 /* ------------------------------------------------------------------ */
 
 static std::atomic<long> qfile_Ae_old_touch (0);
+static std::atomic<long> qfile_New_backed_create (0);
 
 void
 qfile_ae_record_old_touch (void)
 {
-  qfile_Ae_old_touch.fetch_add (1, std::memory_order_relaxed);
+  long count = qfile_Ae_old_touch.fetch_add (1, std::memory_order_relaxed) + 1;
+  perfmon_set_stat_to_global (PSTAT_QF_OLD_TOUCH_ON_NEW, (int) count);
 }
 
 long
@@ -3249,6 +3272,31 @@ void
 qfile_ae_reset_old_touch_count (void)
 {
   qfile_Ae_old_touch.store (0, std::memory_order_relaxed);
+  perfmon_set_stat_to_global (PSTAT_QF_OLD_TOUCH_ON_NEW, 0);
+}
+
+/* NEW(Tapeset)-backed list creation count (redesign #78/#92): the sibling
+ * "did the NEW path actually run" half of the A~E backing-kind census —
+ * qfile_ae_old_touch_count() alone can only prove OLD *violated* a NEW list,
+ * not that a NEW list ever existed (a rejected gate still reads old_touch==0). */
+void
+qfile_new_backed_record_create (void)
+{
+  long count = qfile_New_backed_create.fetch_add (1, std::memory_order_relaxed) + 1;
+  perfmon_set_stat_to_global (PSTAT_QF_NEW_BACKED_CREATE, (int) count);
+}
+
+long
+qfile_new_backed_create_count (void)
+{
+  return qfile_New_backed_create.load (std::memory_order_relaxed);
+}
+
+void
+qfile_new_backed_reset_create_count (void)
+{
+  qfile_New_backed_create.store (0, std::memory_order_relaxed);
+  perfmon_set_stat_to_global (PSTAT_QF_NEW_BACKED_CREATE, 0);
 }
 
 int
@@ -5325,6 +5373,7 @@ qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, 
   VFID_SET_NULL (&list_id_p->temp_vfid);
   QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) = writer;
   QFILE_LIST_ID_PRODUCER_PAGE (list_id_p) = scratch;
+  qfile_new_backed_record_create ();
   er_log_debug (ARG_FILE_LINE, "WM_SORT_NEW: query_id=%lld SORT output -> NEW Tapeset producer (tde=%d)\n",
 		(long long) list_id_p->query_id, (int) tde_encrypted);
   return NO_ERROR;

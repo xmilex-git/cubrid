@@ -32,6 +32,7 @@
 #include "file_io.h"		/* PEEK */
 
 #include <cassert>
+#include <cerrno>		/* ENOSPC/EDQUOT (ensure_buffile os_error mapping) */
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>		/* stat (orphan-zero on-disk check) */
@@ -81,26 +82,7 @@ namespace qfile
   }
 
   PAGE_PTR
-  memory_tape::page_at (THREAD_ENTRY *thread_p, int page_offset)
-  {
-    (void) thread_p;
-    if (page_offset < 0 || page_offset >= (int) m_pages.size ())
-      {
-	return NULL;
-      }
-    return (PAGE_PTR) m_pages[page_offset];
-  }
-
-  void
-  memory_tape::release_page (THREAD_ENTRY *thread_p, PAGE_PTR page)
-  {
-    /* RAM-resident: nothing to unfix. */
-    (void) thread_p;
-    (void) page;
-  }
-
-  PAGE_PTR
-  memory_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde)
+  memory_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde) const
   {
     /* All pages are RAM; return them directly (caller scratch unused). */
     (void) thread_p;
@@ -122,15 +104,10 @@ namespace qfile
     , m_owns_prefix (owns_prefix)
     , m_buffile (bf)
     , m_owns_buffile (owns_buffile)
-    , m_readbuf (NULL)
   {
     if (m_owns_prefix)
       {
 	tape_backing_census_prefix_added ((long) m_prefix.size ());
-      }
-    if (m_buffile != NULL)
-      {
-	m_readbuf = (char *) malloc (DB_PAGESIZE);
       }
   }
 
@@ -150,45 +127,10 @@ namespace qfile
 	delete m_buffile;	/* closes + unlinks */
       }
     m_buffile = NULL;
-    free (m_readbuf);
-    m_readbuf = NULL;
   }
 
   PAGE_PTR
-  buffile_tape::page_at (THREAD_ENTRY *thread_p, int page_offset)
-  {
-    const int prefix = (int) m_prefix.size ();
-    if (page_offset < 0 || page_offset >= total_page_count ())
-      {
-	return NULL;
-      }
-    if (page_offset < prefix)
-      {
-	return (PAGE_PTR) m_prefix[page_offset];
-      }
-    if (m_buffile == NULL || m_readbuf == NULL)
-      {
-	return NULL;
-      }
-    if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) m_readbuf, &m_read_scratch) != NO_ERROR)
-      {
-	return NULL;
-      }
-    return (PAGE_PTR) m_readbuf;
-  }
-
-  void
-  buffile_tape::release_page (THREAD_ENTRY *thread_p, PAGE_PTR page)
-  {
-    /* RAM prefix: nothing to free.  File page: it lives in the reused scratch
-     * buffer, released implicitly by the next page_at.  No pgbuf unfix -- this
-     * backing never enters a pgbuf BCB. */
-    (void) thread_p;
-    (void) page;
-  }
-
-  PAGE_PTR
-  buffile_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde)
+  buffile_tape::read_page_into (THREAD_ENTRY *thread_p, int page_offset, char *page_dest, tde_read_scratch *tde) const
   {
     const int prefix = (int) m_prefix.size ();
     if (page_offset < 0 || page_offset >= total_page_count ())
@@ -201,6 +143,9 @@ namespace qfile
       }
     if (m_buffile == NULL || page_dest == NULL)
       {
+	/* a spilled offset with no backing / no caller scratch is a caller bug,
+	 * not a silent S_END (#90) */
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return NULL;
       }
     if (m_buffile->read_page (thread_p, page_offset - prefix, (PAGE_PTR) page_dest, tde) != NO_ERROR)
@@ -259,7 +204,14 @@ namespace qfile
     m_buffile = buffile::create (thread_p, m_dir.c_str (), m_seq, m_worker_id, m_tde_algo, &os_error);
     if (m_buffile == NULL)
       {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	if (os_error == ENOSPC || os_error == EDQUOT)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	  }
+	else
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  }
 	return ER_FAILED;
       }
     return NO_ERROR;
@@ -368,12 +320,33 @@ namespace qfile
     m_tapes.push_back (tape_p);
   }
 
+  void
+  tapeset::transfer_tapes_from (tapeset *src)
+  {
+    if (src == NULL || src == this)
+      {
+	return;
+      }
+    const size_t n = src->m_tapes.size ();
+    m_tapes.reserve (m_tapes.size () + n);	/* may throw; nothing moved yet */
+    for (size_t i = 0; i < n; i++)
+      {
+	tape *tape_p = src->m_tapes[i];
+	src->m_tapes[i] = nullptr;	/* transfer ownership immediately */
+	if (tape_p != NULL)
+	  {
+	    m_tapes.push_back (tape_p);	/* reserve()'d above: cannot throw/realloc */
+	  }
+      }
+    src->m_tapes.clear ();
+  }
+
   /* ------------------------------------------------------------------ */
   /* tapeset_scan                                                       */
   /* ------------------------------------------------------------------ */
 
   /* Scan-side pgbuf-bypass gate (issue #93): tapeset_scan/tapeset_reader read
-   * pages only via tape::page_at / tape::read_page_into and must never fix a
+   * pages only via tape::read_page_into and must never fix a
    * pgbuf BCB.  Snapshot-diffing the boot-independent debug counter replaces
    * the old always-zero field with a real measurement. */
   static void
@@ -396,6 +369,7 @@ namespace qfile
     , m_curr_tpl (NULL)
     , m_curr_overflow (false)
     , m_overflow_run_end (-1)
+    , m_readbuf (NULL)
     , m_reasm_raw (NULL)
     , m_reasm (NULL)
     , m_peek_reasm_raw (NULL)
@@ -410,8 +384,10 @@ namespace qfile
 
   tapeset_scan::~tapeset_scan ()
   {
-    /* The held page (if any) is released by close() before destruction; the
-     * destructor has no THREAD_ENTRY to unfix a file-backed page. */
+    /* A held page needs no release call (#87): a file page lives in the
+     * scan-owned m_readbuf freed here, a prefix page is Tape-owned RAM. */
+    free (m_readbuf);
+    m_readbuf = NULL;
     free (m_reasm_raw);
     m_reasm_raw = NULL;
     m_reasm = NULL;
@@ -423,16 +399,28 @@ namespace qfile
   void
   tapeset_scan::release_page (THREAD_ENTRY *thread_p)
   {
-    if (m_page != NULL && m_tapeset != NULL)
-      {
-	tape *tape_p = m_tapeset->get_tape (m_tape_idx);
-	if (tape_p != NULL)
-	  {
-	    tape_p->release_page (thread_p, m_page);
-	  }
-      }
+    /* Per-scan scratch (#87): a held file page lives in the scan-owned
+     * m_readbuf and a prefix page is Tape-owned RAM -- dropping the reference
+     * needs no Tape call, so close() does not depend on the Tapeset (or its
+     * Tapes) being alive (#89). */
+    (void) thread_p;
     m_page = NULL;
     m_curr_tpl = NULL;
+  }
+
+  PAGE_PTR
+  tapeset_scan::fetch_page (THREAD_ENTRY *thread_p, tape *tape_p, int page_offset)
+  {
+    if (m_readbuf == NULL && page_offset >= tape_p->prefix_page_count ())
+      {
+	m_readbuf = (char *) malloc (DB_PAGESIZE);
+	if (m_readbuf == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+	    return NULL;
+	  }
+      }
+    return tape_p->read_page_into (thread_p, page_offset, m_readbuf, &m_read_scratch);
   }
 
   void
@@ -641,7 +629,7 @@ namespace qfile
 	int npages = tape_p->total_page_count ();
 	for (; page_offset < npages; page_offset++)
 	  {
-	    PAGE_PTR page = tape_p->page_at (thread_p, page_offset);
+	    PAGE_PTR page = fetch_page (thread_p, tape_p, page_offset);
 	    if (page == NULL)
 	      {
 		return S_ERROR;
@@ -661,8 +649,7 @@ namespace qfile
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
 	    /* zero-tuple page or overflow continuation (start already consumed in
-	     * sequential R1) -- skip. */
-	    tape_p->release_page (thread_p, page);
+	     * sequential R1) -- skip; nothing to release (scan-owned scratch). */
 	  }
       }
 
@@ -729,7 +716,7 @@ namespace qfile
 	int page_offset = (ti == start_tape) ? start_page : tape_p->total_page_count () - 1;
 	for (; page_offset >= 0; page_offset--)
 	  {
-	    PAGE_PTR page = tape_p->page_at (thread_p, page_offset);
+	    PAGE_PTR page = fetch_page (thread_p, tape_p, page_offset);
 	    if (page == NULL)
 	      {
 		return S_ERROR;
@@ -748,8 +735,7 @@ namespace qfile
 		 * reposition to its START page and reassemble the whole run as one
 		 * tuple (ADR 0006).  The next backward step then skips to start-1. */
 		const int first = qfile_overflow_first_page (page);
-		tape_p->release_page (thread_p, page);
-		PAGE_PTR start_pg = tape_p->page_at (thread_p, first);
+		PAGE_PTR start_pg = fetch_page (thread_p, tape_p, first);
 		if (start_pg == NULL)
 		  {
 		    return S_ERROR;
@@ -759,7 +745,6 @@ namespace qfile
 		set_on (ti, first, start_pg, QFILE_PAGE_HEADER_SIZE, 0);
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
-	    tape_p->release_page (thread_p, page);
 	  }
       }
 
@@ -797,7 +782,7 @@ namespace qfile
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
 	    return S_ERROR;
 	  }
-	PAGE_PTR page = tape_p->page_at (thread_p, tuple_position_p->tape_page_offset);
+	PAGE_PTR page = fetch_page (thread_p, tape_p, tuple_position_p->tape_page_offset);
 	if (page == NULL)
 	  {
 	    return S_ERROR;
@@ -1153,6 +1138,12 @@ qfile_tapeset_scan_open (QFILE_LIST_SCAN_ID *scan_id_p)
       }
   }
   qfile::tapeset_scan *scan = new qfile::tapeset_scan (ts);
+  if (scan == NULL)
+    {
+      scan_id_p->tapeset_scan_ = NULL;
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (qfile::tapeset_scan));
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
   scan_id_p->tapeset_scan_ = scan;
   return NO_ERROR;
 }
@@ -1622,6 +1613,11 @@ int
 qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID *src)
 {
   (void) thread_p;
+  if (dest == src)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+      return ER_FAILED;
+    }
   qfile::tapeset *dts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (dest);
   qfile::tapeset *sts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (src);
   if (dts == NULL)
@@ -1631,12 +1627,7 @@ qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID
     }
   if (sts != NULL)
     {
-      const int n = sts->tape_count ();
-      for (int i = 0; i < n; i++)
-	{
-	  dts->append_tape (sts->get_tape (i));
-	}
-      sts->set_owns_tapes (false);	/* dest owns the Tapes now; src frees only its container */
+      dts->transfer_tapes_from (sts);	/* per-tape move-and-null; src left empty */
       if (QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (src))
 	{
 	  QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (dest) = true;
@@ -1673,6 +1664,12 @@ qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer)
       return NULL;
     }
   qfile::tapeset *ts = new qfile::tapeset ();
+  if (ts == NULL)
+    {
+      delete t;		/* nothing else references the freshly-frozen Tape */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (qfile::tapeset));
+      return NULL;
+    }
   ts->set_owns_tapes (true);
   ts->append_tape (t);
   return ts;

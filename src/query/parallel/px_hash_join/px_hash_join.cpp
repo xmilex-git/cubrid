@@ -178,6 +178,10 @@ namespace parallel_query
 			  qfile_destroy_list (&thread_ref, outer->part_list_id[pi]);
 			  qfile_copy_list_id (outer->part_list_id[pi], wpl, false, QFILE_PROHIBIT_DEPENDENT);
 			}
+		      /* NULL the slot before the error check: a jump to error_exit
+		       * must never leave hjoin_clear_shared_split_info looking at a
+		       * wpl whose contents this loop already destroyed (double-destroy). */
+		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
 		      if (error != NO_ERROR)
 			{
 			  goto error_exit;
@@ -186,8 +190,8 @@ namespace parallel_query
 		  else
 		    {
 		      qfile_destroy_list (&thread_ref, wpl);
+		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
 		    }
-		  QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
 		}
 	      db_private_free_and_init (&thread_ref, shared_info.worker_part_lists[wi]);
 	    }
@@ -292,6 +296,10 @@ namespace parallel_query
 			  qfile_destroy_list (&thread_ref, inner->part_list_id[pi]);
 			  qfile_copy_list_id (inner->part_list_id[pi], wpl, false, QFILE_PROHIBIT_DEPENDENT);
 			}
+		      /* NULL the slot before the error check: a jump to error_exit
+		       * must never leave hjoin_clear_shared_split_info looking at a
+		       * wpl whose contents this loop already destroyed (double-destroy). */
+		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
 		      if (error != NO_ERROR)
 			{
 			  goto error_exit;
@@ -300,8 +308,8 @@ namespace parallel_query
 		  else
 		    {
 		      qfile_destroy_list (&thread_ref, wpl);
+		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
 		    }
-		  QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
 		}
 	      db_private_free_and_init (&thread_ref, shared_info.worker_part_lists[wi]);
 	    }

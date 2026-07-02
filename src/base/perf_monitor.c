@@ -591,6 +591,9 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_REGU_NUM_IOREADS, "Num_regu_ioreads"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_REGU_NUM_CALL_EVALS, "Num_regu_call_evals"),
 
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_NEW_BACKED_CREATE, "Num_qfile_new_backed_create"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_OLD_TOUCH_ON_NEW, "Num_qfile_old_touch_on_new"),
+
   /* Array type statistics */
   PSTAT_METADATA_INIT_COMPLEX (PSTAT_PBX_FIX_COUNTERS, "Num_data_page_fix_ext", &f_dump_in_file_Num_data_page_fix_ext,
 			       &f_dump_in_buffer_Num_data_page_fix_ext, &f_load_Num_data_page_fix_ext),
@@ -1604,13 +1607,8 @@ perfmon_server_dump_stats_to_buffer (const UINT64 * stats, char *buffer, int buf
     }
 
   stats_ptr = (UINT64 *) stats;
-  for (i = 0; i < PSTAT_COUNT; i++)
+  for (i = 0; i < PSTAT_COUNT && remained_size > 0; i++)
     {
-      if (pstat_Metadata[i].valtype == PSTAT_COMPLEX_VALUE)
-	{
-	  break;
-	}
-
       if (substr != NULL)
 	{
 	  s = strstr (pstat_Metadata[i].stat_name, substr);
@@ -1620,7 +1618,24 @@ perfmon_server_dump_stats_to_buffer (const UINT64 * stats, char *buffer, int buf
 	  s = pstat_Metadata[i].stat_name;
 	}
 
-      if (s)
+      if (s == NULL)
+	{
+	  continue;
+	}
+
+      if (pstat_Metadata[i].valtype == PSTAT_COMPLEX_VALUE)
+	{
+	  ret = snprintf (p, remained_size, "%s:\n", pstat_Metadata[i].stat_name);
+	  remained_size -= ret;
+	  p += ret;
+	  if (remained_size <= 0)
+	    {
+	      assert (remained_size == 0);	/* should not overrun the buffer */
+	      return;
+	    }
+	  pstat_Metadata[i].f_dump_in_buffer (&p, &(stats[pstat_Metadata[i].start_offset]), &remained_size);
+	}
+      else
 	{
 	  int offset = pstat_Metadata[i].start_offset;
 
@@ -1652,32 +1667,6 @@ perfmon_server_dump_stats_to_buffer (const UINT64 * stats, char *buffer, int buf
 	}
     }
 
-  for (; i < PSTAT_COUNT && remained_size > 0; i++)
-    {
-      if (substr != NULL)
-	{
-	  s = strstr (pstat_Metadata[i].stat_name, substr);
-	}
-      else
-	{
-	  s = pstat_Metadata[i].stat_name;
-	}
-      if (s == NULL)
-	{
-	  continue;
-	}
-
-      ret = snprintf (p, remained_size, "%s:\n", pstat_Metadata[i].stat_name);
-      remained_size -= ret;
-      p += ret;
-      if (remained_size <= 0)
-	{
-	  assert (remained_size == 0);	/* should not overrun the buffer */
-	  return;
-	}
-      pstat_Metadata[i].f_dump_in_buffer (&p, &(stats[pstat_Metadata[i].start_offset]), &remained_size);
-    }
-
   buffer[buf_size - 1] = '\0';
 }
 
@@ -1704,11 +1693,6 @@ perfmon_server_dump_stats (const UINT64 * stats, FILE * stream, const char *subs
   stats_ptr = (UINT64 *) stats;
   for (i = 0; i < PSTAT_COUNT; i++)
     {
-      if (pstat_Metadata[i].valtype == PSTAT_COMPLEX_VALUE)
-	{
-	  break;
-	}
-
       if (substr != NULL)
 	{
 	  s = strstr (pstat_Metadata[i].stat_name, substr);
@@ -1718,7 +1702,17 @@ perfmon_server_dump_stats (const UINT64 * stats, FILE * stream, const char *subs
 	  s = pstat_Metadata[i].stat_name;
 	}
 
-      if (s)
+      if (s == NULL)
+	{
+	  continue;
+	}
+
+      if (pstat_Metadata[i].valtype == PSTAT_COMPLEX_VALUE)
+	{
+	  fprintf (stream, "%s:\n", pstat_Metadata[i].stat_name);
+	  pstat_Metadata[i].f_dump_in_file (stream, &(stats[pstat_Metadata[i].start_offset]));
+	}
+      else
 	{
 	  int offset = pstat_Metadata[i].start_offset;
 
@@ -1747,25 +1741,6 @@ perfmon_server_dump_stats (const UINT64 * stats, FILE * stream, const char *subs
 	      fprintf (stream, "%-29s = %10.2f\n", pstat_Metadata[i].stat_name, (float) stats_ptr[offset] / 100);
 	    }
 	}
-    }
-
-  for (; i < PSTAT_COUNT; i++)
-    {
-      if (substr != NULL)
-	{
-	  s = strstr (pstat_Metadata[i].stat_name, substr);
-	}
-      else
-	{
-	  s = pstat_Metadata[i].stat_name;
-	}
-      if (s == NULL)
-	{
-	  continue;
-	}
-
-      fprintf (stream, "%s:\n", pstat_Metadata[i].stat_name);
-      pstat_Metadata[i].f_dump_in_file (stream, &(stats[pstat_Metadata[i].start_offset]));
     }
 }
 
