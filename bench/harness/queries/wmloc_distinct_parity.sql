@@ -1,0 +1,1 @@
+SELECT COUNT(*) FROM (SELECT /*+ PARALLEL(8) */ DISTINCT grp, val FROM wmloc_t) t;

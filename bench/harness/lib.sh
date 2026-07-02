@@ -21,6 +21,12 @@ SERVER_CTL=${SERVER_CTL:-"${BUILD_WORKTREE}/.agents/skills/cubrid-server-control
 if [[ ! -x "${SERVER_CTL}" ]]; then
   SERVER_CTL="${REPO_ROOT}/.agents/skills/cubrid-server-control/scripts/cubrid-server-ctl.sh"
 fi
+if [[ ! -x "${SERVER_CTL}" ]]; then
+  # The agent tooling (incl. this skill) was extracted out of the CUBRID
+  # checkout into a standalone repo (workspace commit b981c3b) and no longer
+  # ships inside BUILD_WORKTREE/REPO_ROOT. Fall back to the sibling tooling repo.
+  SERVER_CTL="${CUBRID_TOOLING_REPO:-${HOME}/dev/workspace}/.agents/skills/cubrid-server-control/scripts/cubrid-server-ctl.sh"
+fi
 
 export CUBRID_DATABASES="${DB_PATH}"
 if [[ -x "${BUILD_WORKTREE}/build_x86_64_release/_install/CUBRID/bin/csql" ]]; then
@@ -78,7 +84,14 @@ set_server_conf_param()
   local key=$1
   local value=$2
   local conf="${CUBRID}/conf/cubrid.conf"
-  [[ -f "${conf}" && -w "${conf}" ]] || return 0
+  if [[ ! -f "${conf}" ]]; then
+    echo "set_server_conf_param: conf file not found: ${conf} (cannot set ${key}=${value})" >&2
+    return 1
+  fi
+  if [[ ! -w "${conf}" ]]; then
+    echo "set_server_conf_param: conf file not writable: ${conf} (cannot set ${key}=${value})" >&2
+    return 1
+  fi
 
   local tmp="${conf}.harness.$$"
   awk -F= -v key="${key}" -v value="${value}" '
