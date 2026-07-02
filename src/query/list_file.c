@@ -5252,6 +5252,24 @@ qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * key_info_p, QFILE_TUPLE_V
   return NO_ERROR;
 }
 
+/* qfile_list_is_raw_fd_spilled () - true when an OLD-backed list has overflowed
+ *   its membuf into a raw-fd temp file (#107).
+ *
+ *   For such a list a P_sort_key (use_original) sort re-fixes the original
+ *   tuple page per SORT_REC, and every fix past membuf_last is a real pread
+ *   (temp_page_store has no pgbuf in front of the raw fd) — a cyclic access
+ *   pattern turns that into per-row I/O amplification.  MEMBUF-resident and
+ *   PRIVATE_SPILL_FALLBACK lists are excluded: their re-fetches resolve from
+ *   the membuf array / pgbuf respectively, so use_original stays profitable.
+ */
+bool
+qfile_list_is_raw_fd_spilled (const QFILE_LIST_ID * list_id_p)
+{
+  QMGR_TEMP_FILE *tfile_p = (list_id_p != NULL) ? QFILE_LIST_ID_TFILE_VFID (list_id_p) : NULL;
+
+  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW;
+}
+
 /* qfile_initialize_sort_info () -
  *   return:
  *   info(in):
@@ -5276,8 +5294,14 @@ qfile_initialize_sort_info (SORT_INFO * sort_info_p, QFILE_LIST_ID * list_id_p, 
    * non-key columns inside the sort records so the rebuilt tuple keeps its full width —
    * merely dropping use_original truncates the tuple to the key columns (#100).  If the
    * extension bails out (duplicate key column), use_original stays set and the sort fails
-   * loudly on the unresolvable back-reference instead of producing truncated tuples. */
-  if (sort_info_p->key_info.use_original == 1 && qfile_list_has_new_backing (list_id_p))
+   * loudly on the unresolvable back-reference instead of producing truncated tuples.
+   * A raw-fd spilled OLD input gets the same treatment for performance (#107): its
+   * per-SORT_REC use_original re-fix is a real pread past membuf_last, and the sorted-order
+   * access pattern defeats any cache smaller than the file — carrying all columns removes
+   * the re-fetch entirely.  Here a bail-out is harmless: the VPID back-references stay
+   * valid, so the sort falls back to the (slow but correct) re-fetch path. */
+  if (sort_info_p->key_info.use_original == 1
+      && (qfile_list_has_new_backing (list_id_p) || qfile_list_is_raw_fd_spilled (list_id_p)))
     {
       bool all_columns_carried = false;
 

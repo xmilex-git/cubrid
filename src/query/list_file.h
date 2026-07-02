@@ -182,6 +182,7 @@ extern SORTKEY_INFO *qfile_initialize_sort_key_info (SORTKEY_INFO * info, SORT_L
 						     QFILE_TUPLE_VALUE_TYPE_LIST * types);
 extern int qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * info, QFILE_TUPLE_VALUE_TYPE_LIST * types,
 						   bool * extended);
+extern bool qfile_list_is_raw_fd_spilled (const QFILE_LIST_ID * list_id);
 extern void qfile_clear_sort_key_info (SORTKEY_INFO * info);
 extern QFILE_LIST_ID *qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
 						 SORT_LIST * sort_list, QUERY_OPTIONS option, int ls_flag,

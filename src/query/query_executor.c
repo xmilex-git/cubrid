@@ -5681,8 +5681,12 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
   /* When the input list is NEW-backed, VPID back-references are invalid (#80).  Carry the
    * non-key columns inside the sort records instead of just dropping use_original — a plain
    * A_sort_key materializes only the group columns, so the aggregate regu vars would read
-   * past the truncated reconstructed tuple (#100). */
-  if (gbstate.key_info.use_original == 1 && qfile_list_has_new_backing (list_id))
+   * past the truncated reconstructed tuple (#100).  A raw-fd spilled OLD input gets the
+   * same treatment for performance (#107): the per-SORT_REC use_original re-fix is a real
+   * pread past membuf_last, amplified per-row by the sorted-order access pattern; a
+   * bail-out here is harmless (VPID back-references stay valid — slow but correct). */
+  if (gbstate.key_info.use_original == 1
+      && (qfile_list_has_new_backing (list_id) || qfile_list_is_raw_fd_spilled (list_id)))
     {
       bool all_columns_carried = false;
 
