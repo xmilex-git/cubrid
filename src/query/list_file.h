@@ -221,6 +221,10 @@ extern QFILE_LIST_ID *qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALU
 				       SORT_LIST * sort_list, QUERY_ID query_id, int flag,
 				       QFILE_LIST_ID * existing_list_id);
 extern int qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
+/* redesign #78 C-3/C-6: demote a NEW (Tapeset) list to OLD backing for mutable consumers. */
+extern int qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
+/* redesign #78 C-3: promote a finished OLD UNION ALL list to NEW for parallel consumers. */
+extern int qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
 /* redesign #78 2A-1b: NEW (Tapeset) SORT output migration. */
 extern bool qfile_sort_new_backing_enabled (void);
 extern int qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);

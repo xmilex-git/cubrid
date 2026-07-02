@@ -15161,6 +15161,19 @@ qexec_end_mainblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_
 	  GOTO_EXIT_ON_ERROR;
 	}
       QFILE_FREE_AND_INIT_LIST_ID (t_list_id);
+      /* UNION ALL builds an OLD (appendable) list; a parallel consumer (e.g. a
+       * GROUP BY over a derived UNION ALL table) reads it through the OLD
+       * MERGEABLE_LIST sector reader, which drops rows on a list that is not a
+       * parallel-scan producer output (px_scan.cpp).  Promote the finished list
+       * to NEW under the gate so the tuple-level Tapeset reader is used instead
+       * -- UNION (distinct) is already NEW via its sort.  Skip a cached result
+       * file (copy-out path).  (#78 C-3) */
+      if (!QFILE_IS_FLAG_SET (ls_flag, QFILE_FLAG_RESULT_FILE)
+	  && (qfile_sort_new_backing_enabled () || qfile_scan_new_backing_enabled ())
+	  && qfile_list_promote_old_to_new (thread_p, xasl->list_id) != NO_ERROR)
+	{
+	  GOTO_EXIT_ON_ERROR;
+	}
       break;
 
     case CTE_PROC:
@@ -17984,6 +17997,19 @@ qexec_execute_cte (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_
       GOTO_EXIT_ON_ERROR;
     }
 
+  /* The CTE result is shared through the OLD list model: the recursive loop
+   * reopens the working list for append and copies list_ids cheaply through the
+   * qmgr temp file pool, and sibling CTEs in the same WITH clause read this same
+   * non_recursive_part->list_id.  A frozen NEW (Tapeset) output -- e.g. a
+   * GROUP BY / ORDER BY / UNION (distinct) in the non-recursive part under
+   * CUBRID_WM_SORT_NEW -- is single-owner and immutable, so a shared MOVE would
+   * strip one holder's backing.  Demote to OLD up front so every downstream
+   * copy/scan (loop, sibling reference, final hand-off) works.  (#78 C-6) */
+  if (qfile_list_demote_new_to_old (thread_p, non_recursive_part->list_id) != NO_ERROR)
+    {
+      GOTO_EXIT_ON_ERROR;
+    }
+
   if (recursive_part && non_recursive_part->list_id->tuple_cnt == 0)
     {
       // status needs to be changed to XASL_SUCCESS to enable proper cleaning in qexec_clear_xasl
@@ -18023,6 +18049,15 @@ qexec_execute_cte (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_
 	  if (qexec_execute_mainblock (thread_p, recursive_part, xasl_state, NULL) != NO_ERROR)
 	    {
 	      qexec_failure_line (__LINE__, xasl_state);
+	      GOTO_EXIT_ON_ERROR;
+	    }
+
+	  /* Demote a frozen NEW (Tapeset) recursive-part output to OLD backing:
+	   * the loop below copies it into the working list via QFILE_PROHIBIT_DEPENDENT
+	   * (shared pages) and unions it into the accumulator, both of which need the
+	   * mutable OLD model.  (#78 C-6) */
+	  if (qfile_list_demote_new_to_old (thread_p, recursive_part->list_id) != NO_ERROR)
+	    {
 	      GOTO_EXIT_ON_ERROR;
 	    }
 

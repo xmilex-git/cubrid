@@ -1464,6 +1464,111 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 }
 
 /*
+ * qfile_list_demote_new_to_old () - Rewrite a NEW (Tapeset)-backed list as an
+ *   OLD temp-file-backed list carrying identical tuples, so callers that need
+ *   mutable semantics (append / reopen-as-append / the recursive-CTE shared
+ *   copy model) can operate on it.  No-op for an already OLD-backed list.
+ *   return: NO_ERROR or ER_FAILED
+ *   list_id_p(in/out): list whose backing is demoted in place
+ *
+ * Note: A frozen NEW Tapeset is single-owner and immutable -- UNION ALL
+ *   (qfile_union_list) and recursive CTE accumulation (qexec_execute_cte) both
+ *   rely on the OLD model where a list can be reopened for append and its pages
+ *   are shared through cheap list_id copies.  Rather than teach every mutating
+ *   path a NEW variant, this materialises the tuples back into an OLD list (the
+ *   scan below routes through the Tapeset reader transparently) and swaps the
+ *   backing using the same idiom as qfile_sort_list_with_func's sorted-output
+ *   swap.  (#78 C-3/C-6; sibling of #105's CONNECT BY force-OLD.)
+ */
+int
+qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
+{
+  QFILE_LIST_ID *old_list_p;
+
+  if (list_id_p == NULL || !qfile_list_has_new_backing (list_id_p))
+    {
+      return NO_ERROR;
+    }
+
+  old_list_p = qfile_open_list (thread_p, &list_id_p->type_list, list_id_p->sort_list, list_id_p->query_id,
+				QFILE_FLAG_ALL, NULL);
+  if (old_list_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  if (qfile_copy_tuple (thread_p, old_list_p, list_id_p) != NO_ERROR)
+    {
+      qfile_close_and_free_list_file (thread_p, old_list_p);
+      QFILE_FREE_AND_INIT_LIST_ID (old_list_p);
+      return ER_FAILED;
+    }
+  qfile_close_list (thread_p, old_list_p);
+
+  /* Replace the NEW backing with the freshly materialised OLD backing.
+   * qfile_destroy_list frees the Tapeset (owns_tapeset_) and NULLs it so the
+   * MOVE copy does not double-free -- identical to the sorted-output swap. */
+  qfile_destroy_list (thread_p, list_id_p);
+  qfile_copy_list_id (list_id_p, old_list_p, true, QFILE_MOVE_DEPENDENT);
+  QFILE_FREE_AND_INIT_LIST_ID (old_list_p);
+
+  return NO_ERROR;
+}
+
+/*
+ * qfile_list_promote_old_to_new () - Rewrite an OLD temp-file-backed list as a
+ *   frozen NEW (Tapeset) list carrying identical tuples.  No-op for a list that
+ *   is already NEW-backed or that has no OLD temp file to migrate.
+ *   return: NO_ERROR or ER_FAILED
+ *   list_id_p(in/out): list whose backing is promoted in place
+ *
+ * Note: UNION ALL builds its result by appending (an OLD-only operation), but
+ *   when the result feeds a parallel consumer (e.g. a GROUP BY over a derived
+ *   UNION ALL table) the OLD MERGEABLE_LIST sector reader drops rows on a list
+ *   that is not itself a parallel-scan producer output (px_scan.cpp).  The NEW
+ *   tuple-level tapeset_reader reads any Tapeset correctly, so promote the
+ *   finished UNION ALL list to NEW under the gate -- matching UNION (distinct),
+ *   whose sort output is already NEW.  TDE is inherited from the OLD temp file.
+ *   (#78 C-3)
+ */
+int
+qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
+{
+  QFILE_LIST_ID *new_list_p;
+  bool tde_encrypted;
+
+  if (list_id_p == NULL || qfile_list_has_new_backing (list_id_p)
+      || QFILE_LIST_ID_TFILE_VFID (list_id_p) == NULL)
+    {
+      return NO_ERROR;
+    }
+
+  tde_encrypted = QFILE_LIST_ID_TFILE_VFID (list_id_p)->tde_encrypted;
+
+  new_list_p = qfile_open_list (thread_p, &list_id_p->type_list, list_id_p->sort_list, list_id_p->query_id,
+				QFILE_FLAG_ALL, NULL);
+  if (new_list_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  if (qfile_list_make_new_backed (thread_p, new_list_p, tde_encrypted) != NO_ERROR
+      || qfile_copy_tuple (thread_p, new_list_p, list_id_p) != NO_ERROR)
+    {
+      qfile_close_and_free_list_file (thread_p, new_list_p);
+      QFILE_FREE_AND_INIT_LIST_ID (new_list_p);
+      return ER_FAILED;
+    }
+  qfile_close_list (thread_p, new_list_p);	/* freeze -> single-Tape Tapeset */
+
+  qfile_destroy_list (thread_p, list_id_p);	/* free the OLD temp file */
+  qfile_copy_list_id (list_id_p, new_list_p, true, QFILE_MOVE_DEPENDENT);
+  QFILE_FREE_AND_INIT_LIST_ID (new_list_p);
+
+  return NO_ERROR;
+}
+
+/*
  * qfile_reopen_list_as_append_mode () -
  *   thread_p(in) :
  *   list_id_p(in):
@@ -1475,6 +1580,18 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
 {
   PAGE_PTR last_page_ptr;
   QMGR_TEMP_FILE *temp_file_p;
+
+  /* A frozen NEW (Tapeset) list cannot be reopened for append (single-owner,
+   * immutable, no temp-file VFID).  Demote it to an OLD backing first so the
+   * append path below works -- covers UNION ALL (qfile_union_list) and the
+   * recursive-CTE common-list optimisation.  (#78 C-3/C-6) */
+  if (qfile_list_has_new_backing (list_id_p))
+    {
+      if (qfile_list_demote_new_to_old (thread_p, list_id_p) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
 
   if (QFILE_LIST_ID_TFILE_VFID(list_id_p) == NULL)
     {
