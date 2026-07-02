@@ -2501,11 +2501,13 @@ sentry_to_qentry (const SESSION_QUERY_ENTRY * sentry_p, QMGR_QUERY_ENTRY * qentr
 
 /*
  * session_store_query_entry_info () - create a query entry
- * return : void
+ * return : true if ownership of qentry_p's list_id/temp_vfid was taken over by the session
+ *	    (caller must NULL them out), false if the session couldn't take the entry
+ *	    (caller still owns list_id/temp_vfid and must destroy them itself, #96)
  * thread_p (in) :
  * qentry_p (in) : query entry
  */
-void
+bool
 session_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p)
 {
   SESSION_STATE *state_p = NULL;
@@ -2516,7 +2518,7 @@ session_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qent
   state_p = session_get_session_state (thread_p);
   if (state_p == NULL)
     {
-      return;
+      return false;
     }
 
   /* iterate over queries so we don't add the same query twice */
@@ -2528,7 +2530,7 @@ session_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qent
 	  /* we don't need to add it again, just set list_id to null so that the query manager does not drop it */
 	  qentry_p->list_id = NULL;
 	  qentry_p->temp_vfid = NULL;
-	  return;
+	  return true;
 	}
       current = current->next;
     }
@@ -2537,7 +2539,7 @@ session_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qent
   sqentry_p = qentry_to_sentry (qentry_p);
   if (sqentry_p == NULL)
     {
-      return;
+      return false;
     }
 
   session_preserve_temporary_files (thread_p, sqentry_p);
@@ -2553,6 +2555,8 @@ session_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qent
     }
 
   sessions.num_holdable_cursors++;
+
+  return true;
 }
 
 /*

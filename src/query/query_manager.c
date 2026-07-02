@@ -117,6 +117,11 @@ struct qmgr_tran_entry
 
   OID_BLOCK_LIST *modified_classes_p;	/* array of class OIDs */
   pthread_mutex_t mutex;
+#if !defined (NDEBUG)
+  bool clear_wakeup_in_progress;	/* #96: reentrancy guard for the tran->session holdable handoff in
+					 * qmgr_clear_trans_wakeup(); catches a concurrent second invocation for
+					 * the same tran_index (e.g. commit racing logtb_release_tran_index). */
+#endif
 };
 
 typedef struct qmgr_temp_file_list QMGR_TEMP_FILE_LIST;
@@ -674,6 +679,9 @@ qmgr_initialize_tran_entry (QMGR_TRAN_ENTRY * tran_entry_p)
   tran_entry_p->dblink_entry = NULL;
   tran_entry_p->modified_classes_p = NULL;
   pthread_mutex_init (&tran_entry_p->mutex, NULL);
+#if !defined (NDEBUG)
+  tran_entry_p->clear_wakeup_in_progress = false;
+#endif
 }
 
 /*
@@ -2609,6 +2617,19 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 	  assert (query_p->query_status == QUERY_COMPLETED);
 	}
     }
+  /* #96: catch a concurrent second invocation of this function for the same tran_index (e.g. this thread's own
+   * commit racing a disconnect-driven logtb_release_tran_index () for the same tran). Below, each holdable
+   * entry is briefly unlinked from tran_entry_p->query_entry_list_p before it is published to the session
+   * (see the while loop below): materialize + session-store can't be done under tran_entry_p->mutex because
+   * qmgr_materialize_to_pgbuf () -> qfile_open_list () -> qmgr_create_new_temp_file () re-locks this same
+   * (non-recursive) mutex -- holding it across the handoff would deadlock, not just narrow the window. That
+   * window is safe today because: (a) the only sweep that reclaims tran-scoped temp files,
+   * file_tempcache_drop_tran_temp_files() (file_manager.c), is called solely from log_commit_local() /
+   * log_abort_local() (log_manager.c), strictly *after* this function returns, on the *same* thread; and
+   * (b) the only cross-thread caller of this function, logtb_release_tran_index() (log_tran_table.c), never
+   * calls that sweep at all. This assert exists to catch a regression if that ever stops being true. */
+  assert (!tran_entry_p->clear_wakeup_in_progress);
+  tran_entry_p->clear_wakeup_in_progress = true;
   pthread_mutex_unlock (&tran_entry_p->mutex);
 #endif
 
@@ -2664,12 +2685,20 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 		  er_log_debug (ARG_FILE_LINE, "query %d holdable materialize failed !\n", query_p->query_id);
 		  query_p->is_holdable = false;
 		}
-	      else
+	      else if (xsession_store_query_entry_info (thread_p, query_p))
 		{
-		  xsession_store_query_entry_info (thread_p, query_p);
-		  /* reset result info */
+		  /* ownership of list_id/temp_vfid was transferred to the session; reset result info so the
+		   * "destroy the query result" cleanup below doesn't double-free them */
 		  query_p->list_id = NULL;
 		  query_p->temp_vfid = NULL;
+		}
+	      else
+		{
+		  /* Session couldn't take the entry (e.g. no active session, or OOM building the session-side
+		   * entry, #96) -- list_id/temp_vfid are still owned by query_p here, so fall through to the
+		   * "destroy the query result" cleanup below instead of leaking them. */
+		  er_log_debug (ARG_FILE_LINE, "query %d holdable session store failed !\n", query_p->query_id);
+		  query_p->is_holdable = false;
 		}
 	    }
 	}
@@ -2703,6 +2732,9 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
       assert (tran_entry_p->query_entry_list_p == NULL);
     }
   tran_entry_p->trans_stat = QMGR_TRAN_TERMINATED;
+#if defined (SERVER_MODE) && !defined (NDEBUG)
+  tran_entry_p->clear_wakeup_in_progress = false;
+#endif
   pthread_mutex_unlock (&tran_entry_p->mutex);
 }
 

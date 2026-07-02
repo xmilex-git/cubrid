@@ -66,7 +66,7 @@ extern int session_get_variable_no_copy (THREAD_ENTRY * thread_p, const DB_VALUE
 extern int session_define_variable (THREAD_ENTRY * thread_p, DB_VALUE * name, DB_VALUE * value, DB_VALUE * result);
 extern int session_drop_session_variables (THREAD_ENTRY * thread_p, DB_VALUE * values, const int count);
 extern void session_states_dump (THREAD_ENTRY * thread_p);
-extern void session_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p);
+extern bool session_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p);
 extern int session_load_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p);
 extern int session_remove_query_entry_info (THREAD_ENTRY * thread_p, const QUERY_ID query_id);
 extern void session_remove_query_entry_all (THREAD_ENTRY * thread_p);

@@ -325,14 +325,16 @@ xsession_drop_session_variables (THREAD_ENTRY * thread_p, DB_VALUE * values, con
 
 /*
  * xsession_store_query_entry_info () - create a query entry
- * return : void
+ * return : true if ownership of qentry_p's list_id/temp_vfid was taken over by the session
+ *	    (caller must NULL them out), false if the session couldn't take the entry
+ *	    (caller still owns list_id/temp_vfid and must destroy them itself, #96)
  * thread_p (in) :
  * qentry_p (in) : query entry
  */
-void
+bool
 xsession_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p)
 {
-  session_store_query_entry_info (thread_p, qentry_p);
+  return session_store_query_entry_info (thread_p, qentry_p);
 }
 
 /*

@@ -283,7 +283,7 @@ extern int xsession_set_session_variables (THREAD_ENTRY * thread_p, DB_VALUE * v
 extern int xsession_get_session_variable (THREAD_ENTRY * thread_p, const DB_VALUE * name, DB_VALUE * value);
 extern int xsession_get_session_variable_no_copy (THREAD_ENTRY * thread_p, const DB_VALUE * name, DB_VALUE ** value);
 extern int xsession_drop_session_variables (THREAD_ENTRY * thread_p, DB_VALUE * values, const int count);
-extern void xsession_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p);
+extern bool xsession_store_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p);
 extern int xsession_load_query_entry_info (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qentry_p);
 extern int xsession_remove_query_entry_info (THREAD_ENTRY * thread_p, const QUERY_ID query_id);
 extern int xsession_clear_query_entry_info (THREAD_ENTRY * thread_p, const QUERY_ID query_id);
