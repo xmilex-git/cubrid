@@ -4426,41 +4426,22 @@ qmgr_setup_empty_list_file (char *page_p)
 void
 qmgr_initialize_temp_file_list (QMGR_TEMP_FILE_LIST * temp_file_list_p, QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type)
 {
-  int i, num_buffer_pages;
-  QMGR_TEMP_FILE *temp_file_p;
-  int rv;
-
   assert (temp_file_list_p != NULL && QMGR_IS_VALID_MEMBUF_TYPE (membuf_type));
   if (temp_file_list_p == NULL || !QMGR_IS_VALID_MEMBUF_TYPE (membuf_type))
     {
       return;
     }
 
-  num_buffer_pages = ((membuf_type == TEMP_FILE_MEMBUF_NORMAL) ? qmgr_work_mem_buffer_pages ()
-		      : prm_get_integer_value (PRM_ID_INDEX_SCAN_KEY_BUFFER_PAGES));
-
   pthread_mutex_init (&temp_file_list_p->mutex, NULL);
-  rv = pthread_mutex_lock (&temp_file_list_p->mutex);
   temp_file_list_p->list = NULL;
+  temp_file_list_p->count = 0;
 
-  for (i = 0; i < QMGR_TEMP_FILE_FREE_LIST_SIZE; i++)
-    {
-      temp_file_p = qmgr_allocate_tempfile_with_buffer (num_buffer_pages);
-      if (temp_file_p == NULL)
-	{
-	  break;
-	}
-      /* add to the free list */
-      temp_file_p->prev = NULL;
-      temp_file_p->next = temp_file_list_p->list;
-      temp_file_p->membuf_npages = num_buffer_pages;
-      temp_file_p->membuf_type = membuf_type;
-      temp_file_list_p->list = temp_file_p;
-    }
-
-  temp_file_list_p->count = i;
-
-  pthread_mutex_unlock (&temp_file_list_p->mutex);
+  /* redesign #78: removed the boot-time pre-allocation loop that created
+   * QMGR_TEMP_FILE_FREE_LIST_SIZE (100) temp files, each work_mem-sized.
+   * With work_mem=1G that was 100 GB of RSS at server start — unusable.
+   * The free list fills lazily: qmgr_free_temp_file_list returns freed temp
+   * files to the pool for reuse; qmgr_create_new_temp_file allocates on
+   * demand when the pool is empty.  Steady-state reuse is identical. */
 }
 
 /*
