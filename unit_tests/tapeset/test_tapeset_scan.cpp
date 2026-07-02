@@ -277,6 +277,17 @@ namespace
 	return 3;
       }
 
+    /* issue #93: pages_read must be real -- exactly one read_page() call per
+     * spilled file page touched by the single forward pass just completed
+     * (no overflow tuples in this fixture, so no page is read twice). */
+    {
+      qfile::buffile_tape *bft = dynamic_cast<qfile::buffile_tape *> (ts.get_tape (0));
+      if (bft == NULL || bft->backing () == NULL || bft->backing ()->metrics ().pages_read != wr.file_pages)
+	{
+	  return 7;
+	}
+    }
+
     /* backward == reversed */
     {
       qfile::tapeset_scan scan (&ts);

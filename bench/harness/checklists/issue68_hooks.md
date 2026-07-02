@@ -34,7 +34,9 @@ below) and re-wired them; this checklist is the record of what changed and how t
    `m_reads` atomic. Consolidated: `m_reads` removed, `buffile_metrics.pages_read` is now the
    atomic counter `read_page()` updates directly (kept atomic because reads are re-entrant/
    concurrent post-freeze, ADR 0005; `pgbuf_fixes` stays a plain `long` since it's only ever
-   touched from the single-writer producer path).
+   touched from the single-writer producer path). **G8** (`run_file_parity`) asserts
+   `pages_read == wr.file_pages` right after a single forward pass over the fixture's 4 spilled
+   pages, via `dynamic_cast<buffile_tape *>(...)->backing()->metrics().pages_read`.
 3. **selftest return codes discarded** -- `qmgr_initialize` logged `SELFTEST result=%d` but never
    checked it; a FAIL was indistinguishable from a PASS short of reading the number by hand. Now
    each of the 4 selftests additionally logs a `<NAME>_SELFTEST FAIL result=%d` marker and asserts
