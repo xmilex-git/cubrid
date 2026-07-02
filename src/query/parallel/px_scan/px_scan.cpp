@@ -37,7 +37,6 @@
 #include "list_file.h"				/* qfile_close_list, qfile_destroy_list */
 #include "heap_file.h"				/* heap_attrinfo_end */
 #include "file_manager.h"			/* file_get_num_user_pages */
-#include "temp_page_store.hpp"			/* temp_page_store::raw_fd_master_enabled */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -869,13 +868,19 @@ extern "C"
     const bool is_buildvalue_opt = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT);
     const bool is_new_backing = qfile_list_has_new_backing (list_id);
 
-    /* The OLD raw-fd parallel sector input path (input_handler_list / sector_page_iterator) is
-     * correct for MERGEABLE_LIST (the parallel-scan producer's OWN output) but DROPS ROWS on an
-     * arbitrary derived-table list -- e.g. a GROUP BY output scanned as a BUILDVALUE_OPT outer
-     * aggregate returned 349006 / 15000000 rows (#78 2A-2f).  Restrict BUILDVALUE_OPT parallelism
-     * to NEW (Tapeset) input, which the 2A-2e tuple-level tapeset_reader reads correctly; OLD /
-     * raw-fd BUILDVALUE_OPT stays SERIAL until the OLD sector reader is fixed (Phase3). */
-    if (temp_page_store::raw_fd_master_enabled () && !is_mergeable_list && !(is_buildvalue_opt && is_new_backing))
+    /* #113 (wrong-result, gate-independent): the OLD sector-based parallel LIST input reader
+     * (input_handler_list / sector_page_iterator) silently DROPS ROWS on a large derived list.
+     * A serially-produced MERGE JOIN (or UNION ALL) output consumed by a parallel GROUP BY loses
+     * its disk-spilled portion -- a 5.12M-row merge-join list scanned in parallel returned only its
+     * in-membuf prefix (1,669,921 rows; the read count tracks work_mem / membuf size), determin-
+     * istically and independent of the work_mem NEW-backing gate.  This was previously seen only
+     * for BUILDVALUE_OPT (349006 / 15000000 rows, #78 2A-2f) and mitigated for UNION ALL by promot-
+     * ing the finished list to NEW under the gate (#78 C-3); but every such mitigation is gate-
+     * conditioned, so with the gate OFF the wrong result stayed exposed for MERGEABLE_LIST too
+     * (the old raw_fd_master_enabled() guard here never fired).  Only a NEW (Tapeset) input, read by
+     * the correct tuple-level tapeset_reader, is safe to scan in parallel; every OLD-backed list
+     * falls back to a correct SERIAL list scan until the OLD sector reader itself is fixed (Phase3). */
+    if (!is_new_backing)
       {
 	return NO_ERROR;
       }
