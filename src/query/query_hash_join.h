@@ -314,11 +314,21 @@ typedef struct hashjoin_shared_split_info
   qfile::tapeset *new_tapeset;
   qfile::chunk_distributor *new_dist;
 
+  /* redesign #78 per-worker OUTPUT tape (ADR0004): when NEW-input split is active,
+   * each worker writes to its own partition lists without part_mutexes.  After all
+   * workers complete, the leader sequentially merges worker lists into part_list_id.
+   * worker_part_lists[worker_index][part_index] = worker's temp partition list.
+   * Allocated/freed per split-run in build_partitions; NULL on OLD path. */
+  QFILE_LIST_ID ***worker_part_lists;
+  UINT32 worker_count;
+
   hashjoin_shared_split_info ()
     : sector_scan ()
     , part_mutexes (nullptr)
     , new_tapeset (nullptr)
     , new_dist (nullptr)
+    , worker_part_lists (nullptr)
+    , worker_count (0)
   {
     //
   }

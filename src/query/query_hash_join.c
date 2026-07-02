@@ -2446,6 +2446,30 @@ hjoin_clear_shared_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manag
 	}
       db_private_free_and_init (thread_p, shared_info->part_mutexes);
     }
+
+  /* redesign #78 per-worker OUTPUT tape (ADR0004): cleanup any leaked worker lists
+   * (e.g. on error path where leader merge did not run). */
+  if (shared_info->worker_part_lists != NULL)
+    {
+      for (UINT32 wi = 0; wi < shared_info->worker_count; wi++)
+	{
+	  if (shared_info->worker_part_lists[wi] != NULL)
+	    {
+	      for (part_index = 0; part_index < part_cnt; part_index++)
+		{
+		  if (shared_info->worker_part_lists[wi][part_index] != NULL)
+		    {
+		      qfile_close_list (thread_p, shared_info->worker_part_lists[wi][part_index]);
+		      qfile_destroy_list (thread_p, shared_info->worker_part_lists[wi][part_index]);
+		      QFILE_FREE_AND_INIT_LIST_ID (shared_info->worker_part_lists[wi][part_index]);
+		    }
+		}
+	      db_private_free_and_init (thread_p, shared_info->worker_part_lists[wi]);
+	    }
+	}
+      db_private_free_and_init (thread_p, shared_info->worker_part_lists);
+      shared_info->worker_count = 0;
+    }
 }
 
 /*

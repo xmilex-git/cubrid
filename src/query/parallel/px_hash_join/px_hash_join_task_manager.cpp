@@ -242,6 +242,11 @@ namespace parallel_query
 	  assert (thread_ref.m_px_stats == nullptr);
 	}
 
+      /* redesign #78 per-worker OUTPUT tape (ADR0004): when worker_part_lists is
+       * allocated, each worker keeps its partition lists private — no mutex-
+       * protected flush to the shared part_list_id.  The leader merges after join. */
+      bool use_per_worker_output = (m_shared_info->worker_part_lists != nullptr);
+
       /* redesign #78 2A-3: per-tuple partition assignment and buffered write.
        * Shared by OLD sector page walk and NEW tapeset_reader paths.
        * Assumes tuple_record.tpl points to the current tuple.
@@ -279,8 +284,10 @@ namespace parallel_query
 	    hjoin_update_tuple_hash_key (&thread_ref, &tuple_record, hash_key);
 	  }
 
-	/* buffered write to partition */
-	if (temp_part_list_id[part_id] != nullptr
+	/* buffered write to partition — mutex-protected flush to shared part_list_id
+	 * only when NOT using per-worker output (ADR0004). */
+	if (!use_per_worker_output
+	    && temp_part_list_id[part_id] != nullptr
 	    && (QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_last == QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_npages - 1)
 	    && (temp_part_list_id[part_id]->last_offset + QFILE_GET_TUPLE_LENGTH (tuple_record.tpl)) > DB_PAGESIZE)
 	  {
@@ -549,46 +556,73 @@ namespace parallel_query
 
       if (!has_error)
 	{
-	  for (part_index = 0; part_index < part_cnt; part_index++)
+	  if (use_per_worker_output)
 	    {
-	      if (temp_part_list_id[part_index] == nullptr)
+	      /* redesign #78 per-worker OUTPUT tape (ADR0004): transfer ownership
+	       * of temp partition lists to the shared worker_part_lists array.
+	       * The leader will merge them after all workers complete — no mutex. */
+	      QFILE_LIST_ID **slot =
+		      (QFILE_LIST_ID **) db_private_alloc (&thread_ref, part_cnt * sizeof (QFILE_LIST_ID *));
+	      if (slot == nullptr)
 		{
-		  continue;
-		}
-
-	      qfile_close_list (&thread_ref, temp_part_list_id[part_index]);	/* may be meaningless since only memory buffer is used */
-
-	      if (temp_part_list_id[part_index]->tuple_cnt > 0)
-		{
-		  std::unique_lock lock (m_shared_info->part_mutexes[part_index]);
-
-		  assert (part_list_id[part_index]->last_pgptr == nullptr);
-
-		  if (part_list_id[part_index]->tuple_cnt > 0)
-		    {
-		      error = qfile_append_list (&thread_ref, part_list_id[part_index], temp_part_list_id[part_index]);
-		      if (error != NO_ERROR)
-			{
-			  assert_release_error (er_errid () != NO_ERROR);
-			  m_task_manager.handle_error (thread_ref);
-			  has_error = true;
-			  break;
-			}
-
-		      qfile_destroy_list (&thread_ref, temp_part_list_id[part_index]);
-		    }
-		  else
-		    {
-		      qfile_destroy_list (&thread_ref, part_list_id[part_index]);
-		      qfile_copy_list_id (part_list_id[part_index], temp_part_list_id[part_index], false, QFILE_PROHIBIT_DEPENDENT);
-		    }
+		  assert_release_error (er_errid () != NO_ERROR);
+		  m_task_manager.handle_error (thread_ref);
+		  has_error = true;
 		}
 	      else
 		{
-		  qfile_destroy_list (&thread_ref, temp_part_list_id[part_index]);
+		  for (part_index = 0; part_index < part_cnt; part_index++)
+		    {
+		      slot[part_index] = temp_part_list_id[part_index];
+		      temp_part_list_id[part_index] = nullptr;	/* transfer ownership */
+		    }
+		  m_shared_info->worker_part_lists[m_index] = slot;
 		}
+	    }
+	  else
+	    {
+	      /* OLD path: final merge under mutex. */
+	      for (part_index = 0; part_index < part_cnt; part_index++)
+		{
+		  if (temp_part_list_id[part_index] == nullptr)
+		    {
+		      continue;
+		    }
 
-	      QFILE_FREE_AND_INIT_LIST_ID (temp_part_list_id[part_index]);
+		  qfile_close_list (&thread_ref, temp_part_list_id[part_index]);
+
+		  if (temp_part_list_id[part_index]->tuple_cnt > 0)
+		    {
+		      std::unique_lock lock (m_shared_info->part_mutexes[part_index]);
+
+		      assert (part_list_id[part_index]->last_pgptr == nullptr);
+
+		      if (part_list_id[part_index]->tuple_cnt > 0)
+			{
+			  error = qfile_append_list (&thread_ref, part_list_id[part_index], temp_part_list_id[part_index]);
+			  if (error != NO_ERROR)
+			    {
+			      assert_release_error (er_errid () != NO_ERROR);
+			      m_task_manager.handle_error (thread_ref);
+			      has_error = true;
+			      break;
+			    }
+
+			  qfile_destroy_list (&thread_ref, temp_part_list_id[part_index]);
+			}
+		      else
+			{
+			  qfile_destroy_list (&thread_ref, part_list_id[part_index]);
+			  qfile_copy_list_id (part_list_id[part_index], temp_part_list_id[part_index], false, QFILE_PROHIBIT_DEPENDENT);
+			}
+		    }
+		  else
+		    {
+		      qfile_destroy_list (&thread_ref, temp_part_list_id[part_index]);
+		    }
+
+		  QFILE_FREE_AND_INIT_LIST_ID (temp_part_list_id[part_index]);
+		}
 	    }
 	}
 

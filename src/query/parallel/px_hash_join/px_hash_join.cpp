@@ -94,6 +94,18 @@ namespace parallel_query
 		goto error_exit;
 	      }
 	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
+
+	    /* redesign #78 per-worker OUTPUT tape (ADR0004): allocate per-worker
+	     * partition list slots so workers write without part_mutexes. */
+	    shared_info.worker_count = task_cnt;
+	    shared_info.worker_part_lists =
+		    (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
+	    if (shared_info.worker_part_lists == nullptr)
+	      {
+		error = er_errid ();
+		goto error_exit;
+	      }
+	    memset (shared_info.worker_part_lists, 0, task_cnt * sizeof (QFILE_LIST_ID **));
 	  }
 	else
 	  {
@@ -131,6 +143,55 @@ namespace parallel_query
       shared_info.new_dist = nullptr;
       shared_info.new_tapeset = nullptr;
 
+      /* redesign #78 per-worker OUTPUT tape (ADR0004): merge worker partition
+       * lists into the shared part_list_id.  Sequential — no mutex needed
+       * since all workers have completed. */
+      if (shared_info.worker_part_lists != nullptr)
+	{
+	  UINT32 part_cnt = manager->context_cnt;
+	  for (UINT32 wi = 0; wi < shared_info.worker_count; wi++)
+	    {
+	      if (shared_info.worker_part_lists[wi] == nullptr)
+		{
+		  continue;
+		}
+	      for (UINT32 pi = 0; pi < part_cnt; pi++)
+		{
+		  QFILE_LIST_ID *wpl = shared_info.worker_part_lists[wi][pi];
+		  if (wpl == nullptr)
+		    {
+		      continue;
+		    }
+		  if (wpl->tuple_cnt > 0)
+		    {
+		      qfile_close_list (&thread_ref, wpl);
+		      if (outer->part_list_id[pi]->tuple_cnt > 0)
+			{
+			  error = qfile_append_list (&thread_ref, outer->part_list_id[pi], wpl);
+			  qfile_destroy_list (&thread_ref, wpl);
+			}
+		      else
+			{
+			  qfile_destroy_list (&thread_ref, outer->part_list_id[pi]);
+			  qfile_copy_list_id (outer->part_list_id[pi], wpl, false, QFILE_PROHIBIT_DEPENDENT);
+			}
+		      if (error != NO_ERROR)
+			{
+			  goto error_exit;
+			}
+		    }
+		  else
+		    {
+		      qfile_destroy_list (&thread_ref, wpl);
+		    }
+		  QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
+		}
+	      db_private_free_and_init (&thread_ref, shared_info.worker_part_lists[wi]);
+	    }
+	  db_private_free_and_init (&thread_ref, shared_info.worker_part_lists);
+	  shared_info.worker_count = 0;
+	}
+
       if (thread_is_on_trace (&thread_ref))
 	{
 	  hjoin_trace_start (&thread_ref, &start_stats);
@@ -151,6 +212,17 @@ namespace parallel_query
 		goto error_exit;
 	      }
 	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
+
+	    /* redesign #78 per-worker OUTPUT tape (ADR0004): same as outer. */
+	    shared_info.worker_count = task_cnt;
+	    shared_info.worker_part_lists =
+		    (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
+	    if (shared_info.worker_part_lists == nullptr)
+	      {
+		error = er_errid ();
+		goto error_exit;
+	      }
+	    memset (shared_info.worker_part_lists, 0, task_cnt * sizeof (QFILE_LIST_ID **));
 	  }
 	else
 	  {
@@ -183,6 +255,53 @@ namespace parallel_query
 	}
 
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
+
+      /* redesign #78 per-worker OUTPUT tape (ADR0004): merge inner split worker lists. */
+      if (shared_info.worker_part_lists != nullptr)
+	{
+	  UINT32 part_cnt = manager->context_cnt;
+	  for (UINT32 wi = 0; wi < shared_info.worker_count; wi++)
+	    {
+	      if (shared_info.worker_part_lists[wi] == nullptr)
+		{
+		  continue;
+		}
+	      for (UINT32 pi = 0; pi < part_cnt; pi++)
+		{
+		  QFILE_LIST_ID *wpl = shared_info.worker_part_lists[wi][pi];
+		  if (wpl == nullptr)
+		    {
+		      continue;
+		    }
+		  if (wpl->tuple_cnt > 0)
+		    {
+		      qfile_close_list (&thread_ref, wpl);
+		      if (inner->part_list_id[pi]->tuple_cnt > 0)
+			{
+			  error = qfile_append_list (&thread_ref, inner->part_list_id[pi], wpl);
+			  qfile_destroy_list (&thread_ref, wpl);
+			}
+		      else
+			{
+			  qfile_destroy_list (&thread_ref, inner->part_list_id[pi]);
+			  qfile_copy_list_id (inner->part_list_id[pi], wpl, false, QFILE_PROHIBIT_DEPENDENT);
+			}
+		      if (error != NO_ERROR)
+			{
+			  goto error_exit;
+			}
+		    }
+		  else
+		    {
+		      qfile_destroy_list (&thread_ref, wpl);
+		    }
+		  QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
+		}
+	      db_private_free_and_init (&thread_ref, shared_info.worker_part_lists[wi]);
+	    }
+	  db_private_free_and_init (&thread_ref, shared_info.worker_part_lists);
+	  shared_info.worker_count = 0;
+	}
 
 cleanup:
       qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
