@@ -30,6 +30,7 @@
 
 #include "qfile_tape.hpp"
 #include "qfile_chunk.hpp"
+#include "list_file.h"
 #include "object_representation.h"
 #include "error_code.h"
 #include "page_buffer.h"	/* pgbuf_get_fix_debug_count / pgbuf_test_bump_fix_debug_count (issue #93) */
@@ -1788,6 +1789,109 @@ namespace
       }
     return 0;
   }
+
+  /* G21: qfile_tapeset_import (issue #90/#78 R10) -- normal per-tape
+   * move-and-null transfer appends src's Tapes after dest's existing ones,
+   * accumulates tuple_cnt/page_cnt and propagates new_contains_overflow_, and
+   * leaves src's Tapeset structurally empty: the "do not reuse src as a Tape
+   * source" contract this fix establishes (previously src kept unowned
+   * dangling Tape pointers after import).  Also covers the dest==src
+   * self-import guard. */
+  int
+  run_tapeset_import ()
+  {
+    qfile::tapeset *dts = new qfile::tapeset ();
+    dts->set_owns_tapes (true);
+    qfile::memory_tape *d0 = new qfile::memory_tape (true);
+    d0->append_page (make_page ({ 0, 1 }));
+    dts->append_tape (d0);
+
+    qfile::tapeset *sts = new qfile::tapeset ();
+    sts->set_owns_tapes (true);
+    qfile::memory_tape *s0 = new qfile::memory_tape (true);
+    s0->append_page (make_page ({ 2, 3 }));
+    qfile::memory_tape *s1 = new qfile::memory_tape (true);
+    s1->append_page (make_page ({ 4 }));
+    sts->append_tape (s0);
+    sts->append_tape (s1);
+
+    QFILE_LIST_ID dest, src;
+    std::memset (&dest, 0, sizeof (dest));
+    std::memset (&src, 0, sizeof (src));
+    QFILE_CLEAR_LIST_ID (&dest);
+    QFILE_CLEAR_LIST_ID (&src);
+    QFILE_LIST_ID_TAPESET (&dest) = dts;
+    QFILE_LIST_ID_OWNS_TAPESET (&dest) = true;
+    QFILE_LIST_ID_TAPESET (&src) = sts;
+    QFILE_LIST_ID_OWNS_TAPESET (&src) = true;
+    dest.tuple_cnt = 2;
+    dest.page_cnt = 1;
+    src.tuple_cnt = 3;
+    src.page_cnt = 2;
+    QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (&src) = true;
+
+    if (qfile_tapeset_import (NULL, &dest, &src) != NO_ERROR)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 1;
+      }
+
+    /* counts accumulate, overflow flag propagates */
+    if (dest.tuple_cnt != 5 || dest.page_cnt != 3 || !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (&dest))
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 2;
+      }
+
+    /* src reuse-prohibited contract: structurally empty, no dangling Tapes. */
+    if (sts->tape_count () != 0)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 3;
+      }
+
+    /* dest holds all 3 Tapes, combined data intact. */
+    if (dts->tape_count () != 3)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 4;
+      }
+    std::vector<int> got;
+    long fixes = -1;
+    if (scan_forward_ids (*dts, got, &fixes) != 0 || fixes != 0)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 5;
+      }
+    std::vector<int> expected = { 0, 1, 2, 3, 4 };
+    if (got != expected)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 6;
+      }
+
+    /* self-transfer is a safe no-op, not silent corruption.  Drives the
+     * tapeset-level guard directly (not qfile_tapeset_import's dest==src
+     * check): that one er_set()s on rejection, which asserts in this
+     * bootless harness (no er_init()). */
+    dts->transfer_tapes_from (dts);
+    if (dts->tape_count () != 3)
+      {
+	tapeset_teardown (&dest);
+	tapeset_teardown (&src);
+	return 7;
+      }
+
+    tapeset_teardown (&dest);
+    tapeset_teardown (&src);	/* src's now-empty Tapeset container is still owned; freed once here */
+    return 0;
+  }
 }
 
 int
@@ -1814,6 +1918,7 @@ main (int, char **)
     { "G18 N-reader concurrent file read (re-entrant, pgbuf-bypass)", run_concurrent_file_readers },
     { "G19 PEEK x overflow: no realloc-on-borrowed-pointer, no caller alloc (#83)", run_overflow_peek },
     { "G20 pgbuf_fixes anti-tautology: reacts to an injected fix (#93)", run_pgbuf_fixes_anti_tautology },
+    { "G21 qfile_tapeset_import: move-and-null transfer, src reuse prohibited (#90)", run_tapeset_import },
   };
 
   bool all_passed = true;
