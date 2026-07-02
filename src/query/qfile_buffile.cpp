@@ -35,7 +35,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <ctime>
+#include <mutex>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -175,6 +178,187 @@ namespace
 	return false;
       }
     return true;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Boot-time orphan sweep for cubrid_buffile/ (issue #88).  Mirrors the   */
+  /* raw-fd boot sweep in temp_page_store.cpp: a persistent per-database    */
+  /* server_id (survives restarts) namespaces this server's spill subtree, */
+  /* so boot can safely wipe ONLY that subtree -- files left behind by a    */
+  /* kill -9'd previous run of *this* server -- without touching another   */
+  /* live server's spills (a different server_id / different db_root).     */
+  /* ------------------------------------------------------------------ */
+
+  constexpr const char *BUFFILE_SERVER_ID_FILE = ".server-id";
+
+  std::string
+  sanitize_path_component (const char *input)
+  {
+    std::string out;
+    if (input == NULL || input[0] == '\0')
+      {
+	return "unknown";
+      }
+    for (const char *p = input; *p != '\0'; p++)
+      {
+	const unsigned char ch = static_cast<unsigned char> (*p);
+	if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')
+	  {
+	    out.push_back (static_cast<char> (ch));
+	  }
+	else
+	  {
+	    out.push_back ('_');
+	  }
+      }
+    return out.empty () ? std::string ("unknown") : out;
+  }
+
+  std::string
+  read_small_file (const std::string &path)
+  {
+    FILE *fp = fopen (path.c_str (), "r");
+    if (fp == NULL)
+      {
+	return std::string ();
+      }
+    char buffer[128];
+    const std::size_t nread = fread (buffer, 1, sizeof (buffer) - 1, fp);
+    fclose (fp);
+    buffer[nread] = '\0';
+    std::string value (buffer);
+    while (!value.empty () && (value[value.size () - 1] == '\n' || value[value.size () - 1] == '\r'))
+      {
+	value.erase (value.size () - 1);
+      }
+    return value;
+  }
+
+  bool
+  write_small_file (const std::string &path, const std::string &value)
+  {
+    FILE *fp = fopen (path.c_str (), "w");
+    if (fp == NULL)
+      {
+	return false;
+      }
+    const bool ok = fwrite (value.c_str (), 1, value.size (), fp) == value.size () && fputc ('\n', fp) != EOF;
+    fclose (fp);
+    return ok;
+  }
+
+  /* Recursively unlink every file/dir *under* `dir`, keeping `dir` itself. */
+  bool
+  unlink_tree_files_only (const std::string &dir)
+  {
+    DIR *dp = opendir (dir.c_str ());
+    if (dp == NULL)
+      {
+	return false;
+      }
+    bool ok = true;
+    struct dirent *entry = NULL;
+    while ((entry = readdir (dp)) != NULL)
+      {
+	if (strcmp (entry->d_name, ".") == 0 || strcmp (entry->d_name, "..") == 0)
+	  {
+	    continue;
+	  }
+	const std::string child = dir + "/" + entry->d_name;
+	struct stat st;
+	if (lstat (child.c_str (), &st) != 0)
+	  {
+	    ok = false;
+	    continue;
+	  }
+	if (S_ISDIR (st.st_mode))
+	  {
+	    ok = unlink_tree_files_only (child) && ok;
+	    if (rmdir (child.c_str ()) != 0 && errno != ENOENT)
+	      {
+		ok = false;
+	      }
+	  }
+	else if (unlink (child.c_str ()) != 0 && errno != ENOENT)
+	  {
+	    ok = false;
+	  }
+      }
+    closedir (dp);
+    return ok;
+  }
+
+  std::uint64_t
+  make_boot_incarnation () noexcept
+  {
+    const std::uint64_t now = static_cast<std::uint64_t> (time (NULL));
+    const std::uint64_t pid = static_cast<std::uint64_t> (getpid ());
+    return (now << 16) ^ pid;
+  }
+
+  struct buffile_dir_state
+  {
+    std::once_flag once;
+    std::string server_subtree;	/* <root>/cubrid_buffile/<db_name>/<server_id> */
+    bool sweep_ok { false };
+  };
+
+  buffile_dir_state g_buffile_dirs;
+
+  /* Resolve the disk-backed root (no /tmp or $TMP fallback, issue #88 D2:
+   * both can be tmpfs and a spill file on tmpfs defeats the point of
+   * spilling -- risks host OOM).  Priority: $CUBRID_TMP, else the database
+   * volume directory.  Empty return means "no usable disk-backed base". */
+  std::string
+  buffile_root_base ()
+  {
+    const char *cubrid_tmp = getenv ("CUBRID_TMP");
+    if (cubrid_tmp != NULL && cubrid_tmp[0] != '\0')
+      {
+	return cubrid_tmp;
+      }
+    const char *db_full = boot_db_full_name ();
+    if (db_full != NULL && db_full[0] != '\0')
+      {
+	char dir_buf[PATH_MAX];
+	const char *dir = fileio_get_directory_path (dir_buf, db_full);
+	if (dir != NULL && dir[0] != '\0')
+	  {
+	    return dir;
+	  }
+      }
+    return std::string ();
+  }
+
+  void
+  init_buffile_dirs ()
+  {
+    const std::string root_base = buffile_root_base ();
+    if (root_base.empty ())
+      {
+	g_buffile_dirs.sweep_ok = false;
+	return;
+      }
+
+    const std::string db_name = sanitize_path_component (boot_db_name ());
+    const std::string db_root = root_base + "/cubrid_buffile/" + db_name;
+    bool ok = mkdir_p (db_root);
+
+    const std::string server_id_path = db_root + "/" + BUFFILE_SERVER_ID_FILE;
+    std::string server_id = sanitize_path_component (read_small_file (server_id_path).c_str ());
+    if (server_id == "unknown")
+      {
+	server_id = "sid_" + std::to_string (make_boot_incarnation ());
+	ok = write_small_file (server_id_path, server_id) && ok;
+      }
+
+    g_buffile_dirs.server_subtree = db_root + "/" + server_id;
+    ok = mkdir_p (g_buffile_dirs.server_subtree) && ok;
+    if (ok)
+      {
+	ok = unlink_tree_files_only (g_buffile_dirs.server_subtree);
+      }
+    g_buffile_dirs.sweep_ok = ok;
   }
 }				/* anonymous namespace */
 
@@ -329,35 +513,22 @@ namespace qfile
     free (m_plain_raw);
   }
 
+  void
+  buffile::boot_sweep ()
+  {
+    std::call_once (g_buffile_dirs.once, init_buffile_dirs);
+  }
+
   bool
   buffile::default_scratch_dir (std::string &out)
   {
-    std::string base;
-    const char *cubrid_tmp = getenv ("CUBRID_TMP");
-    if (cubrid_tmp != NULL && cubrid_tmp[0] != '\0')
+    std::call_once (g_buffile_dirs.once, init_buffile_dirs);
+    if (!g_buffile_dirs.sweep_ok || g_buffile_dirs.server_subtree.empty ())
       {
-	base = cubrid_tmp;
+	return false;
       }
-    else
-      {
-	const char *db_full = boot_db_full_name ();
-	if (db_full != NULL && db_full[0] != '\0')
-	  {
-	    char dir_buf[PATH_MAX];
-	    const char *dir = fileio_get_directory_path (dir_buf, db_full);
-	    if (dir != NULL && dir[0] != '\0')
-	      {
-		base = dir;
-	      }
-	  }
-      }
-    if (base.empty ())
-      {
-	const char *tmp_env = getenv ("TMP");
-	base = (tmp_env != NULL && tmp_env[0] != '\0') ? std::string (tmp_env) : std::string ("/tmp");
-      }
-    out = base + "/cubrid_buffile";
-    return !out.empty ();
+    out = g_buffile_dirs.server_subtree;
+    return true;
   }
 
   buffile *

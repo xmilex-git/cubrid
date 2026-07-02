@@ -160,9 +160,21 @@ namespace qfile
       static buffile *create (THREAD_ENTRY *thread_p, const char *dir, std::uint64_t seq, unsigned int worker_id,
 			      TDE_ALGORITHM tde_algo, int *os_error_out);
 
-      /* Resolve the server-aware default scratch directory: $CUBRID_TMP, else
-       * the database volume directory, else $TMP, else /tmp.  Returns false
-       * only if no usable base can be formed. */
+      /* One-shot boot sweep (issue #88): wipes this server's cubrid_buffile
+       * spill subtree of any files orphaned by a kill -9'd previous run.
+       * Idempotent (std::call_once); call once at server boot, mirroring
+       * temp_page_store::initialize_raw_fd_boot_sweep(). Safe to skip -- if
+       * never called explicitly, default_scratch_dir() below runs it lazily
+       * on first use, but calling it at boot keeps the sweep off the query
+       * hot path. */
+      static void boot_sweep ();
+
+      /* Resolve the per-server default scratch directory: $CUBRID_TMP, else
+       * the database volume directory, then <base>/cubrid_buffile/<db>/<server_id>
+       * (server_id persists across restarts in a per-db marker file, so boot
+       * sweeps only this server's own subtree; issue #88).  No /tmp or $TMP
+       * fallback -- both can be tmpfs, which would defeat spilling.  Returns
+       * false if no disk-backed base can be formed. */
       static bool default_scratch_dir (std::string &out);
 
       ~buffile ();		/* closes fd and unlinks the file */

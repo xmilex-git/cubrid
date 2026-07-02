@@ -1147,6 +1147,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 
   qfile_initialize ();
   temp_page_store::initialize_raw_fd_boot_sweep ();
+  qfile::buffile::boot_sweep ();	/* issue #88: sweep orphaned cubrid_buffile/ spills */
 
   srand48 ((long) time (NULL));
 
