@@ -2535,6 +2535,16 @@ qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 	    }
 	}
 
+      /* E-1 (#79): destroy NEW backing (Tapeset) at the same level as OLD
+       * backing above.  Previously this was deferred to qfile_clear_list_id,
+       * which runs too late when a parent's tapeset_reader still references
+       * these Tapes.  NULL-out so qfile_clear_list_id does not double-free. */
+      if (QFILE_LIST_ID_TAPESET (list_id_p) != NULL && QFILE_LIST_ID_OWNS_TAPESET (list_id_p))
+	{
+	  qfile_tapeset_destroy (QFILE_LIST_ID_TAPESET (list_id_p));
+	  QFILE_LIST_ID_TAPESET (list_id_p) = NULL;
+	}
+
       if (QFILE_LIST_ID_DEPENDENT(list_id_p) != NULL)
 	{
 	  qfile_destroy_list (thread_p, QFILE_LIST_ID_DEPENDENT(list_id_p));

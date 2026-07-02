@@ -2382,6 +2382,26 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
       qfile_clear_list_id (xasl->list_id);
     }
 
+  /* E-1 (#79): close this node's scans BEFORE clearing children so that any
+   * tapeset_reader / tapeset_scan on a child's list_id is released before the
+   * child's tapeset is destroyed.  OLD backing is protected by pgbuf
+   * refcounting, but NEW Tapeset backing has no such protection — destroying
+   * a Tapeset while an active tapeset_reader references it is use-after-free.
+   *
+   * scan_end_scan / scan_close_scan are idempotent (return immediately when
+   * status is S_ENDED / S_CLOSED), so the per-proc-type calls later in the
+   * switch block become harmless no-ops. */
+  if (xasl->curr_spec)
+    {
+      scan_end_scan (thread_p, &xasl->curr_spec->s_id);
+      scan_close_scan (thread_p, &xasl->curr_spec->s_id);
+    }
+  if (xasl->merge_spec)
+    {
+      scan_end_scan (thread_p, &xasl->merge_spec->s_id);
+      scan_close_scan (thread_p, &xasl->merge_spec->s_id);
+    }
+
   for (xasl_p = xasl->aptr_list; xasl_p; xasl_p = xasl_p->next)
     {
       XASL_SET_FLAG (xasl_p, decache_clone_flag);
@@ -2918,6 +2938,19 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
 
   /* Final teardown of correlated DBLink CCI handles (parallel aptr path). */
   qexec_final_close_dblink_specs (xasl);
+
+  /* E-1 (#79): close scans before clearing children — same rationale as the
+   * non-parallel path (see comment in qexec_clear_xasl). */
+  if (xasl->curr_spec)
+    {
+      scan_end_scan (thread_p, &xasl->curr_spec->s_id);
+      scan_close_scan (thread_p, &xasl->curr_spec->s_id);
+    }
+  if (xasl->merge_spec)
+    {
+      scan_end_scan (thread_p, &xasl->merge_spec->s_id);
+      scan_close_scan (thread_p, &xasl->merge_spec->s_id);
+    }
 
   /* clear the body node */
   /* not clear aptr nodes has px_executor; it will be cleared by other threads. */
