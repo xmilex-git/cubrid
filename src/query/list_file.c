@@ -5049,6 +5049,13 @@ qfile_initialize_sort_info (SORT_INFO * sort_info_p, QFILE_LIST_ID * list_id_p, 
     {
       return NULL;
     }
+  /* When the input list is NEW-backed, VPID back-references are invalid; a partial-key
+   * (use_original=1) sort would jump the input scan by saved position (#85), same as the
+   * existing GROUP BY (query_executor.c) / ANALYTIC guards. */
+  if (qfile_list_has_new_backing (list_id_p))
+    {
+      sort_info_p->key_info.use_original = 0;
+    }
 
   return sort_info_p;
 }

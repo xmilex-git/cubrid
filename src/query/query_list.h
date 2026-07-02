@@ -791,6 +791,10 @@ qfile_tuple_position_db_is_raw_fd (const QFILE_TUPLE_POSITION_DB * tuple_positio
 static inline void
 qfile_tuple_position_store_to_db (QFILE_TUPLE_POSITION_DB * stored_p, const QFILE_TUPLE_POSITION * src_p)
 {
+  /* QFILE_TUPLE_POSITION_DB has no TAPE variant (COORD_TAPE is intra-query only, see the
+   * enum comment) -- a TAPE-coord src_p would otherwise fall through to the VPID branch
+   * below and get its tape_idx/tape_page_offset punned into vpid.pageid/volid (#85). */
+  assert (!qfile_tuple_position_is_tape (src_p));
   stored_p->status = src_p->status;
   stored_p->position = src_p->position;
   if (qfile_tuple_position_is_raw_fd (src_p))

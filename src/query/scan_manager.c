@@ -9242,11 +9242,17 @@ check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_y
       /* bytes of 1 row = sizeof(HENTRY_HLS) + sizeof(QFILE_TUPLE_SIMPLE_POS) = 56 bytes (64bit) */
       /* HENTRY_HLS = pointer(8bytes) * 4 = 32 bytes */
       /* SIMPLE_POS = discriminator(4bytes) + fixed coordinate(16bytes) + reserved(4bytes) = 24 bytes */
-      return HASH_METH_HYBRID;
+      /* HYBRID stores a VPID-coord position (qdata_alloc_hscan_value_OID) that later
+       * re-jumps via qfile_jump_scan_tuple_position.  For a NEW (Tapeset) build list the
+       * saved position is the synthetic mirror curr_vpid, which loses tape_idx -- probing
+       * it re-interprets the union as tape coords and reads the wrong tape or errors
+       * (#85). Fall back to non-hash scan instead. */
+      return qfile_list_has_new_backing (llsidp->list_id) ? HASH_METH_NOT_USE : HASH_METH_HYBRID;
     }
   else
     {
-      return HASH_METH_HASH_FILE;
+      /* HASH_FILE stores a raw VPID (SET_TFTID) for the same reason -- same guard (#85). */
+      return qfile_list_has_new_backing (llsidp->list_id) ? HASH_METH_NOT_USE : HASH_METH_HASH_FILE;
     }
 
   return HASH_METH_NOT_USE;
