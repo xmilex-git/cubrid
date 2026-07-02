@@ -175,6 +175,15 @@ public class ServerConfig {
 
     public void initializeCharset() {
         SysParam sysParam = systemParameters.get(SysParam.INTL_COLLATION);
+        if (sysParam == null) {
+            // intl_collation is a client/session parameter with no server-side default,
+            // so it is not delivered into the boot-time PL context; keep the UTF-8
+            // default set in the constructor, matching Context.getSessionCharset()'s
+            // fallback to Server.getConfig().getServerCharset() when unset.
+            System.setProperty("file.encoding", serverCharset.toString());
+            return;
+        }
+
         String collation = sysParam.getParamValue();
         String codeset = parseCollationString(collation);
 
