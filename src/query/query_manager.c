@@ -125,6 +125,7 @@ struct qmgr_temp_file_list
   pthread_mutex_t mutex;
   QMGR_TEMP_FILE *list;
   int count;
+  size_t bytes;			/* total allocation size of pooled entries (#91) */
 };
 
 /*
@@ -4480,6 +4481,7 @@ qmgr_initialize_temp_file_list (QMGR_TEMP_FILE_LIST * temp_file_list_p, QMGR_TEM
   pthread_mutex_init (&temp_file_list_p->mutex, NULL);
   temp_file_list_p->list = NULL;
   temp_file_list_p->count = 0;
+  temp_file_list_p->bytes = 0;
 
   /* redesign #78: removed the boot-time pre-allocation loop that created
    * QMGR_TEMP_FILE_FREE_LIST_SIZE (100) temp files, each work_mem-sized.
@@ -4512,7 +4514,39 @@ qmgr_finalize_temp_file_list (QMGR_TEMP_FILE_LIST * temp_file_list_p)
       free_and_init (temp_file_p);
     }
   temp_file_list_p->count = 0;
+  temp_file_list_p->bytes = 0;
   pthread_mutex_destroy (&temp_file_list_p->mutex);
+}
+
+/*
+ * qmgr_temp_file_entry_bytes () - allocation size of a pooled temp file
+ *   (struct + membuf pointer array + membuf pages); mirrors
+ *   qmgr_allocate_tempfile_with_buffer.
+ */
+static size_t
+qmgr_temp_file_entry_bytes (const QMGR_TEMP_FILE * temp_file_p)
+{
+  size_t size = DB_ALIGN (sizeof (QMGR_TEMP_FILE), MAX_ALIGNMENT);
+
+  size += DB_ALIGN (sizeof (PAGE_PTR) * temp_file_p->membuf_capacity_pages, MAX_ALIGNMENT);
+  size += (size_t) DB_PAGESIZE * temp_file_p->membuf_capacity_pages;
+  return size;
+}
+
+/*
+ * qmgr_temp_file_pool_cap_bytes () - byte cap for one temp file free list.
+ *   The entry-count cap alone lets a burst leave count x work_mem resident
+ *   forever (100 x 1G = 100 GB); bound the pool by bytes instead: a quarter
+ *   of the work_mem accountant cap, floored so small configurations still
+ *   get reuse (#91).
+ */
+static size_t
+qmgr_temp_file_pool_cap_bytes (void)
+{
+  const size_t min_pool_bytes = 64ULL * 1024 * 1024;
+  size_t cap = temp_page_store::cap_bytes () / 4;
+
+  return MAX (cap, min_pool_bytes);
 }
 
 /*
@@ -4541,6 +4575,7 @@ qmgr_get_temp_file_from_list (QMGR_TEMP_FILE_LIST * temp_file_list_p)
       temp_file_list_p->list = temp_file_p->next;
       temp_file_p->prev = temp_file_p->next = NULL;
       temp_file_list_p->count--;
+      temp_file_list_p->bytes -= qmgr_temp_file_entry_bytes (temp_file_p);
     }
 
   pthread_mutex_unlock (&temp_file_list_p->mutex);
@@ -4580,17 +4615,22 @@ qmgr_put_temp_file_into_list (QMGR_TEMP_FILE * temp_file_p)
 
   if (QMGR_IS_VALID_MEMBUF_TYPE (temp_file_p->membuf_type))
     {
+      size_t entry_bytes = qmgr_temp_file_entry_bytes (temp_file_p);
+
       temp_file_list_p = &qmgr_Query_table.temp_file_list[temp_file_p->membuf_type];
 
       rv = pthread_mutex_lock (&temp_file_list_p->mutex);
 
-      /* add to the free list */
-      if (temp_file_list_p->count < QMGR_TEMP_FILE_FREE_LIST_SIZE)
+      /* add to the free list; anything past the count or byte cap is freed
+       * immediately so a burst cannot leave unbounded RSS pooled (#91) */
+      if (temp_file_list_p->count < QMGR_TEMP_FILE_FREE_LIST_SIZE
+	  && temp_file_list_p->bytes + entry_bytes <= qmgr_temp_file_pool_cap_bytes ())
 	{
 	  temp_file_p->prev = NULL;
 	  temp_file_p->next = temp_file_list_p->list;
 	  temp_file_list_p->list = temp_file_p;
 	  temp_file_list_p->count++;
+	  temp_file_list_p->bytes += entry_bytes;
 	  temp_file_p = NULL;
 	}
 
