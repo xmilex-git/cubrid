@@ -32,6 +32,7 @@
 #include "qfile_chunk.hpp"
 #include "object_representation.h"
 #include "error_code.h"
+#include "page_buffer.h"	/* pgbuf_get_fix_debug_count / pgbuf_test_bump_fix_debug_count (issue #93) */
 
 #include <cstdio>
 #include <cstdlib>
@@ -149,14 +150,25 @@ namespace
     return page;
   }
 
+  /* Scratch dir for file-backed test Tapes: $CUBRID_TMP if set, else $TMP,
+   * else /tmp as a last resort -- mirrors qfile::buffile::default_scratch_dir
+   * (qfile_buffile.cpp), minus the DB-volume-directory step that needs a
+   * booted server (issue #93: this test previously hardcoded /tmp). */
   const char *
   test_scratch_dir ()
   {
     static std::string dir;
     if (dir.empty ())
       {
+	const char *cubrid_tmp = getenv ("CUBRID_TMP");
+	std::string base = (cubrid_tmp != NULL && cubrid_tmp[0] != '\0') ? std::string (cubrid_tmp) : std::string ();
+	if (base.empty ())
+	  {
+	    const char *tmp_env = getenv ("TMP");
+	    base = (tmp_env != NULL && tmp_env[0] != '\0') ? std::string (tmp_env) : std::string ("/tmp");
+	  }
 	char buf[256];
-	std::snprintf (buf, sizeof (buf), "/tmp/cubrid_buffile_ut_%ld", (long) getpid ());
+	std::snprintf (buf, sizeof (buf), "%s/cubrid_buffile_ut_%ld", base.c_str (), (long) getpid ());
 	dir = buf;
       }
     return dir.c_str ();
@@ -711,6 +723,49 @@ namespace
 	return 5;
       }
     scan2.close (NULL);
+    return 0;
+  }
+
+  /* G20 anti-tautology (issue #93): pgbuf_fixes must react to an actual fix,
+   * not just stay at its zero-initialized value forever.  Before this issue,
+   * nothing in src/ ever wrote a nonzero value to pgbuf_fixes, so G7/G8/G10/
+   * G18's "!= 0" checks could never fail regardless of whether the
+   * pgbuf-bypass invariant actually held.  A bootless unit test can't safely
+   * call the real pgbuf_fix() (it needs a booted page buffer pool), so this
+   * bumps the same boot-independent debug counter the real pgbuf_fix_debug()
+   * entry point bumps (pgbuf_get_fix_debug_count(), page_buffer.h) and
+   * confirms the scan-side snapshot-diff (qfile_tape.cpp's
+   * refresh_pgbuf_fixes) picks it up -- proving the wiring is live, not a
+   * tautology. */
+  int
+  run_pgbuf_fixes_anti_tautology ()
+  {
+    qfile::tapeset ts;
+    std::vector<int> expected;
+    build_fixture (ts, expected);
+
+    qfile::tapeset_scan scan (&ts);
+    QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+    if (scan.forward (NULL, &tplrec, PEEK) != S_SUCCESS)
+      {
+	return 1;
+      }
+    if (scan.metrics ().pgbuf_fixes != 0)
+      {
+	return 2;		/* clean before the injected fix -- sanity */
+      }
+
+    pgbuf_test_bump_fix_debug_count ();	/* simulate one stray real pgbuf_fix */
+
+    while (scan.forward (NULL, &tplrec, PEEK) == S_SUCCESS)
+      {
+	;
+      }
+    if (scan.metrics ().pgbuf_fixes == 0)
+      {
+	return 3;		/* gate failed to react: still a tautology */
+      }
+    scan.close (NULL);
     return 0;
   }
 
@@ -1747,6 +1802,7 @@ main (int, char **)
     { "G17 overflow run reassembly across a Chunk boundary (R1+R2)", run_overflow_crosschunk },
     { "G18 N-reader concurrent file read (re-entrant, pgbuf-bypass)", run_concurrent_file_readers },
     { "G19 PEEK x overflow: no realloc-on-borrowed-pointer, no caller alloc (#83)", run_overflow_peek },
+    { "G20 pgbuf_fixes anti-tautology: reacts to an injected fix (#93)", run_pgbuf_fixes_anti_tautology },
   };
 
   bool all_passed = true;

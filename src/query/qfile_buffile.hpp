@@ -72,9 +72,10 @@ namespace qfile
     long pages_appended;	/* append_page() calls (= logical pages produced) */
     long pages_flushed;		/* pages written to disk by flush() */
     long flush_calls;		/* pwrite batches issued */
-    long pages_read;		/* read_page() disk reads */
+    std::atomic<long> pages_read;	/* read_page() disk reads (atomic: re-entrant concurrent readers) */
     long bytes_written;		/* total bytes pwritten */
-    long pgbuf_fixes;		/* pgbuf BCB fixes -- MUST stay 0 (bypass gate, producer side) */
+    long pgbuf_fixes;		/* pgbuf BCB fixes -- MUST stay 0 (bypass gate, producer side); see
+				 * pgbuf_get_fix_debug_count() snapshot-diff in buffile::refresh_pgbuf_fixes() */
 
     buffile_metrics ()
       : pages_appended (0), pages_flushed (0), flush_calls (0), pages_read (0), bytes_written (0), pgbuf_fixes (0)
@@ -195,6 +196,7 @@ namespace qfile
       int ensure_write_scratch ();
       int stage_plaintext (const PAGE_PTR list_page, char *slot);
       int stage_tde (const PAGE_PTR list_page, char *slot, int page_index);
+      void refresh_pgbuf_fixes ();	/* producer-side pgbuf-bypass gate (issue #93) */
 
       int m_fd;
       std::string m_path;
@@ -213,9 +215,9 @@ namespace qfile
       char *m_plain_raw;
       FILEIO_PAGE *m_plain;	/* encrypt staging wrap buffer (write path only) */
 
-      mutable std::atomic<long> m_reads;	/* re-entrant reads served (atomic; read path) */
+      long m_pgbuf_fix_baseline;	/* pgbuf_get_fix_debug_count() at construction (issue #93) */
 
-      buffile_metrics m_metrics;
+      mutable buffile_metrics m_metrics;	/* mutable: pages_read is atomic-updated from const read_page() */
 
       buffile (const buffile &) = delete;
       buffile &operator= (const buffile &) = delete;

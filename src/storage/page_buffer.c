@@ -2103,6 +2103,23 @@ pgbuf_monitor_sum_pg_unfix (bool reset)
   return total;
 }
 
+#if !defined (NDEBUG)
+/* issue #93: boot-independent fix counter (see page_buffer.h). */
+static std::atomic<INT64> pgbuf_Fix_debug_count { 0 };
+
+INT64
+pgbuf_get_fix_debug_count (void)
+{
+  return pgbuf_Fix_debug_count.load (std::memory_order_relaxed);
+}
+
+void
+pgbuf_test_bump_fix_debug_count (void)
+{
+  pgbuf_Fix_debug_count.fetch_add (1, std::memory_order_relaxed);
+}
+#endif /* !NDEBUG */
+
 /*
  * pgbuf_fix () -
  *   return: Pointer to the page or NULL
@@ -2155,6 +2172,9 @@ pgbuf_fix_release (THREAD_ENTRY * thread_p, const VPID * vpid, PAGE_FETCH_MODE f
     }
 
   pgbuf_monitor_inc_fix_req (thread_p);
+#if !defined (NDEBUG)
+  pgbuf_Fix_debug_count.fetch_add (1, std::memory_order_relaxed);
+#endif /* !NDEBUG */
 
   if (pgbuf_get_check_page_validation_level (PGBUF_DEBUG_PAGE_VALIDATION_FETCH) && fetch_mode != RECOVERY_PAGE)
     {

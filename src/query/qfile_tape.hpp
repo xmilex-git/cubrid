@@ -378,6 +378,7 @@ namespace qfile
       char *m_peek_reasm_raw;	/* scan-owned overflow-PEEK result buffer (#83); freed here, never by caller */
       int m_peek_reasm_cap;
       tapeset_scan_metrics m_metrics;
+      long m_pgbuf_fix_baseline;	/* pgbuf_get_fix_debug_count() at construction (issue #93) */
 
       tapeset_scan (const tapeset_scan &) = delete;
       tapeset_scan &operator= (const tapeset_scan &) = delete;
@@ -434,6 +435,7 @@ namespace qfile
       int m_peek_reasm_cap;
 
       tapeset_scan_metrics m_metrics;
+      long m_pgbuf_fix_baseline;	/* pgbuf_get_fix_debug_count() at construction (issue #93) */
 
       tapeset_reader (const tapeset_reader &) = delete;
       tapeset_reader &operator= (const tapeset_reader &) = delete;

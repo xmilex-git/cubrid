@@ -26,6 +26,7 @@
 #include "boot_sr.h"		/* boot_db_full_name */
 #include "error_manager.h"
 #include "file_io.h"		/* FILEIO_PAGE / fileio_initialize_res / fileio_get_directory_path */
+#include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "tde.h"
 
@@ -237,13 +238,29 @@ namespace qfile
     , m_batch_pages (0)
     , m_plain_raw (NULL)
     , m_plain (NULL)
-    , m_reads (0)
+#if !defined (NDEBUG)
+    , m_pgbuf_fix_baseline (pgbuf_get_fix_debug_count ())
+#else /* NDEBUG */
+    , m_pgbuf_fix_baseline (0)
+#endif /* NDEBUG */
     , m_metrics ()
   {
     if (m_fd >= 0)
       {
 	tape_backing_census_file_opened ();
       }
+  }
+
+  /* Producer-side pgbuf-bypass gate (issue #93): a BufFile reads/writes only
+   * through pread/pwrite on its own fd and must never fix a pgbuf BCB.
+   * Snapshot-diffing the boot-independent debug counter across the object's
+   * lifetime replaces the old always-zero field with a real measurement. */
+  void
+  buffile::refresh_pgbuf_fixes ()
+  {
+#if !defined (NDEBUG)
+    m_metrics.pgbuf_fixes = pgbuf_get_fix_debug_count () - m_pgbuf_fix_baseline;
+#endif /* !NDEBUG */
   }
 
   buffile::~buffile ()
@@ -451,6 +468,7 @@ namespace qfile
 
     m_batch_pages++;
     m_metrics.pages_appended++;
+    refresh_pgbuf_fixes ();
     return NO_ERROR;
   }
 
@@ -482,6 +500,7 @@ namespace qfile
     m_metrics.flush_calls++;
     m_metrics.bytes_written += (long) len;
     m_batch_pages = 0;
+    refresh_pgbuf_fixes ();
     return NO_ERROR;
   }
 
@@ -506,7 +525,7 @@ namespace qfile
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	    return ER_FAILED;
 	  }
-	m_reads.fetch_add (1, std::memory_order_relaxed);
+	m_metrics.pages_read.fetch_add (1, std::memory_order_relaxed);
 	return NO_ERROR;
       }
 
@@ -539,7 +558,7 @@ namespace qfile
 	return error;
       }
     std::memcpy (dest, scratch->plain->page, DB_PAGESIZE);
-    m_reads.fetch_add (1, std::memory_order_relaxed);
+    m_metrics.pages_read.fetch_add (1, std::memory_order_relaxed);
     return NO_ERROR;
   }
 }				/* namespace qfile */

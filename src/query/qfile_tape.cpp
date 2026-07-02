@@ -27,6 +27,7 @@
 #include "memory_alloc.h"
 #include "object_representation.h"	/* OR_GET_INT used by the QFILE_GET_* page macros */
 #include "list_file.h"		/* qfile_copy_list_id / qfile_clear_list_id / QFILE_MOVE_DEPENDENT */
+#include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "file_io.h"		/* PEEK */
 
@@ -371,6 +372,18 @@ namespace qfile
   /* tapeset_scan                                                       */
   /* ------------------------------------------------------------------ */
 
+  /* Scan-side pgbuf-bypass gate (issue #93): tapeset_scan/tapeset_reader read
+   * pages only via tape::page_at / tape::read_page_into and must never fix a
+   * pgbuf BCB.  Snapshot-diffing the boot-independent debug counter replaces
+   * the old always-zero field with a real measurement. */
+  static void
+  refresh_pgbuf_fixes (tapeset_scan_metrics &metrics, long baseline)
+  {
+#if !defined (NDEBUG)
+    metrics.pgbuf_fixes = pgbuf_get_fix_debug_count () - baseline;
+#endif /* !NDEBUG */
+  }
+
   tapeset_scan::tapeset_scan (tapeset *ts)
     : m_tapeset (ts)
     , m_position (S_BEFORE)
@@ -387,6 +400,11 @@ namespace qfile
     , m_reasm (NULL)
     , m_peek_reasm_raw (NULL)
     , m_peek_reasm_cap (0)
+#if !defined (NDEBUG)
+    , m_pgbuf_fix_baseline (pgbuf_get_fix_debug_count ())
+#else /* NDEBUG */
+    , m_pgbuf_fix_baseline (0)
+#endif /* NDEBUG */
   {
   }
 
@@ -629,6 +647,7 @@ namespace qfile
 		return S_ERROR;
 	      }
 	    m_metrics.page_reads++;
+	    refresh_pgbuf_fixes (m_metrics, m_pgbuf_fix_baseline);
 	    int count = QFILE_GET_TUPLE_COUNT (page);
 	    if (count > 0)
 	      {
@@ -716,6 +735,7 @@ namespace qfile
 		return S_ERROR;
 	      }
 	    m_metrics.page_reads++;
+	    refresh_pgbuf_fixes (m_metrics, m_pgbuf_fix_baseline);
 	    int count = QFILE_GET_TUPLE_COUNT (page);
 	    if (count > 0)
 	      {
@@ -735,6 +755,7 @@ namespace qfile
 		    return S_ERROR;
 		  }
 		m_metrics.page_reads++;
+		refresh_pgbuf_fixes (m_metrics, m_pgbuf_fix_baseline);
 		set_on (ti, first, start_pg, QFILE_PAGE_HEADER_SIZE, 0);
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
@@ -782,6 +803,7 @@ namespace qfile
 	    return S_ERROR;
 	  }
 	m_metrics.page_reads++;
+	refresh_pgbuf_fixes (m_metrics, m_pgbuf_fix_baseline);
 	release_page (thread_p);
 	set_on (tuple_position_p->tape_idx, tuple_position_p->tape_page_offset, page,
 		tuple_position_p->tape_byte_offset, tuple_position_p->tplno);
@@ -828,6 +850,11 @@ namespace qfile
     , m_peek_reasm_raw (NULL)
     , m_peek_reasm_cap (0)
     , m_metrics ()
+#if !defined (NDEBUG)
+    , m_pgbuf_fix_baseline (pgbuf_get_fix_debug_count ())
+#else /* NDEBUG */
+    , m_pgbuf_fix_baseline (0)
+#endif /* NDEBUG */
   {
     m_page_raw = (char *) malloc (DB_PAGESIZE);
     m_page_buf = (PAGE_PTR) m_page_raw;
@@ -972,6 +999,7 @@ namespace qfile
 	    return S_ERROR;
 	  }
 	m_metrics.page_reads++;
+	refresh_pgbuf_fixes (m_metrics, m_pgbuf_fix_baseline);
 	int count = QFILE_GET_TUPLE_COUNT (page);
 
 	if (count > 0)

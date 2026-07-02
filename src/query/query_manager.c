@@ -1179,24 +1179,50 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       int buffile_selftest_rc = qfile_buffile_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
       fprintf (stderr, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
+      if (buffile_selftest_rc != NO_ERROR)
+	{
+	  /* issue #93: a clear, grep-able marker (gate_tapeset_scan.sh judges on
+	   * it) instead of silently discarding the return code. */
+	  er_log_debug (ARG_FILE_LINE, "BUFFILE_SELFTEST FAIL result=%d\n", buffile_selftest_rc);
+	  fprintf (stderr, "BUFFILE_SELFTEST FAIL result=%d\n", buffile_selftest_rc);
+	  assert (buffile_selftest_rc == NO_ERROR);
+	}
     }
   if (getenv ("CUBRID_HELDTAPE_SELFTEST") != NULL)
     {
       int heldtape_selftest_rc = qfile_heldtape_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "HELDTAPE_SELFTEST result=%d (0=PASS)\n", heldtape_selftest_rc);
       fprintf (stderr, "HELDTAPE_SELFTEST result=%d (0=PASS)\n", heldtape_selftest_rc);
+      if (heldtape_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "HELDTAPE_SELFTEST FAIL result=%d\n", heldtape_selftest_rc);
+	  fprintf (stderr, "HELDTAPE_SELFTEST FAIL result=%d\n", heldtape_selftest_rc);
+	  assert (heldtape_selftest_rc == NO_ERROR);
+	}
     }
   if (getenv ("CUBRID_TAPEREAD_SELFTEST") != NULL)
     {
       int taperead_selftest_rc = qfile_taperead_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "TAPEREAD_SELFTEST result=%d (0=PASS)\n", taperead_selftest_rc);
       fprintf (stderr, "TAPEREAD_SELFTEST result=%d (0=PASS)\n", taperead_selftest_rc);
+      if (taperead_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "TAPEREAD_SELFTEST FAIL result=%d\n", taperead_selftest_rc);
+	  fprintf (stderr, "TAPEREAD_SELFTEST FAIL result=%d\n", taperead_selftest_rc);
+	  assert (taperead_selftest_rc == NO_ERROR);
+	}
     }
   if (getenv ("CUBRID_PRODUCER_SELFTEST") != NULL)
     {
       int producer_selftest_rc = qfile_producer_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "PRODUCER_SELFTEST result=%d (0=PASS)\n", producer_selftest_rc);
       fprintf (stderr, "PRODUCER_SELFTEST result=%d (0=PASS)\n", producer_selftest_rc);
+      if (producer_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "PRODUCER_SELFTEST FAIL result=%d\n", producer_selftest_rc);
+	  fprintf (stderr, "PRODUCER_SELFTEST FAIL result=%d\n", producer_selftest_rc);
+	  assert (producer_selftest_rc == NO_ERROR);
+	}
     }
 #endif /* !NDEBUG */
 
