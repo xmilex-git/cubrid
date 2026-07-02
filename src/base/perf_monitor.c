@@ -591,6 +591,9 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_REGU_NUM_IOREADS, "Num_regu_ioreads"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_REGU_NUM_CALL_EVALS, "Num_regu_call_evals"),
 
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_NEW_BACKED_CREATE, "Num_qfile_new_backed_create"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_OLD_TOUCH_ON_NEW, "Num_qfile_old_touch_on_new"),
+
   /* Array type statistics */
   PSTAT_METADATA_INIT_COMPLEX (PSTAT_PBX_FIX_COUNTERS, "Num_data_page_fix_ext", &f_dump_in_file_Num_data_page_fix_ext,
 			       &f_dump_in_buffer_Num_data_page_fix_ext, &f_load_Num_data_page_fix_ext),

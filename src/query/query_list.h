@@ -644,6 +644,14 @@ extern int qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIN
 extern void qfile_ae_record_old_touch (void);
 extern long qfile_ae_old_touch_count (void);
 extern void qfile_ae_reset_old_touch_count (void);
+
+/* Sibling counter: a list was actually converted to NEW(Tapeset) backing
+ * (qfile_list_make_new_backed()).  Process-wide; reset is for tests. Both
+ * counters are also exposed via `cubrid statdump` (PSTAT_QF_NEW_BACKED_CREATE /
+ * PSTAT_QF_OLD_TOUCH_ON_NEW, redesign #78/#92). */
+extern void qfile_new_backed_record_create (void);
+extern long qfile_new_backed_create_count (void);
+extern void qfile_new_backed_reset_create_count (void);
 #if defined(__cplusplus)
 }
 #endif

@@ -41,6 +41,7 @@
 #include "log_append.hpp"
 #include "object_primitive.h"
 #include "object_representation.h"
+#include "perf_monitor.h"
 #include "query_manager.h"
 #include "qfile_tape.hpp"	/* Phase1 1A scan contract (redesign G005, issue #70) */
 #include "query_opfunc.h"
@@ -3232,11 +3233,13 @@ error:
 /* ------------------------------------------------------------------ */
 
 static std::atomic<long> qfile_Ae_old_touch (0);
+static std::atomic<long> qfile_New_backed_create (0);
 
 void
 qfile_ae_record_old_touch (void)
 {
-  qfile_Ae_old_touch.fetch_add (1, std::memory_order_relaxed);
+  long count = qfile_Ae_old_touch.fetch_add (1, std::memory_order_relaxed) + 1;
+  perfmon_set_stat_to_global (PSTAT_QF_OLD_TOUCH_ON_NEW, (int) count);
 }
 
 long
@@ -3249,6 +3252,31 @@ void
 qfile_ae_reset_old_touch_count (void)
 {
   qfile_Ae_old_touch.store (0, std::memory_order_relaxed);
+  perfmon_set_stat_to_global (PSTAT_QF_OLD_TOUCH_ON_NEW, 0);
+}
+
+/* NEW(Tapeset)-backed list creation count (redesign #78/#92): the sibling
+ * "did the NEW path actually run" half of the A~E backing-kind census —
+ * qfile_ae_old_touch_count() alone can only prove OLD *violated* a NEW list,
+ * not that a NEW list ever existed (a rejected gate still reads old_touch==0). */
+void
+qfile_new_backed_record_create (void)
+{
+  long count = qfile_New_backed_create.fetch_add (1, std::memory_order_relaxed) + 1;
+  perfmon_set_stat_to_global (PSTAT_QF_NEW_BACKED_CREATE, (int) count);
+}
+
+long
+qfile_new_backed_create_count (void)
+{
+  return qfile_New_backed_create.load (std::memory_order_relaxed);
+}
+
+void
+qfile_new_backed_reset_create_count (void)
+{
+  qfile_New_backed_create.store (0, std::memory_order_relaxed);
+  perfmon_set_stat_to_global (PSTAT_QF_NEW_BACKED_CREATE, 0);
 }
 
 int
@@ -5325,6 +5353,7 @@ qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, 
   VFID_SET_NULL (&list_id_p->temp_vfid);
   QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) = writer;
   QFILE_LIST_ID_PRODUCER_PAGE (list_id_p) = scratch;
+  qfile_new_backed_record_create ();
   er_log_debug (ARG_FILE_LINE, "WM_SORT_NEW: query_id=%lld SORT output -> NEW Tapeset producer (tde=%d)\n",
 		(long long) list_id_p->query_id, (int) tde_encrypted);
   return NO_ERROR;

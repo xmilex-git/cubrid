@@ -661,6 +661,14 @@ typedef enum
   PSTAT_REGU_NUM_IOREADS,
   PSTAT_REGU_NUM_CALL_EVALS,
 
+  /* temp-workmem redesign backing-kind census (#78/#92): NEW(Tapeset)-backed
+   * list creation count, and OLD-mechanism-touched-a-NEW-list count. MUST
+   * stay before the "Complex statistics" block below -- perfmon_server_dump_stats()
+   * switches to a complex-only dump path at the first PSTAT_COMPLEX_VALUE
+   * entry and calls every later entry's (possibly NULL) f_dump_in_file. */
+  PSTAT_QF_NEW_BACKED_CREATE,
+  PSTAT_QF_OLD_TOUCH_ON_NEW,
+
   /* Complex statistics */
   PSTAT_PBX_FIX_COUNTERS,
   PSTAT_PBX_PROMOTE_COUNTERS,
