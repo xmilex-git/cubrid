@@ -4311,7 +4311,7 @@ qexec_orderby_distinct_by_sorting (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QU
 
       list_id =
 	qfile_sort_list_with_func (thread_p, list_id, orderby_list, option, ls_flag, NULL, put_fn, NULL, &ordby_info,
-				   limit, true, xasl->parallelism, &xasl->orderby_stats);
+				   limit, true, xasl->parallelism, &xasl->orderby_stats, false);
       if (list_id == NULL)
 	{
 	  error = ER_FAILED;
@@ -17491,7 +17491,10 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 		    }
 
 		  /* set parent tuple position pseudocolumn value */
-		  qfile_tuple_position_store_to_db (&parent_pos_db, &parent_pos);
+		  if (qfile_tuple_position_store_to_db (&parent_pos_db, &parent_pos) != NO_ERROR)
+		    {
+		      GOTO_EXIT_ON_ERROR;
+		    }
 		  db_make_bit (parent_pos_valp, DB_DEFAULT_PRECISION, REINTERPRET_CAST (DB_C_BIT, &parent_pos_db),
 			       QFILE_TUPLE_POSITION_DB_BIT_SIZE);
 
@@ -18762,9 +18765,13 @@ qexec_listfile_orderby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QFILE_LIST_ID
 	  ordby_info.ordbynum_val = NULL;
 	  ordby_info.ordbynum_flag = 0;
 
+	  /* suppress_new_backing=true (#105): qexec_listfile_orderby is CONNECT BY-only;
+	   * its sorted output (incl. the BF->DF result that feeds
+	   * qexec_recalc_tuples_parent_pos_in_list) must stay OLD-backed so parent-pos
+	   * tuple positions can be serialised into QFILE_TUPLE_POSITION_DB (VPID-only). */
 	  list_id =
 	    qfile_sort_list_with_func (thread_p, list_id, orderby_list, Q_ALL, QFILE_FLAG_ALL, NULL, NULL, NULL,
-				       &ordby_info, NO_SORT_LIMIT, true, xasl->parallelism, &xasl->orderby_stats);
+				       &ordby_info, NO_SORT_LIMIT, true, xasl->parallelism, &xasl->orderby_stats, true);
 
 	  if (ordby_info.ordbynum_pos != ordby_info.reserved)
 	    {
@@ -19047,7 +19054,10 @@ qexec_recalc_tuples_parent_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID *
 	  if (level > 1)
 	    {
 	      /* set parent position pseudocolumn value */
-	      qfile_tuple_position_store_to_db (&parent_pos_stored, &pos_info_p->tpl_pos);
+	      if (qfile_tuple_position_store_to_db (&parent_pos_stored, &pos_info_p->tpl_pos) != NO_ERROR)
+		{
+		  goto exit_on_error;
+		}
 	      db_make_bit (&parent_pos_dbval, DB_DEFAULT_PRECISION, REINTERPRET_CAST (DB_C_BIT, &parent_pos_stored),
 			   QFILE_TUPLE_POSITION_DB_BIT_SIZE);
 
@@ -19079,7 +19089,10 @@ qexec_recalc_tuples_parent_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID *
 
 	  qfile_save_current_scan_tuple_position (&prev_s_id, &pos_info_p->tpl_pos);
 
-	  qfile_tuple_position_store_to_db (&parent_pos_stored, &pos_info_p->tpl_pos);
+	  if (qfile_tuple_position_store_to_db (&parent_pos_stored, &pos_info_p->tpl_pos) != NO_ERROR)
+	    {
+	      goto exit_on_error;
+	    }
 	  db_make_bit (&parent_pos_dbval, DB_DEFAULT_PRECISION, REINTERPRET_CAST (DB_C_BIT, &parent_pos_stored),
 		       QFILE_TUPLE_POSITION_DB_BIT_SIZE);
 
@@ -19115,7 +19128,10 @@ qexec_recalc_tuples_parent_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID *
 
 	  if (level > 1)
 	    {
-	      qfile_tuple_position_store_to_db (&parent_pos_stored, &pos_info_p->tpl_pos);
+	      if (qfile_tuple_position_store_to_db (&parent_pos_stored, &pos_info_p->tpl_pos) != NO_ERROR)
+		{
+		  goto exit_on_error;
+		}
 	      db_make_bit (&parent_pos_dbval, DB_DEFAULT_PRECISION, REINTERPRET_CAST (DB_C_BIT, &parent_pos_stored),
 			   QFILE_TUPLE_POSITION_DB_BIT_SIZE);
 

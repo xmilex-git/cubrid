@@ -3316,6 +3316,22 @@ qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism
   return ER_QPROC_INVALID_XASLNODE;
 }
 
+/*
+ * qfile_tuple_position_report_tape_misuse () - release-hard backstop for the
+ *   store-to-DB TAPE-misuse invariant (#105).  Raises ER_QPROC_UNKNOWN_CRSPOS
+ *   when a TAPE-coord tuple position reaches qfile_tuple_position_store_to_db,
+ *   which QFILE_TUPLE_POSITION_DB cannot represent (no TAPE variant, intra-query
+ *   only).  Debug already aborts on the assert inside the inline; this makes the
+ *   release path fail loudly instead of punning tape coords into a bogus VPID.
+ *   Kept out of the inline so query_list.h stays free of er_set (same reasoning
+ *   as qfile_backing_guard).
+ */
+void
+qfile_tuple_position_report_tape_misuse (void)
+{
+  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+}
+
 int
 qfile_append_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_LIST_ID * append_list_id)
 {
@@ -5399,7 +5415,7 @@ QFILE_LIST_ID *
 qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, SORT_LIST * sort_list_p,
 			   QUERY_OPTIONS option, int flag, SORT_GET_FUNC * get_func, SORT_PUT_FUNC * put_func,
 			   SORT_CMP_FUNC * cmp_func, void *extra_arg, int limit, bool do_close, int parallelism,
-			   ORDERBY_STATS * orderby_stats)
+			   ORDERBY_STATS * orderby_stats, bool suppress_new_backing)
 {
   QFILE_LIST_ID *srlist_id;
   QFILE_LIST_SCAN_ID t_scan_id;
@@ -5422,9 +5438,13 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
    * backing when enabled.  Capture tde_encrypted before dropping the OLD temp
    * file (the producer's BufFile re-applies TDE); the parallel path is forced
    * serial while the output is NEW (see sort_listfile) until per-worker import
-   * is wired.  do_close gating keeps an open producer from being MOVE'd. */
+   * is wired.  do_close gating keeps an open producer from being MOVE'd.
+   * suppress_new_backing (#105): CONNECT BY's sort output feeds the parent-pos
+   * recalc, which serialises tuple positions into QFILE_TUPLE_POSITION_DB (a
+   * VPID-only format with no TAPE variant); a NEW(Tapeset) list has only TAPE
+   * coordinates, so such lists MUST stay OLD-backed regardless of the gate. */
   bool srlist_tde = (QFILE_LIST_ID_TFILE_VFID (srlist_id)->tde_encrypted);
-  if (do_close && qfile_sort_new_backing_enabled ()
+  if (do_close && !suppress_new_backing && qfile_sort_new_backing_enabled ()
       && qfile_list_make_new_backed (thread_p, srlist_id, srlist_tde) != NO_ERROR)
     {
       qfile_close_and_free_list_file (thread_p, srlist_id);
@@ -5574,7 +5594,7 @@ qfile_sort_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, SORT_LIST *
   ls_flag = (option == Q_DISTINCT) ? QFILE_FLAG_DISTINCT : QFILE_FLAG_ALL;
 
   return qfile_sort_list_with_func (thread_p, list_id_p, sort_list_p, option, ls_flag, NULL, NULL, NULL, NULL,
-				    NO_SORT_LIMIT, do_close, 0, NULL);
+				    NO_SORT_LIMIT, do_close, 0, NULL, false);
 }
 
 /*

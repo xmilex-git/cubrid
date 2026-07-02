@@ -33,6 +33,7 @@
 
 #include "storage_common.h"
 #include "object_domain.h"
+#include "error_code.h"
 
 #include <assert.h>
 
@@ -652,6 +653,13 @@ extern void qfile_ae_reset_old_touch_count (void);
 extern void qfile_new_backed_record_create (void);
 extern long qfile_new_backed_create_count (void);
 extern void qfile_new_backed_reset_create_count (void);
+
+/* Release-hard backstop for the store-to-DB TAPE-misuse invariant (#105).  Kept
+ * out of the inline (same philosophy as qfile_backing_guard above): raises
+ * ER_QPROC_UNKNOWN_CRSPOS so a TAPE coord that reaches
+ * qfile_tuple_position_store_to_db -- which QFILE_TUPLE_POSITION_DB cannot
+ * represent -- fails loudly in release instead of punning into a bogus VPID. */
+extern void qfile_tuple_position_report_tape_misuse (void);
 #if defined(__cplusplus)
 }
 #endif
@@ -796,13 +804,22 @@ qfile_tuple_position_db_is_raw_fd (const QFILE_TUPLE_POSITION_DB * tuple_positio
   return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
 }
 
-static inline void
+static inline int
 qfile_tuple_position_store_to_db (QFILE_TUPLE_POSITION_DB * stored_p, const QFILE_TUPLE_POSITION * src_p)
 {
   /* QFILE_TUPLE_POSITION_DB has no TAPE variant (COORD_TAPE is intra-query only, see the
    * enum comment) -- a TAPE-coord src_p would otherwise fall through to the VPID branch
-   * below and get its tape_idx/tape_page_offset punned into vpid.pageid/volid (#85). */
-  assert (!qfile_tuple_position_is_tape (src_p));
+   * below and get its tape_idx/tape_page_offset punned into vpid.pageid/volid (#85, #105).
+   * The part-1 CONNECT BY guard (#105) keeps a NEW(Tapeset) list from ever reaching the
+   * parent-pos recalc, so this never fires in normal operation.  It is the release-hard
+   * backstop: debug aborts on the assert; release raises ER_QPROC_UNKNOWN_CRSPOS and
+   * refuses the punning store (returns error) instead of silently persisting a bogus VPID. */
+  if (qfile_tuple_position_is_tape (src_p))
+    {
+      assert (false);
+      qfile_tuple_position_report_tape_misuse ();
+      return ER_FAILED;
+    }
   stored_p->status = src_p->status;
   stored_p->position = src_p->position;
   if (qfile_tuple_position_is_raw_fd (src_p))
@@ -820,6 +837,7 @@ qfile_tuple_position_store_to_db (QFILE_TUPLE_POSITION_DB * stored_p, const QFIL
       stored_p->vpid_reserved = 0;
     }
   stored_p->tplno = src_p->tplno;
+  return NO_ERROR;
 }
 
 
