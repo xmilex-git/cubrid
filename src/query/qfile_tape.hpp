@@ -47,8 +47,10 @@
 #include "qfile_chunk.hpp"	/* qfile::chunk_distributor (R2 distribution) */
 
 #include <vector>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace qfile
 {
@@ -73,7 +75,13 @@ namespace qfile
   class tape
   {
     public:
-      virtual ~tape () = default;
+      virtual ~tape ();		/* releases adopted work_mem charges (#91) */
+
+      /* Adopt work_mem accountant charges (byte/shard pairs) covering this
+       * Tape's RAM prefix pages; released on destruction.  The reservation
+       * follows page ownership (writer -> frozen Tape -> destroy), so a
+       * holdable list's resident prefix stays accounted (#91). */
+      void adopt_wm_charges (std::vector<std::pair<std::size_t, int>> &&charges);
 
       /* Re-entrant read of logical page N into caller scratch (ADR 0005).
        * RAM prefix pages are returned directly (page_dest unused); a file
@@ -85,6 +93,9 @@ namespace qfile
 
       virtual int total_page_count () const = 0;
       virtual int prefix_page_count () const = 0;
+
+    private:
+      std::vector<std::pair<std::size_t, int>> m_wm_charges;	/* accountant (bytes, shard) per batch (#91) */
   };
 
   /*
@@ -216,6 +227,9 @@ namespace qfile
 
     private:
       int ensure_buffile (THREAD_ENTRY *thread_p);
+      bool wm_reserve_batch ();
+      void wm_trim_excess ();
+      void wm_release_all ();
 
       int m_prefix_budget;
       TDE_ALGORITHM m_tde_algo;
@@ -225,6 +239,8 @@ namespace qfile
       std::vector<char *> m_prefix;	/* owned until freeze transfers */
       buffile *m_buffile;		/* lazily created; owned until freeze transfers */
       bool m_frozen;
+      std::vector<std::pair<std::size_t, int>> m_wm_charges;	/* accountant (bytes, shard) per batch (#91) */
+      int m_wm_reserved_pages;	/* prefix pages covered by m_wm_charges */
 
       tape_writer (const tape_writer &) = delete;
       tape_writer &operator= (const tape_writer &) = delete;

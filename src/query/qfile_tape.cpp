@@ -30,6 +30,7 @@
 #include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "file_io.h"		/* PEEK */
+#include "temp_page_store.hpp"	/* work_mem accountant: reserve_held / release_held (#91) */
 
 #include <cassert>
 #include <cerrno>		/* ENOSPC/EDQUOT (ensure_buffile os_error mapping) */
@@ -44,6 +45,25 @@
 
 namespace qfile
 {
+  /* ------------------------------------------------------------------ */
+  /* tape (work_mem charge lifetime, #91)                               */
+  /* ------------------------------------------------------------------ */
+
+  tape::~tape ()
+  {
+    for (const std::pair<std::size_t, int> &charge : m_wm_charges)
+      {
+	temp_page_store::release_held (charge.first, charge.second);
+      }
+  }
+
+  void
+  tape::adopt_wm_charges (std::vector<std::pair<std::size_t, int>> &&charges)
+  {
+    assert (m_wm_charges.empty ());
+    m_wm_charges = std::move (charges);
+  }
+
   /* ------------------------------------------------------------------ */
   /* memory_tape                                                        */
   /* ------------------------------------------------------------------ */
@@ -175,6 +195,8 @@ namespace qfile
     , m_prefix ()
     , m_buffile (NULL)
     , m_frozen (false)
+    , m_wm_charges ()
+    , m_wm_reserved_pages (0)
   {
   }
 
@@ -186,11 +208,81 @@ namespace qfile
 	free (page);
       }
     m_prefix.clear ();
+    wm_release_all ();
     if (m_buffile != NULL)
       {
 	delete m_buffile;	/* closes + unlinks the partial spill */
 	m_buffile = NULL;
       }
+  }
+
+  /* Prefix pages are charged to the work_mem accountant in batches (one
+   * atomic reservation per WM_PREFIX_RESERVE_BATCH_PAGES pages, not per
+   * page).  A failed reservation is a soft degrade, never a hard OOM: the
+   * prefix budget shrinks to what is already reserved and subsequent pages
+   * spill to the BufFile early (#91). */
+  static const int WM_PREFIX_RESERVE_BATCH_PAGES = 64;
+
+  bool
+  tape_writer::wm_reserve_batch ()
+  {
+    int want = m_prefix_budget - m_wm_reserved_pages;
+    if (want > WM_PREFIX_RESERVE_BATCH_PAGES)
+      {
+	want = WM_PREFIX_RESERVE_BATCH_PAGES;
+      }
+    if (want <= 0)
+      {
+	return false;
+      }
+    const std::size_t bytes = (std::size_t) want * DB_PAGESIZE;
+    int shard = -1;
+    if (!temp_page_store::reserve_held (bytes, &shard))
+      {
+	/* cap reached: shrink the budget to what is reserved so the writer
+	 * spills from here on (degrade once, no per-page retry). */
+	m_prefix_budget = (int) m_prefix.size ();
+	temp_page_store::record_degrade ();
+	return false;
+      }
+    m_wm_charges.emplace_back (bytes, shard);
+    m_wm_reserved_pages += want;
+    return true;
+  }
+
+  void
+  tape_writer::wm_trim_excess ()
+  {
+    /* Give back the unused tail of the last batch so steady-state accounting
+     * is exact (reserved == actual prefix pages). */
+    int excess = m_wm_reserved_pages - (int) m_prefix.size ();
+    if (excess <= 0 || m_wm_charges.empty ())
+      {
+	return;
+      }
+    std::size_t bytes = (std::size_t) excess * DB_PAGESIZE;
+    if (bytes > m_wm_charges.back ().first)
+      {
+	bytes = m_wm_charges.back ().first;	/* excess never spans batches */
+      }
+    temp_page_store::release_held (bytes, m_wm_charges.back ().second);
+    m_wm_charges.back ().first -= bytes;
+    m_wm_reserved_pages = (int) m_prefix.size ();
+    if (m_wm_charges.back ().first == 0)
+      {
+	m_wm_charges.pop_back ();
+      }
+  }
+
+  void
+  tape_writer::wm_release_all ()
+  {
+    for (const std::pair<std::size_t, int> &charge : m_wm_charges)
+      {
+	temp_page_store::release_held (charge.first, charge.second);
+      }
+    m_wm_charges.clear ();
+    m_wm_reserved_pages = 0;
   }
 
   int
@@ -226,7 +318,8 @@ namespace qfile
 	return ER_FAILED;
       }
 
-    if ((int) m_prefix.size () < m_prefix_budget)
+    if ((int) m_prefix.size () < m_prefix_budget
+	&& ((int) m_prefix.size () < m_wm_reserved_pages || wm_reserve_batch ()))
       {
 	char *copy = (char *) malloc (DB_PAGESIZE);
 	if (copy == NULL)
@@ -255,6 +348,8 @@ namespace qfile
 	return NULL;
       }
 
+    wm_trim_excess ();
+
     if (m_buffile == NULL)
       {
 	/* tiny / no spill: an all-RAM Tape, no disk touch. */
@@ -264,6 +359,9 @@ namespace qfile
 	    mt->append_page (page);
 	  }
 	m_prefix.clear ();	/* ownership transferred to the memory_tape */
+	mt->adopt_wm_charges (std::move (m_wm_charges));
+	m_wm_charges.clear ();
+	m_wm_reserved_pages = 0;
 	m_frozen = true;
 	return mt;
       }
@@ -277,6 +375,9 @@ namespace qfile
     m_buffile = NULL;		/* allocation succeeded: ownership is now the Tape's
 				 * (reorder keeps bf owned by the writer if new throws) */
     m_prefix.clear ();
+    bt->adopt_wm_charges (std::move (m_wm_charges));
+    m_wm_charges.clear ();
+    m_wm_reserved_pages = 0;
     m_frozen = true;
     return bt;
   }
