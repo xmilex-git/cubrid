@@ -55,6 +55,47 @@ namespace
   std::atomic<long> g_census_open_files {0};
   std::atomic<long> g_census_held_prefix_pages {0};
 
+#if !defined (NDEBUG)
+  /* ENOSPC fault injection (#86, debug-only).  g_fault_flush_target is the
+   * 1-based ordinal of the real (page-bearing) flush to fail; 0 = disarmed.
+   * g_fault_flush_count counts real flushes seen since the last arm. */
+  std::atomic<int> g_fault_flush_target {0};
+  std::atomic<int> g_fault_flush_count {0};
+
+  /* True exactly once, for the armed Nth real flush.  Called only from the
+   * page-bearing branch of buffile::flush so idle flushes are not counted. */
+  bool
+  fault_flush_should_fail () noexcept
+  {
+    /* One-time arm from env for query-level repro; the self-test arms directly
+     * (env unset) so this leaves its arming untouched. */
+    static const bool env_armed = [] ()
+    {
+      const char *e = getenv ("CUBRID_WM_FAULT_FLUSH_AT");
+      if (e != NULL)
+	{
+	  int n = atoi (e);
+	  if (n > 0)
+	    {
+	      g_fault_flush_target.store (n, std::memory_order_relaxed);
+	      g_fault_flush_count.store (0, std::memory_order_relaxed);
+	      return true;
+	    }
+	}
+      return false;
+    } ();
+    (void) env_armed;
+
+    const int target = g_fault_flush_target.load (std::memory_order_relaxed);
+    if (target <= 0)
+      {
+	return false;
+      }
+    const int seen = g_fault_flush_count.fetch_add (1, std::memory_order_relaxed) + 1;
+    return seen == target;
+  }
+#endif /* !NDEBUG */
+
   bool
   full_pwrite (int fd, const void *buf, std::size_t len, off_t offset) noexcept
   {
@@ -181,6 +222,15 @@ namespace qfile
 	g_census_held_prefix_pages.fetch_sub (pages, std::memory_order_relaxed);
       }
   }
+
+#if !defined (NDEBUG)
+  void
+  buffile_fault_arm_flush_fail (int nth)
+  {
+    g_fault_flush_count.store (0, std::memory_order_relaxed);
+    g_fault_flush_target.store (nth > 0 ? nth : 0, std::memory_order_relaxed);
+  }
+#endif /* !NDEBUG */
 
   /* ------------------------------------------------------------------ */
   /* tde_read_scratch (per-reader read scratch, ADR 0005)               */
@@ -480,6 +530,16 @@ namespace qfile
       {
 	return NO_ERROR;
       }
+#if !defined (NDEBUG)
+    if (fault_flush_should_fail ())
+      {
+	/* simulate a disk-full pwrite (#86): same error the real ENOSPC path
+	 * raises, so the close/freeze failure-propagation contract is exercised
+	 * end to end without an actual full filesystem. */
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	return ER_FAILED;
+      }
+#endif /* !NDEBUG */
     const off_t offset = (off_t) m_pages_on_disk * (off_t) m_disk_pagesize;
     const std::size_t len = (std::size_t) m_batch_pages * (std::size_t) m_disk_pagesize;
     if (!full_pwrite (m_fd, m_batch, len, offset))

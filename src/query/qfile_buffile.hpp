@@ -112,6 +112,16 @@ namespace qfile
   void tape_backing_census_prefix_added (long pages);
   void tape_backing_census_prefix_removed (long pages);
 
+#if !defined (NDEBUG)
+  /* ENOSPC fault injection (#86, debug-only).  Arm to make the Nth subsequent
+   * buffile::flush that actually writes fail as if the disk hit ENOSPC (er_set
+   * ER_QPROC_OUT_OF_TEMP_SPACE, no pwrite).  nth <= 0 disarms.  Also armed at
+   * boot from env CUBRID_WM_FAULT_FLUSH_AT for query-level repro.  Exists only
+   * to mechanically exercise the close/freeze failure-propagation contract;
+   * compiled out of release (AC: fault hook excluded under NDEBUG). */
+  void buffile_fault_arm_flush_fail (int nth);
+#endif /* !NDEBUG */
+
   /*
    * tde_read_scratch - per-reader cipher/plain page buffers for the re-entrant
    * read path (ADR 0005).  A concurrent reader owns one of these so two threads

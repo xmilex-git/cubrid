@@ -485,6 +485,13 @@ struct qfile_list_id
    * Opaque; access via the accessor macros.  Not serialized (transient). */
   void *producer_writer_;	/* qfile::tape_writer * (QFILE_LIST_ID_PRODUCER_WRITER) */
   void *producer_page_;		/* scratch page being filled (QFILE_LIST_ID_PRODUCER_PAGE) */
+  /* Close-failure latch (redesign #78, issue #86).  qfile_close_list is void
+   * (its callers predate any "close can fail" concept), so a NEW-production
+   * close that loses the final page append or whose freeze flush fails records
+   * the failure here instead of returning silently.  qfile_open_list_scan then
+   * raises ER_QPROC_OUT_OF_TEMP_SPACE on a failed list rather than serving a
+   * silently truncated / empty result.  Transient runtime tag; not serialized. */
+  bool producer_failed_;	/* (access via QFILE_LIST_ID_PRODUCER_FAILED) */
 };
 
 #define QFILE_CLEAR_LIST_ID(list_id) \
@@ -525,6 +532,7 @@ struct qfile_list_id
       (list_id)->new_contains_overflow_ = false; \
       (list_id)->producer_writer_ = NULL; \
       (list_id)->producer_page_ = NULL; \
+      (list_id)->producer_failed_ = false; \
     } \
   while (0)
 
@@ -552,6 +560,7 @@ struct qfile_list_id
 #define QFILE_LIST_ID_BACKING_KIND(list_id) ((list_id)->backing_kind_)
 #define QFILE_LIST_ID_PRODUCER_WRITER(list_id) ((list_id)->producer_writer_)
 #define QFILE_LIST_ID_PRODUCER_PAGE(list_id)   ((list_id)->producer_page_)
+#define QFILE_LIST_ID_PRODUCER_FAILED(list_id) ((list_id)->producer_failed_)
 #define QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW(list_id) ((list_id)->new_contains_overflow_)
 
 /*

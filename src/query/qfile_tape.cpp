@@ -195,6 +195,7 @@ namespace qfile
     , m_prefix ()
     , m_buffile (NULL)
     , m_frozen (false)
+    , m_failed (false)
     , m_wm_charges ()
     , m_wm_reserved_pages (0)
   {
@@ -312,6 +313,21 @@ namespace qfile
   int
   tape_writer::append_page (THREAD_ENTRY *thread_p, const PAGE_PTR list_page)
   {
+    /* Single latch point (#86): any failed append -- lost prefix page, spill
+     * flush ENOSPC, buffile-create error -- sets the sticky flag so freeze ()
+     * cannot later hand back a silently truncated Tape.  Only the error path
+     * writes the flag, so the steady-state append costs nothing extra. */
+    const int rc = append_page_impl (thread_p, list_page);
+    if (rc != NO_ERROR)
+      {
+	m_failed = true;
+      }
+    return rc;
+  }
+
+  int
+  tape_writer::append_page_impl (THREAD_ENTRY *thread_p, const PAGE_PTR list_page)
+  {
     if (m_frozen || list_page == NULL)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
@@ -344,6 +360,15 @@ namespace qfile
   tape_writer::freeze (THREAD_ENTRY *thread_p)
   {
     if (m_frozen)
+      {
+	return NULL;
+      }
+
+    /* Sticky-error gate (#86): a prior append lost a page, so any Tape built
+     * here would be silently short.  Refuse -- return NULL before touching
+     * ownership so the caller's teardown (delete w / ~tape_writer) reclaims
+     * the partial spill exactly as on a freeze-flush failure. */
+    if (m_failed)
       {
 	return NULL;
       }
@@ -2015,3 +2040,168 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
   fprintf (stderr, "PRODUCER_SELFTEST algo=%d result=%d (0=PASS)\n", (int) algo, rc);
   return rc;
 }
+
+#if !defined (NDEBUG)
+/* ------------------------------------------------------------------ */
+/* In-server self-test: close/freeze ENOSPC failure propagation (#86)  */
+/* Gated by env CUBRID_WM_CLOSE_FAULT_SELFTEST (debug-only invocation). */
+/* ------------------------------------------------------------------ */
+/*
+ * Drives the buffile flush fault injector to prove the two silent-data-loss
+ * holes this issue closes:
+ *   P1 (writer sticky error):  an append whose spill flush fails must make
+ *       freeze () return NULL.  A writer must never hand back a "successful"
+ *       -- but silently short -- Tape after it has lost a page.
+ *   P2 (close contract):  a NEW-backed list whose freeze flush fails must be
+ *       marked so the next scan-open raises ER_QPROC_OUT_OF_TEMP_SPACE, never
+ *       silently scans 0 rows while tuple_cnt still reads full.
+ * Census must return to its pre-test baseline on both failure paths (the
+ * partial spill is reclaimed, not orphaned).  Returns 0 (NO_ERROR) on PASS.
+ *
+ * Fail-before-fix: without the sticky flag / close-mark / scan-open guard, P1
+ * sees a non-NULL short Tape and P2 sees scan-open succeed with 0 rows -- both
+ * flip the result to FAIL, which is exactly the pre-fix reproduction.
+ */
+int
+qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
+{
+  int rc = NO_ERROR;
+  const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+
+  /* ---- P1: sticky error -> freeze () refuses to fake success ---- */
+  {
+    std::string dir;
+    if (!qfile::buffile::default_scratch_dir (dir))
+      {
+	rc = ER_FAILED;
+      }
+    else
+      {
+	static std::uint64_t seq = 86000;
+	qfile::tape_writer w (0, TDE_ALGORITHM_NONE, dir, seq++, 0);	/* budget 0 -> all spill */
+	int prc = NO_ERROR;
+
+	qfile::buffile_fault_arm_flush_fail (1);	/* fail the first real (batch) flush */
+	/* BufFile batches 8 pages; the 9th append triggers the flush that the
+	 * injector fails, surfacing as an append error. */
+	for (int p = 0; p < 16 && prc == NO_ERROR; p++)
+	  {
+	    char *pg = (char *) malloc (DB_PAGESIZE);
+	    if (pg == NULL)
+	      {
+		prc = ER_FAILED;
+		break;
+	      }
+	    std::memset (pg, 0, DB_PAGESIZE);
+	    prc = w.append_page (thread_p, (PAGE_PTR) pg);
+	    free (pg);
+	  }
+	qfile::buffile_fault_arm_flush_fail (0);	/* disarm: freeze must fail on its own memory of the loss */
+
+	if (prc == NO_ERROR)
+	  {
+	    rc = ER_FAILED;		/* injection never fired -> test is not exercising the path */
+	  }
+	qfile::tape *t = w.freeze (thread_p);
+	if (t != NULL)
+	  {
+	    delete t;			/* pre-fix: a silently truncated Tape */
+	    rc = ER_FAILED;
+	  }
+	/* w destructs here; the partial spill it still owns is reclaimed. */
+      }
+    qfile::buffile_fault_arm_flush_fail (0);
+  }
+
+  /* ---- P2: failed close -> scan-open raises, never silent 0 rows ---- */
+  if (rc == NO_ERROR)
+    {
+      const int N = 5000;		/* 16B tuples -> spills well past budget */
+      const int TUPLE_LEN = 16;
+      const int ID_OFFSET = 8;
+      QFILE_LIST_ID lst;
+      QFILE_CLEAR_LIST_ID (&lst);
+      void *writer = qfile_producer_create (2, TDE_ALGORITHM_NONE, 86100ULL, 0);
+      char *scratch = (writer != NULL) ? (char *) malloc (DB_PAGESIZE) : NULL;
+      if (writer == NULL || scratch == NULL)
+	{
+	  qfile_producer_destroy (writer);
+	  free (scratch);
+	  rc = ER_FAILED;
+	}
+      else
+	{
+	  int prc = NO_ERROR;
+	  char tuple[16];
+
+	  QFILE_LIST_ID_PRODUCER_WRITER (&lst) = writer;
+	  QFILE_LIST_ID_PRODUCER_PAGE (&lst) = scratch;
+	  for (int i = 0; i < N && prc == NO_ERROR; i++)
+	    {
+	      std::memset (tuple, 0, TUPLE_LEN);
+	      QFILE_PUT_TUPLE_LENGTH (tuple, TUPLE_LEN);
+	      QFILE_PUT_PREV_TUPLE_LENGTH (tuple, (i == 0) ? 0 : TUPLE_LEN);
+	      OR_PUT_INT (tuple + ID_OFFSET, i);
+	      prc = qfile_add_tuple_to_list (thread_p, &lst, (QFILE_TUPLE) tuple);
+	    }
+	  if (prc != NO_ERROR)
+	    {
+	      rc = ER_FAILED;		/* production must succeed before the injected close */
+	    }
+
+	  /* Arm so the freeze flush inside close fails; close must not swallow it. */
+	  qfile::buffile_fault_arm_flush_fail (1);
+	  qfile_close_list (thread_p, &lst);
+	  qfile::buffile_fault_arm_flush_fail (0);
+
+	  if (rc == NO_ERROR)
+	    {
+	      QFILE_LIST_SCAN_ID sid;
+	      std::memset (&sid, 0, sizeof (sid));
+	      er_clear ();
+	      int open_rc = qfile_open_list_scan (&lst, &sid);
+	      if (open_rc == NO_ERROR)
+		{
+		  /* pre-fix reproduction: a failed close left the list scannable
+		   * while tuple_cnt still reads full (%lld) but there is no backing
+		   * (first_vpid + tapeset both NULL).  The next scan step would then
+		   * hand back a silently short / empty result (top-level fetch) or
+		   * fault on the NULL first page (intermediate scan) -- never a clean
+		   * error.  A failed close must never open cleanly; do NOT walk the
+		   * scan here (walking a backing-less list is itself the crash the
+		   * fix prevents).  Log the symptom and fail. */
+		  qfile_close_scan (thread_p, &sid);
+		  er_log_debug (ARG_FILE_LINE,
+				"CLOSE_FAULT_SELFTEST no-propagation: scan-open OK on failed close, tuple_cnt=%lld\n",
+				(long long) lst.tuple_cnt);
+		  fprintf (stderr,
+			   "CLOSE_FAULT_SELFTEST no-propagation: scan-open OK on failed close, tuple_cnt=%lld\n",
+			   (long long) lst.tuple_cnt);
+		  rc = ER_FAILED;
+		}
+	      else if (er_errid () != ER_QPROC_OUT_OF_TEMP_SPACE)
+		{
+		  rc = ER_FAILED;	/* raised, but not the temp-space error */
+		}
+	    }
+
+	  qfile_clear_list_id (&lst);	/* free producer residue / any backing */
+	}
+    }
+  qfile::buffile_fault_arm_flush_fail (0);
+
+  /* ---- leak check: census back to baseline on the failure path ---- */
+  if (rc == NO_ERROR)
+    {
+      const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+      if (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages)
+	{
+	  rc = ER_FAILED;
+	}
+    }
+
+  er_log_debug (ARG_FILE_LINE, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
+  fprintf (stderr, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
+  return rc;
+}
+#endif /* !NDEBUG */

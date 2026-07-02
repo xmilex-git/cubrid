@@ -1233,6 +1233,20 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  assert (producer_selftest_rc == NO_ERROR);
 	}
     }
+  if (getenv ("CUBRID_WM_CLOSE_FAULT_SELFTEST") != NULL)
+    {
+      /* #86: close/freeze ENOSPC failure-propagation contract.  Log-only (no
+       * assert) so the pre-fix run reproduces the silent truncation without
+       * aborting boot; the grep-able marker below judges PASS/FAIL. */
+      int close_fault_selftest_rc = qfile_close_fault_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", close_fault_selftest_rc);
+      fprintf (stderr, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", close_fault_selftest_rc);
+      if (close_fault_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "CLOSE_FAULT_SELFTEST FAIL result=%d\n", close_fault_selftest_rc);
+	  fprintf (stderr, "CLOSE_FAULT_SELFTEST FAIL result=%d\n", close_fault_selftest_rc);
+	}
+    }
 #endif /* !NDEBUG */
 
   return scan_initialize ();

@@ -211,8 +211,18 @@ namespace qfile
       int append_page (THREAD_ENTRY *thread_p, const PAGE_PTR list_page);
 
       /* Freeze into a read-only Tape; ownership of prefix + BufFile transfers
-       * to it.  The writer is spent afterwards.  Returns NULL on error. */
+       * to it.  The writer is spent afterwards.  Returns NULL on error --
+       * including when a prior append_page failed (see failed ()). */
       tape *freeze (THREAD_ENTRY *thread_p);
+
+      /* Sticky error latch (#86): true once any append_page has failed.  A
+       * failed writer must never be frozen into a "successful" (silently
+       * short) Tape, so freeze () returns NULL while this is set.  Also the
+       * hook #95 builds on for freeze-time OOM ownership recovery. */
+      bool failed () const
+      {
+	return m_failed;
+      }
 
       bool spilled () const
       {
@@ -226,6 +236,7 @@ namespace qfile
       const buffile_metrics *file_metrics () const;
 
     private:
+      int append_page_impl (THREAD_ENTRY *thread_p, const PAGE_PTR list_page);
       int ensure_buffile (THREAD_ENTRY *thread_p);
       bool wm_reserve_batch ();
       void wm_trim_excess ();
@@ -239,6 +250,7 @@ namespace qfile
       std::vector<char *> m_prefix;	/* owned until freeze transfers */
       buffile *m_buffile;		/* lazily created; owned until freeze transfers */
       bool m_frozen;
+      bool m_failed;		/* sticky: an append_page failed; freeze must not fake success (#86) */
       std::vector<std::pair<std::size_t, int>> m_wm_charges;	/* accountant (bytes, shard) per batch (#91) */
       int m_wm_reserved_pages;	/* prefix pages covered by m_wm_charges */
 
@@ -560,5 +572,15 @@ int qfile_taperead_selftest (THREAD_ENTRY *thread_p);
  * QFILE_LIST_ID, close (freeze into a Tapeset), then scan via tapeset_scan and
  * assert robust parity.  Gated by env CUBRID_PRODUCER_SELFTEST (debug). */
 int qfile_producer_selftest (THREAD_ENTRY *thread_p);
+
+#if !defined (NDEBUG)
+/* In-server self-test of the close/freeze ENOSPC failure-propagation contract
+ * (#86): drive the buffile flush fault injector so an append/freeze flush
+ * fails, then assert freeze () returns NULL and a failed close makes scan-open
+ * raise ER_QPROC_OUT_OF_TEMP_SPACE (never a silent 0-row / truncated result),
+ * with the census back to baseline.  Gated by env CUBRID_WM_CLOSE_FAULT_SELFTEST
+ * (debug).  Returns 0 on PASS. */
+int qfile_close_fault_selftest (THREAD_ENTRY *thread_p);
+#endif /* !NDEBUG */
 
 #endif /* _QFILE_TAPE_HPP_ */

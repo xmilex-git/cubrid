@@ -1419,20 +1419,37 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 	  /* NEW production (redesign #78): append the final page, freeze the
 	   * tape_writer into a single-Tape Tapeset, mark backing NEW.  No qmgr. */
 	  void *writer = QFILE_LIST_ID_PRODUCER_WRITER (list_id_p);
+	  int append_rc = NO_ERROR;
 	  if (list_id_p->last_pgptr != NULL)
 	    {
-	      (void) qfile_producer_append (thread_p, writer, list_id_p->last_pgptr);
+	      /* Final (possibly full) page.  A lost append is no longer swallowed
+	       * (#86): the error latches the writer so freeze below returns NULL
+	       * rather than a silently truncated Tape. */
+	      append_rc = qfile_producer_append (thread_p, writer, list_id_p->last_pgptr);
 	    }
 	  void *ts = qfile_producer_freeze_tapeset (thread_p, writer);
 	  QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) = NULL;
 	  free (QFILE_LIST_ID_PRODUCER_PAGE (list_id_p));
 	  QFILE_LIST_ID_PRODUCER_PAGE (list_id_p) = NULL;
 	  list_id_p->last_pgptr = NULL;
-	  if (ts != NULL)
+	  /* A lost final-page append latches the writer, so freeze must have
+	   * returned NULL; a Tapeset therefore implies the append also succeeded. */
+	  assert (append_rc == NO_ERROR || ts == NULL);
+	  if (ts != NULL && append_rc == NO_ERROR)
 	    {
 	      QFILE_LIST_ID_TAPESET (list_id_p) = ts;
 	      QFILE_LIST_ID_OWNS_TAPESET (list_id_p) = true;
 	      QFILE_LIST_ID_BACKING_KIND (list_id_p) = QFILE_BACKING_NEW;
+	    }
+	  else
+	    {
+	      /* Append lost the final page, or the freeze flush hit ENOSPC: the
+	       * list has no backing.  qfile_close_list is void (its callers predate
+	       * "close can fail"), so latch the failure on the list -- the next
+	       * qfile_open_list_scan raises ER_QPROC_OUT_OF_TEMP_SPACE instead of
+	       * serving a silently truncated / empty result (#86).  The error
+	       * already set by append/freeze is left intact. */
+	      QFILE_LIST_ID_PRODUCER_FAILED (list_id_p) = true;
 	    }
 	  return;
 	}
@@ -6520,6 +6537,17 @@ qfile_start_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 static int
 qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
+  if (QFILE_LIST_ID_PRODUCER_FAILED (list_id_p))
+    {
+      /* The NEW-production close of this list failed (lost final-page append or
+       * a freeze-flush ENOSPC) and latched the failure here (#86).  Opening a
+       * scan would serve a silently truncated / empty result even though
+       * tuple_cnt still reads full, so raise instead.  This is the single choke
+       * point every list scan passes through. */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+      return ER_FAILED;
+    }
+
   scan_id_p->status = S_OPENED;
   scan_id_p->position = S_BEFORE;
   scan_id_p->keep_page_on_finish = 0;
