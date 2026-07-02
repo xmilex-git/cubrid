@@ -1930,7 +1930,7 @@ qfile_save_sort_key_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p
   char *src_p;
 
   key_info_p = (SORTKEY_INFO *) (tuple_descr_p->sortkey_info);
-  nkeys = key_info_p->nkeys;
+  nkeys = key_info_p->ncols;	/* all materialized columns, key and payload alike (#100) */
   sort_rec_p = (SORT_REC *) (tuple_descr_p->sort_rec);
 
   for (i = 0; i < nkeys; i++)
@@ -3919,7 +3919,9 @@ qfile_make_sort_key (THREAD_ENTRY * thread_p, SORTKEY_INFO * key_info_p, RECDES 
     }
   else
     {
-      /* A_sort_key */
+      /* A_sort_key.  Walk all `ncols` entries (== nkeys unless the key info
+       * was extended to carry non-key payload columns, #100). */
+      nkeys = key_info_p->ncols;
 
       /* get sort_key body start position, align data to 8 bytes boundary */
       data = (char *) &sort_record_p->s.offset[nkeys];
@@ -3977,7 +3979,19 @@ qfile_make_sort_key (THREAD_ENTRY * thread_p, SORTKEY_INFO * key_info_p, RECDES 
     }
   else
     {
-      scan_status = qfile_scan_prev (thread_p, input_scan_p);
+      if (input_scan_p->tapeset_scan_ != NULL)
+	{
+	  /* A Tapeset scan owns its page; the legacy stepper below would free the
+	   * mirrored page pointer through qmgr.  Step back through the driver so the
+	   * caller's retry (a forward step) re-reads the same tuple (#100). */
+	  QFILE_TUPLE_RECORD dummy_record = { NULL, 0 };
+
+	  scan_status = qfile_tapeset_scan_backward (thread_p, input_scan_p, &dummy_record, PEEK);
+	}
+      else
+	{
+	  scan_status = qfile_scan_prev (thread_p, input_scan_p);
+	}
       status = ((scan_status == S_ERROR) ? SORT_ERROR_OCCURRED : SORT_REC_DOESNT_FIT);
     }
 
@@ -4000,7 +4014,8 @@ qfile_generate_sort_tuple (SORTKEY_INFO * key_info_p, SORT_REC * sort_record_p, 
   char *src;
   int len;
 
-  nkeys = key_info_p->nkeys;
+  /* rebuild all materialized columns, key and payload alike (#100) */
+  nkeys = key_info_p->ncols;
   size = QFILE_TUPLE_LENGTH_SIZE;
 
   for (i = 0; i < nkeys; i++)
@@ -4254,6 +4269,8 @@ qfile_sort_build_key_from_tuple (SORTKEY_INFO * key_info_p, RECDES * recdes_p, Q
     }
   else
     {
+      /* A_sort_key: all materialized columns, key and payload alike (#100) */
+      nkeys = key_info_p->ncols;
       data = (char *) &sort_record_p->s.offset[nkeys];
       data = PTR_ALIGN (data, MAX_ALIGNMENT);
       length = CAST_BUFLEN (data - recdes_p->data);
@@ -4417,6 +4434,8 @@ qfile_sort_get_next_parallel (THREAD_ENTRY * thread_p, RECDES * recdes_p, void *
 	    }
 	  else
 	    {
+	      /* A_sort_key: all materialized columns, key and payload alike (#100) */
+	      nkeys = key_info_p->ncols;
 	      data = (char *) &sort_record_p->s.offset[nkeys];
 	      data = PTR_ALIGN (data, MAX_ALIGNMENT);
 	      length = CAST_BUFLEN (data - recdes_p->data);
@@ -4627,7 +4646,7 @@ qfile_put_next_sort_item (THREAD_ENTRY * thread_p, const RECDES * recdes_p, void
 	{
 	  /* A_sort_key */
 
-	  nkeys = sort_info_p->key_info.nkeys;	/* get sort_key field number */
+	  nkeys = sort_info_p->key_info.ncols;	/* all materialized columns, key and payload alike (#100) */
 
 	  /* generate tuple descriptor */
 	  tuple_descr_p = &(sort_info_p->output_file->tpl_descr);
@@ -4901,7 +4920,7 @@ qfile_get_estimated_pages_for_sorting (QFILE_LIST_ID * list_id_p, SORTKEY_INFO *
        * per field in the key (for the offset vector).
        */
       sort_key_size =
-	(int) offsetof (SORT_REC, s.offset[0]) + sizeof (((SORT_REC *) 0)->s.offset[0]) * key_info_p->nkeys;
+	(int) offsetof (SORT_REC, s.offset[0]) + sizeof (((SORT_REC *) 0)->s.offset[0]) * key_info_p->ncols;
       sort_key_overhead = (int) ceil (((double) (list_id_p->tuple_cnt * sort_key_size)) / DB_PAGESIZE);
     }
 
@@ -4936,6 +4955,7 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
     }
 
   key_info_p->nkeys = n;
+  key_info_p->ncols = n;
   key_info_p->use_original = (n != types->type_cnt);
   key_info_p->error = NO_ERROR;
 
@@ -5027,6 +5047,112 @@ qfile_clear_sort_key_info (SORTKEY_INFO * key_info_p)
 
   key_info_p->key = NULL;
   key_info_p->nkeys = 0;
+  key_info_p->ncols = 0;
+}
+
+/* qfile_sort_key_info_extend_all_columns () - extend a partial (use_original)
+ *   sort key so every input column travels inside the sort record (#100).
+ *
+ *   A NEW (Tapeset)-backed list has no valid VPID back-references, so the
+ *   P_sort_key "bread crumbs back to the original tuple" cannot be followed
+ *   (qmgr_get_old_page has nothing to resolve them against).  Instead of
+ *   switching to plain A_sort_key — which materializes only the key columns
+ *   and hands consumers a truncated tuple (issue #100: GROUP BY aggregate
+ *   regu vars then read past the reconstructed tuple) — append every non-key
+ *   column as a payload entry.  Comparison still uses only the first `nkeys`
+ *   entries; copy/rebuild walk all `ncols`, so qfile_generate_sort_tuple
+ *   rebuilds a full-width tuple in the original column order.
+ *
+ *   Falls back without extending (*extended_p = false) when a key column is
+ *   duplicated or out of range — the caller keeps use_original and fails
+ *   loudly instead of corrupting data.
+ *
+ *   return: NO_ERROR or error code (allocation failure)
+ */
+int
+qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * key_info_p, QFILE_TUPLE_VALUE_TYPE_LIST * types_p,
+					bool * extended_p)
+{
+  int nkeys = key_info_p->nkeys;
+  int ncols = types_p->type_cnt;
+  int i, c, idx;
+
+  *extended_p = false;
+
+  assert (key_info_p->use_original == 1 && nkeys < ncols);
+
+  /* reject duplicated or out-of-range key columns: the position<->priority
+   * mapping below must be a bijection over 0..ncols-1 */
+  for (i = 0; i < nkeys; i++)
+    {
+      if (key_info_p->key[i].col < 0 || key_info_p->key[i].col >= ncols)
+	{
+	  assert (false);
+	  return NO_ERROR;
+	}
+      for (c = 0; c < i; c++)
+	{
+	  if (key_info_p->key[c].col == key_info_p->key[i].col)
+	    {
+	      return NO_ERROR;
+	    }
+	}
+    }
+
+  if (ncols > (int) DIM (key_info_p->default_keys) && ncols > nkeys)
+    {
+      SUBKEY_INFO *keys = (SUBKEY_INFO *) db_private_alloc (NULL, ncols * sizeof (SUBKEY_INFO));
+      if (keys == NULL)
+	{
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      memcpy (keys, key_info_p->key, nkeys * sizeof (SUBKEY_INFO));
+      if (key_info_p->key != key_info_p->default_keys)
+	{
+	  db_private_free (NULL, key_info_p->key);
+	}
+      key_info_p->key = keys;
+    }
+
+  /* append the non-key columns, in ascending column order, as payload */
+  idx = nkeys;
+  for (c = 0; c < ncols; c++)
+    {
+      bool is_key = false;
+      for (i = 0; i < nkeys; i++)
+	{
+	  if (key_info_p->key[i].col == c)
+	    {
+	      is_key = true;
+	      break;
+	    }
+	}
+      if (is_key)
+	{
+	  continue;
+	}
+
+      SUBKEY_INFO *subkey = &key_info_p->key[idx++];
+      subkey->col = c;
+      subkey->col_dom = types_p->domp[c];
+      subkey->cmp_dom = NULL;
+      subkey->use_cmp_dom = false;
+      subkey->sort_f = types_p->domp[c]->type->get_data_cmpdisk_function ();
+      subkey->is_desc = 0;
+      subkey->is_nulls_first = 1;
+    }
+  assert (idx == ncols);
+
+  /* rebuild the position -> priority permutation over all columns */
+  for (i = 0; i < ncols; i++)
+    {
+      key_info_p->key[key_info_p->key[i].col].permuted_col = i;
+    }
+
+  key_info_p->ncols = ncols;
+  key_info_p->use_original = 0;
+  *extended_p = true;
+  return NO_ERROR;
 }
 
 /* qfile_initialize_sort_info () -
@@ -5049,12 +5175,21 @@ qfile_initialize_sort_info (SORT_INFO * sort_info_p, QFILE_LIST_ID * list_id_p, 
     {
       return NULL;
     }
-  /* When the input list is NEW-backed, VPID back-references are invalid; a partial-key
-   * (use_original=1) sort would jump the input scan by saved position (#85), same as the
-   * existing GROUP BY (query_executor.c) / ANALYTIC guards. */
-  if (qfile_list_has_new_backing (list_id_p))
+  /* When the input list is NEW-backed, VPID back-references are invalid (#85); carry the
+   * non-key columns inside the sort records so the rebuilt tuple keeps its full width —
+   * merely dropping use_original truncates the tuple to the key columns (#100).  If the
+   * extension bails out (duplicate key column), use_original stays set and the sort fails
+   * loudly on the unresolvable back-reference instead of producing truncated tuples. */
+  if (sort_info_p->key_info.use_original == 1 && qfile_list_has_new_backing (list_id_p))
     {
-      sort_info_p->key_info.use_original = 0;
+      bool all_columns_carried = false;
+
+      if (qfile_sort_key_info_extend_all_columns (&sort_info_p->key_info, &list_id_p->type_list,
+						  &all_columns_carried) != NO_ERROR)
+	{
+	  qfile_clear_sort_info (sort_info_p);
+	  return NULL;
+	}
     }
 
   return sort_info_p;

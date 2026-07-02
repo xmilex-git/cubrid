@@ -5678,10 +5678,21 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
    * Now load up the sort module and set it off...
    */
   gbstate.key_info.use_original = (gbstate.key_info.nkeys != list_id->type_list.type_cnt);
-  /* When the input list is NEW-backed, VPID back-references are invalid (#80). */
-  if (qfile_list_has_new_backing (list_id))
+  /* When the input list is NEW-backed, VPID back-references are invalid (#80).  Carry the
+   * non-key columns inside the sort records instead of just dropping use_original — a plain
+   * A_sort_key materializes only the group columns, so the aggregate regu vars would read
+   * past the truncated reconstructed tuple (#100). */
+  if (gbstate.key_info.use_original == 1 && qfile_list_has_new_backing (list_id))
     {
-      gbstate.key_info.use_original = 0;
+      bool all_columns_carried = false;
+
+      if (qfile_sort_key_info_extend_all_columns (&gbstate.key_info, &list_id->type_list,
+						  &all_columns_carried) != NO_ERROR)
+	{
+	  GOTO_EXIT_ON_ERROR;
+	}
+      /* !all_columns_carried leaves use_original set: the sort then fails loudly on the
+       * unresolvable back-reference instead of aggregating corrupt tuples. */
     }
   gbstate.cmp_fn =
     (gbstate.key_info.use_original == 1 ? &qfile_compare_partial_sort_record : &qfile_compare_all_sort_record);
