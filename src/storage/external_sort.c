@@ -5181,6 +5181,34 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
       /* get scan id of input file */
       sort_info_p = (SORT_INFO *) sort_param->get_arg;
 
+      /* #99 safety net: qfile_sort_list_with_func() (list_file.c) already keeps
+       * an expected-parallel SORT output out of FILE_QUERY_AREA backing, but
+       * QFILE_FLAG_DISTINCT (and any other future caller) can still route
+       * qfile_open_list() to a FILE_QUERY_AREA result file regardless of the
+       * parallel prediction.  file_manager's temp-file page allocation for a
+       * query-area list does not support concurrent same-transaction workers,
+       * so catch any output list that actually ended up FILE_QUERY_AREA here
+       * and force serial execution rather than relying solely on prediction. */
+      if (sort_info_p->output_file != NULL && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file) != NULL
+	  && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file)->temp_file_type == FILE_QUERY_AREA)
+	{
+	  er_log_debug (ARG_FILE_LINE, "sort: FILE_QUERY_AREA output -> serial (#99 safety net)\n");
+	  return 1;
+	}
+
+      /* #99 root cause: the px input sector scan enumerates only the membuf
+       * prefix (one worker claims it) plus the file_manager data sectors of
+       * temp_vfid -- raw-fd overflow pages (qmgr_temp_backing::RAW_FD_OVERFLOW,
+       * temp_vfid stays NULL) are invisible to it, so parallel workers would
+       * silently sort only the membuf prefix of the input and drop the spilled
+       * remainder.  Until the sector scan learns raw-fd chunking (the NEW
+       * backing already has chunk_distributor for this), force serial. */
+      if (qmgr_list_has_raw_fd_segments (sort_info_p->input_file))
+	{
+	  er_log_debug (ARG_FILE_LINE, "sort: raw-fd overflow input -> serial (#99 input guard)\n");
+	  return 1;
+	}
+
       parallel_num =
 	parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, sort_info_p->input_file->page_cnt,
 						 sort_info_p->parallelism /* hint */ );

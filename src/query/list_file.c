@@ -42,6 +42,7 @@
 #include "object_primitive.h"
 #include "object_representation.h"
 #include "perf_monitor.h"
+#include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
 #include "query_manager.h"
 #include "qfile_tape.hpp"	/* Phase1 1A scan contract (redesign G005, issue #70) */
 #include "query_opfunc.h"
@@ -5459,6 +5460,35 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
 
   /* The result file must be closed for parallel processing. If not closed, Latch contention may occur. */
   qfile_close_list (thread_p, list_id_p);
+
+#if defined(SERVER_MODE)
+  /* #99: px sort workers must not write into a FILE_QUERY_AREA list -- its page
+   * allocation (temp_page_store.cpp alloc_private_spill_page, via file_manager)
+   * does not support concurrent same-transaction workers (file_manager.c, temp
+   * file creation guarded only per-tempcache-entry), so a QUERY_CACHE hint
+   * combined with a parallel ORDER BY truncates the cached result.  When this
+   * sort is expected to run parallel, drop QFILE_FLAG_RESULT_FILE from the open
+   * flag so the sort lands in normal (non query-area) backing; the cache-
+   * registration sink (qmgr_process_query()'s qfile_duplicate_list fallback in
+   * query_manager.c) duplicates the finished result into a query-area list
+   * afterward.  Mirror sort_check_parallelism()'s (external_sort.c) own
+   * eligibility check exactly, using the same input list and parallelism hint
+   * it will read via SORT_INFO once sort_listfile() runs below. */
+  if (QFILE_IS_FLAG_SET (flag, QFILE_FLAG_RESULT_FILE))
+    {
+      int px_predicted_num = (int) parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT,
+									     list_id_p->page_cnt, parallelism);
+      if (px_predicted_num >= 2 && list_id_p->tuple_cnt > px_predicted_num
+	  && !qmgr_list_has_raw_fd_segments (list_id_p))
+	{
+	  /* raw-fd overflow input forces serial in sort_check_parallelism (the px
+	   * sector scan cannot see those pages) -- keep the RESULT_FILE flag then,
+	   * so a serial cached sort still writes straight into the query area. */
+	  flag &= ~QFILE_FLAG_RESULT_FILE;
+	  er_log_debug (ARG_FILE_LINE, "sort output: parallel expected, RESULT_FILE deferred to sink (#99)\n");
+	}
+    }
+#endif /* SERVER_MODE */
 
   srlist_id = qfile_open_list (thread_p, &list_id_p->type_list, sort_list_p, list_id_p->query_id, flag, NULL);
   if (srlist_id == NULL)
