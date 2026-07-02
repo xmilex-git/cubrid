@@ -48,6 +48,8 @@
 
 #include <vector>
 #include <cstddef>
+#include <atomic>
+#include <memory>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -291,9 +293,24 @@ namespace qfile
        * (tape_count () == 0) and must not be used as a Tape source again. */
       void transfer_tapes_from (tapeset *src);
 
+      /* Open-scan liveness cell (#89 debug assert).  A shared_ptr<atomic<int>>
+       * so the count cell outlives the Tapeset itself: tapeset_scan copies
+       * this shared_ptr at construction (while the Tapeset is provably alive)
+       * and increments/decrements ITS OWN copy of the shared_ptr, never the
+       * Tapeset object -- the cell must be reachable after the Tapeset is
+       * destroyed without dereferencing the (possibly freed) Tapeset, or it
+       * would reintroduce the exact #87 D3 hazard tapeset_scan::close() was
+       * written to avoid.  Debug-only consumer: qfile_tapeset_open_scan_count(). */
+      using scan_count_cell = std::shared_ptr<std::atomic<int>>;
+      const scan_count_cell &open_scan_cell () const
+      {
+	return m_open_scan_cell;
+      }
+
     private:
       std::vector<tape *> m_tapes;
       bool m_owns_tapes;
+      scan_count_cell m_open_scan_cell;
 
       tapeset (const tapeset &) = delete;
       tapeset &operator= (const tapeset &) = delete;
@@ -424,6 +441,7 @@ namespace qfile
       int m_peek_reasm_cap;
       tapeset_scan_metrics m_metrics;
       long m_pgbuf_fix_baseline;	/* pgbuf_get_fix_debug_count() at construction (issue #93) */
+      tapeset::scan_count_cell m_open_scan_cell;	/* #89 debug assert; never dereferences the Tapeset (see class comment) */
 
       tapeset_scan (const tapeset_scan &) = delete;
       tapeset_scan &operator= (const tapeset_scan &) = delete;
@@ -533,6 +551,11 @@ void qfile_tapeset_scan_save_position (QFILE_LIST_SCAN_ID *scan_id_p, QFILE_TUPL
 
 /* Destroy a tapeset owned by a QFILE_LIST_ID (used by qfile_clear_list_id). */
 void qfile_tapeset_destroy (void *tapeset_ptr);
+
+/* #89 debug assert: number of tapeset_scan objects currently open against this
+ * (live) Tapeset.  Caller must only call this while the Tapeset itself is
+ * known to be alive (e.g. right before destroying it). */
+int qfile_tapeset_open_scan_count (void *tapeset_ptr);
 
 /* Phase2 2A-1 producer bridge (redesign #78): build a NEW-backed list by
  * appending its completed list-pages to a tape_writer, then freezing into a

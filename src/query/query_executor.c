@@ -8647,6 +8647,15 @@ qexec_execute_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl
       if (qualified)
 	{
 	  /* clear bptr subquery list files */
+#if !defined (NDEBUG)
+	  /* #89: this per-row re-clear must never race a still-open scan on a
+	   * bptr result (that would be a genuine premature-clear bug, distinct
+	   * from the #87/#89-E1 teardown ordering, which is already safe). */
+	  for (XASL_NODE * chk89 = xasl->bptr_list; chk89 != NULL; chk89 = chk89->next)
+	    {
+	      assert (chk89->list_id == NULL || qfile_list_id_open_scan_count (chk89->list_id) == 0);
+	    }
+#endif /* !NDEBUG */
 	  if (xasl->bptr_list)
 	    {
 	      qexec_clear_head_lists (thread_p, xasl->bptr_list);
@@ -8720,6 +8729,13 @@ qexec_execute_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl
       if (qualified)
 	{
 	  /* clear fptr subquery list files */
+#if !defined (NDEBUG)
+	  /* #89: same rationale as the bptr assert above. */
+	  for (XASL_NODE * chk89 = xasl->fptr_list; chk89 != NULL; chk89 = chk89->next)
+	    {
+	      assert (chk89->list_id == NULL || qfile_list_id_open_scan_count (chk89->list_id) == 0);
+	    }
+#endif /* !NDEBUG */
 	  if (xasl->fptr_list)
 	    {
 	      qexec_clear_head_lists (thread_p, xasl->fptr_list);

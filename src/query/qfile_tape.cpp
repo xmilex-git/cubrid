@@ -424,7 +424,7 @@ namespace qfile
   /* ------------------------------------------------------------------ */
 
   tapeset::tapeset ()
-    : m_tapes (), m_owns_tapes (false)
+    : m_tapes (), m_owns_tapes (false), m_open_scan_cell (std::make_shared<std::atomic<int>> (0))
   {
   }
 
@@ -505,13 +505,25 @@ namespace qfile
 #else /* NDEBUG */
     , m_pgbuf_fix_baseline (0)
 #endif /* NDEBUG */
+    , m_open_scan_cell (ts ? ts->open_scan_cell () : nullptr)
   {
+    if (m_open_scan_cell)
+      {
+	m_open_scan_cell->fetch_add (1, std::memory_order_relaxed);
+      }
   }
 
   tapeset_scan::~tapeset_scan ()
   {
     /* A held page needs no release call (#87): a file page lives in the
      * scan-owned m_readbuf freed here, a prefix page is Tape-owned RAM. */
+    /* #89: drop this scan's reference on its OWN copy of the shared cell --
+     * never touches m_tapeset, which may already be freed (see class comment
+     * in qfile_tape.hpp / D3 in #87). */
+    if (m_open_scan_cell)
+      {
+	m_open_scan_cell->fetch_sub (1, std::memory_order_relaxed);
+      }
     free (m_readbuf);
     m_readbuf = NULL;
     free (m_reasm_raw);
@@ -1331,6 +1343,13 @@ void
 qfile_tapeset_destroy (void *tapeset_ptr)
 {
   delete (qfile::tapeset *) tapeset_ptr;
+}
+
+int
+qfile_tapeset_open_scan_count (void *tapeset_ptr)
+{
+  qfile::tapeset *ts = (qfile::tapeset *) tapeset_ptr;
+  return (ts == NULL) ? 0 : ts->open_scan_cell ()->load (std::memory_order_relaxed);
 }
 
 /* ------------------------------------------------------------------ */

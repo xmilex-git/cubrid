@@ -3659,6 +3659,21 @@ qfile_truncate_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id)
   list_id->last_pgptr = NULL;
   list_id->last_offset = QFILE_NULL_PAGE_OFFSET;
   list_id->lasttpl_len = 0;
+
+  /* #89: NEW (Tapeset) backing is not reset by the VPID/tuple_cnt fields
+   * above -- a stale Tapeset would keep pointing at logical pages that
+   * file_temp_truncate() below throws away, corrupting a subsequent reuse of
+   * this list_id (CONNECT BY re-iteration, hash-join partition reuse,
+   * index-covering rescan).  Destroy it the same way qfile_destroy_list()
+   * does, guarded by ownership so a borrowing scan copy never frees a
+   * producer's Tapes; the next qfile_add_tuple/producer path allocates a
+   * fresh Tapeset on demand. */
+  if (QFILE_LIST_ID_TAPESET (list_id) != NULL && QFILE_LIST_ID_OWNS_TAPESET (list_id))
+    {
+      qfile_tapeset_destroy (QFILE_LIST_ID_TAPESET (list_id));
+      QFILE_LIST_ID_TAPESET (list_id) = NULL;
+    }
+
   if (tfile_vfid_p != NULL)
     {
       switch (tfile_vfid_p->membuf_type)
@@ -6736,6 +6751,16 @@ qfile_close_scan (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
   qfile_clear_list_id (&scan_id_p->list_id);
 
   scan_id_p->status = S_CLOSED;
+}
+
+int
+qfile_list_id_open_scan_count (const QFILE_LIST_ID * list_id_p)
+{
+  if (list_id_p == NULL || QFILE_LIST_ID_TAPESET (list_id_p) == NULL)
+    {
+      return 0;
+    }
+  return qfile_tapeset_open_scan_count (QFILE_LIST_ID_TAPESET (list_id_p));
 }
 
 #if defined(SERVER_MODE)
