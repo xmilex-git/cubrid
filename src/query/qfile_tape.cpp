@@ -45,6 +45,58 @@
 
 namespace qfile
 {
+#if !defined (NDEBUG)
+  namespace
+  {
+    /* freeze() allocation fault injection (#95, debug-only).  Simulates the
+     * SERVER_MODE noexcept-new returning NULL at a tape allocation without
+     * exhausting real memory, so the OOM ownership-recovery path is exercised
+     * deterministically.  g_fault_alloc_target is the 1-based ordinal of the
+     * tape allocation to fail (0 = disarmed); g_fault_alloc_count counts tape
+     * allocations seen since the last arm.  Reuses the #86 fault-hook shape. */
+    std::atomic<int> g_fault_alloc_target {0};
+    std::atomic<int> g_fault_alloc_count {0};
+
+    bool
+    fault_alloc_should_fail () noexcept
+    {
+      /* one-time arm from env for query-level repro; the self-test arms
+       * directly (env unset), leaving its arming untouched. */
+      static const bool env_armed = [] ()
+      {
+	const char *e = getenv ("CUBRID_WM_FAULT_ALLOC_AT");
+	if (e != NULL)
+	  {
+	    int n = atoi (e);
+	    if (n > 0)
+	      {
+		g_fault_alloc_target.store (n, std::memory_order_relaxed);
+		g_fault_alloc_count.store (0, std::memory_order_relaxed);
+		return true;
+	      }
+	  }
+	return false;
+      } ();
+      (void) env_armed;
+
+      const int target = g_fault_alloc_target.load (std::memory_order_relaxed);
+      if (target <= 0)
+	{
+	  return false;
+	}
+      const int seen = g_fault_alloc_count.fetch_add (1, std::memory_order_relaxed) + 1;
+      return seen == target;
+    }
+  }				/* anonymous namespace */
+
+  void
+  tape_fault_arm_alloc_fail (int nth)
+  {
+    g_fault_alloc_count.store (0, std::memory_order_relaxed);
+    g_fault_alloc_target.store (nth > 0 ? nth : 0, std::memory_order_relaxed);
+  }
+#endif /* !NDEBUG */
+
   /* ------------------------------------------------------------------ */
   /* tape (work_mem charge lifetime, #91)                               */
   /* ------------------------------------------------------------------ */
@@ -378,7 +430,27 @@ namespace qfile
     if (m_buffile == NULL)
       {
 	/* tiny / no spill: an all-RAM Tape, no disk touch. */
-	memory_tape *mt = new memory_tape (true);
+	memory_tape *mt;
+#if !defined (NDEBUG)
+	if (fault_alloc_should_fail ())
+	  {
+	    mt = NULL;		/* simulate noexcept-new OOM (#95) */
+	  }
+	else
+#endif
+	  {
+	    mt = new memory_tape (true);
+	  }
+	if (mt == NULL)
+	  {
+	    /* SERVER_MODE new is noexcept and returns NULL on OOM (#95): the
+	     * prefix pages are still ours and untouched.  Latch + return NULL
+	     * WITHOUT transferring ownership -- caller's delete w -> ~tape_writer
+	     * frees the prefix.  (No NULL-deref, no lost pages.) */
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (memory_tape));
+	    m_failed = true;
+	    return NULL;
+	  }
 	for (char *page : m_prefix)
 	  {
 	    mt->append_page (page);
@@ -396,9 +468,30 @@ namespace qfile
 	return NULL;
       }
     buffile *bf = m_buffile;
-    buffile_tape *bt = new buffile_tape (std::move (m_prefix), true, bf, true);
+    buffile_tape *bt;
+#if !defined (NDEBUG)
+    if (fault_alloc_should_fail ())
+      {
+	bt = NULL;		/* simulate noexcept-new OOM (#95) */
+      }
+    else
+#endif
+      {
+	bt = new buffile_tape (std::move (m_prefix), true, bf, true);
+      }
+    if (bt == NULL)
+      {
+	/* SERVER_MODE new is noexcept and returns NULL on OOM (#95): the ctor
+	 * never ran, so m_prefix was NOT moved and m_buffile is still ours.
+	 * Latch + return NULL BEFORE touching ownership -- caller's delete w ->
+	 * ~tape_writer frees the prefix and closes/unlinks the spill file.
+	 * (No NULL-deref, no orphaned fd/file, no lost pages.) */
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (buffile_tape));
+	m_failed = true;
+	return NULL;
+      }
     m_buffile = NULL;		/* allocation succeeded: ownership is now the Tape's
-				 * (reorder keeps bf owned by the writer if new throws) */
+				 * (NULL-check above keeps bf owned by the writer on OOM) */
     m_prefix.clear ();
     bt->adopt_wm_charges (std::move (m_wm_charges));
     m_wm_charges.clear ();
@@ -2221,6 +2314,150 @@ qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
 
   er_log_debug (ARG_FILE_LINE, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
   fprintf (stderr, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
+  return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* In-server self-test: freeze() OOM ownership recovery (#95)          */
+/* Gated by env CUBRID_WM_FREEZE_OOM_SELFTEST (debug-only invocation).  */
+/* ------------------------------------------------------------------ */
+/*
+ * SERVER_MODE new is noexcept (returns NULL on OOM), so freeze() must NULL-check
+ * both tape allocations and, on failure, retain ownership of the prefix +
+ * BufFile so the caller's teardown reclaims them.  Drives the alloc fault
+ * injector to force each path's tape allocation to NULL and asserts:
+ *   P1 (spill/buffile path): freeze()==NULL (no crash, no fake success),
+ *       er=ER_OUT_OF_VIRTUAL_MEMORY, writer still owns the BufFile (spilled())
+ *       and is latched failed(); after the writer is destroyed the census
+ *       open_files returns to baseline (fd closed + spill file unlinked by
+ *       ~buffile -- not orphaned).
+ *   P2 (tiny/RAM path): freeze()==NULL (no NULL-deref crash), er=OOM, writer
+ *       still owns its prefix pages (prefix_pages() unchanged) and is latched
+ *       failed(); after destroy the census returns to baseline (prefix freed,
+ *       not lost via a premature clear).
+ * Returns 0 (NO_ERROR) on PASS.  Fail-before-fix: without the NULL checks the
+ * tiny path NULL-derefs and the spill path orphans the fd/file.
+ */
+int
+qfile_freeze_oom_selftest (THREAD_ENTRY *thread_p)
+{
+  int rc = NO_ERROR;
+  std::string dir;
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      rc = ER_FAILED;
+    }
+
+  /* ---- P1: spill/buffile path OOM -> fd + file reclaimed, no orphan ---- */
+  if (rc == NO_ERROR)
+    {
+      const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+      {
+	static std::uint64_t seq = 95000;
+	qfile::tape_writer w (0, TDE_ALGORITHM_NONE, dir, seq++, 0);	/* budget 0 -> spill */
+	int prc = NO_ERROR;
+	for (int p = 0; p < 12 && prc == NO_ERROR; p++)
+	  {
+	    char *pg = (char *) malloc (DB_PAGESIZE);
+	    if (pg == NULL)
+	      {
+		prc = ER_FAILED;
+		break;
+	      }
+	    std::memset (pg, 0, DB_PAGESIZE);
+	    prc = w.append_page (thread_p, (PAGE_PTR) pg);
+	    free (pg);
+	  }
+	if (prc != NO_ERROR || !w.spilled ())
+	  {
+	    rc = ER_FAILED;		/* setup: must have spilled to a BufFile */
+	  }
+	else
+	  {
+	    er_clear ();
+	    qfile::tape_fault_arm_alloc_fail (1);	/* fail the buffile_tape alloc */
+	    qfile::tape *t = w.freeze (thread_p);
+	    qfile::tape_fault_arm_alloc_fail (0);
+	    if (t != NULL)
+	      {
+		delete t;		/* freeze must fail on OOM, not fake success */
+		rc = ER_FAILED;
+	      }
+	    else if (!w.spilled () || !w.failed () || er_errid () != ER_OUT_OF_VIRTUAL_MEMORY)
+	      {
+		/* BufFile must still be the writer's, failure latched + OOM. */
+		rc = ER_FAILED;
+	      }
+	  }
+	/* w destructs here -> ~tape_writer closes + unlinks the BufFile. */
+      }
+      if (rc == NO_ERROR)
+	{
+	  const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+	  if (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages)
+	    {
+	      rc = ER_FAILED;		/* orphaned fd / prefix -> leak */
+	    }
+	}
+    }
+
+  /* ---- P2: tiny/RAM path OOM -> no crash, prefix retained then freed ---- */
+  if (rc == NO_ERROR)
+    {
+      const int NP = 5;
+      const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+      {
+	static std::uint64_t seq = 95500;
+	qfile::tape_writer w (64, TDE_ALGORITHM_NONE, dir, seq++, 0);	/* big budget -> all RAM */
+	int prc = NO_ERROR;
+	for (int p = 0; p < NP && prc == NO_ERROR; p++)
+	  {
+	    char *pg = (char *) malloc (DB_PAGESIZE);
+	    if (pg == NULL)
+	      {
+		prc = ER_FAILED;
+		break;
+	      }
+	    std::memset (pg, 0, DB_PAGESIZE);
+	    prc = w.append_page (thread_p, (PAGE_PTR) pg);
+	    free (pg);
+	  }
+	if (prc != NO_ERROR || w.spilled () || w.prefix_pages () != NP)
+	  {
+	    rc = ER_FAILED;		/* setup: must be all-RAM prefix, no spill */
+	  }
+	else
+	  {
+	    er_clear ();
+	    qfile::tape_fault_arm_alloc_fail (1);	/* fail the memory_tape alloc */
+	    qfile::tape *t = w.freeze (thread_p);
+	    qfile::tape_fault_arm_alloc_fail (0);
+	    if (t != NULL)
+	      {
+		delete t;
+		rc = ER_FAILED;
+	      }
+	    else if (w.prefix_pages () != NP || !w.failed () || er_errid () != ER_OUT_OF_VIRTUAL_MEMORY)
+	      {
+		/* prefix must be retained (not cleared), failure latched + OOM. */
+		rc = ER_FAILED;
+	      }
+	  }
+	/* w destructs here -> ~tape_writer frees the retained prefix pages. */
+      }
+      if (rc == NO_ERROR)
+	{
+	  const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+	  if (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages)
+	    {
+	      rc = ER_FAILED;
+	    }
+	}
+    }
+
+  qfile::tape_fault_arm_alloc_fail (0);
+  er_log_debug (ARG_FILE_LINE, "FREEZE_OOM_SELFTEST result=%d (0=PASS)\n", rc);
+  fprintf (stderr, "FREEZE_OOM_SELFTEST result=%d (0=PASS)\n", rc);
   return rc;
 }
 #endif /* !NDEBUG */

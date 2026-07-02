@@ -1248,6 +1248,20 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  fprintf (stderr, "CLOSE_FAULT_SELFTEST FAIL result=%d\n", close_fault_selftest_rc);
 	}
     }
+  if (getenv ("CUBRID_WM_FREEZE_OOM_SELFTEST") != NULL)
+    {
+      /* #95: freeze OOM ownership recovery.  Log-only (no assert) so a pre-fix
+       * run reproduces the crash/leak observably; the grep-able marker judges
+       * PASS/FAIL. */
+      int freeze_oom_selftest_rc = qfile_freeze_oom_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "FREEZE_OOM_SELFTEST result=%d (0=PASS)\n", freeze_oom_selftest_rc);
+      fprintf (stderr, "FREEZE_OOM_SELFTEST result=%d (0=PASS)\n", freeze_oom_selftest_rc);
+      if (freeze_oom_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "FREEZE_OOM_SELFTEST FAIL result=%d\n", freeze_oom_selftest_rc);
+	  fprintf (stderr, "FREEZE_OOM_SELFTEST FAIL result=%d\n", freeze_oom_selftest_rc);
+	}
+    }
 #endif /* !NDEBUG */
 
   return scan_initialize ();

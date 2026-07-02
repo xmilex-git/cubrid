@@ -503,6 +503,16 @@ namespace qfile
       tapeset_reader (const tapeset_reader &) = delete;
       tapeset_reader &operator= (const tapeset_reader &) = delete;
   };
+
+#if !defined (NDEBUG)
+  /* OOM fault injection for freeze() (#95, debug-only).  Arm to make the Nth
+   * subsequent tape allocation inside freeze() (memory_tape / buffile_tape)
+   * behave as the SERVER_MODE noexcept-new does under OOM -- return NULL --
+   * so the ownership-recovery path is exercised without exhausting memory.
+   * nth <= 0 disarms.  Also armed at boot from env CUBRID_WM_FAULT_ALLOC_AT.
+   * Compiled out of release. */
+  void tape_fault_arm_alloc_fail (int nth);
+#endif /* !NDEBUG */
 }				/* namespace qfile */
 
 /* ------------------------------------------------------------------ */
@@ -604,6 +614,14 @@ int qfile_producer_selftest (THREAD_ENTRY *thread_p);
  * with the census back to baseline.  Gated by env CUBRID_WM_CLOSE_FAULT_SELFTEST
  * (debug).  Returns 0 on PASS. */
 int qfile_close_fault_selftest (THREAD_ENTRY *thread_p);
+
+/* In-server self-test of freeze() OOM ownership recovery (#95): drive the tape
+ * alloc fault injector so each freeze path's noexcept-new returns NULL, then
+ * assert freeze()==NULL (no crash, no fake success), ER_OUT_OF_VIRTUAL_MEMORY,
+ * ownership retained by the writer, and census back to baseline after teardown
+ * (fd/file/prefix reclaimed).  Gated by env CUBRID_WM_FREEZE_OOM_SELFTEST
+ * (debug).  Returns 0 on PASS. */
+int qfile_freeze_oom_selftest (THREAD_ENTRY *thread_p);
 #endif /* !NDEBUG */
 
 #endif /* _QFILE_TAPE_HPP_ */
