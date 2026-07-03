@@ -416,7 +416,12 @@ public class ExecuteThread extends Thread {
                 SourceCode sCode = new SourceCode(info.className, info.translated);
 
                 // dump translated code into $CUBRID_TMP
-                if (Context.getSystemParameterBool(SysParam.STORED_PROCEDURE_DUMP_ICODE)) {
+                // getSystemParameterBool() returns a boxed Boolean and is null when the
+                // compile request's session parameter map has no STORED_PROCEDURE_DUMP_ICODE
+                // entry; auto-unboxing that null threw NPE on every compile, so compare
+                // against Boolean.TRUE instead of unboxing directly.
+                if (Boolean.TRUE.equals(
+                        Context.getSystemParameterBool(SysParam.STORED_PROCEDURE_DUMP_ICODE))) {
 
                     Path dirPath = Paths.get(Server.getConfig().getTmpPath() + "/icode");
                     if (Files.notExists(dirPath)) {
