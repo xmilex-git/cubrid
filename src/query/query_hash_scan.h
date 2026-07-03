@@ -149,19 +149,6 @@ qfile_tuple_position_set_simple_pos (QFILE_TUPLE_POSITION * tuple_position_p,
     } \
   while (0)
 
-#define MAKE_TFTID_TO_TUPLE_POSTION(tuple_pos, tftid, scan_id_p) \
-  do \
-    { \
-      (tuple_pos).status = (scan_id_p)->status; \
-      (tuple_pos).position = S_ON; \
-      (tuple_pos).vpid.pageid = (tftid).pageid; \
-      (tuple_pos).vpid.volid = (tftid).volid; \
-      qfile_tuple_position_set_vpid (&(tuple_pos), &(tuple_pos).vpid, (tftid).offset); \
-      (tuple_pos).tpl = NULL; \
-      (tuple_pos).tplno = 0; /* If tplno is needed, add it from scan_build_hash_list_scan() */ \
-    } \
-  while (0)
-
 /* hash scan value */
 typedef union hash_scan_value HASH_SCAN_VALUE;
 union hash_scan_value
@@ -178,16 +165,6 @@ struct hash_scan_key
   int val_count;		/* key size */
   bool free_values;		/* true if values need to be freed */
   db_value **values;		/* value array */
-};
-
-typedef struct file_hash_scan_id FHSID;
-struct file_hash_scan_id
-{
-  /* Fields should be ordered according to their sizes */
-  EHID ehid;			/* dir file identifier */
-  VFID bucket_file;		/* bucket file identifier */
-  unsigned short depth;		/* global depth of the directory */
-  char alignment;		/* alignment value used on slots of bucket pages */
 };
 
 /* hash list scan */
@@ -217,13 +194,7 @@ struct hash_list_scan
     } memory;
     struct
     {
-      FHSID *hash_table;	/* extendible hash table file */
-      OID curr_oid;		/* current bucket oid */
-      bool is_dk_bucket;	/* is current bucket dk? */
-    } file;
-    struct
-    {
-      HLS_SPILL *hash_table;	/* batch-spill hash (replaces `file`, #123) */
+      HLS_SPILL *hash_table;	/* batch-spill hash for the HASH_FILE tier (#123) */
       HLS_SPILL_CURSOR *cursor;	/* this scan's own probe cursor (#127) */
     } spill;
   };
@@ -255,32 +226,6 @@ HASH_SCAN_KEY *qdata_copy_hscan_key_without_alloc (THREAD_ENTRY * thread_p, HASH
 
 int qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *data, const void *type_list,
 				 void *args);
-
-/* FILE HASH STRUCTURE */
-typedef struct temp_file_tuple_id TFTID;
-struct temp_file_tuple_id
-{
-  int pageid;
-  short volid;
-  short offset;			/* Since the maximum page size is 16K, can store the offset in the short type. */
-};
-
-#define SET_TFTID(dest_tftid, vol_id, page_id, param_offset)  \
-  do \
-    { \
-      (dest_tftid).volid = vol_id; \
-      (dest_tftid).pageid = page_id; \
-      (dest_tftid).offset = param_offset; \
-    } \
-  while (0)
-
-extern FHSID *fhs_create (THREAD_ENTRY * thread_p, FHSID * fhsid, int exp_num_entries);
-extern int fhs_destroy (THREAD_ENTRY * thread_p, FHSID * fhsid);
-extern void *fhs_insert (THREAD_ENTRY * thread_p, FHSID * fhsid, void *key, TFTID * value_ptr);
-extern EH_SEARCH fhs_search (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid, TFTID * value_ptr);
-extern EH_SEARCH fhs_search_next (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid, TFTID * value_ptr);
-extern void fhs_dump (THREAD_ENTRY * thread_p, FHSID * fhsid);
-/* end : FILE HASH SCAN */
 
 /* start : PG-style batch-spill hash (#123) — HASH_FILE-tier replacement.
  * Values are QFILE_TUPLE_SIMPLE_POS (coord_type-tagged), so a NEW (Tapeset)
