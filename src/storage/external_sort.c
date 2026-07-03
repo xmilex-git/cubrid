@@ -5299,23 +5299,24 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 	  return 1;
 	}
       QFILE_LIST_ID *input_list = px->input_list;
-      /* A NEW (Tapeset)-backed input cannot be read by the parallel sector scan
-       * that sort_start_parallelism opens for GROUP_BY/ANALYTIC workers:
-       * qfile_open_list_sector_scan is an OLD-only mechanism whose backing guard
-       * rejects a NEW list with ER_QPROC_INVALID_XASLNODE.  Unlike the ORDER_BY
-       * branch, this path has no chunk_distributor reader yet, so force serial
-       * execution -- the serial sort reads the NEW input through the normal
-       * tuple-level list scan (tapeset reader) and drives qexec_analytic_put_next
-       * via the #103 A_sort_key path (verified correct: serial == gate-OFF golden).
-       * Reachable once the SCAN/SORT gates default ON (ceb8997e8): a parallel base
-       * scan hands the analytic a NEW "mergeable list" input.  Mirrors the #99
-       * raw-fd input guard above; the chunk_distributor parity is a later perf
-       * slice.  (#78 C-7/C-8; corrects the #97 external_sort.c:5636 "unreachable"
-       * verdict.) */
-      if (input_list != NULL && qfile_list_has_new_backing (input_list))
+      /* A NEW (Tapeset)-backed input is read in parallel through the shared
+       * chunk_distributor + per-worker tapeset_reader that sort_start_parallelism
+       * builds (#122, ported from the ORDER_BY branch), instead of the OLD-only
+       * qfile_open_list_sector_scan the #118 blanket guard had to avoid.  That
+       * reader builds A_sort_key records via qfile_sort_build_key_from_tuple, which
+       * requires use_original == 0 -- every column materialized in the sort record
+       * (the #103/#100 extend_all_columns treatment that qexec_gby_* and
+       * qexec_execute_analytic apply to NEW input).  In the rare case where
+       * extend_all_columns bailed (duplicated / out-of-range key column) use_original
+       * stays 1, the A_sort_key path cannot carry the payload, so keep forcing serial:
+       * the serial sort then fails loudly on the unresolvable back-reference exactly
+       * as before, rather than mis-reading the record.  (#78 C-7/C-8; supersedes the
+       * #118 blanket NEW->serial guard now that the reader exists.) */
+      if (input_list != NULL && qfile_list_has_new_backing (input_list)
+	  && (px->key_info == NULL || px->key_info->use_original))
 	{
 	  er_log_debug (ARG_FILE_LINE,
-			"sort: NEW-backed %s input -> serial (#118 input guard)\n",
+			"sort: NEW-backed %s input with use_original -> serial (#122 A_sort_key guard)\n",
 			(sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
 	  return 1;
 	}
@@ -5645,22 +5646,42 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
       SORT_LISTFILE_PX_ARG *px = (SORT_LISTFILE_PX_ARG *) sort_param->px_extra_arg;
       QFILE_LIST_ID *input_list = px->input_list;
 
-      /* open shared sector scan */
-      sort_param->px_sector_scan =
-	(QFILE_LIST_SECTOR_SCAN_INFO *) db_private_alloc (thread_p, sizeof (QFILE_LIST_SECTOR_SCAN_INFO));
-      if (sort_param->px_sector_scan == NULL)
+      if (qfile_list_has_new_backing (input_list))
 	{
-	  return ER_FAILED;
+	  /* NEW (Tapeset) input: build a shared chunk_distributor; each worker gets its
+	   * own tapeset_reader below and atomically steals 64-page chunks from it.  No
+	   * OLD sector scan is opened (qfile_open_list_sector_scan is OLD-only and would
+	   * reject the NEW list -- the crash the #118 guard used to prevent).  Mirrors
+	   * the ORDER_BY branch (#122).  sort_check_parallelism has already ensured the
+	   * key builds as an A_sort_key (use_original == 0). */
+	  qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list);
+	  sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);
+	  if (sort_param->px_chunk_dist == NULL)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		      sizeof (qfile::chunk_distributor));
+	      return ER_FAILED;
+	    }
 	}
-      placement_new (sort_param->px_sector_scan);
-
-      error = qfile_open_list_sector_scan (thread_p, input_list, sort_param->px_sector_scan);
-      if (error != NO_ERROR)
+      else
 	{
-	  qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
-	  sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
-	  db_private_free_and_init (thread_p, sort_param->px_sector_scan);
-	  return ER_FAILED;
+	  /* open shared sector scan */
+	  sort_param->px_sector_scan =
+	    (QFILE_LIST_SECTOR_SCAN_INFO *) db_private_alloc (thread_p, sizeof (QFILE_LIST_SECTOR_SCAN_INFO));
+	  if (sort_param->px_sector_scan == NULL)
+	    {
+	      return ER_FAILED;
+	    }
+	  placement_new (sort_param->px_sector_scan);
+
+	  error = qfile_open_list_sector_scan (thread_p, input_list, sort_param->px_sector_scan);
+	  if (error != NO_ERROR)
+	    {
+	      qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
+	      sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
+	      db_private_free_and_init (thread_p, sort_param->px_sector_scan);
+	      return ER_FAILED;
+	    }
 	}
 
       /* null out get_arg so partial-init cleanup is safe */
@@ -5714,6 +5735,21 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 
 	  winfo->px_state = state;
 	  px_sort_param[i].get_arg = winfo;
+
+	  if (sort_param->px_chunk_dist != NULL)
+	    {
+	      /* NEW input: this worker reads its stolen chunks through a tapeset_reader.
+	       * get_arg/px_state are already wired, so an alloc failure here is reclaimed
+	       * by the partial-init cleanup (qfile_sort_px_state_free).  Mirrors ORDER_BY. */
+	      qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list);
+	      state->tapeset_reader = new qfile::tapeset_reader (ts, sort_param->px_chunk_dist, i);
+	      if (state->tapeset_reader == NULL)
+		{
+		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+			  sizeof (qfile::tapeset_reader));
+		  return ER_FAILED;
+		}
+	    }
 	  px_sort_param[i].get_fn = &qfile_sort_get_next_parallel;
 	}
     }
