@@ -40,6 +40,7 @@
 #include <direct.h>
 #else /* WINDOWS */
 #include <unistd.h>
+#include <sys/resource.h>	/* getrlimit / RLIMIT_NOFILE (#125 fd headroom check) */
 #endif /* WINDOWS */
 #include <assert.h>
 
@@ -1954,6 +1955,58 @@ boot_make_session_server_key (void)
   return NO_ERROR;
 }
 
+#if defined (SERVER_MODE) && !defined (WINDOWS)
+/*
+ * boot_check_fd_headroom () - advisory check of RLIMIT_NOFILE vs worst-case fd
+ *                             demand (#125 gap B); emits one notification if low
+ *
+ * return : void (best-effort; never fails boot)
+ *
+ * Note: Each spilling parallel worker of each client holds ~1 temp BufFile fd
+ *       (ADR 0005: one shared fd per spilled tape, no per-reader open), so the
+ *       worst case is roughly max_clients * max_parallel_workers temp fds on top
+ *       of the server's socket/volume/log fds.  We compare that estimate (plus a
+ *       fixed headroom for the non-temp fds) against the soft RLIMIT_NOFILE and
+ *       log a single ER_NOTIFICATION_SEVERITY line if the limit is below it, so
+ *       an operator can raise the open-file limit before high-concurrency
+ *       spilling queries hit EMFILE.  A dedicated fd cap / VFD-LRU layer is a
+ *       non-goal (D-record in the #125 commit): over-design given the thread
+ *       model + lazy BufFile create + one-fd-per-tape structure.
+ */
+static void
+boot_check_fd_headroom (void)
+{
+  struct rlimit rlim;
+  int max_clients, max_workers;
+  long long need;
+  const long long headroom = 1024;	/* client sockets + volumes + logs + misc */
+
+  if (getrlimit (RLIMIT_NOFILE, &rlim) != 0 || rlim.rlim_cur == RLIM_INFINITY)
+    {
+      return;
+    }
+
+  max_clients = prm_get_integer_value (PRM_ID_CSS_MAX_CLIENTS);
+  max_workers = prm_get_integer_value (PRM_ID_MAX_PARALLEL_WORKERS);
+  if (max_workers <= 0)
+    {
+      max_workers = 1;
+    }
+  need = (long long) max_clients * max_workers + headroom;
+
+  if ((long long) rlim.rlim_cur < need)
+    {
+      char msg[512];
+      snprintf (msg, sizeof (msg),
+		"open-file limit (RLIMIT_NOFILE soft=%lld) is below the estimated worst-case fd demand %lld "
+		"(max_clients=%d * max_parallel_workers=%d + %lld headroom); high-concurrency spilling queries "
+		"may fail with EMFILE. Consider raising the open-file limit (ulimit -n).",
+		(long long) rlim.rlim_cur, need, max_clients, max_workers, headroom);
+      er_set (ER_NOTIFICATION_SEVERITY, ARG_FILE_LINE, ER_BO_NOFILE_LIMIT_LOW, 1, msg);
+    }
+}
+#endif /* SERVER_MODE && !WINDOWS */
+
 /*
  * boot_restart_server () - restart server
  *
@@ -2419,6 +2472,9 @@ boot_restart_server (THREAD_ENTRY * thread_p, bool print_restart, const char *db
   pgbuf_daemons_init ();
   dwb_daemons_init ();
   parallel_query::worker_manager_global::get_manager ().init ();
+#if !defined (WINDOWS)
+  boot_check_fd_headroom ();	/* #125 gap B: advisory open-file-limit check */
+#endif /* !WINDOWS */
 #endif /* SERVER_MODE */
 
   /*

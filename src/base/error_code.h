@@ -1765,7 +1765,9 @@
 
 #define ER_PARTITION_TABLE_NAME_OVERFLOW            -1374
 
-#define ER_LAST_ERROR                               -1375
+#define ER_BO_NOFILE_LIMIT_LOW                      -1375
+
+#define ER_LAST_ERROR                               -1376
 
 
 

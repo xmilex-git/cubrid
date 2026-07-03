@@ -1263,6 +1263,20 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  fprintf (stderr, "FREEZE_OOM_SELFTEST FAIL result=%d\n", freeze_oom_selftest_rc);
 	}
     }
+  if (getenv ("CUBRID_WM_EMFILE_FAULT_SELFTEST") != NULL)
+    {
+      /* #125: BufFile fd-exhaustion (EMFILE/ENFILE) error mapping.  Log-only (no
+       * assert) so a pre-fix run reproduces the generic ER_FAILED observably;
+       * the grep-able marker judges PASS/FAIL. */
+      int emfile_fault_selftest_rc = qfile_emfile_fault_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "EMFILE_FAULT_SELFTEST result=%d (0=PASS)\n", emfile_fault_selftest_rc);
+      fprintf (stderr, "EMFILE_FAULT_SELFTEST result=%d (0=PASS)\n", emfile_fault_selftest_rc);
+      if (emfile_fault_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "EMFILE_FAULT_SELFTEST FAIL result=%d\n", emfile_fault_selftest_rc);
+	  fprintf (stderr, "EMFILE_FAULT_SELFTEST FAIL result=%d\n", emfile_fault_selftest_rc);
+	}
+    }
 #endif /* !NDEBUG */
 
   return scan_initialize ();
@@ -1561,25 +1575,30 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   assert (query_p->list_id != NULL);
-  /* Class-B sink.  A NEW (Tapeset)-backed, non-raw-fd, non-holdable result never
-   * touches the OLD-legacy raw-fd/sector machinery:
-   *  - non-cacheable: served to the client straight from its Tapeset
-   *    (xqfile_get_list_file_page); overflow (big-tuple) runs are translated on
-   *    the fly to the legacy VPID overflow chain by the serve path (#120b), so
-   *    no copy at all (#120a/#120b facade).
-   *  - cacheable, overflow-free: copied out straight from its Tapeset into a
-   *    permanent FILE_QUERY_AREA list (#121 cached-persist, redesign axis 1) --
-   *    the copy is by design, but its source is the Tapeset
-   *    (qmgr_copy_new_result_to_query_area), not the #94 qmgr_materialize_to_pgbuf
-   *    OLD copy.  (The list-cache publish reads tuples, not the serve path's
-   *    on-the-fly VPID overflow translation, so a still-overflowing cacheable
-   *    result keeps the materialize fallback below for now.)
+  /* Class-B sink.  A NEW (Tapeset)-backed, non-raw-fd result never touches the
+   * OLD-legacy raw-fd/sector machinery:
+   *  - non-cacheable (incl. holdable, #111): served to the client straight from
+   *    its Tapeset (xqfile_get_list_file_page); overflow (big-tuple) runs are
+   *    translated on the fly to the legacy VPID overflow chain by the serve
+   *    path (#120b), so no copy at all (#120a/#120b facade).  A holdable
+   *    result's Tapeset reparents to the session with zero copy at commit
+   *    (qmgr_clear_trans_wakeup, #111); post-commit fetches route back here
+   *    through the session-restored query entry over the SAME Tapeset-intrinsic
+   *    global page space.
+   *  - cacheable, overflow-free, non-holdable: copied out straight from its
+   *    Tapeset into a permanent FILE_QUERY_AREA list (#121 cached-persist,
+   *    redesign axis 1) -- the copy is by design, but its source is the Tapeset
+   *    (qmgr_copy_new_result_to_query_area), not the #94
+   *    qmgr_materialize_to_pgbuf OLD copy.  (The list-cache publish reads
+   *    tuples, not the serve path's on-the-fly VPID overflow translation, so a
+   *    still-overflowing cacheable result keeps the materialize fallback below
+   *    for now.)
    * Everything else -- raw-fd overflow segments, a cacheable overflow result,
-   * and holdable cursors (#111) -- keeps the #94 materialize fallback, retained
-   * until Phase3 (#120/#74).  For plain VPID-backed lists every path is a no-op. */
+   * and a cacheable holdable result -- keeps the #94 materialize fallback,
+   * retained until Phase3 (#120/#74).  For plain VPID-backed lists every path
+   * is a no-op. */
   tapeset_direct_fetch = (qfile_list_has_new_backing (query_p->list_id)
 			  && !qmgr_list_has_raw_fd_segments (query_p->list_id)
-			  && !query_p->is_holdable
 			  && !qmgr_is_allowed_result_cache (flag));
   tapeset_cache_copyout = (qfile_list_has_new_backing (query_p->list_id)
 			   && !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (query_p->list_id)
@@ -2776,8 +2795,20 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 		{
 		  er_log_debug (ARG_FILE_LINE, "query %d is completed!\n", query_p->query_id);
 		}
-	      /* Class-B sink: holdable results must be preserved across commit as real-VPID pgbuf-backed lists. */
-	      if (qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
+	      /* Class-B sink (holdable commit).  #111 (ADR 0001 restored): a NEW
+	       * (Tapeset)-backed result reparents to the session with ZERO copy --
+	       * the list_id pointer handoff below (xsession_store_query_entry_info
+	       * -> qentry_to_sentry) moves the single-owner Tapeset intact, and the
+	       * client facade (#120a/b) keeps serving it across the commit boundary
+	       * (the marker-volid global page space is Tapeset-intrinsic, so VPIDs
+	       * the client fetched pre-commit stay valid).  Session teardown already
+	       * destroys an owned Tapeset (qfile_clear_list_id), and a kill-9'd
+	       * server's spilled tapes are reclaimed by the #88 boot sweep.  Raw-fd
+	       * overflow segments still materialize into real-VPID pgbuf pages (the
+	       * legacy VPID-wire requirement, until Phase3 deletes raw-fd). */
+	      bool holdable_needs_materialize = !(qfile_list_has_new_backing (query_p->list_id)
+						  && !qmgr_list_has_raw_fd_segments (query_p->list_id));
+	      if (holdable_needs_materialize && qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
 		{
 		  er_log_debug (ARG_FILE_LINE, "query %d holdable materialize failed !\n", query_p->query_id);
 		  query_p->is_holdable = false;

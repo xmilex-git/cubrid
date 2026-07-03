@@ -37,6 +37,7 @@
 #include "list_file.h"				/* qfile_close_list, qfile_destroy_list */
 #include "heap_file.h"				/* heap_attrinfo_end */
 #include "file_manager.h"			/* file_get_num_user_pages */
+#include "query_manager.h"			/* qmgr_list_has_raw_fd_segments (#126 guard) */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -354,6 +355,43 @@ extern "C"
       }
   }
 
+  /* #126 correctness guard: px workers snapshot-execute the whole scan_ptr
+   * chain, so every worker opens its own scan over each inner TARGET_LIST
+   * (per-worker hash list scan build / list probe).  When such a list is OLD
+   * and spilled to raw-fd overflow, those concurrent full scans of the same
+   * raw-fd file corrupt reads (garbage tuple headers -> silent row loss or
+   * crash; #126).  Root cause lives in the raw-fd read layer, which Phase3
+   * (#74) deletes wholesale, so this stays a serial-degrade guard (#99/#113
+   * idiom) and is removed together with that substrate.  NEW (Tapeset) lists
+   * are parallel-safe (#87 per-scan read scratch) and must never be flagged. */
+  static bool
+  px_join_has_raw_fd_list_scan (XASL_NODE *xasl)
+  {
+    for (XASL_NODE *xptr = xasl; xptr != NULL; xptr = xptr->scan_ptr)
+      {
+	for (ACCESS_SPEC_TYPE *specp = xptr->spec_list; specp != NULL; specp = specp->next)
+	  {
+	    if (specp->type != TARGET_LIST || ACCESS_SPEC_XASL_NODE (specp) == NULL)
+	      {
+		continue;
+	      }
+	    QFILE_LIST_ID *list_id = ACCESS_SPEC_LIST_ID (specp);
+	    if (list_id == NULL || qfile_list_has_new_backing (list_id))
+	      {
+		continue;
+	      }
+	    if (qmgr_list_has_raw_fd_segments (list_id))
+	      {
+		er_log_debug (ARG_FILE_LINE,
+			      "WM_PX_RAWFD_LIST_GUARD: query_id=%lld inner list carries raw-fd segments -> serial (#126)\n",
+			      (long long) list_id->query_id);
+		return true;
+	      }
+	  }
+      }
+    return false;
+  }
+
   int
   scan_open_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, bool mvcc_select_lock_needed, int fixed_scan,
 				int grouped_scan, VAL_DESCR *vd, ACCESS_SPEC_TYPE *spec, OID *class_oid, HFID *class_hfid, XASL_NODE *xasl,
@@ -397,6 +435,12 @@ extern "C"
     if (ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN) || HFID_IS_NULL (class_hfid))
       {
 	/* try single-thread heap scan */
+	return NO_ERROR;
+      }
+
+    if (px_join_has_raw_fd_list_scan (xasl))
+      {
+	/* single-thread heap scan: inner raw-fd list is not parallel-consumable (#126) */
 	return NO_ERROR;
       }
 
@@ -1400,6 +1444,13 @@ extern "C"
     num_parallel_threads = spec->num_parallel_threads;
     if (num_parallel_threads < 2)
       {
+	assert (scan_id->type == S_INDX_SCAN);
+	return NO_ERROR;
+      }
+
+    if (px_join_has_raw_fd_list_scan (xasl))
+      {
+	/* single-thread index scan: inner raw-fd list is not parallel-consumable (#126) */
 	assert (scan_id->type == S_INDX_SCAN);
 	return NO_ERROR;
       }
