@@ -270,6 +270,27 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
       QFILE_FREE_AND_INIT_LIST_ID (single_context->list_id);
 
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
+
+      /* C-15 (#119): the hash join ST/partition path builds an OLD (appendable)
+       * output list.  A nested hash join ((t1 JOIN t2) JOIN t3) whose upper join
+       * consumes this list can only run its parallel split when the input is
+       * NEW-backed -- the split guards (hjoin_try_parallel* + #113 px_scan
+       * fallback) require qfile_list_has_new_backing on both inputs -- so an OLD
+       * lower-HJ output forced the upper split permanently serial even with the
+       * gate ON (#112).  Promote the finished list to NEW under the HJ gate:
+       * same consumed-not-reopened NEW-promote direction as UNION ALL C-3
+       * (43048f481) and merge join C-1/2 (c447d929b), reusing
+       * qfile_list_promote_old_to_new (a no-op when the parallel path already
+       * produced a NEW list).  Skip a to-be-cached result (copy-out keeps OLD,
+       * #94).  */
+      if (!XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED) && qfile_hashjoin_new_backing_enabled ())
+	{
+	  error = qfile_list_promote_old_to_new (thread_p, xasl->list_id);
+	  if (error != NO_ERROR)
+	    {
+	      goto error_exit;
+	    }
+	}
     }
   else if (status == HASHJOIN_STATUS_END)
     {
