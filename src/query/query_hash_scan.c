@@ -3271,7 +3271,7 @@ struct hls_spill
 {
   int nbatch;			/* power of two */
   std::vector<hls_spill_batch> batches;
-  char *stage;			/* nbatch staging pages (build) + 1 probe page (tail slot) */
+  char *stage;			/* nbatch staging pages (build) + 1 finalize-scratch page (tail slot) */
   std::vector<int> stage_cnt;	/* staged entries per batch */
   std::string dir;
   std::uint64_t seq_base;
@@ -3280,14 +3280,28 @@ struct hls_spill
   /* accountant */
   size_t charged_bytes;
   int charged_shard;
-  /* probe cursor */
+  /* Build/finalize-only read scratch (single-threaded, runs to completion
+   * before any probing starts) -- NOT shared with probe, see HLS_SPILL_CURSOR. */
+  qfile::tde_read_scratch scratch;
+  /* instrumentation: read_page calls across all probe cursors of this scan,
+   * flushed in by hls_spill_cursor_destroy() as each worker tears down. */
+  std::atomic<long> probe_page_reads;
+};
+
+/* PROBE-side mutable state (#127): each HASH_LIST_SCAN that probes a given
+ * HLS_SPILL owns exactly one of these.  In parallel probe, every worker
+ * shares the same HLS_SPILL (built once) but must create its own cursor --
+ * sharing a cursor across workers reintroduces the race this type fixes. */
+struct hls_spill_cursor
+{
   int probe_batch;
   size_t probe_run;
   INT64 probe_idx;		/* entry index within run */
   UINT32 probe_hash;
   qfile::buffile *probe_page_bf;	/* which run file the cached page belongs to */
   int probe_page_off;		/* cached page offset, -1 = none */
-  long probe_page_reads;	/* instrumentation: read_page calls during probe */
+  char *page;			/* this cursor's own cached probe page (DB_PAGESIZE) */
+  long page_reads;		/* read_page calls through this cursor */
   qfile::tde_read_scratch scratch;
 };
 
@@ -3301,8 +3315,10 @@ hls_spill_stage_page (HLS_SPILL * spill, int batchno)
   return spill->stage + (size_t) batchno * DB_PAGESIZE;
 }
 
+/* Build/finalize-only scratch page (tail stage slot).  Safe to share: finalize
+ * runs single-threaded to completion before any probe cursor is created. */
 static char *
-hls_spill_probe_page (HLS_SPILL * spill)
+hls_spill_finalize_scratch_page (HLS_SPILL * spill)
 {
   return spill->stage + (size_t) spill->nbatch * DB_PAGESIZE;
 }
@@ -3384,14 +3400,57 @@ hls_spill_create (THREAD_ENTRY * thread_p, INT64 tuple_cnt)
   spill->finalized = false;
   spill->charged_bytes = stage_bytes;
   spill->charged_shard = shard;
-  spill->probe_batch = -1;
-  spill->probe_run = 0;
-  spill->probe_idx = -1;
-  spill->probe_hash = 0;
-  spill->probe_page_bf = NULL;
-  spill->probe_page_off = -1;
   spill->probe_page_reads = 0;
   return spill;
+}
+
+/*
+ * hls_spill_cursor_create () - allocate a per-scan PROBE cursor (#127).
+ *   Call once per HASH_LIST_SCAN before its first hls_spill_search(); in
+ *   parallel probe, each worker creates its own even though they share one
+ *   HLS_SPILL.
+ */
+HLS_SPILL_CURSOR *
+hls_spill_cursor_create (THREAD_ENTRY * thread_p)
+{
+  (void) thread_p;
+  HLS_SPILL_CURSOR *cursor = new hls_spill_cursor ();
+  cursor->probe_batch = -1;
+  cursor->probe_run = 0;
+  cursor->probe_idx = -1;
+  cursor->probe_hash = 0;
+  cursor->probe_page_bf = NULL;
+  cursor->probe_page_off = -1;
+  cursor->page = (char *) malloc (DB_PAGESIZE);
+  if (cursor->page == NULL)
+    {
+      delete cursor;
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+      return NULL;
+    }
+  cursor->page_reads = 0;
+  return cursor;
+}
+
+/*
+ * hls_spill_cursor_destroy () - free a PROBE cursor, folding its read-page
+ *   count into `spill`'s instrumentation total.  Pass spill == NULL only if
+ *   the spill itself was already destroyed (nothing left to flush into).
+ */
+void
+hls_spill_cursor_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill, HLS_SPILL_CURSOR * cursor)
+{
+  (void) thread_p;
+  if (cursor == NULL)
+    {
+      return;
+    }
+  if (spill != NULL)
+    {
+      spill->probe_page_reads.fetch_add (cursor->page_reads, std::memory_order_relaxed);
+    }
+  free (cursor->page);
+  delete cursor;
 }
 
 static int
@@ -3460,7 +3519,7 @@ hls_spill_write_run (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_batch
   run.first_hash = ents[0].hash;
 
   INT64 pages = (cnt + HLS_SPILL_EPP - 1) / HLS_SPILL_EPP;
-  char *page = hls_spill_probe_page (spill);	/* reuse the probe slot as write scratch */
+  char *page = hls_spill_finalize_scratch_page (spill);
   for (INT64 p = 0; p < pages; p++)
     {
       INT64 first = p * HLS_SPILL_EPP;
@@ -3516,7 +3575,7 @@ hls_spill_finalize_file (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_b
       UINT32 mid = lo + (hi - lo) / 2;	/* lo..mid -> low file, mid+1..hi -> high file */
       qfile::buffile *lo_bf = NULL, *hi_bf = NULL;
       INT64 lo_cnt = 0, hi_cnt = 0;
-      char *rd = hls_spill_probe_page (spill);
+      char *rd = hls_spill_finalize_scratch_page (spill);
       HLS_SPILL_ENTRY *lo_stage = (HLS_SPILL_ENTRY *) hls_spill_stage_page (spill, 0);
       HLS_SPILL_ENTRY *hi_stage = (HLS_SPILL_ENTRY *) hls_spill_stage_page (spill, 1 % spill->nbatch);
       int lo_n = 0, hi_n = 0;
@@ -3640,7 +3699,7 @@ overshoot:
     /* pages carry HLS_SPILL_EPP entries + tail slack, so compact per page
      * into a contiguous entry array for the sort */
     HLS_SPILL_ENTRY *ents = (HLS_SPILL_ENTRY *) malloc ((size_t) entry_cnt * sizeof (HLS_SPILL_ENTRY));
-    char *rd = hls_spill_probe_page (spill);
+    char *rd = hls_spill_finalize_scratch_page (spill);
     INT64 got = 0;
 
     if (ents == NULL)
@@ -3723,7 +3782,7 @@ hls_spill_finalize (THREAD_ENTRY * thread_p, HLS_SPILL * spill)
  * run, starting the page scan at fence lower bound.  Returns EH_KEY_FOUND /
  * EH_KEY_NOTFOUND / EH_ERROR_OCCURRED and fills pos_out on found. */
 static EH_SEARCH
-hls_spill_probe_run (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_run & run, UINT32 hash,
+hls_spill_probe_run (THREAD_ENTRY * thread_p, hls_spill_run & run, HLS_SPILL_CURSOR * cursor, UINT32 hash,
 		     QFILE_TUPLE_SIMPLE_POS * pos_out)
 {
   /* first page that can contain `hash`: the last fence <= hash */
@@ -3740,22 +3799,22 @@ hls_spill_probe_run (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_run &
       page--;
     }
 
-  char *pg = hls_spill_probe_page (spill);
+  char *pg = cursor->page;
   for (; page < (INT64) run.fences.size (); page++)
     {
       if (run.fences[(size_t) page] > hash)
 	{
 	  return EH_KEY_NOTFOUND;
 	}
-      if (spill->probe_page_bf != run.bf || spill->probe_page_off != (int) page)
+      if (cursor->probe_page_bf != run.bf || cursor->probe_page_off != (int) page)
 	{
-	  if (run.bf->read_page (thread_p, (int) page, (PAGE_PTR) pg, &spill->scratch) != NO_ERROR)
+	  if (run.bf->read_page (thread_p, (int) page, (PAGE_PTR) pg, &cursor->scratch) != NO_ERROR)
 	    {
 	      return EH_ERROR_OCCURRED;
 	    }
-	  spill->probe_page_bf = run.bf;
-	  spill->probe_page_off = (int) page;
-	  spill->probe_page_reads++;
+	  cursor->probe_page_bf = run.bf;
+	  cursor->probe_page_off = (int) page;
+	  cursor->page_reads++;
 	}
       const HLS_SPILL_ENTRY *ents = (const HLS_SPILL_ENTRY *) pg;
       INT64 first = page * HLS_SPILL_EPP;
@@ -3768,8 +3827,8 @@ hls_spill_probe_run (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_run &
 	    {
 	      return EH_KEY_NOTFOUND;
 	    }
-	  spill->probe_idx = first + (lb - ents);
-	  spill->probe_hash = hash;
+	  cursor->probe_idx = first + (lb - ents);
+	  cursor->probe_hash = hash;
 	  *pos_out = lb->pos;
 	  return EH_KEY_FOUND;
 	}
@@ -3782,7 +3841,7 @@ hls_spill_probe_run (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_run &
  * hls_spill_search () - probe: first entry with the given hash key.
  */
 EH_SEARCH
-hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
+hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, HLS_SPILL_CURSOR * cursor, unsigned int hash_key,
 		  QFILE_TUPLE_SIMPLE_POS * pos_out)
 {
   assert (spill->finalized);
@@ -3790,8 +3849,8 @@ hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_
   int batchno = (int) (hash & (unsigned int) (spill->nbatch - 1));
   hls_spill_batch & batch = spill->batches[batchno];
 
-  spill->probe_batch = -1;
-  spill->probe_idx = -1;
+  cursor->probe_batch = -1;
+  cursor->probe_idx = -1;
 
   for (size_t r = 0; r < batch.runs.size (); r++)
     {
@@ -3800,11 +3859,11 @@ hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_
 	{
 	  continue;
 	}
-      EH_SEARCH es = hls_spill_probe_run (thread_p, spill, run, hash, pos_out);
+      EH_SEARCH es = hls_spill_probe_run (thread_p, run, cursor, hash, pos_out);
       if (es == EH_KEY_FOUND)
 	{
-	  spill->probe_batch = batchno;
-	  spill->probe_run = r;
+	  cursor->probe_batch = batchno;
+	  cursor->probe_run = r;
 	  return EH_KEY_FOUND;
 	}
       if (es == EH_ERROR_OCCURRED)
@@ -3823,36 +3882,37 @@ hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_
  *   (duplicates are adjacent within a sorted run).
  */
 EH_SEARCH
-hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spill, QFILE_TUPLE_SIMPLE_POS * pos_out)
+hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spill, HLS_SPILL_CURSOR * cursor,
+		       QFILE_TUPLE_SIMPLE_POS * pos_out)
 {
-  if (spill->probe_batch < 0 || spill->probe_idx < 0)
+  if (cursor->probe_batch < 0 || cursor->probe_idx < 0)
     {
       return EH_KEY_NOTFOUND;
     }
-  hls_spill_run & run = spill->batches[spill->probe_batch].runs[spill->probe_run];
-  INT64 idx = spill->probe_idx + 1;
+  hls_spill_run & run = spill->batches[cursor->probe_batch].runs[cursor->probe_run];
+  INT64 idx = cursor->probe_idx + 1;
   if (idx >= run.entry_cnt)
     {
       return EH_KEY_NOTFOUND;
     }
   INT64 page = idx / HLS_SPILL_EPP;
-  char *pg = hls_spill_probe_page (spill);
-  if (spill->probe_page_bf != run.bf || spill->probe_page_off != (int) page)
+  char *pg = cursor->page;
+  if (cursor->probe_page_bf != run.bf || cursor->probe_page_off != (int) page)
     {
-      if (run.bf->read_page (thread_p, (int) page, (PAGE_PTR) pg, &spill->scratch) != NO_ERROR)
+      if (run.bf->read_page (thread_p, (int) page, (PAGE_PTR) pg, &cursor->scratch) != NO_ERROR)
 	{
 	  return EH_ERROR_OCCURRED;
 	}
-      spill->probe_page_bf = run.bf;
-      spill->probe_page_off = (int) page;
-      spill->probe_page_reads++;
+      cursor->probe_page_bf = run.bf;
+      cursor->probe_page_off = (int) page;
+      cursor->page_reads++;
     }
   const HLS_SPILL_ENTRY & e = ((const HLS_SPILL_ENTRY *) pg)[idx - page * HLS_SPILL_EPP];
-  if (e.hash != spill->probe_hash)
+  if (e.hash != cursor->probe_hash)
     {
       return EH_KEY_NOTFOUND;
     }
-  spill->probe_idx = idx;
+  cursor->probe_idx = idx;
   *pos_out = e.pos;
   return EH_KEY_FOUND;
 }
@@ -3860,7 +3920,7 @@ hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spill, QFILE_TUPLE_S
 long
 hls_spill_probe_page_reads (const HLS_SPILL * spill)
 {
-  return spill->probe_page_reads;
+  return spill->probe_page_reads.load (std::memory_order_relaxed);
 }
 
 /*

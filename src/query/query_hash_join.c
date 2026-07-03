@@ -2810,6 +2810,15 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 	    {
 	      goto error_exit;
 	    }
+
+	  /* per-scan probe cursor (#127): created alongside the table so every
+	   * scan of type HASH_METH_HASH_FILE always has a cursor whenever
+	   * spill.hash_table != NULL */
+	  hash_scan->spill.cursor = hls_spill_cursor_create (thread_p);
+	  if (hash_scan->spill.cursor == NULL)
+	    {
+	      goto error_exit;
+	    }
 	}
     }
   else
@@ -2875,8 +2884,10 @@ hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan)
     case HASH_METH_HASH_FILE:
       if (hash_scan->spill.hash_table != NULL)
 	{
+	  hls_spill_cursor_destroy (thread_p, hash_scan->spill.hash_table, hash_scan->spill.cursor);
 	  hls_spill_destroy (thread_p, hash_scan->spill.hash_table);
 	  hash_scan->spill.hash_table = NULL;
+	  hash_scan->spill.cursor = NULL;
 	}
       break;
 
@@ -4161,11 +4172,13 @@ hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
       /* batch-spill probe (#123) */
       if (tuple_record->tpl == NULL)
 	{
-	  eh_search = hls_spill_search (thread_p, hash_scan->spill.hash_table, hash_scan->curr_hash_key, &spill_pos);
+	  eh_search = hls_spill_search (thread_p, hash_scan->spill.hash_table, hash_scan->spill.cursor,
+					hash_scan->curr_hash_key, &spill_pos);
 	}
       else
 	{
-	  eh_search = hls_spill_search_next (thread_p, hash_scan->spill.hash_table, &spill_pos);
+	  eh_search = hls_spill_search_next (thread_p, hash_scan->spill.hash_table, hash_scan->spill.cursor,
+					     &spill_pos);
 	}
 
       if (eh_search == EH_KEY_FOUND)

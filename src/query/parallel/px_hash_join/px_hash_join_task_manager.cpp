@@ -920,9 +920,17 @@ namespace parallel_query
 	  break;
 
 	case HASH_METH_HASH_FILE:
-	  m_context->hash_scan.file.hash_table = single_context->hash_scan.file.hash_table;
-	  m_context->hash_scan.file.curr_oid = OID_INITIALIZER;
-	  m_context->hash_scan.file.is_dk_bucket = false;
+	  /* batch-spill hash (#123): the table is built once and shared read-only
+	   * across probe workers, but each worker must own its own probe cursor
+	   * -- sharing a cursor across workers races (#127). */
+	  m_context->hash_scan.spill.hash_table = single_context->hash_scan.spill.hash_table;
+	  m_context->hash_scan.spill.cursor = hls_spill_cursor_create (&thread_ref);
+	  if (m_context->hash_scan.spill.cursor == NULL)
+	    {
+	      assert_release_error (er_errid () != NO_ERROR);
+	      m_task_manager.handle_error (thread_ref);
+	      goto cleanup;		/* error_exit */
+	    }
 	  break;
 
 	case HASH_METH_NOT_USE:
@@ -990,7 +998,10 @@ cleanup:
 	  break;
 
 	case HASH_METH_HASH_FILE:
-	  m_context->hash_scan.file.hash_table = nullptr;
+	  /* destroy only this worker's own cursor (#127); the table itself is skipped, per comment above */
+	  hls_spill_cursor_destroy (&thread_ref, m_context->hash_scan.spill.hash_table, m_context->hash_scan.spill.cursor);
+	  m_context->hash_scan.spill.cursor = nullptr;
+	  m_context->hash_scan.spill.hash_table = nullptr;
 	  break;
 
 	case HASH_METH_NOT_USE:

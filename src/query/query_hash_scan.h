@@ -195,6 +195,11 @@ struct file_hash_scan_id
  * extendible-hash temp file (fhs_*) with per-batch append-only BufFiles
  * (nodeHash.c ExecHashIncreaseNumBatches idiom).  Opaque; see query_hash_scan.c. */
 typedef struct hls_spill HLS_SPILL;
+/* Per-scan probe cursor: PROBE-side mutable state (batch/run/idx position,
+ * cached page, read scratch) split out of HLS_SPILL so that concurrent
+ * parallel-probe workers sharing one HLS_SPILL each get their own cursor
+ * instead of racing on shared fields (#127). */
+typedef struct hls_spill_cursor HLS_SPILL_CURSOR;
 
 typedef struct hash_list_scan HASH_LIST_SCAN;
 struct hash_list_scan
@@ -219,6 +224,7 @@ struct hash_list_scan
     struct
     {
       HLS_SPILL *hash_table;	/* batch-spill hash (replaces `file`, #123) */
+      HLS_SPILL_CURSOR *cursor;	/* this scan's own probe cursor (#127) */
     } spill;
   };
   HASH_METHOD hash_list_scan_type;	/* IN_MEM, HYBRID or HASH_FILE */
@@ -284,12 +290,19 @@ extern HLS_SPILL *hls_spill_create (THREAD_ENTRY * thread_p, INT64 tuple_cnt);
 extern int hls_spill_insert (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
 			     const QFILE_TUPLE_SIMPLE_POS * pos);
 extern int hls_spill_finalize (THREAD_ENTRY * thread_p, HLS_SPILL * spill);
-extern EH_SEARCH hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
-				   QFILE_TUPLE_SIMPLE_POS * pos_out);
-extern EH_SEARCH hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spill,
+extern EH_SEARCH hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, HLS_SPILL_CURSOR * cursor,
+				   unsigned int hash_key, QFILE_TUPLE_SIMPLE_POS * pos_out);
+extern EH_SEARCH hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spill, HLS_SPILL_CURSOR * cursor,
 					QFILE_TUPLE_SIMPLE_POS * pos_out);
 extern void hls_spill_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill);
 extern long hls_spill_probe_page_reads (const HLS_SPILL * spill);
+
+/* Per-scan probe cursor lifecycle (#127): create once per HASH_LIST_SCAN
+ * before the first probe, destroy alongside that scan's spill/table cleanup.
+ * hls_spill_cursor_destroy() flushes the cursor's page-read count into
+ * `spill` (pass NULL only if the spill is already gone). */
+extern HLS_SPILL_CURSOR *hls_spill_cursor_create (THREAD_ENTRY * thread_p);
+extern void hls_spill_cursor_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill, HLS_SPILL_CURSOR * cursor);
 
 /* Save the scan's current tuple position as a SIMPLE_POS (backing-aware:
  * TAPE / raw-fd / VPID) — shared by the HYBRID producer and the spill build. */

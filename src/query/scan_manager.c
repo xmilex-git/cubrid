@@ -4162,6 +4162,13 @@ scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 	    {
 	      return S_ERROR;
 	    }
+
+	  /* per-scan probe cursor (#127), created alongside the table */
+	  llsidp->hlsid.spill.cursor = hls_spill_cursor_create (thread_p);
+	  if (llsidp->hlsid.spill.cursor == NULL)
+	    {
+	      return S_ERROR;
+	    }
 	}
       else
 	{
@@ -5531,8 +5538,10 @@ scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	}
       else if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HASH_FILE)
 	{
+	  hls_spill_cursor_destroy (thread_p, llsidp->hlsid.spill.hash_table, llsidp->hlsid.spill.cursor);
 	  hls_spill_destroy (thread_p, llsidp->hlsid.spill.hash_table);
 	  llsidp->hlsid.spill.hash_table = NULL;
+	  llsidp->hlsid.spill.cursor = NULL;
 	}
       /* release the IN_MEM/HYBRID build estimate charge (#123/#91) */
       qdata_hscan_wm_release (&llsidp->hlsid);
@@ -9062,7 +9071,8 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 
 	case HASH_METH_HASH_FILE:
 	  /* batch-spill probe (#123) */
-	  eh_search = hls_spill_search (thread_p, llsidp->hlsid.spill.hash_table, hash_key, &spill_pos);
+	  eh_search = hls_spill_search (thread_p, llsidp->hlsid.spill.hash_table, llsidp->hlsid.spill.cursor, hash_key,
+					&spill_pos);
 	  switch (eh_search)
 	    {
 	    case EH_KEY_FOUND:
@@ -9130,7 +9140,8 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	  return S_SUCCESS;
 
 	case HASH_METH_HASH_FILE:
-	  eh_search = hls_spill_search_next (thread_p, llsidp->hlsid.spill.hash_table, &spill_pos);
+	  eh_search = hls_spill_search_next (thread_p, llsidp->hlsid.spill.hash_table, llsidp->hlsid.spill.cursor,
+					     &spill_pos);
 	  switch (eh_search)
 	    {
 	    case EH_KEY_FOUND:
