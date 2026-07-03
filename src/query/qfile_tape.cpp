@@ -1474,7 +1474,7 @@ qfile_tapeset_page_count (const QFILE_LIST_ID *list_id_p)
 
 int
 qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *list_id_p, int global_index,
-				char *page_dest)
+				char *page_dest, int *local_offset_out)
 {
   qfile::tapeset *ts = (list_id_p != NULL) ? (qfile::tapeset *) QFILE_LIST_ID_TAPESET (list_id_p) : NULL;
   if (ts == NULL || global_index < 0 || page_dest == NULL)
@@ -1508,6 +1508,10 @@ qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *lis
 	  if (pg != page_dest)
 	    {
 	      std::memcpy (page_dest, pg, DB_PAGESIZE);
+	    }
+	  if (local_offset_out != NULL)
+	    {
+	      *local_offset_out = remaining;	/* tape-local logical offset (#120b D2) */
 	    }
 	  return NO_ERROR;
 	}

@@ -666,6 +666,11 @@ typedef enum
   PSTAT_QF_NEW_BACKED_CREATE,
   PSTAT_QF_OLD_TOUCH_ON_NEW,
 
+  /* #120 client-fetch routing census: Tapeset direct serves vs actual Class-B
+   * pgbuf materializations (the "materialize firing 0" acceptance counter). */
+  PSTAT_QF_CLIENT_FETCH_SERVE,
+  PSTAT_QF_CLIENT_FETCH_MATERIALIZE,
+
   /* Complex statistics */
   PSTAT_PBX_FIX_COUNTERS,
   PSTAT_PBX_PROMOTE_COUNTERS,

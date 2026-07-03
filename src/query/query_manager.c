@@ -1559,17 +1559,15 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   assert (query_p->list_id != NULL);
-  /* Class-B sink (client fetch).  #120a: a NEW (Tapeset)-backed result is served
-   * to the client straight from its Tapeset (xqfile_get_list_file_page) with no
-   * #94 pgbuf materialize (full OLD copy) -- as long as it has no overflow
-   * (big-tuple) pages, whose ADR0006 offset-run format is not yet translated to
-   * the client's VPID overflow chain (#120b keeps the materialize fallback for
-   * those).  Raw-fd overflow segments still materialize.  Results bound for the
-   * list cache (#121) or a holdable cursor (#111) also keep the materialize path
-   * (out of #120a scope; both need a real OLD list stored beyond this result).
-   * For plain VPID-backed lists both paths are a no-op. */
+  /* Class-B sink (client fetch).  #120a/#120b: a NEW (Tapeset)-backed result is
+   * served to the client straight from its Tapeset (xqfile_get_list_file_page)
+   * with no #94 pgbuf materialize (full OLD copy).  Overflow (big-tuple) runs
+   * are translated on the fly to the legacy VPID overflow chain by the serve
+   * path (#120b).  Raw-fd overflow segments still materialize.  Results bound
+   * for the list cache (#121) or a holdable cursor (#111) also keep the
+   * materialize path (out of #120 scope; both need a real OLD list stored
+   * beyond this result).  For plain VPID-backed lists both paths are a no-op. */
   tapeset_direct_fetch = (qfile_list_has_new_backing (query_p->list_id)
-			  && !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (query_p->list_id)
 			  && !qmgr_list_has_raw_fd_segments (query_p->list_id)
 			  && !query_p->is_holdable
 			  && !qmgr_is_allowed_result_cache (flag));
@@ -3817,6 +3815,10 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
     {
       return NO_ERROR;
     }
+
+  /* #120 routing census: a list is actually being pgbuf-materialized at a
+   * Class-B sink (statdump Num_qfile_client_fetch_materialize). */
+  qfile_client_fetch_record_materialize ();
 
   QFILE_LIST_ID *materialized_p = qfile_open_list (thread_p, &list_id_p->type_list, list_id_p->sort_list,
 						   list_id_p->query_id, QFILE_FLAG_RESULT_FILE, NULL);

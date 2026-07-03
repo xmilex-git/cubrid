@@ -674,6 +674,13 @@ extern void qfile_new_backed_record_create (void);
 extern long qfile_new_backed_create_count (void);
 extern void qfile_new_backed_reset_create_count (void);
 
+/* #120 client-fetch routing census (statdump PSTAT_QF_CLIENT_FETCH_SERVE /
+ * PSTAT_QF_CLIENT_FETCH_MATERIALIZE): Tapeset direct serves of client fetch
+ * requests vs actual Class-B pgbuf materializations.  The "materialize firing
+ * 0" acceptance (#120) is asserted from statdump deltas of these. */
+extern void qfile_client_fetch_record_serve (void);
+extern void qfile_client_fetch_record_materialize (void);
+
 /* Release-hard backstop for the store-to-DB TAPE-misuse invariant (#105).  Kept
  * out of the inline (same philosophy as qfile_backing_guard above): raises
  * ER_QPROC_UNKNOWN_CRSPOS so a TAPE coord that reaches

@@ -593,6 +593,8 @@ PSTAT_METADATA pstat_Metadata[] = {
 
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_NEW_BACKED_CREATE, "Num_qfile_new_backed_create"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_OLD_TOUCH_ON_NEW, "Num_qfile_old_touch_on_new"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_CLIENT_FETCH_SERVE, "Num_qfile_client_fetch_serve"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QF_CLIENT_FETCH_MATERIALIZE, "Num_qfile_client_fetch_materialize"),
 
   /* Array type statistics */
   PSTAT_METADATA_INIT_COMPLEX (PSTAT_PBX_FIX_COUNTERS, "Num_data_page_fix_ext", &f_dump_in_file_Num_data_page_fix_ext,

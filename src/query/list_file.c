@@ -2712,26 +2712,42 @@ qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 }
 
 /*
- * qfile_serve_tapeset_fetch_pages () - #120a: serve packed client-fetch pages
- *   straight from a NEW (Tapeset)-backed top-level result, in place of the
- *   pgbuf VPID page chain the OLD path walks.  The result's ordered Tapes form
- *   one dense logical page sequence 0..page_count-1; the client addresses it by
- *   that global index (marker volid QFILE_TAPESET_FETCH_VOLID).  Reads global
- *   pages [start_gp ..] via the Tapeset bridge into page_buf_p, packing full
- *   DB_PAGESIZE pages until the network page (IO_MAX_PAGE_SIZE) is full, and
- *   rewrites each page header's next_vpid to the next synthetic coordinate (or
- *   NULL on the last page) and nulls its overflow vpid, so the unchanged client
- *   cursor walks it exactly like a real VPID page chain.
+ * qfile_serve_tapeset_fetch_pages () - #120a/#120b: serve packed client-fetch
+ *   pages straight from a NEW (Tapeset)-backed top-level result, in place of
+ *   the pgbuf VPID page chain the OLD path walks.  The result's ordered Tapes
+ *   form one dense logical page sequence 0..page_count-1; the client addresses
+ *   it by that global index (marker volid QFILE_TAPESET_FETCH_VOLID).  Reads
+ *   global pages [start_gp ..] via the Tapeset bridge into page_buf_p, packing
+ *   full DB_PAGESIZE pages until the network page (IO_MAX_PAGE_SIZE) is full,
+ *   and rewrites each page header's VPID links so the unchanged client cursor
+ *   walks it exactly like a real VPID page chain:
+ *
+ *   - normal page: next_vpid -> next global index (NULL on the last page),
+ *     overflow vpid cleared.
+ *   - ADR0006 overflow run (#120b D2): the run's offset-run markers are
+ *     TAPE-LOCAL coordinates rewritten to the legacy client wire format.  A run
+ *     is contiguous within ONE tape (qfile_producer_add_overflow_tuple appends
+ *     all run pages to the same writer -- D4), so local<->global translation is
+ *     the constant base = gp - local_offset.  START page (first == self):
+ *     becomes the legacy HEAD -- real tuple count 1 (the START page holds only
+ *     this tuple by construction), last_tuple_offset = header size, overflow
+ *     vpid -> next global page, next_vpid -> first page AFTER the run (what the
+ *     client's post-reassembly advance follows).  CONTINUATION page: keeps
+ *     tuple count -2, +12 slot rewritten from the NEW run-end marker to the
+ *     legacy per-page payload size, overflow vpid -> next run page (NULL on the
+ *     run's last page), next_vpid NULL (legacy continuations never carry one).
+ *     The payload itself needs no translation: both formats place
+ *     MIN(remaining, QFILE_MAX_TUPLE_SIZE_IN_PAGE) bytes at
+ *     QFILE_PAGE_HEADER_SIZE, and the client resizes from the tuple length
+ *     header on the HEAD page (cursor_construct_tuple_from_overflow_pages).
+ *     A continuation-first fetch (the client requests each run page as its own
+ *     network round-trip) re-reads the run's START page for the tuple length
+ *     (D3: through the same TDE-aware bridge, caller-owned scratch).
  *   return: NO_ERROR or ER_ code
  *   list_id_p(in): the retained NEW-backed result (carries the Tapeset)
  *   start_gp(in): first global logical page index requested by the client
  *   page_buf_p(out): caller network page buffer (>= IO_MAX_PAGE_SIZE)
  *   page_size_p(out): bytes filled
- *
- * Note: Overflow-free lists only.  A result with big (multi-page) tuples has
- *   NEW_CONTAINS_OVERFLOW set and is routed through qmgr_materialize_to_pgbuf at
- *   the sink instead (the ADR0006 offset-run page format is not yet translated
- *   to the client's VPID overflow chain -- #120b).
  */
 static int
 qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * list_id_p, PAGEID start_gp,
@@ -2740,6 +2756,8 @@ qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * 
   const int total = qfile_tapeset_page_count (list_id_p);
   PAGEID gp = start_gp;
   int one_page_size = DB_PAGESIZE;
+  char *head_scratch_p = NULL;	/* lazy DB_PAGESIZE scratch for a run's START page */
+  int error = NO_ERROR;
 
   *page_size_p = 0;
 
@@ -2750,44 +2768,167 @@ qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * 
       return NO_ERROR;
     }
 
+  qfile_client_fetch_record_serve ();
+
   /* append pages until a network page is full */
   while ((*page_size_p + DB_PAGESIZE) <= IO_MAX_PAGE_SIZE && gp < total)
     {
       char *dest = page_buf_p + *page_size_p;
+      int local_off = -1;
 
-      if (qfile_tapeset_read_global_page (thread_p, list_id_p, (int) gp, dest) != NO_ERROR)
+      if (qfile_tapeset_read_global_page (thread_p, list_id_p, (int) gp, dest, &local_off) != NO_ERROR)
 	{
 	  ASSERT_ERROR ();
-	  return er_errid ();
+	  error = er_errid ();
+	  goto end;
 	}
 
-      /* Synthesize the VPID-wire chaining the client walks: the next page is
-       * the next global index (same marker volid), NULL on the last page.  The
-       * overflow vpid is cleared -- overflow-free by construction. */
-      if (gp + 1 < total)
+      if (qfile_overflow_is_overflow_page (dest))
 	{
-	  VPID next_vpid;
-	  next_vpid.volid = QFILE_TAPESET_FETCH_VOLID;
-	  next_vpid.pageid = gp + 1;
-	  QFILE_PUT_NEXT_VPID (dest, &next_vpid);
+	  /* ADR0006 offset-run -> legacy VPID overflow chain (#120b D2). */
+	  const int first_local = qfile_overflow_first_page (dest);
+	  const PAGEID base_gp = gp - local_off;	/* run is single-tape (D4): constant base */
+	  int run_end_local;
+	  VPID link_vpid;
+
+	  if (first_local < 0 || first_local > local_off)
+	    {
+	      assert (false);
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1,
+		      LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+	      error = ER_QPROC_INVALID_TEMP_FILE;
+	      goto end;
+	    }
+
+	  if (first_local == local_off)
+	    {
+	      /* START page: run length from the tuple length header it carries. */
+	      const int tuple_len = QFILE_GET_TUPLE_LENGTH (dest + QFILE_PAGE_HEADER_SIZE);
+	      const int run_pages = qfile_overflow_run_pages (tuple_len);
+
+	      if (run_pages < 2)
+		{
+		  assert (false);	/* producer only builds >1-page runs */
+		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1,
+			  LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+		  error = ER_QPROC_INVALID_TEMP_FILE;
+		  goto end;
+		}
+	      run_end_local = first_local + run_pages - 1;
+
+	      /* Legacy HEAD: the client reads the tuple count and, after
+	       * reassembly, this page's next_vpid (first page after the run). */
+	      QFILE_PUT_TUPLE_COUNT (dest, 1);
+	      QFILE_PUT_LAST_TUPLE_OFFSET (dest, QFILE_PAGE_HEADER_SIZE);
+	      link_vpid.volid = QFILE_TAPESET_FETCH_VOLID;
+	      link_vpid.pageid = gp + 1;
+	      QFILE_PUT_OVERFLOW_VPID (dest, &link_vpid);
+	      if (base_gp + run_end_local + 1 < total)
+		{
+		  link_vpid.pageid = base_gp + run_end_local + 1;
+		  QFILE_PUT_NEXT_VPID (dest, &link_vpid);
+		}
+	      else
+		{
+		  QFILE_PUT_NEXT_VPID_NULL (dest);
+		}
+	    }
+	  else
+	    {
+	      /* CONTINUATION page: the NEW marker in the +12 slot is the run-end
+	       * local offset; the legacy wire wants the per-page payload size
+	       * there, which needs the tuple length from the run's START page. */
+	      int tuple_len, payload;
+
+	      run_end_local = qfile_overflow_run_end (dest);
+	      if (run_end_local < local_off)
+		{
+		  assert (false);
+		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1,
+			  LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+		  error = ER_QPROC_INVALID_TEMP_FILE;
+		  goto end;
+		}
+
+	      if (head_scratch_p == NULL)
+		{
+		  head_scratch_p = (char *) malloc (DB_PAGESIZE);
+		  if (head_scratch_p == NULL)
+		    {
+		      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
+		      error = ER_OUT_OF_VIRTUAL_MEMORY;
+		      goto end;
+		    }
+		}
+	      if (qfile_tapeset_read_global_page (thread_p, list_id_p, (int) (base_gp + first_local),
+						  head_scratch_p, NULL) != NO_ERROR)
+		{
+		  ASSERT_ERROR ();
+		  error = er_errid ();
+		  goto end;
+		}
+	      tuple_len = QFILE_GET_TUPLE_LENGTH (head_scratch_p + QFILE_PAGE_HEADER_SIZE);
+	      payload = tuple_len - (local_off - first_local) * QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+	      if (payload > QFILE_MAX_TUPLE_SIZE_IN_PAGE)
+		{
+		  payload = QFILE_MAX_TUPLE_SIZE_IN_PAGE;
+		}
+	      if (payload <= 0)
+		{
+		  assert (false);	/* page past the run end: marker corruption */
+		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1,
+			  LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+		  error = ER_QPROC_INVALID_TEMP_FILE;
+		  goto end;
+		}
+
+	      /* tuple count stays QFILE_OVERFLOW_TUPLE_COUNT_FLAG (legacy too). */
+	      QFILE_PUT_OVERFLOW_TUPLE_PAGE_SIZE (dest, payload);
+	      if (local_off < run_end_local)
+		{
+		  link_vpid.volid = QFILE_TAPESET_FETCH_VOLID;
+		  link_vpid.pageid = gp + 1;
+		  QFILE_PUT_OVERFLOW_VPID (dest, &link_vpid);
+		}
+	      else
+		{
+		  QFILE_PUT_OVERFLOW_VPID_NULL (dest);
+		}
+	      QFILE_PUT_NEXT_VPID_NULL (dest);
+	    }
+
+	  /* legacy packer contract: overflow pages ship whole. */
+	  one_page_size = DB_PAGESIZE;
 	}
       else
 	{
-	  QFILE_PUT_NEXT_VPID_NULL (dest);
-	}
-      QFILE_PUT_OVERFLOW_VPID_NULL (dest);
+	  /* Normal page: next_vpid -> next global index (NULL on the last
+	   * page), overflow vpid cleared. */
+	  if (gp + 1 < total)
+	    {
+	      VPID next_vpid;
+	      next_vpid.volid = QFILE_TAPESET_FETCH_VOLID;
+	      next_vpid.pageid = gp + 1;
+	      QFILE_PUT_NEXT_VPID (dest, &next_vpid);
+	    }
+	  else
+	    {
+	      QFILE_PUT_NEXT_VPID_NULL (dest);
+	    }
+	  QFILE_PUT_OVERFLOW_VPID_NULL (dest);
 
-      /* Trimmed size of this (non-overflow) page, mirroring the OLD packer so
-       * the reported buffer size matches the classic contract. */
-      one_page_size = (QFILE_GET_LAST_TUPLE_OFFSET (dest)
-		       + QFILE_GET_TUPLE_LENGTH (dest + QFILE_GET_LAST_TUPLE_OFFSET (dest)));
-      if (one_page_size < QFILE_PAGE_HEADER_SIZE)
-	{
-	  one_page_size = QFILE_PAGE_HEADER_SIZE;
-	}
-      if (one_page_size > DB_PAGESIZE)
-	{
-	  one_page_size = DB_PAGESIZE;
+	  /* Trimmed size of this (non-overflow) page, mirroring the OLD packer
+	   * so the reported buffer size matches the classic contract. */
+	  one_page_size = (QFILE_GET_LAST_TUPLE_OFFSET (dest)
+			   + QFILE_GET_TUPLE_LENGTH (dest + QFILE_GET_LAST_TUPLE_OFFSET (dest)));
+	  if (one_page_size < QFILE_PAGE_HEADER_SIZE)
+	    {
+	      one_page_size = QFILE_PAGE_HEADER_SIZE;
+	    }
+	  if (one_page_size > DB_PAGESIZE)
+	    {
+	      one_page_size = DB_PAGESIZE;
+	    }
 	}
 
       *page_size_p += DB_PAGESIZE;
@@ -2797,7 +2938,16 @@ qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * 
   /* Report the trimmed size of the final page (OLD packer contract). */
   *page_size_p += one_page_size - DB_PAGESIZE;
 
-  return NO_ERROR;
+end:
+  if (head_scratch_p != NULL)
+    {
+      free (head_scratch_p);
+    }
+  if (error != NO_ERROR)
+    {
+      *page_size_p = 0;
+    }
+  return error;
 }
 
 /*
@@ -2867,12 +3017,13 @@ xqfile_get_list_file_page (THREAD_ENTRY * thread_p, QUERY_ID query_id, VOLID vol
 	  return NO_ERROR;
 	}
 
-      /* #120a: a NEW (Tapeset)-backed top-level result has no VPID page chain
-       * (first_vpid is NULL), so serve its pages straight from the Tapeset
-       * instead of the pgbuf VPID walk below.  The incoming page_id is a global
-       * logical page index (marker volid); the client got it from the synthetic
-       * first_vpid/next_vpid seeded at the sink.  Overflow-free lists only --
-       * NEW_CONTAINS_OVERFLOW results were materialized at the sink (#120b). */
+      /* #120a/#120b: a NEW (Tapeset)-backed top-level result has no VPID page
+       * chain (first_vpid is NULL), so serve its pages straight from the
+       * Tapeset instead of the pgbuf VPID walk below.  The incoming page_id is
+       * a global logical page index (marker volid); the client got it from the
+       * synthetic first_vpid/next_vpid seeded at the sink.  ADR0006 overflow
+       * runs are translated to the legacy VPID overflow chain inside the serve
+       * (#120b D2). */
       if (qfile_list_has_new_backing (query_entry_p->list_id))
 	{
 	  return qfile_serve_tapeset_fetch_pages (thread_p, query_entry_p->list_id, page_id, page_buf_p, page_size_p);
@@ -3489,6 +3640,28 @@ error:
 
 static std::atomic<long> qfile_Ae_old_touch (0);
 static std::atomic<long> qfile_New_backed_create (0);
+
+/* #120 client-fetch routing census: how many client fetch requests were served
+ * straight from a Tapeset (qfile_serve_tapeset_fetch_pages) vs how many lists
+ * were actually pgbuf-materialized at a Class-B sink (qmgr_materialize_to_pgbuf
+ * past its needs-gate).  The "materialize firing 0" acceptance (#120) is
+ * asserted from statdump deltas of these -- no debugger attach needed. */
+static std::atomic<long> qfile_Client_fetch_serve (0);
+static std::atomic<long> qfile_Client_fetch_materialize (0);
+
+void
+qfile_client_fetch_record_serve (void)
+{
+  long count = qfile_Client_fetch_serve.fetch_add (1, std::memory_order_relaxed) + 1;
+  perfmon_set_stat_to_global (PSTAT_QF_CLIENT_FETCH_SERVE, (int) count);
+}
+
+void
+qfile_client_fetch_record_materialize (void)
+{
+  long count = qfile_Client_fetch_materialize.fetch_add (1, std::memory_order_relaxed) + 1;
+  perfmon_set_stat_to_global (PSTAT_QF_CLIENT_FETCH_MATERIALIZE, (int) count);
+}
 
 void
 qfile_ae_record_old_touch (void)
