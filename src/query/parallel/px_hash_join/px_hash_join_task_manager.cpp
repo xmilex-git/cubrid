@@ -162,7 +162,6 @@ namespace parallel_query
     }
 
     /*
-
      * split_task
      */
 

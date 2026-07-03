@@ -21732,6 +21732,13 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
   anl_px.stats = new_stat;	/* may be NULL when not tracing */
   anl_px.parallelism = xasl->parallelism;
 
+  SORT_LISTFILE_PX_ARG anl_px;
+  anl_px.key_info = &analytic_state.key_info;
+  anl_px.input_list = list_id;
+  anl_px.hash_eligible = 0;	/* GROUP_BY only; never skip ANALYTIC parallelism on this account */
+  anl_px.stats = new_stat;	/* may be NULL when not tracing */
+  anl_px.parallelism = xasl->parallelism;
+
   if (sort_listfile (thread_p, NULL_VOLID, estimated_pages, &qexec_analytic_get_next, &analytic_state,
 		     &qexec_analytic_put_next, &analytic_state, analytic_state.cmp_fn, &analytic_state.key_info,
 		     SORT_DUP, NO_SORT_LIMIT,
