@@ -567,6 +567,15 @@ void qfile_tapeset_destroy (void *tapeset_ptr);
  * known to be alive (e.g. right before destroying it). */
 int qfile_tapeset_open_scan_count (void *tapeset_ptr);
 
+/* #120a client-fetch-over-Tapeset bridges: serve a NEW-backed top-level result
+ * straight from its frozen Tapeset (no #94 pgbuf materialize).  page_count is
+ * the total logical page count across the ordered Tapes; read_global_page reads
+ * the `global_index`-th logical page (0-based, across Tape boundaries) into a
+ * caller DB_PAGESIZE buffer (TDE handled internally).  Returns NO_ERROR/ER_FAILED. */
+int qfile_tapeset_page_count (const QFILE_LIST_ID *list_id_p);
+int qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *list_id_p, int global_index,
+				    char *page_dest);
+
 /* Phase2 2A-1 producer bridge (redesign #78): build a NEW-backed list by
  * appending its completed list-pages to a tape_writer, then freezing into a
  * single-Tape Tapeset.  Pairs with the qfile producer hook in list_file.c.

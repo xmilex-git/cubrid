@@ -1493,6 +1493,7 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
   XASL_NODE *xasl_p;
   XASL_UNPACK_INFO *xasl_buf_info;
   QFILE_LIST_ID *list_id;
+  bool tapeset_direct_fetch = false;	/* #120a: serve NEW result from Tapeset (no materialize) */
 
   assert (query_p != NULL);
   assert (tran_entry_p != NULL);
@@ -1558,12 +1559,26 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   assert (query_p->list_id != NULL);
-  /* Class-B sink: before returning a client-fetchable result, ensure the VPID-wire page chain is backed by real
-   * pgbuf pages. Raw-fd overflow segments and NEW (Tapeset) backings do not maintain the next_vpid chain consumed
-   * by xqfile_get_list_file_page(). For plain VPID-backed lists this is a no-op. */
-  if (qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
+  /* Class-B sink (client fetch).  #120a: a NEW (Tapeset)-backed result is served
+   * to the client straight from its Tapeset (xqfile_get_list_file_page) with no
+   * #94 pgbuf materialize (full OLD copy) -- as long as it has no overflow
+   * (big-tuple) pages, whose ADR0006 offset-run format is not yet translated to
+   * the client's VPID overflow chain (#120b keeps the materialize fallback for
+   * those).  Raw-fd overflow segments still materialize.  Results bound for the
+   * list cache (#121) or a holdable cursor (#111) also keep the materialize path
+   * (out of #120a scope; both need a real OLD list stored beyond this result).
+   * For plain VPID-backed lists both paths are a no-op. */
+  tapeset_direct_fetch = (qfile_list_has_new_backing (query_p->list_id)
+			  && !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (query_p->list_id)
+			  && !qmgr_list_has_raw_fd_segments (query_p->list_id)
+			  && !query_p->is_holdable
+			  && !qmgr_is_allowed_result_cache (flag));
+  if (!tapeset_direct_fetch)
     {
-      goto exit_on_error;
+      if (qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
     }
 
   qfile_close_list (thread_p, query_p->list_id);
@@ -1578,6 +1593,39 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
   assert (list_id->sort_list == NULL);
 
   list_id->last_pgptr = NULL;
+
+  if (tapeset_direct_fetch)
+    {
+      /* Turn the client-shipped clone into a pure VPID facade over the retained
+       * result's Tapeset: synthetic first/last VPID = (marker volid, global
+       * page index), no Tapeset pointer.  The retained list (query_p->list_id)
+       * keeps sole Tapeset ownership; the clone borrowed it non-owning under
+       * QFILE_SKIP_DEPENDENT, so dropping the pointer here is a safe no-op,
+       * never a double free.  The client fetches every page (including the
+       * first) on demand via xqfile_get_list_file_page, which serves them from
+       * the retained Tapeset. */
+      int total_pages = qfile_tapeset_page_count (query_p->list_id);
+
+      QFILE_LIST_ID_TAPESET (list_id) = NULL;
+      QFILE_LIST_ID_OWNS_TAPESET (list_id) = false;
+      QFILE_LIST_ID_BACKING_KIND (list_id) = QFILE_BACKING_OLD;
+      QFILE_LIST_ID_TFILE_VFID (list_id) = NULL;
+      list_id->page_cnt = total_pages;
+      if (total_pages > 0)
+	{
+	  QFILE_LIST_ID_FIRST_VPID (list_id).volid = QFILE_TAPESET_FETCH_VOLID;
+	  QFILE_LIST_ID_FIRST_VPID (list_id).pageid = 0;
+	  QFILE_LIST_ID_LAST_VPID (list_id).volid = QFILE_TAPESET_FETCH_VOLID;
+	  QFILE_LIST_ID_LAST_VPID (list_id).pageid = total_pages - 1;
+	}
+      else
+	{
+	  /* 0-row result: NULL first_vpid -> client cursor returns DB_CURSOR_END
+	   * (0 rows), never issuing a fetch. */
+	  VPID_SET_NULL (&QFILE_LIST_ID_FIRST_VPID (list_id));
+	  VPID_SET_NULL (&QFILE_LIST_ID_LAST_VPID (list_id));
+	}
+    }
 
 end:
 

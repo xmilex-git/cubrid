@@ -5616,7 +5616,18 @@ null_list:
   if (list_id != NULL)
     {
       /* get the first page of the list file */
-      if (VPID_ISNULL (& (QFILE_LIST_ID_FIRST_VPID(list_id))))
+      if (QFILE_LIST_ID_FIRST_VPID (list_id).volid == QFILE_TAPESET_FETCH_VOLID)
+	{
+	  /* #120a: a NEW (Tapeset)-backed result is served on demand straight
+	   * from its Tapeset by xqfile_get_list_file_page -- the first page is
+	   * NOT shipped inline (the client fetches it like any other page).  The
+	   * result must stay alive for those fetches, so it is never eligible for
+	   * query-end here (same as any multi-page result). */
+	  page_ptr = NULL;
+	  page_size = 0;
+	  end_query_allowed = false;
+	}
+      else if (VPID_ISNULL (& (QFILE_LIST_ID_FIRST_VPID(list_id))))
 	{
 	  // Note that not all list files have a page, for instance, insert.
 	  page_ptr = NULL;
@@ -6124,7 +6135,14 @@ sqmgr_prepare_and_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char 
 
   if (listid_length)
     {
-      if (VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(q_result)))
+      if (QFILE_LIST_ID_FIRST_VPID (q_result).volid == QFILE_TAPESET_FETCH_VOLID)
+	{
+	  /* #120a: NEW (Tapeset)-backed result served on demand from its Tapeset
+	   * by xqfile_get_list_file_page -- no inline first page (see the
+	   * matching branch in sqmgr_execute_query). */
+	  page_ptr = NULL;
+	}
+      else if (VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(q_result)))
 	{
 	  page_ptr = NULL;
 	}

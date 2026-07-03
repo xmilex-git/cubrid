@@ -1445,6 +1445,79 @@ qfile_tapeset_open_scan_count (void *tapeset_ptr)
   return (ts == NULL) ? 0 : ts->open_scan_cell ()->load (std::memory_order_relaxed);
 }
 
+/* #120a client-fetch-over-Tapeset bridges.  Serve a NEW (Tapeset)-backed
+ * top-level result straight from its frozen Tapes for the VPID-page client
+ * fetch protocol, without the #94 pgbuf materialize (full OLD copy).  The
+ * Tapeset's ordered Tapes form one dense logical page sequence
+ * 0..page_count()-1 (offset arithmetic, ADR 0003); the client addresses pages
+ * by that global index (see QFILE_TAPESET_FETCH_VOLID).  Overflow-free lists
+ * only -- the caller keeps materialize for NEW_CONTAINS_OVERFLOW (#120b). */
+int
+qfile_tapeset_page_count (const QFILE_LIST_ID *list_id_p)
+{
+  qfile::tapeset *ts = (list_id_p != NULL) ? (qfile::tapeset *) QFILE_LIST_ID_TAPESET (list_id_p) : NULL;
+  if (ts == NULL)
+    {
+      return 0;
+    }
+  int total = 0;
+  for (int t = 0; t < ts->tape_count (); ++t)
+    {
+      qfile::tape *tp = ts->get_tape (t);
+      if (tp != NULL)
+	{
+	  total += tp->total_page_count ();
+	}
+    }
+  return total;
+}
+
+int
+qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *list_id_p, int global_index,
+				char *page_dest)
+{
+  qfile::tapeset *ts = (list_id_p != NULL) ? (qfile::tapeset *) QFILE_LIST_ID_TAPESET (list_id_p) : NULL;
+  if (ts == NULL || global_index < 0 || page_dest == NULL)
+    {
+      assert (false);
+      return ER_FAILED;
+    }
+
+  /* Map the global logical page index across the ordered Tapes (no built-in
+   * mapper -- accumulate total_page_count per Tape). */
+  int remaining = global_index;
+  for (int t = 0; t < ts->tape_count (); ++t)
+    {
+      qfile::tape *tp = ts->get_tape (t);
+      if (tp == NULL)
+	{
+	  continue;
+	}
+      const int n = tp->total_page_count ();
+      if (remaining < n)
+	{
+	  /* Re-entrant read into caller scratch (ADR 0005); a RAM prefix page is
+	   * returned in place (pg != page_dest), a file page is read into
+	   * page_dest.  TDE decrypt uses the local scratch (freed on return). */
+	  qfile::tde_read_scratch tde;
+	  PAGE_PTR pg = tp->read_page_into (thread_p, remaining, page_dest, &tde);
+	  if (pg == NULL)
+	    {
+	      return ER_FAILED;	/* read_page_into already er_set */
+	    }
+	  if (pg != page_dest)
+	    {
+	      std::memcpy (page_dest, pg, DB_PAGESIZE);
+	    }
+	  return NO_ERROR;
+	}
+      remaining -= n;
+    }
+
+  assert (false);		/* global_index >= page_count: caller bug */
+  return ER_FAILED;
+}
+
 /* ------------------------------------------------------------------ */
 /* In-server self-test: holdable reparent lifecycle (Phase1 1C, #72). */
 /* Gated by env CUBRID_HELDTAPE_SELFTEST (debug-only invocation).      */

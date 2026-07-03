@@ -563,6 +563,17 @@ struct qfile_list_id
 #define QFILE_LIST_ID_PRODUCER_FAILED(list_id) ((list_id)->producer_failed_)
 #define QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW(list_id) ((list_id)->new_contains_overflow_)
 
+/* Synthetic marker volid for a NEW (Tapeset)-backed top-level result served
+ * directly to the client without pgbuf materialization (#120a).  The client
+ * fetch descriptor's first_vpid (and every synthesized next_vpid) carries this
+ * volid; the pageid is a global logical page index over the result's Tapeset.
+ * It is inert -- the server decides "serve from Tapeset" from the retained
+ * list's backing, never routing this VPID into volume/pgbuf code -- but the
+ * value stays clear of every real volid (perm/temp are >= 0; reserved auxiliary
+ * volids are small negatives down to -22 and SHRT_MIN+1) so it can never be
+ * mistaken for a real list-file page. */
+#define QFILE_TAPESET_FETCH_VOLID  ((VOLID) -1000)
+
 /*
  * No-mixed-backing invariant (redesign G008, issue #73; SSOT #75 §5.5 (7) /
  * §6).  A list "has OLD backing" when it is physically backed the legacy way

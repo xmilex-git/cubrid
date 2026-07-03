@@ -2712,6 +2712,95 @@ qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 }
 
 /*
+ * qfile_serve_tapeset_fetch_pages () - #120a: serve packed client-fetch pages
+ *   straight from a NEW (Tapeset)-backed top-level result, in place of the
+ *   pgbuf VPID page chain the OLD path walks.  The result's ordered Tapes form
+ *   one dense logical page sequence 0..page_count-1; the client addresses it by
+ *   that global index (marker volid QFILE_TAPESET_FETCH_VOLID).  Reads global
+ *   pages [start_gp ..] via the Tapeset bridge into page_buf_p, packing full
+ *   DB_PAGESIZE pages until the network page (IO_MAX_PAGE_SIZE) is full, and
+ *   rewrites each page header's next_vpid to the next synthetic coordinate (or
+ *   NULL on the last page) and nulls its overflow vpid, so the unchanged client
+ *   cursor walks it exactly like a real VPID page chain.
+ *   return: NO_ERROR or ER_ code
+ *   list_id_p(in): the retained NEW-backed result (carries the Tapeset)
+ *   start_gp(in): first global logical page index requested by the client
+ *   page_buf_p(out): caller network page buffer (>= IO_MAX_PAGE_SIZE)
+ *   page_size_p(out): bytes filled
+ *
+ * Note: Overflow-free lists only.  A result with big (multi-page) tuples has
+ *   NEW_CONTAINS_OVERFLOW set and is routed through qmgr_materialize_to_pgbuf at
+ *   the sink instead (the ADR0006 offset-run page format is not yet translated
+ *   to the client's VPID overflow chain -- #120b).
+ */
+static int
+qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * list_id_p, PAGEID start_gp,
+				 char *page_buf_p, int *page_size_p)
+{
+  const int total = qfile_tapeset_page_count (list_id_p);
+  PAGEID gp = start_gp;
+  int one_page_size = DB_PAGESIZE;
+
+  *page_size_p = 0;
+
+  /* A request past the end (or for an empty result) returns no data; the client
+   * stops on the previous page's NULL next_vpid (or a NULL first_vpid). */
+  if (start_gp < 0 || start_gp >= total)
+    {
+      return NO_ERROR;
+    }
+
+  /* append pages until a network page is full */
+  while ((*page_size_p + DB_PAGESIZE) <= IO_MAX_PAGE_SIZE && gp < total)
+    {
+      char *dest = page_buf_p + *page_size_p;
+
+      if (qfile_tapeset_read_global_page (thread_p, list_id_p, (int) gp, dest) != NO_ERROR)
+	{
+	  ASSERT_ERROR ();
+	  return er_errid ();
+	}
+
+      /* Synthesize the VPID-wire chaining the client walks: the next page is
+       * the next global index (same marker volid), NULL on the last page.  The
+       * overflow vpid is cleared -- overflow-free by construction. */
+      if (gp + 1 < total)
+	{
+	  VPID next_vpid;
+	  next_vpid.volid = QFILE_TAPESET_FETCH_VOLID;
+	  next_vpid.pageid = gp + 1;
+	  QFILE_PUT_NEXT_VPID (dest, &next_vpid);
+	}
+      else
+	{
+	  QFILE_PUT_NEXT_VPID_NULL (dest);
+	}
+      QFILE_PUT_OVERFLOW_VPID_NULL (dest);
+
+      /* Trimmed size of this (non-overflow) page, mirroring the OLD packer so
+       * the reported buffer size matches the classic contract. */
+      one_page_size = (QFILE_GET_LAST_TUPLE_OFFSET (dest)
+		       + QFILE_GET_TUPLE_LENGTH (dest + QFILE_GET_LAST_TUPLE_OFFSET (dest)));
+      if (one_page_size < QFILE_PAGE_HEADER_SIZE)
+	{
+	  one_page_size = QFILE_PAGE_HEADER_SIZE;
+	}
+      if (one_page_size > DB_PAGESIZE)
+	{
+	  one_page_size = DB_PAGESIZE;
+	}
+
+      *page_size_p += DB_PAGESIZE;
+      gp++;
+    }
+
+  /* Report the trimmed size of the final page (OLD packer contract). */
+  *page_size_p += one_page_size - DB_PAGESIZE;
+
+  return NO_ERROR;
+}
+
+/*
  * xqfile_get_list_file_page () -
  *   return: NO_ERROR or ER_ code
  *   query_id(in):
@@ -2776,6 +2865,17 @@ xqfile_get_list_file_page (THREAD_ENTRY * thread_p, QUERY_ID query_id, VOLID vol
 	  assert (query_entry_p->list_id != NULL);
 	  *page_size_p = 0;
 	  return NO_ERROR;
+	}
+
+      /* #120a: a NEW (Tapeset)-backed top-level result has no VPID page chain
+       * (first_vpid is NULL), so serve its pages straight from the Tapeset
+       * instead of the pgbuf VPID walk below.  The incoming page_id is a global
+       * logical page index (marker volid); the client got it from the synthetic
+       * first_vpid/next_vpid seeded at the sink.  Overflow-free lists only --
+       * NEW_CONTAINS_OVERFLOW results were materialized at the sink (#120b). */
+      if (qfile_list_has_new_backing (query_entry_p->list_id))
+	{
+	  return qfile_serve_tapeset_fetch_pages (thread_p, query_entry_p->list_id, page_id, page_buf_p, page_size_p);
 	}
 
       assert (NULL_PAGEID < QFILE_LIST_ID_FIRST_VPID(query_entry_p->list_id).pageid);
