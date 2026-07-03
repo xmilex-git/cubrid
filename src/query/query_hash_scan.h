@@ -191,6 +191,11 @@ struct file_hash_scan_id
 };
 
 /* hash list scan */
+/* PG-style batch-spill hash for the HASH_FILE tier (#123): replaces the
+ * extendible-hash temp file (fhs_*) with per-batch append-only BufFiles
+ * (nodeHash.c ExecHashIncreaseNumBatches idiom).  Opaque; see query_hash_scan.c. */
+typedef struct hls_spill HLS_SPILL;
+
 typedef struct hash_list_scan HASH_LIST_SCAN;
 struct hash_list_scan
 {
@@ -211,10 +216,18 @@ struct hash_list_scan
       OID curr_oid;		/* current bucket oid */
       bool is_dk_bucket;	/* is current bucket dk? */
     } file;
+    struct
+    {
+      HLS_SPILL *hash_table;	/* batch-spill hash (replaces `file`, #123) */
+    } spill;
   };
   HASH_METHOD hash_list_scan_type;	/* IN_MEM, HYBRID or HASH_FILE */
   unsigned int curr_hash_key;	/* current hash key */
   bool need_coerce_type;	/* Are the types of probe and build different? */
+  /* work_mem accountant charge covering the IN_MEM/HYBRID build estimate
+   * (#123/#91); released when the hash table is destroyed. */
+  size_t wm_bytes;
+  int wm_shard;
 };
 
 HASH_SCAN_KEY *qdata_alloc_hscan_key (THREAD_ENTRY * thread_p, int val_cnt, bool alloc_vals);
@@ -262,6 +275,30 @@ extern EH_SEARCH fhs_search (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid, TF
 extern EH_SEARCH fhs_search_next (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid, TFTID * value_ptr);
 extern void fhs_dump (THREAD_ENTRY * thread_p, FHSID * fhsid);
 /* end : FILE HASH SCAN */
+
+/* start : PG-style batch-spill hash (#123) — HASH_FILE-tier replacement.
+ * Values are QFILE_TUPLE_SIMPLE_POS (coord_type-tagged), so a NEW (Tapeset)
+ * build list works too (TAPE coords, #101).  Entries carry no user data
+ * (hash + coordinates only), so the spill files need no TDE. */
+extern HLS_SPILL *hls_spill_create (THREAD_ENTRY * thread_p, INT64 tuple_cnt);
+extern int hls_spill_insert (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
+			     const QFILE_TUPLE_SIMPLE_POS * pos);
+extern int hls_spill_finalize (THREAD_ENTRY * thread_p, HLS_SPILL * spill);
+extern EH_SEARCH hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
+				   QFILE_TUPLE_SIMPLE_POS * pos_out);
+extern EH_SEARCH hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spill,
+					QFILE_TUPLE_SIMPLE_POS * pos_out);
+extern void hls_spill_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill);
+extern long hls_spill_probe_page_reads (const HLS_SPILL * spill);
+
+/* Save the scan's current tuple position as a SIMPLE_POS (backing-aware:
+ * TAPE / raw-fd / VPID) — shared by the HYBRID producer and the spill build. */
+extern void qdata_save_hscan_pos (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_SIMPLE_POS * pos);
+
+/* work_mem accountant charge helpers for the IN_MEM/HYBRID build estimate (#123/#91). */
+extern bool qdata_hscan_wm_reserve (HASH_LIST_SCAN * hlsid, size_t bytes);
+extern void qdata_hscan_wm_release (HASH_LIST_SCAN * hlsid);
+/* end : batch-spill hash */
 
 #endif /* defined (SERVER_MODE) || defined (SA_MODE) */
 

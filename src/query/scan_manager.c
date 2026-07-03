@@ -4134,6 +4134,8 @@ scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
   llsidp->hlsid.build_regu_list = regu_list_build;
   llsidp->hlsid.probe_regu_list = regu_list_probe;
   llsidp->hlsid.need_coerce_type = false;
+  llsidp->hlsid.wm_bytes = 0;
+  llsidp->hlsid.wm_shard = -1;
 
   llsidp->is_read_only = is_read_only;
 
@@ -4154,12 +4156,9 @@ scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
       /* create hash table */
       if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HASH_FILE)
 	{
-	  llsidp->hlsid.file.hash_table = (FHSID *) db_private_alloc (thread_p, sizeof (FHSID));
-	  if (llsidp->hlsid.file.hash_table == NULL)
-	    {
-	      return S_ERROR;
-	    }
-	  if (fhs_create (thread_p, llsidp->hlsid.file.hash_table, llsidp->list_id->tuple_cnt) == NULL)
+	  /* PG-style batch spill (#123) — replaces the extendible-hash temp file */
+	  llsidp->hlsid.spill.hash_table = hls_spill_create (thread_p, llsidp->list_id->tuple_cnt);
+	  if (llsidp->hlsid.spill.hash_table == NULL)
 	    {
 	      return S_ERROR;
 	    }
@@ -4180,6 +4179,11 @@ scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 	  return S_ERROR;
 	}
       if (scan_build_hash_list_scan (thread_p, scan_id) == S_ERROR)
+	{
+	  return S_ERROR;
+	}
+      if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HASH_FILE
+	  && hls_spill_finalize (thread_p, llsidp->hlsid.spill.hash_table) != NO_ERROR)
 	{
 	  return S_ERROR;
 	}
@@ -5527,9 +5531,11 @@ scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	}
       else if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HASH_FILE)
 	{
-	  fhs_destroy (thread_p, llsidp->hlsid.file.hash_table);
-	  db_private_free_and_init (thread_p, llsidp->hlsid.file.hash_table);
+	  hls_spill_destroy (thread_p, llsidp->hlsid.spill.hash_table);
+	  llsidp->hlsid.spill.hash_table = NULL;
 	}
+      /* release the IN_MEM/HYBRID build estimate charge (#123/#91) */
+      qdata_hscan_wm_release (&llsidp->hlsid);
       /* free temp keys and values */
       if (llsidp->hlsid.temp_key != NULL)
 	{
@@ -8784,7 +8790,6 @@ scan_build_hash_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
   HASH_SCAN_KEY *key, *new_key;
   HASH_SCAN_VALUE *new_value;
   unsigned int hash_key;
-  TFTID tftid;
 
   llsidp = &scan_id->s.llsid;
   key = llsidp->hlsid.temp_key;
@@ -8859,14 +8864,16 @@ scan_build_hash_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	    }
 	  break;
 	case HASH_METH_HASH_FILE:
-	  /* curr_offset is int and tftid.offset is short. */
-	  /* the offset is a position within a page(16K), so it can be stored as a short type. */
-	  SET_TFTID (tftid, llsidp->lsid.curr_vpid.volid, llsidp->lsid.curr_vpid.pageid, llsidp->lsid.curr_offset);
-	  /* add to hash table */
-	  if (fhs_insert (thread_p, llsidp->hlsid.file.hash_table, (void *) &hash_key, &tftid) == NULL)
-	    {
-	      return S_ERROR;
-	    }
+	  /* batch spill (#123): backing-aware SIMPLE_POS value (TAPE/raw-fd/VPID) */
+	  {
+	    QFILE_TUPLE_SIMPLE_POS spill_pos;
+
+	    qdata_save_hscan_pos (&llsidp->lsid, &spill_pos);
+	    if (hls_spill_insert (thread_p, llsidp->hlsid.spill.hash_table, hash_key, &spill_pos) != NO_ERROR)
+	      {
+		return S_ERROR;
+	      }
+	  }
 	  break;
 	default:
 	  return S_ERROR;
@@ -9002,7 +9009,7 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
   QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
   unsigned int hash_key;
   EH_SEARCH eh_search;
-  TFTID result;
+  QFILE_TUPLE_SIMPLE_POS spill_pos;
 
   llsidp = &scan_id->s.llsid;
   key = llsidp->hlsid.temp_key;
@@ -9054,12 +9061,12 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	  return S_SUCCESS;
 
 	case HASH_METH_HASH_FILE:
-	  /* init curr_oid and get value from hash table */
-	  eh_search = fhs_search (thread_p, &llsidp->hlsid, &result);
+	  /* batch-spill probe (#123) */
+	  eh_search = hls_spill_search (thread_p, llsidp->hlsid.spill.hash_table, hash_key, &spill_pos);
 	  switch (eh_search)
 	    {
 	    case EH_KEY_FOUND:
-	      MAKE_TFTID_TO_TUPLE_POSTION (tuple_pos, result, scan_id_p);
+	      MAKE_TUPLE_POSTION (tuple_pos, &spill_pos, scan_id_p);
 	      if (qfile_jump_scan_tuple_position (thread_p, scan_id_p, &tuple_pos, &tplrec, PEEK) != S_SUCCESS)
 		{
 		  return S_ERROR;
@@ -9123,11 +9130,11 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	  return S_SUCCESS;
 
 	case HASH_METH_HASH_FILE:
-	  eh_search = fhs_search_next (thread_p, &llsidp->hlsid, &result);
+	  eh_search = hls_spill_search_next (thread_p, llsidp->hlsid.spill.hash_table, &spill_pos);
 	  switch (eh_search)
 	    {
 	    case EH_KEY_FOUND:
-	      MAKE_TFTID_TO_TUPLE_POSTION (tuple_pos, result, scan_id_p);
+	      MAKE_TUPLE_POSTION (tuple_pos, &spill_pos, scan_id_p);
 	      if (qfile_jump_scan_tuple_position (thread_p, scan_id_p, &tuple_pos, &tplrec, PEEK) != S_SUCCESS)
 		{
 		  return S_ERROR;
@@ -9135,10 +9142,8 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	      *tuple = tplrec.tpl;
 	      return S_SUCCESS;
 	    case EH_KEY_NOTFOUND:
-	      /* Same backing-aware release as the HYBRID branch above (#101).  HASH_FILE
-	       * is still fenced off for NEW lists (see check_hash_list_scan), so the
-	       * tapeset case is unreachable here today -- kept consistent for when #123
-	       * lifts that fence. */
+	      /* Backing-aware release (#101): a Tapeset scan's page is owned by the
+	       * driver and released via qfile_close_scan. */
 	      if (scan_id_p->tapeset_scan_ == NULL)
 		{
 		  qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
@@ -9239,16 +9244,24 @@ check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_y
   /* 6. list file from dptr is not allowed */
   /* Since dptr is searched after scan_open_scan, it is checked when llsidp->list_id->tuple_cnt <= 0 */
 
-  /* list file size check */
+  /* list file size check.  Each in-memory tier must both fit work_mem AND
+   * secure its estimate from the work_mem accountant (total cap across
+   * concurrent consumers, #123/#91); on refusal it degrades to the next tier.
+   * The charge is the same quantity the size check compares, released when
+   * the hash table is destroyed (scan_close_scan). */
   if (mem_limit == 0)
     {
       return HASH_METH_NOT_USE;
     }
-  else if ((UINT64) llsidp->list_id->page_cnt * DB_PAGESIZE <= mem_limit)
+  if ((UINT64) llsidp->list_id->page_cnt * DB_PAGESIZE <= mem_limit
+      && qdata_hscan_wm_reserve (&llsidp->hlsid, (size_t) llsidp->list_id->page_cnt * DB_PAGESIZE))
     {
       return HASH_METH_IN_MEM;
     }
-  else if ((UINT64) llsidp->list_id->tuple_cnt * (sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) <= mem_limit)
+  if ((UINT64) llsidp->list_id->tuple_cnt * (sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) <= mem_limit
+      && qdata_hscan_wm_reserve (&llsidp->hlsid,
+				 (size_t) llsidp->list_id->tuple_cnt * (sizeof (HENTRY_HLS) +
+									sizeof (QFILE_TUPLE_SIMPLE_POS))))
     {
       /* bytes of 1 row = sizeof(HENTRY_HLS) + sizeof(QFILE_TUPLE_SIMPLE_POS) = 56 bytes (64bit) */
       /* HENTRY_HLS = pointer(8bytes) * 4 = 32 bytes */
@@ -9258,13 +9271,8 @@ check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_y
        * dispatches on coord_type. */
       return HASH_METH_HYBRID;
     }
-  else
-    {
-      /* HASH_FILE stores a raw VPID (SET_TFTID), which a NEW (Tapeset) list cannot
-       * provide -- guard kept (#85).  #123 replaces the extendible-hash temp file
-       * with PG-style batch spill and lifts this fence. */
-      return qfile_list_has_new_backing (llsidp->list_id) ? HASH_METH_NOT_USE : HASH_METH_HASH_FILE;
-    }
-
-  return HASH_METH_NOT_USE;
+  /* HASH_FILE tier = PG-style batch spill (#123), which bounds its own memory
+   * (staging + one batch) under the accountant.  Values are coord_type-tagged
+   * SIMPLE_POS, so the #85 NEW-list fence is lifted (TAPE coords, #101). */
+  return HASH_METH_HASH_FILE;
 }

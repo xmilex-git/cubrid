@@ -2733,6 +2733,9 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
   assert (hash_scan->build_regu_list == NULL);	/* Unused */
   assert (hash_scan->probe_regu_list == NULL);	/* Unused */
 
+  hash_scan->wm_bytes = 0;
+  hash_scan->wm_shard = -1;
+
   hash_scan->temp_key = qdata_alloc_hscan_key (thread_p, key_cnt, true);
   if (hash_scan->temp_key == NULL)
     {
@@ -2747,7 +2750,11 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 
   if (list_id != NULL)
     {
-      if ((UINT64) list_id->page_cnt * DB_PAGESIZE <= mem_limit)
+      /* Same tier contract as check_hash_list_scan (#123/#91): an in-memory
+       * tier must both fit work_mem AND secure its estimate from the work_mem
+       * accountant; on refusal it degrades to the next tier. */
+      if ((UINT64) list_id->page_cnt * DB_PAGESIZE <= mem_limit
+	  && qdata_hscan_wm_reserve (hash_scan, (size_t) list_id->page_cnt * DB_PAGESIZE))
 	{
 #if HASHJOIN_DUMP_BUILD
 	  fprintf (stdout, "\nHash Join Method: In Memory\n");
@@ -2764,7 +2771,10 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 
 	  hash_scan->memory.curr_hash_entry = NULL;
 	}
-      else if ((UINT64) list_id->tuple_cnt * (sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) <= mem_limit)
+      else if ((UINT64) list_id->tuple_cnt * (sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) <= mem_limit
+	       && qdata_hscan_wm_reserve (hash_scan,
+					  (size_t) list_id->tuple_cnt * (sizeof (HENTRY_HLS) +
+									 sizeof (QFILE_TUPLE_SIMPLE_POS))))
 	{
 #if HASHJOIN_DUMP_BUILD
 	  fprintf (stdout, "\nHash Join Method: Hybrid\n");
@@ -2794,19 +2804,12 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 
 	  hash_scan->hash_list_scan_type = HASH_METH_HASH_FILE;
 
-	  hash_scan->file.hash_table = (FHSID *) db_private_alloc (thread_p, sizeof (FHSID));
-	  if (hash_scan->file.hash_table == NULL)
+	  /* PG-style batch spill (#123) — replaces the extendible-hash temp file */
+	  hash_scan->spill.hash_table = hls_spill_create (thread_p, list_id->tuple_cnt);
+	  if (hash_scan->spill.hash_table == NULL)
 	    {
 	      goto error_exit;
 	    }
-
-	  if (fhs_create (thread_p, hash_scan->file.hash_table, list_id->tuple_cnt) == NULL)
-	    {
-	      goto error_exit;
-	    }
-
-	  hash_scan->file.curr_oid = OID_INITIALIZER;
-	  hash_scan->file.is_dk_bucket = false;
 	}
     }
   else
@@ -2870,10 +2873,10 @@ hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan)
       break;
 
     case HASH_METH_HASH_FILE:
-      if (hash_scan->file.hash_table != NULL)
+      if (hash_scan->spill.hash_table != NULL)
 	{
-	  fhs_destroy (thread_p, hash_scan->file.hash_table);
-	  db_private_free_and_init (thread_p, hash_scan->file.hash_table);
+	  hls_spill_destroy (thread_p, hash_scan->spill.hash_table);
+	  hash_scan->spill.hash_table = NULL;
 	}
       break;
 
@@ -2883,6 +2886,9 @@ hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan)
       /* Nothing to do */
       break;
     }
+
+  /* release the IN_MEM/HYBRID build estimate charge (#123/#91) */
+  qdata_hscan_wm_release (hash_scan);
 
   hash_scan->hash_list_scan_type = HASH_METH_NOT_USE;
 }
@@ -3286,6 +3292,13 @@ hjoin_build (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTE
       goto error_exit;
     }
 
+  if (hash_scan->hash_list_scan_type == HASH_METH_HASH_FILE
+      && hls_spill_finalize (thread_p, hash_scan->spill.hash_table) != NO_ERROR)
+    {
+      error = er_errid ();
+      goto error_exit;
+    }
+
 #if HASHJOIN_DUMP_HASH_TABLE
   if (build->list_id->tuple_cnt <= DUMP_HASH_TABLE_LIMIT)
     {
@@ -3325,7 +3338,6 @@ hjoin_build_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
 		 QFILE_TUPLE_RECORD * tuple_record)
 {
   HASH_SCAN_VALUE *hash_value = NULL;
-  TFTID tftid;
 
   assert (thread_p != NULL);
   assert (hash_scan != NULL);
@@ -3373,14 +3385,19 @@ hjoin_build_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
       break;
 
     case HASH_METH_HASH_FILE:
-      assert (hash_scan->file.hash_table != NULL);
+      assert (hash_scan->spill.hash_table != NULL);
 
-      SET_TFTID (tftid, list_scan_id->curr_vpid.volid, list_scan_id->curr_vpid.pageid, list_scan_id->curr_offset);
-      if (fhs_insert (thread_p, hash_scan->file.hash_table, (void *) &hash_scan->curr_hash_key, &tftid) == NULL)
-	{
-	  assert_release_error (er_errid () != NO_ERROR);
-	  return er_errid ();
-	}
+      /* batch spill (#123): backing-aware SIMPLE_POS value (TAPE/raw-fd/VPID) */
+      {
+	QFILE_TUPLE_SIMPLE_POS spill_pos;
+
+	qdata_save_hscan_pos (list_scan_id, &spill_pos);
+	if (hls_spill_insert (thread_p, hash_scan->spill.hash_table, hash_scan->curr_hash_key, &spill_pos) != NO_ERROR)
+	  {
+	    assert_release_error (er_errid () != NO_ERROR);
+	    return er_errid ();
+	  }
+      }
       break;
 
     case HASH_METH_NOT_USE:
@@ -4062,7 +4079,7 @@ hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
 		 QFILE_TUPLE_RECORD * tuple_record)
 {
   HASH_SCAN_VALUE *hash_value = NULL;
-  TFTID tftid;
+  QFILE_TUPLE_SIMPLE_POS spill_pos;
   EH_SEARCH eh_search;
   QFILE_TUPLE_POSITION tuple_position;
   SCAN_CODE scan_code;
@@ -4139,20 +4156,21 @@ hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
       break;			/* HASH_METH_HYBRID */
 
     case HASH_METH_HASH_FILE:
-      assert (hash_scan->file.hash_table != NULL);
+      assert (hash_scan->spill.hash_table != NULL);
 
+      /* batch-spill probe (#123) */
       if (tuple_record->tpl == NULL)
 	{
-	  eh_search = fhs_search (thread_p, hash_scan, &tftid);
+	  eh_search = hls_spill_search (thread_p, hash_scan->spill.hash_table, hash_scan->curr_hash_key, &spill_pos);
 	}
       else
 	{
-	  eh_search = fhs_search_next (thread_p, hash_scan, &tftid);
+	  eh_search = hls_spill_search_next (thread_p, hash_scan->spill.hash_table, &spill_pos);
 	}
 
       if (eh_search == EH_KEY_FOUND)
 	{
-	  MAKE_TFTID_TO_TUPLE_POSTION (tuple_position, tftid, list_scan_id);
+	  MAKE_TUPLE_POSTION (tuple_position, &spill_pos, list_scan_id);
 	  scan_code = qfile_jump_scan_tuple_position (thread_p, list_scan_id, &tuple_position, tuple_record, PEEK);
 	  if (scan_code != S_SUCCESS)
 	    {
@@ -4695,8 +4713,8 @@ hjoin_dump_hash_table (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFIL
       break;
 
     case HASH_METH_HASH_FILE:
-      assert (hash_scan->file.hash_table != NULL);
-      fhs_dump (thread_p, hash_scan->file.hash_table);
+      assert (hash_scan->spill.hash_table != NULL);
+      printf ("batch-spill hash : tuple count = %ld, file_size = %dK\n", list_id->tuple_cnt, list_id->page_cnt * 16);
       break;
 
     case HASH_METH_NOT_USE:

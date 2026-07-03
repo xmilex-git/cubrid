@@ -1488,8 +1488,6 @@ namespace
 
 namespace temp_page_store
 {
-  void reserve_held_soft (std::size_t bytes, int *shard_out) noexcept;
-
   raw_fd_file::raw_fd_file () noexcept
     : m_fd (-1)
     , m_path ()

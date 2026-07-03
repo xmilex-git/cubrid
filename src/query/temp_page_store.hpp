@@ -190,6 +190,7 @@ namespace temp_page_store
   void release_held_reservation (QMGR_TEMP_FILE * tfile_p) noexcept;
 
   bool reserve_held (std::size_t bytes, int *shard_out) noexcept;
+  void reserve_held_soft (std::size_t bytes, int *shard_out) noexcept;
   void release_held (std::size_t bytes, int shard_index) noexcept;
 
   std::size_t reservation_bytes_for_pages (std::size_t pages) noexcept;

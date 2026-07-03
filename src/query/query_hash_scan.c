@@ -51,6 +51,13 @@
 #include "thread_compat.hpp"
 #include "oid.h"
 #include "qfile_tape.hpp"
+#include "qfile_buffile.hpp"
+#include "temp_page_store.hpp"	/* work_mem accountant: reserve_held / release_held (#91/#123) */
+
+#include <algorithm>
+#include <atomic>
+#include <string>
+#include <vector>
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -699,6 +706,19 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
     }
 
   /* save position */
+  qdata_save_hscan_pos (scan_id_p, value->pos);
+
+  return value;
+}
+
+/*
+ * qdata_save_hscan_pos () - save the scan's current tuple position as a
+ *   backing-aware SIMPLE_POS (TAPE / raw-fd / VPID).  Shared by the HYBRID
+ *   value producer above and the batch-spill build (#123).
+ */
+void
+qdata_save_hscan_pos (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_SIMPLE_POS * pos)
+{
   if (scan_id_p->tapeset_scan_ != NULL)
     {
       /* NEW (Tapeset) list: the mirror curr_vpid is synthetic (volid = NULL_VOLID,
@@ -708,23 +728,20 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
 
       qfile_tapeset_scan_save_position (scan_id_p, &tape_pos);
       assert (qfile_tuple_position_is_tape (&tape_pos));
-      qfile_tuple_simple_pos_set_tape (value->pos, tape_pos.tape_idx, tape_pos.tape_page_offset,
-				       tape_pos.tape_byte_offset);
+      qfile_tuple_simple_pos_set_tape (pos, tape_pos.tape_idx, tape_pos.tape_page_offset, tape_pos.tape_byte_offset);
     }
   else if (QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)) != NULL
       && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
       && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
       && scan_id_p->curr_vpid.pageid > QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->membuf_last)
     {
-      qfile_tuple_simple_pos_set_raw_fd (value->pos, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle->segment_id (),
+      qfile_tuple_simple_pos_set_raw_fd (pos, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle->segment_id (),
 					 scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
     }
   else
     {
-      qfile_tuple_simple_pos_set_vpid (value->pos, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
+      qfile_tuple_simple_pos_set_vpid (pos, &scan_id_p->curr_vpid, scan_id_p->curr_offset);
     }
-
-  return value;
 }
 
 static bool
@@ -3190,4 +3207,717 @@ fhs_get_pseudo_key (THREAD_ENTRY * thread_p, RECDES * recdes_p, FHS_HASH_KEY * o
 
   *out_hash_key_p = hash_key;
   return NO_ERROR;
+}
+
+/****************************************************************************/
+/*********** PG-style batch-spill hash (HASH_FILE tier, #123) **************/
+/****************************************************************************/
+/* Replaces the extendible-hash temp file (fhs_*, pgbuf pages + global temp
+ * file machinery) with per-batch append-only BufFiles, borrowing the
+ * PostgreSQL nodeHash.c idiom (ExecHashGetBucketAndBatch batch split by hash
+ * bits; ExecHashIncreaseNumBatches growth when a batch exceeds its memory
+ * target).  Shape is symmetric with the PHJ partition spill (#91-accounted).
+ *
+ * Build:    entries (hash_key, QFILE_TUPLE_SIMPLE_POS) are appended to
+ *           nbatch BufFiles, batchno = hash & (nbatch - 1).  nbatch is sized
+ *           up front from the exact list tuple_cnt (materialized list), so
+ *           PG's mid-build doubling reduces to exact sizing here.
+ * Finalize: each batch is loaded whole (<= target, work_mem-accounted),
+ *           sorted by hash, written back as a sorted run + an in-memory
+ *           page-fence index (first hash per page).  An overweight batch
+ *           (hash skew or accountant pressure) is range-bisected by hash --
+ *           the lazy per-batch form of ExecHashIncreaseNumBatches; when
+ *           bisection cannot help (depth cap: all-equal hashes), we soft-
+ *           reserve and overshoot, mirroring PG's growEnabled=false escape.
+ * Probe:    batchno -> run by hash range -> fence binary search -> one
+ *           read_page -> in-page binary search; duplicates are adjacent.
+ *
+ * Values are coord_type-tagged SIMPLE_POS, so NEW (Tapeset) build lists work
+ * (TAPE coords, #101).  Entries carry no user data (hash + coordinates), so
+ * spill files need no TDE -- an improvement over fhs, which wrote key values
+ * into temp pages. */
+
+typedef struct hls_spill_entry HLS_SPILL_ENTRY;
+struct hls_spill_entry
+{
+  UINT32 hash;
+  UINT32 reserved;
+  QFILE_TUPLE_SIMPLE_POS pos;
+};
+
+/* SIMPLE_POS is 8-byte aligned (raw-fd UINT64), so 4+16+4 pads to 32 */
+static_assert (sizeof (QFILE_TUPLE_SIMPLE_POS) == 32, "SIMPLE_POS layout drift");
+static_assert (sizeof (HLS_SPILL_ENTRY) == 40, "spill entry layout drift");
+
+static const int HLS_SPILL_MAX_NBATCH = 512;
+static const int HLS_SPILL_BISECT_DEPTH_MAX = 4;
+
+struct hls_spill_run
+{
+  qfile::buffile *bf;		/* sorted run */
+  INT64 entry_cnt;
+  UINT32 first_hash;		/* run hash range lower bound (runs are disjoint, ascending) */
+  std::vector<UINT32> fences;	/* first hash per page */
+};
+
+struct hls_spill_batch
+{
+  qfile::buffile *raw;		/* build-phase append file (consumed by finalize) */
+  INT64 entry_cnt;
+  std::vector<hls_spill_run> runs;	/* finalize output */
+};
+
+struct hls_spill
+{
+  int nbatch;			/* power of two */
+  std::vector<hls_spill_batch> batches;
+  char *stage;			/* nbatch staging pages (build) + 1 probe page (tail slot) */
+  std::vector<int> stage_cnt;	/* staged entries per batch */
+  std::string dir;
+  std::uint64_t seq_base;
+  std::uint64_t seq_next;
+  bool finalized;
+  /* accountant */
+  size_t charged_bytes;
+  int charged_shard;
+  /* probe cursor */
+  int probe_batch;
+  size_t probe_run;
+  INT64 probe_idx;		/* entry index within run */
+  UINT32 probe_hash;
+  qfile::buffile *probe_page_bf;	/* which run file the cached page belongs to */
+  int probe_page_off;		/* cached page offset, -1 = none */
+  long probe_page_reads;	/* instrumentation: read_page calls during probe */
+  qfile::tde_read_scratch scratch;
+};
+
+/* entries per page — DB_PAGESIZE is a boot-time runtime value, so this must
+ * not be a namespace-scope static initializer */
+#define HLS_SPILL_EPP ((INT64) (DB_PAGESIZE / (int) sizeof (HLS_SPILL_ENTRY)))
+
+static char *
+hls_spill_stage_page (HLS_SPILL * spill, int batchno)
+{
+  return spill->stage + (size_t) batchno * DB_PAGESIZE;
+}
+
+static char *
+hls_spill_probe_page (HLS_SPILL * spill)
+{
+  return spill->stage + (size_t) spill->nbatch * DB_PAGESIZE;
+}
+
+static qfile::buffile *
+hls_spill_new_file (THREAD_ENTRY * thread_p, HLS_SPILL * spill)
+{
+  int os_error = 0;
+  qfile::buffile *bf =
+    qfile::buffile::create (thread_p, spill->dir.c_str (), spill->seq_next++, 0, TDE_ALGORITHM_NONE, &os_error);
+  if (bf == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+    }
+  return bf;
+}
+
+/*
+ * hls_spill_create () - create a batch-spill hash sized from the exact build
+ *   list tuple_cnt.  Charges the staging pages (+ 1 probe page) to the
+ *   work_mem accountant; NULL on reservation or scratch-dir failure.
+ */
+HLS_SPILL *
+hls_spill_create (THREAD_ENTRY * thread_p, INT64 tuple_cnt)
+{
+  UINT64 work_mem = (UINT64) prm_get_bigint_value (PRM_ID_WORK_MEM);
+  UINT64 target = (work_mem / 2 > (UINT64) DB_PAGESIZE) ? work_mem / 2 : (UINT64) DB_PAGESIZE;
+  UINT64 total_bytes = (UINT64) tuple_cnt * sizeof (HLS_SPILL_ENTRY);
+
+  int nbatch = 1;
+  while (nbatch < HLS_SPILL_MAX_NBATCH && total_bytes / (UINT64) nbatch > target)
+    {
+      nbatch <<= 1;
+    }
+
+  std::string dir;
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+      return NULL;
+    }
+
+  size_t stage_bytes = ((size_t) nbatch + 1) * DB_PAGESIZE;	/* + probe page */
+  int shard = -1;
+  if (!temp_page_store::reserve_held (stage_bytes, &shard))
+    {
+      /* The spill tier is the floor: it must stay constructible under pool
+       * saturation (refusing would fall to the plain list scan's O(n)-per-probe
+       * cliff, and an unset-error NULL trips ASSERT_ERROR upstream).  The
+       * staging footprint is small and bounded (<= MAX_NBATCH + 1 pages), so
+       * overshoot soft-accounted. */
+      temp_page_store::record_degrade ();
+      temp_page_store::reserve_held_soft (stage_bytes, &shard);
+    }
+
+  HLS_SPILL *spill = new hls_spill ();
+  spill->nbatch = nbatch;
+  spill->batches.resize (nbatch);
+  for (int b = 0; b < nbatch; b++)
+    {
+      spill->batches[b].raw = NULL;
+      spill->batches[b].entry_cnt = 0;
+    }
+  spill->stage = (char *) malloc (stage_bytes);
+  if (spill->stage == NULL)
+    {
+      temp_page_store::release_held (stage_bytes, shard);
+      delete spill;
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, stage_bytes);
+      return NULL;
+    }
+  spill->stage_cnt.assign (nbatch, 0);
+  spill->dir = dir;
+  /* process-unique seq block so concurrent spills never collide on a BufFile
+   * name (open is O_EXCL); distinct base from the tape producers'. */
+  static std::atomic<std::uint64_t> seq_gen { 0x200000000ULL };
+  spill->seq_base = seq_gen.fetch_add (0x10000ULL);
+  spill->seq_next = spill->seq_base;
+  spill->finalized = false;
+  spill->charged_bytes = stage_bytes;
+  spill->charged_shard = shard;
+  spill->probe_batch = -1;
+  spill->probe_run = 0;
+  spill->probe_idx = -1;
+  spill->probe_hash = 0;
+  spill->probe_page_bf = NULL;
+  spill->probe_page_off = -1;
+  spill->probe_page_reads = 0;
+  return spill;
+}
+
+static int
+hls_spill_flush_stage (THREAD_ENTRY * thread_p, HLS_SPILL * spill, int batchno)
+{
+  hls_spill_batch & batch = spill->batches[batchno];
+  if (spill->stage_cnt[batchno] == 0)
+    {
+      return NO_ERROR;
+    }
+  if (batch.raw == NULL)
+    {
+      batch.raw = hls_spill_new_file (thread_p, spill);
+      if (batch.raw == NULL)
+	{
+	  return ER_FAILED;
+	}
+    }
+  if (batch.raw->append_page (thread_p, (PAGE_PTR) hls_spill_stage_page (spill, batchno)) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+  spill->stage_cnt[batchno] = 0;
+  return NO_ERROR;
+}
+
+/*
+ * hls_spill_insert () - append one (hash, pos) entry (build phase).
+ */
+int
+hls_spill_insert (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
+		  const QFILE_TUPLE_SIMPLE_POS * pos)
+{
+  assert (!spill->finalized);
+  int batchno = (int) (hash_key & (unsigned int) (spill->nbatch - 1));
+  HLS_SPILL_ENTRY *slot =
+    (HLS_SPILL_ENTRY *) hls_spill_stage_page (spill, batchno) + spill->stage_cnt[batchno];
+
+  slot->hash = (UINT32) hash_key;
+  slot->reserved = 0;
+  slot->pos = *pos;
+  spill->batches[batchno].entry_cnt++;
+  if (++spill->stage_cnt[batchno] == HLS_SPILL_EPP)
+    {
+      return hls_spill_flush_stage (thread_p, spill, batchno);
+    }
+  return NO_ERROR;
+}
+
+/* Write `cnt` sorted entries as a run (pages + fences). */
+static int
+hls_spill_write_run (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_batch & batch,
+		     const HLS_SPILL_ENTRY * ents, INT64 cnt)
+{
+  if (cnt == 0)
+    {
+      return NO_ERROR;
+    }
+  hls_spill_run run;
+  run.bf = hls_spill_new_file (thread_p, spill);
+  if (run.bf == NULL)
+    {
+      return ER_FAILED;
+    }
+  run.entry_cnt = cnt;
+  run.first_hash = ents[0].hash;
+
+  INT64 pages = (cnt + HLS_SPILL_EPP - 1) / HLS_SPILL_EPP;
+  char *page = hls_spill_probe_page (spill);	/* reuse the probe slot as write scratch */
+  for (INT64 p = 0; p < pages; p++)
+    {
+      INT64 first = p * HLS_SPILL_EPP;
+      INT64 n = std::min ((INT64) HLS_SPILL_EPP, cnt - first);
+      memcpy (page, ents + first, (size_t) n * sizeof (HLS_SPILL_ENTRY));
+      run.fences.push_back (ents[first].hash);
+      if (run.bf->append_page (thread_p, (PAGE_PTR) page) != NO_ERROR)
+	{
+	  delete run.bf;
+	  return ER_FAILED;
+	}
+    }
+  if (run.bf->flush (thread_p) != NO_ERROR)
+    {
+      delete run.bf;
+      return ER_FAILED;
+    }
+  batch.runs.push_back (std::move (run));
+  return NO_ERROR;
+}
+
+/* Load a raw batch file whole, sort by hash, emit one sorted run.  When the
+ * accountant refuses the load and the file still bisects, range-split by hash
+ * (lazy ExecHashIncreaseNumBatches); at depth cap, soft-reserve and overshoot
+ * (PG growEnabled=false escape). */
+static int
+hls_spill_finalize_file (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_batch & batch,
+			 qfile::buffile * raw, INT64 entry_cnt, UINT32 lo, UINT32 hi, int depth)
+{
+  if (entry_cnt == 0)
+    {
+      delete raw;
+      return NO_ERROR;
+    }
+
+  int rc = spill->scratch.ensure ();
+  if (rc != NO_ERROR)
+    {
+      delete raw;
+      return rc;
+    }
+
+  INT64 pages = raw->page_count ();
+  size_t load_bytes = (size_t) pages * DB_PAGESIZE;
+  int shard = -1;
+  bool hard = temp_page_store::reserve_held (load_bytes, &shard);
+  if (!hard && depth < HLS_SPILL_BISECT_DEPTH_MAX && lo < hi)
+    {
+      /* range-bisect: split by hash midpoint into two raw files, recurse.
+       * The split key is the sort key's range, so child runs stay disjoint
+       * and ordered (lo-run entirely below hi-run). */
+      temp_page_store::record_degrade ();
+      UINT32 mid = lo + (hi - lo) / 2;	/* lo..mid -> low file, mid+1..hi -> high file */
+      qfile::buffile *lo_bf = NULL, *hi_bf = NULL;
+      INT64 lo_cnt = 0, hi_cnt = 0;
+      char *rd = hls_spill_probe_page (spill);
+      HLS_SPILL_ENTRY *lo_stage = (HLS_SPILL_ENTRY *) hls_spill_stage_page (spill, 0);
+      HLS_SPILL_ENTRY *hi_stage = (HLS_SPILL_ENTRY *) hls_spill_stage_page (spill, 1 % spill->nbatch);
+      int lo_n = 0, hi_n = 0;
+
+      /* nbatch == 1 would alias the two staging slots; bisection needs 2 pages */
+      if (spill->nbatch < 2)
+	{
+	  goto overshoot;
+	}
+
+      for (INT64 p = 0; p < pages; p++)
+	{
+	  if (raw->read_page (thread_p, (int) p, (PAGE_PTR) rd, &spill->scratch) != NO_ERROR)
+	    {
+	      delete lo_bf;
+	      delete hi_bf;
+	      delete raw;
+	      return ER_FAILED;
+	    }
+	  INT64 first = p * HLS_SPILL_EPP;
+	  INT64 n = std::min ((INT64) HLS_SPILL_EPP, entry_cnt - first);
+	  const HLS_SPILL_ENTRY *ents = (const HLS_SPILL_ENTRY *) rd;
+	  for (INT64 i = 0; i < n; i++)
+	    {
+	      const HLS_SPILL_ENTRY & e = ents[i];
+	      HLS_SPILL_ENTRY *dst_stage = (e.hash <= mid) ? lo_stage : hi_stage;
+	      int *dst_n = (e.hash <= mid) ? &lo_n : &hi_n;
+	      qfile::buffile **dst_bf = (e.hash <= mid) ? &lo_bf : &hi_bf;
+	      INT64 *dst_cnt = (e.hash <= mid) ? &lo_cnt : &hi_cnt;
+
+	      dst_stage[*dst_n] = e;
+	      (*dst_cnt)++;
+	      if (++(*dst_n) == HLS_SPILL_EPP)
+		{
+		  if (*dst_bf == NULL && (*dst_bf = hls_spill_new_file (thread_p, spill)) == NULL)
+		    {
+		      delete lo_bf;
+		      delete hi_bf;
+		      delete raw;
+		      return ER_FAILED;
+		    }
+		  if ((*dst_bf)->append_page (thread_p, (PAGE_PTR) dst_stage) != NO_ERROR)
+		    {
+		      delete lo_bf;
+		      delete hi_bf;
+		      delete raw;
+		      return ER_FAILED;
+		    }
+		  *dst_n = 0;
+		}
+	    }
+	}
+      /* flush partial staging pages */
+      if (lo_n > 0)
+	{
+	  if (lo_bf == NULL && (lo_bf = hls_spill_new_file (thread_p, spill)) == NULL)
+	    {
+	      delete hi_bf;
+	      delete raw;
+	      return ER_FAILED;
+	    }
+	  if (lo_bf->append_page (thread_p, (PAGE_PTR) lo_stage) != NO_ERROR)
+	    {
+	      delete lo_bf;
+	      delete hi_bf;
+	      delete raw;
+	      return ER_FAILED;
+	    }
+	}
+      if (hi_n > 0)
+	{
+	  if (hi_bf == NULL && (hi_bf = hls_spill_new_file (thread_p, spill)) == NULL)
+	    {
+	      delete lo_bf;
+	      delete raw;
+	      return ER_FAILED;
+	    }
+	  if (hi_bf->append_page (thread_p, (PAGE_PTR) hi_stage) != NO_ERROR)
+	    {
+	      delete lo_bf;
+	      delete hi_bf;
+	      delete raw;
+	      return ER_FAILED;
+	    }
+	}
+      if ((lo_bf != NULL && lo_bf->flush (thread_p) != NO_ERROR)
+	  || (hi_bf != NULL && hi_bf->flush (thread_p) != NO_ERROR))
+	{
+	  delete lo_bf;
+	  delete hi_bf;
+	  delete raw;
+	  return ER_FAILED;
+	}
+      delete raw;
+      if (lo_bf != NULL)
+	{
+	  rc = hls_spill_finalize_file (thread_p, spill, batch, lo_bf, lo_cnt, lo, mid, depth + 1);
+	  if (rc != NO_ERROR)
+	    {
+	      delete hi_bf;
+	      return rc;
+	    }
+	}
+      if (hi_bf != NULL)
+	{
+	  return hls_spill_finalize_file (thread_p, spill, batch, hi_bf, hi_cnt, mid + 1, hi, depth + 1);
+	}
+      return NO_ERROR;
+    }
+
+overshoot:
+  if (!hard)
+    {
+      /* bisection unavailable (depth cap / degenerate range): overshoot,
+       * soft-accounted -- mirrors PG's growEnabled=false. */
+      temp_page_store::record_degrade ();
+      temp_page_store::reserve_held_soft (load_bytes, &shard);
+    }
+
+  {
+    /* pages carry HLS_SPILL_EPP entries + tail slack, so compact per page
+     * into a contiguous entry array for the sort */
+    HLS_SPILL_ENTRY *ents = (HLS_SPILL_ENTRY *) malloc ((size_t) entry_cnt * sizeof (HLS_SPILL_ENTRY));
+    char *rd = hls_spill_probe_page (spill);
+    INT64 got = 0;
+
+    if (ents == NULL)
+      {
+	temp_page_store::release_held (load_bytes, shard);
+	delete raw;
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		(size_t) entry_cnt * sizeof (HLS_SPILL_ENTRY));
+	return ER_FAILED;
+      }
+    for (INT64 p = 0; p < pages; p++)
+      {
+	if (raw->read_page (thread_p, (int) p, (PAGE_PTR) rd, &spill->scratch) != NO_ERROR)
+	  {
+	    free (ents);
+	    temp_page_store::release_held (load_bytes, shard);
+	    delete raw;
+	    return ER_FAILED;
+	  }
+	INT64 n = std::min (HLS_SPILL_EPP, entry_cnt - got);
+	memcpy (ents + got, rd, (size_t) n * sizeof (HLS_SPILL_ENTRY));
+	got += n;
+      }
+    assert (got == entry_cnt);
+    delete raw;			/* consumed */
+
+    std::sort (ents, ents + entry_cnt,
+	       [] (const HLS_SPILL_ENTRY & a, const HLS_SPILL_ENTRY & b) { return a.hash < b.hash; });
+
+    rc = hls_spill_write_run (thread_p, spill, batch, ents, entry_cnt);
+    free (ents);
+    temp_page_store::release_held (load_bytes, shard);
+    return rc;
+  }
+}
+
+/*
+ * hls_spill_finalize () - end of build: flush staging, convert every raw
+ *   batch file into sorted run(s) + fence indexes.
+ */
+int
+hls_spill_finalize (THREAD_ENTRY * thread_p, HLS_SPILL * spill)
+{
+  assert (!spill->finalized);
+  /* Flush ALL staging pages first: finalize_file's bisection reuses staging
+   * slots 0/1 as split buffers, which must not still hold live staged entries
+   * of later batches. */
+  for (int b = 0; b < spill->nbatch; b++)
+    {
+      if (hls_spill_flush_stage (thread_p, spill, b) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
+  for (int b = 0; b < spill->nbatch; b++)
+    {
+      hls_spill_batch & batch = spill->batches[b];
+      qfile::buffile *raw = batch.raw;
+      batch.raw = NULL;
+      if (raw == NULL)
+	{
+	  assert (batch.entry_cnt == 0);
+	  continue;
+	}
+      if (raw->flush (thread_p) != NO_ERROR)
+	{
+	  delete raw;
+	  return ER_FAILED;
+	}
+      if (hls_spill_finalize_file (thread_p, spill, batch, raw, batch.entry_cnt, 0, 0xFFFFFFFFU, 0) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
+  spill->finalized = true;
+  return NO_ERROR;
+}
+
+/* Position the probe cursor on the first entry with hash == probe within the
+ * run, starting the page scan at fence lower bound.  Returns EH_KEY_FOUND /
+ * EH_KEY_NOTFOUND / EH_ERROR_OCCURRED and fills pos_out on found. */
+static EH_SEARCH
+hls_spill_probe_run (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_run & run, UINT32 hash,
+		     QFILE_TUPLE_SIMPLE_POS * pos_out)
+{
+  /* first page that can contain `hash`: the last fence <= hash */
+  std::vector<UINT32>::const_iterator it = std::upper_bound (run.fences.begin (), run.fences.end (), hash);
+  if (it == run.fences.begin ())
+    {
+      return EH_KEY_NOTFOUND;	/* hash below the run's first entry */
+    }
+  INT64 page = (INT64) (it - run.fences.begin ()) - 1;
+  /* duplicates spanning a page boundary: a page starting exactly with `hash`
+   * may be preceded by pages ending with it */
+  while (page > 0 && run.fences[(size_t) page] == hash)
+    {
+      page--;
+    }
+
+  char *pg = hls_spill_probe_page (spill);
+  for (; page < (INT64) run.fences.size (); page++)
+    {
+      if (run.fences[(size_t) page] > hash)
+	{
+	  return EH_KEY_NOTFOUND;
+	}
+      if (spill->probe_page_bf != run.bf || spill->probe_page_off != (int) page)
+	{
+	  if (run.bf->read_page (thread_p, (int) page, (PAGE_PTR) pg, &spill->scratch) != NO_ERROR)
+	    {
+	      return EH_ERROR_OCCURRED;
+	    }
+	  spill->probe_page_bf = run.bf;
+	  spill->probe_page_off = (int) page;
+	  spill->probe_page_reads++;
+	}
+      const HLS_SPILL_ENTRY *ents = (const HLS_SPILL_ENTRY *) pg;
+      INT64 first = page * HLS_SPILL_EPP;
+      INT64 n = std::min ((INT64) HLS_SPILL_EPP, run.entry_cnt - first);
+      const HLS_SPILL_ENTRY *lb = std::lower_bound (ents, ents + n, hash,
+						    [] (const HLS_SPILL_ENTRY & e, UINT32 h) { return e.hash < h; });
+      if (lb < ents + n)
+	{
+	  if (lb->hash != hash)
+	    {
+	      return EH_KEY_NOTFOUND;
+	    }
+	  spill->probe_idx = first + (lb - ents);
+	  spill->probe_hash = hash;
+	  *pos_out = lb->pos;
+	  return EH_KEY_FOUND;
+	}
+      /* all entries on this page < hash; try next page */
+    }
+  return EH_KEY_NOTFOUND;
+}
+
+/*
+ * hls_spill_search () - probe: first entry with the given hash key.
+ */
+EH_SEARCH
+hls_spill_search (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
+		  QFILE_TUPLE_SIMPLE_POS * pos_out)
+{
+  assert (spill->finalized);
+  UINT32 hash = (UINT32) hash_key;
+  int batchno = (int) (hash & (unsigned int) (spill->nbatch - 1));
+  hls_spill_batch & batch = spill->batches[batchno];
+
+  spill->probe_batch = -1;
+  spill->probe_idx = -1;
+
+  for (size_t r = 0; r < batch.runs.size (); r++)
+    {
+      hls_spill_run & run = batch.runs[r];
+      if (run.entry_cnt == 0 || run.first_hash > hash)
+	{
+	  continue;
+	}
+      EH_SEARCH es = hls_spill_probe_run (thread_p, spill, run, hash, pos_out);
+      if (es == EH_KEY_FOUND)
+	{
+	  spill->probe_batch = batchno;
+	  spill->probe_run = r;
+	  return EH_KEY_FOUND;
+	}
+      if (es == EH_ERROR_OCCURRED)
+	{
+	  return es;
+	}
+      /* runs have disjoint hash ranges; a miss in the covering run is final,
+       * but ranges are only bounded below (first_hash), so keep scanning
+       * remaining runs whose range could still cover `hash`. */
+    }
+  return EH_KEY_NOTFOUND;
+}
+
+/*
+ * hls_spill_search_next () - next duplicate of the last found hash key
+ *   (duplicates are adjacent within a sorted run).
+ */
+EH_SEARCH
+hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spill, QFILE_TUPLE_SIMPLE_POS * pos_out)
+{
+  if (spill->probe_batch < 0 || spill->probe_idx < 0)
+    {
+      return EH_KEY_NOTFOUND;
+    }
+  hls_spill_run & run = spill->batches[spill->probe_batch].runs[spill->probe_run];
+  INT64 idx = spill->probe_idx + 1;
+  if (idx >= run.entry_cnt)
+    {
+      return EH_KEY_NOTFOUND;
+    }
+  INT64 page = idx / HLS_SPILL_EPP;
+  char *pg = hls_spill_probe_page (spill);
+  if (spill->probe_page_bf != run.bf || spill->probe_page_off != (int) page)
+    {
+      if (run.bf->read_page (thread_p, (int) page, (PAGE_PTR) pg, &spill->scratch) != NO_ERROR)
+	{
+	  return EH_ERROR_OCCURRED;
+	}
+      spill->probe_page_bf = run.bf;
+      spill->probe_page_off = (int) page;
+      spill->probe_page_reads++;
+    }
+  const HLS_SPILL_ENTRY & e = ((const HLS_SPILL_ENTRY *) pg)[idx - page * HLS_SPILL_EPP];
+  if (e.hash != spill->probe_hash)
+    {
+      return EH_KEY_NOTFOUND;
+    }
+  spill->probe_idx = idx;
+  *pos_out = e.pos;
+  return EH_KEY_FOUND;
+}
+
+long
+hls_spill_probe_page_reads (const HLS_SPILL * spill)
+{
+  return spill->probe_page_reads;
+}
+
+/*
+ * hls_spill_destroy () - drop all spill files and release accountant charges.
+ */
+void
+hls_spill_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill)
+{
+  (void) thread_p;
+  if (spill == NULL)
+    {
+      return;
+    }
+  for (hls_spill_batch & batch : spill->batches)
+    {
+      delete batch.raw;		/* build aborted before finalize */
+      for (hls_spill_run & run : batch.runs)
+	{
+	  delete run.bf;
+	}
+    }
+  free (spill->stage);
+  if (spill->charged_bytes > 0)
+    {
+      temp_page_store::release_held (spill->charged_bytes, spill->charged_shard);
+    }
+  delete spill;
+}
+
+/*
+ * qdata_hscan_wm_reserve () / qdata_hscan_wm_release () - work_mem accountant
+ *   charge covering the IN_MEM/HYBRID build estimate (#123/#91).  The charge
+ *   is the same quantity check_hash_list_scan compares against work_mem, so
+ *   the comparison and the accounting can never disagree.
+ */
+bool
+qdata_hscan_wm_reserve (HASH_LIST_SCAN * hlsid, size_t bytes)
+{
+  int shard = -1;
+  assert (hlsid->wm_bytes == 0);
+  if (!temp_page_store::reserve_held (bytes, &shard))
+    {
+      temp_page_store::record_degrade ();	/* caller falls to the next tier */
+      return false;
+    }
+  hlsid->wm_bytes = bytes;
+  hlsid->wm_shard = shard;
+  return true;
+}
+
+void
+qdata_hscan_wm_release (HASH_LIST_SCAN * hlsid)
+{
+  if (hlsid->wm_bytes > 0)
+    {
+      temp_page_store::release_held (hlsid->wm_bytes, hlsid->wm_shard);
+      hlsid->wm_bytes = 0;
+      hlsid->wm_shard = -1;
+    }
 }
