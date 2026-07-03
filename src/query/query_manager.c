@@ -160,6 +160,7 @@ static struct drand48_data qmgr_rand_buf;
 
 static QMGR_PAGE_TYPE qmgr_get_page_type (PAGE_PTR page_p, QMGR_TEMP_FILE * temp_file_p);
 static bool qmgr_is_allowed_result_cache (QUERY_FLAG flag);
+static int qmgr_copy_new_result_to_query_area (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
 static bool qmgr_can_get_from_cache (QUERY_FLAG flag);
 static bool qmgr_can_get_result_from_cache (QUERY_FLAG flag);
 static void qmgr_put_page_header (PAGE_PTR page_p, QFILE_PAGE_HEADER * header_p);
@@ -1494,6 +1495,7 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
   XASL_UNPACK_INFO *xasl_buf_info;
   QFILE_LIST_ID *list_id;
   bool tapeset_direct_fetch = false;	/* #120a: serve NEW result from Tapeset (no materialize) */
+  bool tapeset_cache_copyout = false;	/* #121: persist NEW result to query area straight from Tapeset */
 
   assert (query_p != NULL);
   assert (tran_entry_p != NULL);
@@ -1559,19 +1561,38 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   assert (query_p->list_id != NULL);
-  /* Class-B sink (client fetch).  #120a/#120b: a NEW (Tapeset)-backed result is
-   * served to the client straight from its Tapeset (xqfile_get_list_file_page)
-   * with no #94 pgbuf materialize (full OLD copy).  Overflow (big-tuple) runs
-   * are translated on the fly to the legacy VPID overflow chain by the serve
-   * path (#120b).  Raw-fd overflow segments still materialize.  Results bound
-   * for the list cache (#121) or a holdable cursor (#111) also keep the
-   * materialize path (out of #120 scope; both need a real OLD list stored
-   * beyond this result).  For plain VPID-backed lists both paths are a no-op. */
+  /* Class-B sink.  A NEW (Tapeset)-backed, non-raw-fd, non-holdable result never
+   * touches the OLD-legacy raw-fd/sector machinery:
+   *  - non-cacheable: served to the client straight from its Tapeset
+   *    (xqfile_get_list_file_page); overflow (big-tuple) runs are translated on
+   *    the fly to the legacy VPID overflow chain by the serve path (#120b), so
+   *    no copy at all (#120a/#120b facade).
+   *  - cacheable, overflow-free: copied out straight from its Tapeset into a
+   *    permanent FILE_QUERY_AREA list (#121 cached-persist, redesign axis 1) --
+   *    the copy is by design, but its source is the Tapeset
+   *    (qmgr_copy_new_result_to_query_area), not the #94 qmgr_materialize_to_pgbuf
+   *    OLD copy.  (The list-cache publish reads tuples, not the serve path's
+   *    on-the-fly VPID overflow translation, so a still-overflowing cacheable
+   *    result keeps the materialize fallback below for now.)
+   * Everything else -- raw-fd overflow segments, a cacheable overflow result,
+   * and holdable cursors (#111) -- keeps the #94 materialize fallback, retained
+   * until Phase3 (#120/#74).  For plain VPID-backed lists every path is a no-op. */
   tapeset_direct_fetch = (qfile_list_has_new_backing (query_p->list_id)
 			  && !qmgr_list_has_raw_fd_segments (query_p->list_id)
 			  && !query_p->is_holdable
 			  && !qmgr_is_allowed_result_cache (flag));
-  if (!tapeset_direct_fetch)
+  tapeset_cache_copyout = (qfile_list_has_new_backing (query_p->list_id)
+			   && !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (query_p->list_id)
+			   && !qmgr_list_has_raw_fd_segments (query_p->list_id) && !query_p->is_holdable
+			   && qmgr_is_allowed_result_cache (flag));
+  if (tapeset_cache_copyout)
+    {
+      if (qmgr_copy_new_result_to_query_area (thread_p, query_p->list_id) != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+    }
+  else if (!tapeset_direct_fetch)
     {
       if (qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
 	{
@@ -3876,6 +3897,94 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
       return ER_FAILED;
     }
   QFILE_FREE_AND_INIT_LIST_ID (materialized_p);
+
+  return NO_ERROR;
+}
+
+/*
+ * qmgr_copy_new_result_to_query_area () - #121: cache copy-out sourced from the Tapeset.
+ *   return: NO_ERROR or ER_FAILED
+ *   list_id_p(in/out): a NEW (Tapeset)-backed result to be cached; replaced in
+ *                      place with an equivalent permanent FILE_QUERY_AREA list.
+ *
+ * The result cache (cached-persist, redesign axis 1) must own a permanent
+ * FILE_QUERY_AREA list that outlives the producing transaction, so a NEW result
+ * bound for the list cache is copied out into a query-area list -- that copy is
+ * by design and stays.  What changes here (vs qmgr_materialize_to_pgbuf, the #94
+ * OLD-legacy path built around raw-fd segment enumeration, a Phase3 deletion
+ * target) is the SOURCE: the copy is read straight from the Tapeset through the
+ * unified list scan (qfile_open_list_scan -> qfile_tapeset_scan_*, the #120
+ * direct-read idiom), with no raw-fd/sector dependency.  The caller guarantees a
+ * NEW-backed, overflow-free, non-raw-fd, non-holdable, to-be-cached list; a NEW
+ * list is a single Tapeset, so there is no dependent segment chain to walk.
+ */
+static int
+qmgr_copy_new_result_to_query_area (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
+{
+  assert (list_id_p != NULL);
+  assert (qfile_list_has_new_backing (list_id_p));
+  assert (!qmgr_list_has_raw_fd_segments (list_id_p));
+
+  /* QFILE_FLAG_RESULT_FILE -> a permanent FILE_QUERY_AREA list (the cache is
+   * enabled on this path, so qfile_open_list honors the flag). */
+  QFILE_LIST_ID *query_area_p = qfile_open_list (thread_p, &list_id_p->type_list, list_id_p->sort_list,
+						 list_id_p->query_id, QFILE_FLAG_RESULT_FILE, NULL);
+  if (query_area_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  QFILE_LIST_SCAN_ID scan_id;
+  if (qfile_open_list_scan (list_id_p, &scan_id) != NO_ERROR)
+    {
+      qfile_destroy_list (thread_p, query_area_p);
+      QFILE_FREE_AND_INIT_LIST_ID (query_area_p);
+      return ER_FAILED;
+    }
+
+  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  int error = NO_ERROR;
+  SCAN_CODE scan_code;
+  while ((scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK)) == S_SUCCESS)
+    {
+      if (qfile_add_tuple_to_list (thread_p, query_area_p, tuple_record.tpl) != NO_ERROR)
+	{
+	  error = ER_FAILED;
+	  break;
+	}
+    }
+  qfile_close_scan (thread_p, &scan_id);
+  if (scan_code != S_END && error == NO_ERROR)
+    {
+      error = ER_FAILED;
+    }
+  /* PEEK never allocates tuple_record.tpl (size stays 0); guard mirrors
+   * qmgr_materialize_to_pgbuf so a copy-mode buffer, if any, is still freed. */
+  if (tuple_record.tpl != NULL && tuple_record.size > 0)
+    {
+      db_private_free_and_init (thread_p, tuple_record.tpl);
+    }
+
+  if (error != NO_ERROR)
+    {
+      qfile_destroy_list (thread_p, query_area_p);
+      QFILE_FREE_AND_INIT_LIST_ID (query_area_p);
+      return error;
+    }
+
+  er_log_debug (ARG_FILE_LINE,
+		"cache copy-out: NEW/Tapeset source -> FILE_QUERY_AREA (Tapeset-native, %lld tuples) [#121]\n",
+		(long long) query_area_p->tuple_cnt);
+
+  qfile_close_list (thread_p, query_area_p);
+  qfile_destroy_list (thread_p, list_id_p);
+  if (qfile_copy_list_id (list_id_p, query_area_p, true, QFILE_MOVE_DEPENDENT) != NO_ERROR)
+    {
+      qfile_destroy_list (thread_p, query_area_p);
+      QFILE_FREE_AND_INIT_LIST_ID (query_area_p);
+      return ER_FAILED;
+    }
+  QFILE_FREE_AND_INIT_LIST_ID (query_area_p);
 
   return NO_ERROR;
 }
