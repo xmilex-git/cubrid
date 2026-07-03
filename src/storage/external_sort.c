@@ -5299,6 +5299,26 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 	  return 1;
 	}
       QFILE_LIST_ID *input_list = px->input_list;
+      /* A NEW (Tapeset)-backed input cannot be read by the parallel sector scan
+       * that sort_start_parallelism opens for GROUP_BY/ANALYTIC workers:
+       * qfile_open_list_sector_scan is an OLD-only mechanism whose backing guard
+       * rejects a NEW list with ER_QPROC_INVALID_XASLNODE.  Unlike the ORDER_BY
+       * branch, this path has no chunk_distributor reader yet, so force serial
+       * execution -- the serial sort reads the NEW input through the normal
+       * tuple-level list scan (tapeset reader) and drives qexec_analytic_put_next
+       * via the #103 A_sort_key path (verified correct: serial == gate-OFF golden).
+       * Reachable once the SCAN/SORT gates default ON (ceb8997e8): a parallel base
+       * scan hands the analytic a NEW "mergeable list" input.  Mirrors the #99
+       * raw-fd input guard above; the chunk_distributor parity is a later perf
+       * slice.  (#78 C-7/C-8; corrects the #97 external_sort.c:5636 "unreachable"
+       * verdict.) */
+      if (input_list != NULL && qfile_list_has_new_backing (input_list))
+	{
+	  er_log_debug (ARG_FILE_LINE,
+			"sort: NEW-backed %s input -> serial (#118 input guard)\n",
+			(sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
+	  return 1;
+	}
       parallel_num =
 	parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, input_list->page_cnt,
 						 px->parallelism /* hint */ );
