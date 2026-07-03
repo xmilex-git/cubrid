@@ -40,8 +40,7 @@ namespace parallel_scan
 
     public:
       input_handler_list (interrupt *interrupt_p, err_messages_with_lock *err_messages_p)
-	: m_sector_scan (),
-	  m_new_dist (nullptr),
+	: m_new_dist (nullptr),
 	  m_new_tapeset (nullptr),
 	  m_new_parallelism (0),
 	  m_next_new_reader_id (0),
@@ -54,8 +53,8 @@ namespace parallel_scan
       int init_on_main (THREAD_ENTRY *thread_p, QFILE_LIST_ID *list_id, int parallelism);
 
       /*
-       * OLD backing: single READ-latch page fix, ownership transfers to caller on S_SUCCESS.
-       * NEW backing: arms this worker's thread-local tapeset_reader and returns a null page sentinel once.
+       * NEW backing: arms this worker's thread-local tapeset_reader and returns a null
+       * page sentinel once (#130: OLD backing never reaches a parallel list scan).
        */
       SCAN_CODE get_next_page_with_fix (THREAD_ENTRY *thread_p,
 					PAGE_PTR &out_page,
@@ -83,7 +82,6 @@ namespace parallel_scan
       }
 
     private:
-      QFILE_LIST_SECTOR_SCAN_INFO m_sector_scan;
       qfile::chunk_distributor *m_new_dist;
       qfile::tapeset *m_new_tapeset;
       int m_new_parallelism;
@@ -94,11 +92,6 @@ namespace parallel_scan
       interrupt *m_interrupt_p;
       err_messages_with_lock *m_err_messages_p;
 
-      thread_local static UINT64 m_tl_bitmap;
-      thread_local static VSID m_tl_vsid;
-      thread_local static QMGR_TEMP_FILE *m_tl_current_tfile;
-      thread_local static bool m_tl_is_membuf_worker;
-      thread_local static int m_tl_membuf_pageid;
       thread_local static int m_tl_new_reader_id;
       thread_local static qfile::tapeset_reader *m_tl_new_reader;
       thread_local static bool m_tl_new_reader_exhausted;

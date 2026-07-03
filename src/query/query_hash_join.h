@@ -303,14 +303,13 @@ typedef struct hashjoin_split_info
 typedef struct hashjoin_shared_split_info
 {
   // *INDENT-OFF*
-  QFILE_LIST_SECTOR_SCAN_INFO sector_scan;
-
   std::mutex *part_mutexes;
 
   /* redesign #78 2A-3: NEW (Tapeset) split input read via chunk_distributor +
    * per-worker tapeset_reader, mirroring the probe path (HASHJOIN_SHARED_PROBE_INFO).
-   * new_dist != NULL selects the NEW read path; sector_scan stays unused then.
-   * Created/destroyed per split-run (outer, then inner) in build_partitions. */
+   * Created/destroyed per split-run (outer, then inner) in build_partitions.
+   * #130: the OLD sector-scan read path is deleted; hjoin_try_parallel forces
+   * serial partitioning for OLD-backed input, so new_dist is always built here. */
   qfile::tapeset *new_tapeset;
   qfile::chunk_distributor *new_dist;
 
@@ -323,8 +322,7 @@ typedef struct hashjoin_shared_split_info
   UINT32 worker_count;
 
   hashjoin_shared_split_info ()
-    : sector_scan ()
-    , part_mutexes (nullptr)
+    : part_mutexes (nullptr)
     , new_tapeset (nullptr)
     , new_dist (nullptr)
     , worker_part_lists (nullptr)
@@ -339,21 +337,19 @@ typedef struct hashjoin_shared_split_info
 typedef struct hashjoin_shared_probe_info
 {
   // *INDENT-OFF*
-  QFILE_LIST_SECTOR_SCAN_INFO sector_scan;
-
   std::mutex stats_mutex;
   HASHJOIN_RANGE_STATS probe_range;
 
   /* redesign #78 2A-3: NEW (Tapeset) probe input read via chunk_distributor +
-   * per-worker tapeset_reader (ADR 0003/0005/0006).  new_dist != NULL selects
-   * the NEW read path (built on the coordinating thread, freed at cleanup);
-   * sector_scan stays unused then.  Only meaningful under CUBRID_WM_HASHJOIN_NEW. */
+   * per-worker tapeset_reader (ADR 0003/0005/0006), built on the coordinating
+   * thread and freed at cleanup.  Only meaningful under CUBRID_WM_HASHJOIN_NEW.
+   * #130: the OLD sector-scan read path is deleted; hjoin_try_parallel_probe
+   * forces serial for OLD-backed input, so new_dist is always built here. */
   qfile::tapeset *new_tapeset;
   qfile::chunk_distributor *new_dist;
 
   hashjoin_shared_probe_info ()
-    : sector_scan ()
-    , stats_mutex ()
+    : stats_mutex ()
     , probe_range HASHJOIN_RANGE_STATS_INITIALIZER
     , new_tapeset (nullptr)
     , new_dist (nullptr)

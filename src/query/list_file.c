@@ -4564,126 +4564,6 @@ qfile_generate_sort_tuple (SORTKEY_INFO * key_info_p, SORT_REC * sort_record_p, 
 
 #if defined (SERVER_MODE)
 /*
- * sector_page_iterator
- */
-
-// *INDENT-OFF*
-sector_page_iterator::sector_page_iterator ()
-{
-  m_membuf_index = -1;
-  m_sector_index = -1;
-  m_current_bitmap = 0;
-  VSID_SET_NULL (&m_current_vsid);
-  VPID_SET_NULL (&m_last_vpid);
-  m_current_tfile = NULL;
-}
-
-PAGE_PTR
-sector_page_iterator::get_next_page (THREAD_ENTRY * thread_p, QFILE_LIST_SECTOR_SCAN_INFO & sector_scan)
-{
-  QFILE_LIST_SECTOR_INFO *sinfo = &sector_scan.sector_info;
-  FILE_PARTIAL_SECTOR *sectors = sinfo->sectors;
-  void **tfiles = sinfo->tfiles;
-  int sector_index;
-
-  /* Phase 1: membuf pages — the CAS winner claims the entire membuf region */
-  while (true)
-    {
-      if (m_membuf_index >= 0)
-	{
-	  if (m_membuf_index <= sinfo->membuf_tfile->membuf_last)
-	    {
-	      VPID vpid;
-	      vpid.volid = NULL_VOLID;
-	      vpid.pageid = m_membuf_index++;
-
-	      PAGE_PTR page = qmgr_get_old_page (thread_p, &vpid, sinfo->membuf_tfile);
-	      if (page == NULL)
-		{
-		  assert_release_error (er_errid () != NO_ERROR);
-		  return NULL;
-		}
-
-	      if (QFILE_GET_TUPLE_COUNT (page) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG
-		  || QFILE_GET_TUPLE_COUNT (page) == 0)
-		{
-		  qmgr_free_old_page_and_init (thread_p, page, sinfo->membuf_tfile);
-		  continue;
-		}
-
-	      m_current_tfile = sinfo->membuf_tfile;
-	      m_last_vpid = vpid;
-	      return page;
-	    }
-
-	  /* membuf exhausted — fall through to Phase 2 */
-	  m_membuf_index = -1;
-	  break;
-	}
-
-      if (m_sector_index == -1 && sinfo->membuf_tfile != NULL)
-	{
-	  bool expected = false;
-	  if (sector_scan.membuf_claimed.compare_exchange_strong (expected, true, std::memory_order_acq_rel))
-	    {
-	      assert (m_membuf_index == -1);
-	      m_membuf_index = 0;
-	      continue;		/* re-enter Phase 1 as the owner */
-	    }
-	}
-
-      /* not the owner — proceed to Phase 2 */
-      break;
-    }
-
-  /* Phase 2: sector-based disk pages */
-  while (true)
-    {
-      while (true)
-	{
-	  VPID vpid;
-	  if (!qfile_sector_bitmap_next_vpid (&m_current_vsid, &m_current_bitmap, &vpid))
-	    {
-	      break;		/* current sector exhausted — fall through to next-sector fetch */
-	    }
-
-	  QMGR_TEMP_FILE *tfile = (QMGR_TEMP_FILE *) tfiles[m_sector_index];
-	  assert (tfile != NULL);
-
-	  PAGE_PTR page = qmgr_get_old_page (thread_p, &vpid, tfile);
-	  if (page == NULL)
-	    {
-	      assert_release_error (er_errid () != NO_ERROR);
-	      return NULL;
-	    }
-
-	  if (QFILE_GET_TUPLE_COUNT (page) == QFILE_OVERFLOW_TUPLE_COUNT_FLAG
-	      || QFILE_GET_TUPLE_COUNT (page) == 0)
-	    {
-	      qmgr_free_old_page_and_init (thread_p, page, tfile);
-	      continue;
-	    }
-
-	  m_current_tfile = tfile;
-	  m_last_vpid = vpid;
-	  return page;
-	}
-
-      /* current sector exhausted — grab next sector atomically */
-      sector_index = sector_scan.next_sector_index.fetch_add (1, std::memory_order_relaxed);
-      if (sector_index >= sinfo->sector_cnt)
-	{
-	  return NULL;		/* all sectors distributed */
-	}
-
-      m_sector_index = sector_index;
-      m_current_vsid = sectors[sector_index].vsid;
-      m_current_bitmap = sectors[sector_index].page_bitmap;
-    }
-}
-// *INDENT-ON*
-
-/*
  * qfile_sort_px_state_free () - free a sort_px_list_state allocated with db_private_alloc
  */
 void
@@ -4705,9 +4585,9 @@ qfile_sort_px_state_free (THREAD_ENTRY * thread_p, sort_px_list_state * state)
 
 /*
  * qfile_sort_build_key_from_tuple () - build a sort key from an already-fetched tuple.
- *   The OLD sector path supplies original_vpid/original_offset when partial sort keys
- *   must retain the input tuple address; the NEW Tapeset path is used only for full-key
- *   DISTINCT-style input and rejects partial-key original-address records.
+ *   Used by the NEW (Tapeset) parallel readers, which carry full-key A_sort_key
+ *   records only; partial-key original-address records are rejected
+ *   (original_vpid stays NULL — the OLD sector path that supplied it is deleted, #130).
  */
 static SORT_STATUS
 qfile_sort_build_key_from_tuple (SORTKEY_INFO * key_info_p, RECDES * recdes_p, QFILE_TUPLE tpl,
@@ -4796,10 +4676,11 @@ qfile_sort_build_key_from_tuple (SORTKEY_INFO * key_info_p, RECDES * recdes_p, Q
 }
 
 /*
- * qfile_sort_get_next_parallel () - parallel ORDER_BY sort key builder.
- *   Structured like btree_sort_get_next_parallel but iterates list file pages
- *   via sector bitmap (from qfile_collect_list_sector_info) instead of heap scan.
- *   Replaces qfile_get_next_sort_item for parallel ORDER_BY workers.
+ * qfile_sort_get_next_parallel () - parallel sort key builder (ORDER_BY /
+ *   ORDER_WITH_LIMIT / GROUP_BY / ANALYTIC workers).  Reads this worker's share
+ *   of the NEW (Tapeset)-backed input via its tapeset_reader and builds the sort
+ *   key with qfile_sort_build_key_from_tuple.  An OLD-backed input never reaches
+ *   here: sort_check_parallelism demotes it to a serial sort (#130).
  *
  *   recdes (in/out): sort key record descriptor
  *   arg   (in):      SORT_INFO pointer; px_state holds sort_px_list_state
@@ -4809,182 +4690,30 @@ qfile_sort_get_next_parallel (THREAD_ENTRY * thread_p, RECDES * recdes_p, void *
 {
   SORT_INFO *sort_info_p = (SORT_INFO *) arg;
   sort_px_list_state *state = (sort_px_list_state *) sort_info_p->px_state;
-  QFILE_LIST_ID *input_file = sort_info_p->input_file;
   SORTKEY_INFO *key_info_p = &sort_info_p->key_info;
-  if (state->tapeset_reader != NULL)
+
+  assert (state->tapeset_reader != NULL);
+  qfile::tapeset_reader *reader = (qfile::tapeset_reader *) state->tapeset_reader;
+
+  if (!state->has_tapeset_tuple)
     {
-      qfile::tapeset_reader *reader = (qfile::tapeset_reader *) state->tapeset_reader;
-
-      if (!state->has_tapeset_tuple)
+      /* COPY (peek=0): own state->tplrec.tpl via db_private so the worker-thread
+       * cleanup db_private_free is valid; PEEK would store a borrowed page pointer
+       * (reader's m_page) and freeing it corrupts the heap (#78 2A-2). */
+      SCAN_CODE scan_status = reader->next (thread_p, &state->tplrec, 0);
+      if (scan_status != S_SUCCESS)
 	{
-	  /* COPY (peek=0): own state->tplrec.tpl via db_private so the worker-thread
-	   * cleanup db_private_free is valid; PEEK would store a borrowed page pointer
-	   * (reader's m_page) and freeing it corrupts the heap (#78 2A-2). */
-	  SCAN_CODE scan_status = reader->next (thread_p, &state->tplrec, 0);
-	  if (scan_status != S_SUCCESS)
-	    {
-	      return ((scan_status == S_END) ? SORT_NOMORE_RECS : SORT_ERROR_OCCURRED);
-	    }
-	  state->has_tapeset_tuple = true;
+	  return ((scan_status == S_END) ? SORT_NOMORE_RECS : SORT_ERROR_OCCURRED);
 	}
-
-      SORT_STATUS status = qfile_sort_build_key_from_tuple (key_info_p, recdes_p, state->tplrec.tpl, NULL, 0);
-      if (status == SORT_SUCCESS)
-	{
-	  state->has_tapeset_tuple = false;
-	}
-      return status;
+      state->has_tapeset_tuple = true;
     }
-  while (true)
+
+  SORT_STATUS status = qfile_sort_build_key_from_tuple (key_info_p, recdes_p, state->tplrec.tpl, NULL, 0);
+  if (status == SORT_SUCCESS)
     {
-      /* ---------------------------------------------------------------
-       * If we already have an active page, process the next tuple on it.
-       * curr_page is set when we land on a page and cleared only after
-       * all tuples on that page are consumed — so SORT_REC_DOESNT_FIT
-       * always re-enters here and retries the same tuple.
-       * --------------------------------------------------------------- */
-      if (state->curr_page != NULL)
-	{
-	  int tpl_cnt = QFILE_GET_TUPLE_COUNT (state->curr_page);
-
-	  if (state->curr_tplno >= tpl_cnt)
-	    {
-	      /* page exhausted — release it and get the next one */
-	      qmgr_free_old_page_and_init (thread_p, state->curr_page, state->curr_tfile);
-	      state->curr_page = NULL;
-	      state->curr_tfile = NULL;
-	      state->curr_tplno = 0;
-	      state->curr_offset = 0;
-	      continue;
-	    }
-
-	  /* ---- build sort key for tuple at curr_offset ---- */
-	  QFILE_TUPLE tuple_p = (QFILE_TUPLE) ((char *) state->curr_page + state->curr_offset);
-	  int tuple_length = QFILE_GET_TUPLE_LENGTH (tuple_p);
-
-	  /* assemble overflow tuple when the page has an overflow chain */
-	  QFILE_TUPLE tpl;
-	  if (QFILE_GET_OVERFLOW_PAGE_ID (state->curr_page) != NULL_PAGEID)
-	    {
-	      /* qfile_get_tuple uses QFILE_LIST_ID_TFILE_VFID(input_file); redirect it to this page's tfile.
-	       * input_file is per-worker cloned, so this modification is thread-safe. */
-	      QFILE_LIST_ID_TFILE_VFID(input_file) = state->curr_tfile;
-	      if (qfile_get_tuple (thread_p, state->curr_page, tuple_p, &state->tplrec, input_file) != NO_ERROR)
-		{
-		  qmgr_free_old_page_and_init (thread_p, state->curr_page, state->curr_tfile);
-		  state->curr_page = NULL;
-		  state->curr_tfile = NULL;
-		  return SORT_ERROR_OCCURRED;
-		}
-	      tpl = state->tplrec.tpl;
-	    }
-	  else
-	    {
-	      tpl = tuple_p;
-	    }
-
-	  /* mirrors qfile_make_sort_key() */
-	  int nkeys = key_info_p->nkeys;
-	  SORT_REC *sort_record_p = (SORT_REC *) recdes_p->data;
-	  sort_record_p->next = NULL;
-	  char *data;
-	  int length;
-
-	  if (key_info_p->use_original)
-	    {
-	      data = &(sort_record_p->s.original.body[0]);
-	      data = PTR_ALIGN (data, MAX_ALIGNMENT);
-	      length = CAST_BUFLEN (data - recdes_p->data);
-
-	      if (length <= recdes_p->area_size)
-		{
-		  sort_record_p->s.original.pageid = state->curr_vpid.pageid;
-		  sort_record_p->s.original.volid = state->curr_vpid.volid;
-		  sort_record_p->s.original.offset = state->curr_offset;
-		}
-
-	      for (int i = 0; i < nkeys; i++)
-		{
-		  char *field_data;
-		  int field_length;
-		  QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tpl, key_info_p->key[i].col, field_data);
-		  field_length =
-		    ((QFILE_GET_TUPLE_VALUE_FLAG (field_data) == V_BOUND)
-		     ? QFILE_GET_TUPLE_VALUE_LENGTH (field_data) : 0);
-		  length += QFILE_TUPLE_VALUE_HEADER_SIZE + field_length;
-		  if (length <= recdes_p->area_size)
-		    {
-		      memcpy (data, field_data, QFILE_TUPLE_VALUE_HEADER_SIZE + field_length);
-		    }
-		  data += QFILE_TUPLE_VALUE_HEADER_SIZE + field_length;
-		}
-	    }
-	  else
-	    {
-	      /* A_sort_key: all materialized columns, key and payload alike (#100) */
-	      nkeys = key_info_p->ncols;
-	      data = (char *) &sort_record_p->s.offset[nkeys];
-	      data = PTR_ALIGN (data, MAX_ALIGNMENT);
-	      length = CAST_BUFLEN (data - recdes_p->data);
-
-	      for (int i = 0; i < nkeys; i++)
-		{
-		  char *field_data;
-		  int field_length, offset;
-		  QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tpl, key_info_p->key[i].col, field_data);
-		  field_length =
-		    ((QFILE_GET_TUPLE_VALUE_FLAG (field_data) == V_BOUND)
-		     ? QFILE_GET_TUPLE_VALUE_LENGTH (field_data) : 0);
-		  if (field_length)
-		    {
-		      offset = CAST_BUFLEN (data - recdes_p->data + QFILE_TUPLE_VALUE_HEADER_SIZE);
-		      length = offset + field_length;
-		      if (length <= recdes_p->area_size)
-			{
-			  sort_record_p->s.offset[i] = offset;
-			  memcpy (data, field_data, QFILE_TUPLE_VALUE_HEADER_SIZE + field_length);
-			}
-		      data += QFILE_TUPLE_VALUE_HEADER_SIZE + field_length;
-		    }
-		  else
-		    {
-		      if (length <= recdes_p->area_size)
-			{
-			  sort_record_p->s.offset[i] = 0;
-			}
-		    }
-		}
-	    }
-
-	  recdes_p->length = CAST_BUFLEN (data - recdes_p->data);
-
-	  if (recdes_p->length <= recdes_p->area_size)
-	    {
-	      /* advance position — done only on success so SORT_REC_DOESNT_FIT retries */
-	      state->curr_tplno++;
-	      state->curr_offset += tuple_length;
-	      return SORT_SUCCESS;
-	    }
-	  else
-	    {
-	      return SORT_REC_DOESNT_FIT;
-	    }
-	}
-
-      /* Acquire the next page via shared sector scan (membuf CAS + atomic sector steal).
-       * Overflow and empty pages are skipped inside get_next_page. */
-      PAGE_PTR page_p = state->page_iter.get_next_page (thread_p, *state->sector_scan);
-      if (page_p == NULL)
-	{
-	  return (er_errid () != NO_ERROR) ? SORT_ERROR_OCCURRED : SORT_NOMORE_RECS;
-	}
-
-      state->curr_page = page_p;
-      state->curr_tfile = state->page_iter.get_current_tfile ();
-      state->curr_vpid = state->page_iter.get_current_vpid ();
-      state->curr_tplno = 0;
-      state->curr_offset = QFILE_PAGE_HEADER_SIZE;
+      state->has_tapeset_tuple = false;
     }
+  return status;
 }
 #endif /* SERVER_MODE */
 
@@ -9048,185 +8777,3 @@ qfile_has_no_cache_entries ()
   return (qfile_List_cache.n_entries == 0);
 }
 
-/*
- * qfile_collect_list_sector_info () - Collect data page sectors from list_id and all dependent list files.
- *   membuf exists only in the first list_id (not in dependent_list_id).
- *   Disk sectors are collected via file_get_all_data_sectors for each dependent list_id.
- *
- * return          : error code
- * thread_p (in)   : thread entry
- * list_id (in)    : list file identifier (may have dependent_list_id chain)
- * sector_info (out) : output sector info (caller must free with qfile_free_list_sector_info)
- */
-int
-qfile_collect_list_sector_info (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, QFILE_LIST_SECTOR_INFO * sector_info)
-{
-  QFILE_LIST_ID *current;
-  FILE_FTAB_COLLECTOR collector = FILE_FTAB_COLLECTOR_INITIALIZER;
-  int error = NO_ERROR;
-
-  assert (thread_p != NULL);
-  assert (list_id != NULL);
-  assert (QFILE_LIST_ID_TFILE_VFID(list_id) != NULL);
-  assert (sector_info != NULL);
-
-  /* reset sector_info */
-  qfile_free_list_sector_info (thread_p, sector_info);
-
-  /* membuf exists only in the first list_id */
-  if (QFILE_LIST_ID_TFILE_VFID(list_id)->membuf != NULL && QFILE_LIST_ID_TFILE_VFID(list_id)->membuf_last >= 0)
-    {
-      assert (QFILE_LIST_ID_TFILE_VFID(list_id)->membuf_npages > 0);
-      sector_info->membuf_tfile = QFILE_LIST_ID_TFILE_VFID(list_id);
-    }
-
-  for (current = list_id; current != NULL; current = QFILE_LIST_ID_DEPENDENT(current))
-    {
-      assert (QFILE_LIST_ID_TFILE_VFID(current) != NULL);
-
-      if (VFID_ISNULL (&QFILE_LIST_ID_TFILE_VFID(current)->temp_vfid))
-	{
-	  continue;
-	}
-
-      error = file_get_all_data_sectors (thread_p, &QFILE_LIST_ID_TFILE_VFID(current)->temp_vfid, &collector);
-      if (error != NO_ERROR)
-	{
-	  goto error_exit;
-	}
-
-      if (collector.nsects > 0)
-	{
-	  int old_cnt = sector_info->sector_cnt;
-	  int new_cnt = old_cnt + collector.nsects;
-
-	  FILE_PARTIAL_SECTOR *merged_sectors =
-	    (FILE_PARTIAL_SECTOR *) db_private_realloc (thread_p, sector_info->sectors,
-							new_cnt * sizeof (FILE_PARTIAL_SECTOR));
-	  if (merged_sectors == NULL)
-	    {
-	      goto error_exit;
-	    }
-	  sector_info->sectors = merged_sectors;
-
-	  void **merged_tfiles =
-	    (void **) db_private_realloc (thread_p, sector_info->tfiles, new_cnt * sizeof (void *));
-	  if (merged_tfiles == NULL)
-	    {
-	      goto error_exit;
-	    }
-	  sector_info->tfiles = merged_tfiles;
-
-	  memcpy (sector_info->sectors + old_cnt, collector.partsect_ftab,
-		  collector.nsects * sizeof (FILE_PARTIAL_SECTOR));
-
-	  for (int i = 0; i < collector.nsects; i++)
-	    {
-	      sector_info->tfiles[old_cnt + i] = (void *) QFILE_LIST_ID_TFILE_VFID(current);
-	    }
-
-	  sector_info->sector_cnt = new_cnt;
-	}
-
-      if (collector.partsect_ftab != NULL)
-	{
-	  db_private_free_and_init (thread_p, collector.partsect_ftab);
-	}
-    }
-
-  return NO_ERROR;
-
-error_exit:
-  if (collector.partsect_ftab != NULL)
-    {
-      db_private_free_and_init (thread_p, collector.partsect_ftab);
-    }
-
-  qfile_free_list_sector_info (thread_p, sector_info);
-
-  assert_release_error (er_errid () != NO_ERROR);
-  return er_errid ();
-}
-
-/*
- * qfile_free_list_sector_info () - Free sector info allocated by qfile_collect_list_sector_info.
- *
- * thread_p (in)     : thread entry
- * sector_info (in)  : sector info to free
- */
-void
-qfile_free_list_sector_info (THREAD_ENTRY * thread_p, QFILE_LIST_SECTOR_INFO * sector_info)
-{
-  assert (thread_p != NULL);
-  assert (sector_info != NULL);
-
-  if (sector_info->sectors != NULL)
-    {
-      db_private_free_and_init (thread_p, sector_info->sectors);
-    }
-
-  if (sector_info->tfiles != NULL)
-    {
-      db_private_free_and_init (thread_p, sector_info->tfiles);
-    }
-
-  sector_info->membuf_tfile = NULL;
-  sector_info->sector_cnt = 0;
-}
-
-/*
- * qfile_open_list_sector_scan () - Begin a sector-based parallel page scan: collect data
- *   page sectors from list_id and reset the per-pass atomic cursors.
- *
- *   return: error code
- *   thread_p (in)  : thread entry
- *   list_id (in)   : source list_id whose data pages drive this pass
- *   sector_scan (out): sector scan distribution state (caller must release
- *                    via qfile_close_list_sector_scan)
- */
-int
-qfile_open_list_sector_scan (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
-			     QFILE_LIST_SECTOR_SCAN_INFO * sector_scan)
-{
-  int error = NO_ERROR;
-
-  assert (thread_p != NULL);
-  assert (list_id != NULL);
-  assert (sector_scan != NULL);
-  /* backing-kind entry guard (production-hard): the OLD sector-scan input
-   * mechanism never takes a NEW (Tapeset) list (SSOT #75 round-3 (d)). */
-  {
-    int guard_rc = QFILE_GUARD_OLD_MECHANISM (list_id);
-    if (guard_rc != NO_ERROR)
-      {
-	return guard_rc;
-      }
-  }
-
-  error = qfile_collect_list_sector_info (thread_p, list_id, &sector_scan->sector_info);
-  if (error != NO_ERROR)
-    {
-      assert_release_error (er_errid () != NO_ERROR);
-      return er_errid ();
-    }
-
-  sector_scan->membuf_claimed.store (false, std::memory_order_relaxed);
-  sector_scan->next_sector_index.store (0, std::memory_order_relaxed);
-
-  return NO_ERROR;
-}
-
-/*
- * qfile_close_list_sector_scan () - Release a sector scan opened by qfile_open_list_sector_scan.
- *
- * thread_p (in)  : thread entry
- * sector_scan (in) : sector scan distribution state to release
- */
-void
-qfile_close_list_sector_scan (THREAD_ENTRY * thread_p, QFILE_LIST_SECTOR_SCAN_INFO * sector_scan)
-{
-  assert (thread_p != NULL);
-  assert (sector_scan != NULL);
-
-  qfile_free_list_sector_info (thread_p, &sector_scan->sector_info);
-}

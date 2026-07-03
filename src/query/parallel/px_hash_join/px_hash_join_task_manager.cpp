@@ -149,7 +149,6 @@ namespace parallel_query
       : m_task_manager (task_manager)
       , m_manager (manager)
       , m_index (index)
-      , m_page_iter ()
     {
       assert (m_manager != nullptr);
       assert (m_manager->context_cnt > 1);
@@ -188,10 +187,7 @@ namespace parallel_query
       QFILE_LIST_ID **part_list_id;
       QFILE_LIST_ID **temp_part_list_id = nullptr;
 
-      PAGE_PTR page = nullptr;
       QFILE_TUPLE_RECORD tuple_record = { nullptr, 0 };
-      QFILE_TUPLE_RECORD overflow_record = { nullptr, 0 };
-      int tuple_cnt, tuple_index, tuple_length;
 
       HASH_SCAN_KEY *temp_key = nullptr;
       unsigned int hash_key;
@@ -247,7 +243,7 @@ namespace parallel_query
       bool use_per_worker_output = (m_shared_info->worker_part_lists != nullptr);
 
       /* redesign #78 2A-3: per-tuple partition assignment and buffered write.
-       * Shared by OLD sector page walk and NEW tapeset_reader paths.
+       * Consumed by the NEW (Tapeset) tapeset_reader path.
        * Assumes tuple_record.tpl points to the current tuple.
        * Returns true to advance to the next tuple, false on error. */
       auto process_split_tuple = [&] () -> bool
@@ -355,7 +351,7 @@ namespace parallel_query
 	{
 	  /* NEW (Tapeset) split input: per-worker tapeset_reader over shared
 	   * chunk_distributor.  Overflow reassembly handled by the reader
-	   * (ADR 0005/0006), so the OLD sector page walk is bypassed. */
+	   * (ADR 0005/0006). */
 	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
 	  qfile::tapeset_reader *reader =
 		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);
@@ -401,159 +397,6 @@ namespace parallel_query
 	    {
 	      db_private_free_and_init (&thread_ref, new_trec.tpl);
 	    }
-	}
-      else
-	{
-      /* next page (OLD sector walk) */
-      do
-	{
-	  if (m_task_manager.has_error () || m_task_manager.check_interrupt (thread_ref))
-	    {
-	      has_error = true;
-	      break;		/* error_exit */
-	    }
-
-	  page = m_page_iter.get_next_page (&thread_ref, m_shared_info->sector_scan);
-	  if (page == nullptr)
-	    {
-	      if (er_errid () != NO_ERROR)
-		{
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		}
-
-	      /* end */
-	      break;
-	    }
-
-	  tuple_cnt = QFILE_GET_TUPLE_COUNT (page);
-	  if (tuple_cnt == 0)
-	    {
-	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
-	      continue;
-	    }
-
-	  tuple_index = -1;
-
-	  /* first tuple */
-	  tuple_record.tpl = (char *) page + QFILE_PAGE_HEADER_SIZE;
-
-	  /* overflow page */
-	  if (QFILE_GET_OVERFLOW_PAGE_ID (page) != NULL_PAGEID)
-	    {
-	      assert (tuple_cnt == 1);
-
-	      error = qfile_assemble_overflow_tuple (&thread_ref, page, &overflow_record, m_page_iter.get_current_tfile ());
-	      if (error != NO_ERROR)
-		{
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		  break;	/* error_exit */
-		}
-
-	      tuple_record.tpl = overflow_record.tpl;
-	    }
-
-	  assert (has_error == false);
-
-	  /* next tuple */
-	  do
-	    {
-	      if (tuple_index == -1)
-		{
-		  /* first tuple */
-		}
-	      else if (tuple_index < tuple_cnt - 1)
-		{
-		  /* next tuple */
-		  tuple_length = QFILE_GET_TUPLE_LENGTH (tuple_record.tpl);
-		  tuple_record.tpl += tuple_length;
-		}
-	      else
-		{
-		  /* next page */
-		  assert (tuple_index == tuple_cnt - 1);
-		  break;
-		}
-
-	      tuple_index++;
-
-	      /* overflow page — direct write to partition (bypasses local buffer) */
-	      if (QFILE_GET_OVERFLOW_PAGE_ID (page) != NULL_PAGEID)
-		{
-		  error = hjoin_fetch_key (&thread_ref, m_split_info->fetch_info, &tuple_record, temp_key,
-					   nullptr /* compare_key */, &need_skip_next);
-		  if (error != NO_ERROR)
-		    {
-		      assert_release_error (er_errid () != NO_ERROR);
-		      m_task_manager.handle_error (thread_ref);
-		      has_error = true;
-		      break;
-		    }
-		  else if (need_skip_next)
-		    {
-		      need_skip_next = false;
-		      part_id = (is_outer_join) ? (part_cnt - 1) : 0; /* null partition or skip */
-		      if (!is_outer_join) { break; /* skip tuple entirely for non-outer */ }
-		    }
-		  else
-		    {
-		      hash_key = qdata_hash_scan_key (temp_key, UINT_MAX, HASH_METH_IN_MEM);
-		      part_id = (is_outer_join) ? hash_key % (part_cnt - 1) : hash_key % (part_cnt);
-		      hjoin_update_tuple_hash_key (&thread_ref, &tuple_record, hash_key);
-		    }
-
-		  std::unique_lock lock (m_shared_info->part_mutexes[part_id]);
-
-		  assert (part_list_id[part_id]->last_pgptr == nullptr);
-
-		  if (qfile_reopen_list_as_append_mode (&thread_ref, part_list_id[part_id]) != NO_ERROR)
-		    {
-		      assert_release_error (er_errid () != NO_ERROR);
-		      m_task_manager.handle_error (thread_ref);
-		      has_error = true;
-		      break;		/* error_exit */
-		    }
-
-		  error = qfile_add_tuple_to_list (&thread_ref, part_list_id[part_id], tuple_record.tpl);
-		  if (error != NO_ERROR)
-		    {
-		      assert_release_error (er_errid () != NO_ERROR);
-		      m_task_manager.handle_error (thread_ref);
-		      has_error = true;
-		      break;		/* error_exit */
-		    }
-
-		  qfile_close_list (&thread_ref, part_list_id[part_id]);
-
-		  /* next page */
-		  break;
-		}
-
-	      if (!process_split_tuple ())
-		{
-		  break;
-		}
-	    }
-	  while (true);		/* next tuple */
-
-	  if (page != nullptr)
-	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
-	    }
-
-	  if (has_error)
-	    {
-	      break;
-	    }
-	}
-      while (true);	/* next page */
-	}		/* end OLD-backing page walk */
-
-      if (page != nullptr)
-	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
 	}
 
       assert (temp_part_list_id != nullptr);
@@ -645,11 +488,6 @@ namespace parallel_query
       db_private_free_and_init (&thread_ref, temp_part_list_id);
 
       qdata_free_hscan_key (&thread_ref, temp_key, m_manager->key_cnt);
-
-      if (overflow_record.tpl != nullptr)
-	{
-	  db_private_free_and_init (&thread_ref, overflow_record.tpl);
-	}
 
       thread_ref.m_px_stats = nullptr;
       thread_ref.m_uses_px_stats = false;
@@ -901,7 +739,7 @@ namespace parallel_query
 	}
       m_context->build->list_scan_id.is_read_only = true;
 
-      /* probe input is consumed via sector_page_iterator — no list_scan_id needed */
+      /* probe input is consumed via the per-worker tapeset_reader — no list_scan_id needed */
 
       error = hjoin_scan_init (&thread_ref, &m_context->hash_scan, m_manager->key_cnt, nullptr /* skip hash table */ );
       if (error != NO_ERROR)
@@ -1027,9 +865,7 @@ cleanup:
     {
       QFILE_LIST_ID *list_id;
 
-      PAGE_PTR page = nullptr;
       QFILE_TUPLE_RECORD overflow_record = { nullptr, 0 };
-      int tuple_cnt, tuple_index, tuple_length;
 
       HASHJOIN_FETCH_INFO *outer, *inner;
       HASHJOIN_FETCH_INFO *build = nullptr, *probe = nullptr;
@@ -1083,8 +919,8 @@ cleanup:
 	}
 
       /* redesign #78 2A-3: per-probe-tuple processing (fetch key -> hash -> probe
-       * build hash table -> merge matched tuple).  Shared by the OLD sector page
-       * walk and the NEW (Tapeset) tapeset_reader path.  Returns true to advance to
+       * build hash table -> merge matched tuple).  Consumed by the NEW (Tapeset)
+       * tapeset_reader path.  Returns true to advance to
        * the next tuple, false on error (has_error set). */
       auto process_probe_tuple = [&] () -> bool
       {
@@ -1189,8 +1025,7 @@ cleanup:
 	  /* NEW (Tapeset) probe input: this worker reads its share of tuples via a
 	   * per-worker tapeset_reader over the shared chunk_distributor (reader id =
 	   * worker index).  Overflow reassembly and offset-based page reads happen
-	   * inside the reader (ADR 0005/0006), so the OLD sector page walk (and its
-	   * backing guard) is bypassed. */
+	   * inside the reader (ADR 0005/0006). */
 	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
 	  qfile::tapeset_reader *reader =
 		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);
@@ -1237,106 +1072,6 @@ cleanup:
 	      db_private_free_and_init (&thread_ref, new_trec.tpl);
 	    }
 	}
-      else
-	{
-      /* next page */
-      do
-	{
-	  if (m_task_manager.has_error () || m_task_manager.check_interrupt (thread_ref))
-	    {
-	      has_error = true;
-	      break;		/* error_exit */
-	    }
-
-	  page = m_page_iter.get_next_page (&thread_ref, m_shared_info->sector_scan);
-	  if (page == nullptr)
-	    {
-	      if (er_errid () != NO_ERROR)
-		{
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		}
-
-	      /* end */
-	      break;
-	    }
-
-	  tuple_cnt = QFILE_GET_TUPLE_COUNT (page);
-	  if (tuple_cnt == 0)
-	    {
-	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
-	      continue;
-	    }
-	  tuple_index = -1;
-
-	  /* first tuple */
-	  probe->tuple_record.tpl = (char *) page + QFILE_PAGE_HEADER_SIZE;
-
-	  /* overflow page */
-	  if (QFILE_GET_OVERFLOW_PAGE_ID (page) != NULL_PAGEID)
-	    {
-	      assert (tuple_cnt == 1);
-
-	      error = qfile_assemble_overflow_tuple (&thread_ref, page, &overflow_record, m_page_iter.get_current_tfile ());
-	      if (error != NO_ERROR)
-		{
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		  break;	/* error_exit */
-		}
-
-	      probe->tuple_record.tpl = overflow_record.tpl;
-	    }
-
-	  assert (has_error == false);
-
-	  /* next tuple */
-	  do
-	    {
-	      if (tuple_index == -1)
-		{
-		  /* first tuple */
-		}
-	      else if (tuple_index < tuple_cnt - 1)
-		{
-		  /* next tuple */
-		  tuple_length = QFILE_GET_TUPLE_LENGTH (probe->tuple_record.tpl);
-		  probe->tuple_record.tpl += tuple_length;
-		}
-	      else
-		{
-		  /* next page */
-		  assert (tuple_index == tuple_cnt - 1);
-		  break;
-		}
-
-	      tuple_index++;
-
-	      if (!process_probe_tuple ())
-		{
-		  break;		/* error_exit */
-		}
-	    }
-	  while (true);
-
-	  if (page != nullptr)
-	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
-	    }
-
-	  if (has_error)
-	    {
-	      break;
-	    }
-	}
-      while (true);	/* next page */
-	}		/* end OLD-backing page walk */
-
-      if (page != nullptr)
-	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
-	}
 
       if (thread_is_on_trace (&thread_ref))
 	{
@@ -1357,9 +1092,7 @@ cleanup:
     {
       QFILE_LIST_ID *list_id;
 
-      PAGE_PTR page = nullptr;
       QFILE_TUPLE_RECORD overflow_record = { nullptr, 0 };
-      int tuple_cnt, tuple_index, tuple_length;
 
       HASHJOIN_FETCH_INFO *outer, *inner;
       HASHJOIN_FETCH_INFO *build = nullptr, *probe = nullptr;
@@ -1416,8 +1149,7 @@ cleanup:
 	}
 
       /* redesign #78 2A-3: per-probe-tuple processing for outer join.
-       * Shared by the OLD sector page walk and the NEW (Tapeset) tapeset_reader
-       * path.  Returns true to advance to the next tuple, false on error
+       * Consumed by the NEW (Tapeset) tapeset_reader path.  Returns true to advance to the next tuple, false on error
        * (has_error set).  Covers hash probe, match/NULL-fill, during_join_pred. */
       auto process_probe_tuple = [&] () -> bool
       {
@@ -1608,8 +1340,7 @@ cleanup:
 	  /* NEW (Tapeset) probe input: this worker reads its share of tuples via a
 	   * per-worker tapeset_reader over the shared chunk_distributor (reader id =
 	   * worker index).  Overflow reassembly and offset-based page reads happen
-	   * inside the reader (ADR 0005/0006), so the OLD sector page walk (and its
-	   * backing guard) is bypassed. */
+	   * inside the reader (ADR 0005/0006). */
 	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
 	  qfile::tapeset_reader *reader =
 		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);
@@ -1655,106 +1386,6 @@ cleanup:
 	    {
 	      db_private_free_and_init (&thread_ref, new_trec.tpl);
 	    }
-	}
-      else
-	{
-      /* next page (OLD sector walk) */
-      do
-	{
-	  if (m_task_manager.has_error () || m_task_manager.check_interrupt (thread_ref))
-	    {
-	      has_error = true;
-	      break;		/* error_exit */
-	    }
-
-	  page = m_page_iter.get_next_page (&thread_ref, m_shared_info->sector_scan);
-	  if (page == nullptr)
-	    {
-	      if (er_errid () != NO_ERROR)
-		{
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		}
-
-	      /* end */
-	      break;
-	    }
-
-	  tuple_cnt = QFILE_GET_TUPLE_COUNT (page);
-	  if (tuple_cnt == 0)
-	    {
-	      /* empty page */
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
-	      continue;
-	    }
-	  tuple_index = -1;
-
-	  /* first tuple */
-	  probe->tuple_record.tpl = (char *) page + QFILE_PAGE_HEADER_SIZE;
-
-	  /* overflow page */
-	  if (QFILE_GET_OVERFLOW_PAGE_ID (page) != NULL_PAGEID)
-	    {
-	      assert (tuple_cnt == 1);
-
-	      error = qfile_assemble_overflow_tuple (&thread_ref, page, &overflow_record, m_page_iter.get_current_tfile ());
-	      if (error != NO_ERROR)
-		{
-		  m_task_manager.handle_error (thread_ref);
-		  has_error = true;
-		  break;	/* error_exit */
-		}
-
-	      probe->tuple_record.tpl = overflow_record.tpl;
-	    }
-
-	  assert (has_error == false);
-
-	  /* next tuple */
-	  do
-	    {
-	      if (tuple_index == -1)
-		{
-		  /* first tuple */
-		}
-	      else if (tuple_index < tuple_cnt - 1)
-		{
-		  /* next tuple */
-		  tuple_length = QFILE_GET_TUPLE_LENGTH (probe->tuple_record.tpl);
-		  probe->tuple_record.tpl += tuple_length;
-		}
-	      else
-		{
-		  /* next page */
-		  assert (tuple_index == tuple_cnt - 1);
-		  break;
-		}
-
-	      tuple_index++;
-
-	      if (!process_probe_tuple ())
-		{
-		  break;		/* error_exit */
-		}
-	    }
-	  while (true);
-
-	  if (page != nullptr)
-	    {
-	      qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
-	    }
-
-	  if (has_error)
-	    {
-	      break;
-	    }
-	}
-      while (true);	/* next page */
-	}		/* end OLD-backing page walk */
-
-      if (page != nullptr)
-	{
-	  qmgr_free_old_page_and_init (&thread_ref, page, m_page_iter.get_current_tfile ());
 	}
 
       if (thread_is_on_trace (&thread_ref))

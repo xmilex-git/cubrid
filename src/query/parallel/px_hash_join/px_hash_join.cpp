@@ -130,12 +130,13 @@ namespace parallel_query
 	  }
 	else
 	  {
-	    /* OLD: sector page scan. */
-	    error = qfile_open_list_sector_scan (&thread_ref, outer_list_id, &shared_info.sector_scan);
-	    if (error != NO_ERROR)
-	      {
-		goto error_exit;
-	      }
+	    /* #84/#130: hjoin_try_parallel forces serial partitioning for
+	     * OLD-backed input and the OLD sector scan is deleted; reaching
+	     * here is a guard violation. */
+	    assert (false);
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    error = ER_FAILED;
+	    goto error_exit;
 	  }
       }
 
@@ -159,7 +160,6 @@ namespace parallel_query
 	}
 
       /* Release outer split resources before inner run. */
-      qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
       delete shared_info.new_dist;
       shared_info.new_dist = nullptr;
       shared_info.new_tapeset = nullptr;
@@ -268,12 +268,13 @@ namespace parallel_query
 	  }
 	else
 	  {
-	    /* OLD: sector page scan. */
-	    error = qfile_open_list_sector_scan (&thread_ref, inner_list_id, &shared_info.sector_scan);
-	    if (error != NO_ERROR)
-	      {
-		goto error_exit;
-	      }
+	    /* #84/#130: hjoin_try_parallel forces serial partitioning for
+	     * OLD-backed input and the OLD sector scan is deleted; reaching
+	     * here is a guard violation. */
+	    assert (false);
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    error = ER_FAILED;
+	    goto error_exit;
 	  }
       }
 
@@ -350,9 +351,7 @@ namespace parallel_query
 	}
 
 cleanup:
-      qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
-
-      /* redesign #78 2A-3: release the NEW-input distributor (nullptr on OLD path). */
+      /* redesign #78 2A-3: release the NEW-input distributor. */
       delete shared_info.new_dist;
       shared_info.new_dist = nullptr;
 
@@ -758,12 +757,13 @@ error_exit:
 	  }
 	else
 	  {
-	    /* collect data page sectors for probe relation (OLD backing) */
-	    error = qfile_open_list_sector_scan (&thread_ref, probe_list_id, &shared_info.sector_scan);
-	    if (error != NO_ERROR)
-	      {
-		goto error_exit;
-	      }
+	    /* #130: hjoin_try_parallel_probe forces serial for OLD-backed input
+	     * and the OLD sector scan is deleted; reaching here is a guard
+	     * violation. */
+	    assert (false);
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    error = ER_FAILED;
+	    goto error_exit;
 	  }
       }
 
@@ -842,9 +842,7 @@ error_exit:
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
 cleanup:
-      qfile_close_list_sector_scan (&thread_ref, &shared_info.sector_scan);
-
-      /* redesign #78 2A-3: release the NEW-input distributor (nullptr on OLD path). */
+      /* redesign #78 2A-3: release the NEW-input distributor. */
       delete shared_info.new_dist;
       shared_info.new_dist = nullptr;
 

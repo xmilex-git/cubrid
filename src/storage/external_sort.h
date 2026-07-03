@@ -160,7 +160,7 @@ struct SORT_INFO
   int flag;			/* to open output list file */
   int parallelism;
   void *orderby_stats;
-  void *px_state;		/* per-worker sector scan state (ORDER_BY and GROUP_BY parallel) */
+  void *px_state;		/* per-worker parallel input reader state (sort_px_list_state) */
 };
 
 /* Passed as px_extra_arg to sort_listfile for SORT_GROUP_BY / SORT_ANALYTIC parallel runs.

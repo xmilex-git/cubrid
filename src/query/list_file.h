@@ -120,20 +120,12 @@ typedef enum
 #if defined (SERVER_MODE)
 struct sort_px_list_state
 {
-  /* shared sector scan — owned by sort_param->px_sector_scan, freed after all workers finish */
-  QFILE_LIST_SECTOR_SCAN_INFO *sector_scan;
-  /* per-worker page iterator — encapsulates membuf CAS + atomic sector steal */
-  sector_page_iterator page_iter;
-  /* per-worker NEW (Tapeset) reader — owned by this state; NULL keeps OLD sector path */
+  /* per-worker NEW (Tapeset) reader — owned by this state.  #130: the OLD
+   * sector-scan path is deleted; a parallel sort input is always NEW-backed
+   * (sort_check_parallelism demotes OLD-backed input to serial). */
   void *tapeset_reader;
   bool has_tapeset_tuple;
-  /* current active page — set when we land on a page, cleared after all tuples are consumed */
-  PAGE_PTR curr_page;
-  struct qmgr_temp_file *curr_tfile;	/* tfile for curr_page (membuf_tfile or disk tfile) */
-  VPID curr_vpid;		/* VPID of curr_page (used for sort key pageid/volid) */
-  int curr_tplno;		/* tuple index within curr_page */
-  int curr_offset;		/* byte offset of current tuple in curr_page */
-  QFILE_TUPLE_RECORD tplrec;	/* buffer for assembling overflow tuples */
+  QFILE_TUPLE_RECORD tplrec;	/* tuple buffer (reader COPY target) */
 };
 
 extern SORT_STATUS qfile_sort_get_next_parallel (THREAD_ENTRY * thread_p, RECDES * recdes_p, void *arg);
@@ -288,30 +280,5 @@ extern int qfile_overwrite_tuple (THREAD_ENTRY * thread_p, PAGE_PTR first_page, 
 extern void qfile_update_qlist_count (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * list_p, int inc);
 extern int qfile_get_list_cache_number_of_entries (int ht_no);
 extern bool qfile_has_no_cache_entries ();
-
-/* Sector-based page distribution */
-extern int qfile_collect_list_sector_info (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
-					   QFILE_LIST_SECTOR_INFO * sector_info);
-extern void qfile_free_list_sector_info (THREAD_ENTRY * thread_p, QFILE_LIST_SECTOR_INFO * sector_info);
-extern int qfile_open_list_sector_scan (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
-					QFILE_LIST_SECTOR_SCAN_INFO * sector_scan);
-extern void qfile_close_list_sector_scan (THREAD_ENTRY * thread_p, QFILE_LIST_SECTOR_SCAN_INFO * sector_scan);
-
-#ifdef __cplusplus
-/* ctz on bitmap_inout: lowest set bit -> VPID; clears that bit. false = sector drained. */
-static inline bool
-qfile_sector_bitmap_next_vpid (const VSID * vsid, UINT64 * bitmap_inout, VPID * out_vpid)
-{
-  if (*bitmap_inout == 0)
-    {
-      return false;
-    }
-  int bit_pos = __builtin_ctzll (*bitmap_inout);
-  *bitmap_inout &= *bitmap_inout - 1;
-  out_vpid->volid = vsid->volid;
-  out_vpid->pageid = SECTOR_FIRST_PAGEID (vsid->sectid) + bit_pos;
-  return true;
-}
-#endif /* __cplusplus */
 
 #endif /* _LIST_FILE_H_ */

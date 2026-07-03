@@ -2012,12 +2012,12 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
   assert (inner_list_id != NULL);
 
   /* #84: mirror hjoin_try_parallel_probe's OLD-input guard.  The OLD
-   * sector_page_iterator has a confirmed row-loss bug on derived-list
-   * inputs (#78 evidence (k); bug2 149510 vs 200360).  If either side of
-   * the split lacks NEW (Tapeset) backing (e.g. worker pool exhaustion
-   * forced a serial OLD-backed scan upstream) or the HASHJOIN_NEW gate is
-   * off, force serial partitioning (HASHJOIN_STATUS_PARTITION) rather than
-   * letting build_partitions() reach the buggy OLD reader in parallel. */
+   * sector_page_iterator had a confirmed row-loss bug on derived-list
+   * inputs (#78 evidence (k); bug2 149510 vs 200360) and is deleted in #130.
+   * If either side of the split lacks NEW (Tapeset) backing (e.g. worker pool
+   * exhaustion forced a serial OLD-backed scan upstream) or the HASHJOIN_NEW
+   * gate is off, force serial partitioning (HASHJOIN_STATUS_PARTITION) --
+   * this is now the permanent serial fallback for OLD-backed input. */
   if (!qfile_list_has_new_backing (outer_list_id) || !qfile_list_has_new_backing (inner_list_id)
       || !qfile_hashjoin_new_backing_enabled ())
     {
@@ -2143,16 +2143,15 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
   assert (false);
 #endif /* defined (SERVER_MODE) */
 
-  /* redesign #78 2A-3: the parallel probe path uses chunk_distributor (NEW) or
-   * sector_page_iterator (OLD).  The OLD sector reader has a known row-loss bug
-   * on arbitrary derived-list inputs (#78 evidence (k)/(q): pre-existing in the
-   * #7173 sector machinery, develop is immune because it never hits PARALLEL_PROBE
-   * at work_mem=1G).  The NEW path (chunk_distributor + tapeset_reader) is correct.
+  /* redesign #78 2A-3: the parallel probe path reads NEW (Tapeset) input via
+   * chunk_distributor + tapeset_reader.  The OLD sector reader had a known
+   * row-loss bug on arbitrary derived-list inputs (#78 evidence (k)/(q)) and is
+   * deleted in #130.
    *
    * Decision matrix:
    *   NEW input + HASHJOIN_NEW gate ON  -> parallel probe via chunk_distributor (correct)
    *   NEW input + HASHJOIN_NEW gate OFF -> serial (unified list scan reads NEW correctly)
-   *   OLD input                         -> serial (avoids the buggy sector_page_iterator)
+   *   OLD input                         -> serial (permanent fallback; the OLD reader is gone)
    *
    * The OLD-input serial fallback is the fix for the "session state corruption"
    * symptom: on re-execution the parallel worker pool can be exhausted (by the
@@ -2459,11 +2458,6 @@ hjoin_clear_shared_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manag
   assert (thread_p != NULL);
   assert (manager != NULL);
   assert (shared_info != NULL);
-
-  /* NOTE: sector_info must be freed BEFORE the early-return below.
-   * Do not move this call into the (part_cnt > 1) branch — doing so would leak
-   * sectors/tfiles arrays when part_cnt <= 1. */
-  qfile_close_list_sector_scan (thread_p, &shared_info->sector_scan);
 
   part_cnt = manager->context_cnt;
   if (part_cnt <= 1)

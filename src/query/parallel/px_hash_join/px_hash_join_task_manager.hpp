@@ -156,10 +156,6 @@ namespace parallel_query
 	task_manager &m_task_manager;
 	HASHJOIN_MANAGER *m_manager;
 	const int m_index;
-
-	/* Worker-local sector/page iterator. join_task does not consume it, but keeping it
-	 * in the base avoids splitting the hierarchy just for this single member. */
-	sector_page_iterator m_page_iter;
     };
 
     /*

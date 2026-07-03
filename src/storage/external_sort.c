@@ -188,7 +188,6 @@ struct sort_param
     cuberr::context * main_error_context;
   void *px_extra_arg;		/* extra parallel context; for SORT_GROUP_BY/SORT_ANALYTIC: SORT_LISTFILE_PX_ARG* */
   bool px_output_is_new;	/* 2A-1b (#78): this SORT output migrated to NEW Tapeset backing */
-  QFILE_LIST_SECTOR_SCAN_INFO *px_sector_scan;	/* shared sector scan for ORDER_BY/ORDER_WITH_LIMIT/GROUP_BY/ANALYTIC workers */
   qfile::chunk_distributor *px_chunk_dist;	/* shared NEW (Tapeset) chunk distributor for ORDER_BY workers */
 #if defined(SERVER_MODE)
   pthread_mutex_t *px_mtx;	/* px_status mutex */
@@ -1489,7 +1488,6 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->tde_encrypted = includes_tde_class;
   sort_param->px_type = parallel_type;
   sort_param->px_extra_arg = px_extra_arg;
-  sort_param->px_sector_scan = NULL;
   sort_param->px_chunk_dist = NULL;
   /* 2A-1b (#78): capture whether this SORT output was converted to NEW (Tapeset)
    * backing -- stably, before the parallel workers run -- so each worker's
@@ -1719,21 +1717,14 @@ cleanup:
 	  sort_param->orderby_stats.orderby_ioreads += (perfmon_get_from_statistic (thread_p, PSTAT_SORT_NUM_IO_PAGES));
 	}
 
-      /* Worker-thread-only cleanup: unfix the active page (latch held by this
-       * thread) and free tplrec.tpl (allocated from this thread's private heap).
-       * On the early-termination path curr_page may still be fixed; the main
-       * thread cannot release either resource correctly. */
+      /* Worker-thread-only cleanup: free tplrec.tpl (allocated from this
+       * thread's private heap; the main thread cannot free it correctly). */
       if (sort_param->get_arg != NULL)
 	{
 	  SORT_INFO *sort_info_p = (SORT_INFO *) sort_param->get_arg;
 	  if (sort_info_p->px_state != NULL)
 	    {
 	      sort_px_list_state *state = (sort_px_list_state *) sort_info_p->px_state;
-	      if (state->curr_page != NULL)
-		{
-		  qmgr_free_old_page_and_init (thread_p, state->curr_page, state->curr_tfile);
-		  state->curr_tfile = NULL;
-		}
 	      if (state->tplrec.tpl != NULL)
 		{
 		  db_private_free_and_init (thread_p, state->tplrec.tpl);
@@ -1759,20 +1750,13 @@ cleanup:
 	  sort_param->orderby_stats.orderby_ioreads += (perfmon_get_from_statistic (thread_p, PSTAT_SORT_NUM_IO_PAGES));
 	}
 
-      /* Worker-thread-only cleanup: unfix the active page (latch held by this
-       * thread) and free tplrec.tpl (worker-private heap). On the
-       * early-termination path curr_page may still be fixed. */
+      /* Worker-thread-only cleanup: free tplrec.tpl (worker-private heap). */
       if (sort_param->get_arg != NULL)
 	{
 	  SORT_INFO *sort_info_p = (SORT_INFO *) sort_param->get_arg;
 	  if (sort_info_p->px_state != NULL)
 	    {
 	      sort_px_list_state *state = (sort_px_list_state *) sort_info_p->px_state;
-	      if (state->curr_page != NULL)
-		{
-		  qmgr_free_old_page_and_init (thread_p, state->curr_page, state->curr_tfile);
-		  state->curr_tfile = NULL;
-		}
 	      if (state->tplrec.tpl != NULL)
 		{
 		  db_private_free_and_init (thread_p, state->tplrec.tpl);
@@ -4256,13 +4240,8 @@ sort_return_used_resources (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, PA
 	    }
 	}
 
-      /* Safety net: free shared sector scan if sort_end_parallelism was skipped due to error */
-      if (sort_param->px_sector_scan != NULL)
-	{
-	  qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
-	  sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
-	  db_private_free_and_init (thread_p, sort_param->px_sector_scan);
-	}
+      /* Safety net: free the shared chunk distributor if sort_end_parallelism
+       * was skipped due to error */
       if (sort_param->px_chunk_dist != NULL)
 	{
 	  delete sort_param->px_chunk_dist;
@@ -5196,16 +5175,14 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 	  return 1;
 	}
 
-      /* #99 root cause: the px input sector scan enumerates only the membuf
-       * prefix (one worker claims it) plus the file_manager data sectors of
-       * temp_vfid -- raw-fd overflow pages (qmgr_temp_backing::RAW_FD_OVERFLOW,
-       * temp_vfid stays NULL) are invisible to it, so parallel workers would
-       * silently sort only the membuf prefix of the input and drop the spilled
-       * remainder.  Until the sector scan learns raw-fd chunking (the NEW
-       * backing already has chunk_distributor for this), force serial. */
-      if (qmgr_list_has_raw_fd_segments (sort_info_p->input_file))
+      /* #130 fallback: the OLD sector-scan parallel input reader is deleted, so
+       * only a NEW (Tapeset)-backed input can be read in parallel
+       * (chunk_distributor + per-worker tapeset_reader).  Any OLD-backed input
+       * -- including raw-fd overflow spill, which the deleted sector scan could
+       * not enumerate anyway (#99) -- is demoted to a correct serial sort. */
+      if (!qfile_list_has_new_backing (sort_info_p->input_file))
 	{
-	  er_log_debug (ARG_FILE_LINE, "sort: raw-fd overflow input -> serial (#99 input guard)\n");
+	  er_log_debug (ARG_FILE_LINE, "sort: OLD-backed ORDER_BY input -> serial (#130 fallback)\n");
 	  return 1;
 	}
 
@@ -5299,10 +5276,16 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 	  return 1;
 	}
       QFILE_LIST_ID *input_list = px->input_list;
-      /* A NEW (Tapeset)-backed input is read in parallel through the shared
-       * chunk_distributor + per-worker tapeset_reader that sort_start_parallelism
-       * builds (#122, ported from the ORDER_BY branch), instead of the OLD-only
-       * qfile_open_list_sector_scan the #118 blanket guard had to avoid.  That
+      /* #130 fallback: OLD-backed input -> serial (the OLD sector-scan reader is
+       * deleted; see the ORDER_BY branch above). */
+      if (input_list == NULL || !qfile_list_has_new_backing (input_list))
+	{
+	  er_log_debug (ARG_FILE_LINE, "sort: OLD-backed %s input -> serial (#130 fallback)\n",
+			(sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
+	  return 1;
+	}
+      /* The NEW input is read in parallel through the shared chunk_distributor +
+       * per-worker tapeset_reader that sort_start_parallelism builds (#122).  That
        * reader builds A_sort_key records via qfile_sort_build_key_from_tuple, which
        * requires use_original == 0 -- every column materialized in the sort record
        * (the #103/#100 extend_all_columns treatment that qexec_gby_* and
@@ -5310,10 +5293,8 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
        * extend_all_columns bailed (duplicated / out-of-range key column) use_original
        * stays 1, the A_sort_key path cannot carry the payload, so keep forcing serial:
        * the serial sort then fails loudly on the unresolvable back-reference exactly
-       * as before, rather than mis-reading the record.  (#78 C-7/C-8; supersedes the
-       * #118 blanket NEW->serial guard now that the reader exists.) */
-      if (input_list != NULL && qfile_list_has_new_backing (input_list)
-	  && (px->key_info == NULL || px->key_info->use_original))
+       * as before, rather than mis-reading the record.  (#78 C-7/C-8) */
+      if (px->key_info == NULL || px->key_info->use_original)
 	{
 	  er_log_debug (ARG_FILE_LINE,
 			"sort: NEW-backed %s input with use_original -> serial (#122 A_sort_key guard)\n",
@@ -5458,43 +5439,26 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
       return ER_FAILED;
     }
 
-  /* case of ORDER BY / ORDER WITH LIMIT — open shared sector scan; put_arg differs per type */
+  /* case of ORDER BY / ORDER WITH LIMIT — build the shared NEW (Tapeset) chunk
+   * distributor; put_arg differs per type */
   if (sort_param->px_type == SORT_ORDER_BY || sort_param->px_type == SORT_ORDER_WITH_LIMIT)
     {
       SORT_INFO *sort_info_p = (SORT_INFO *) sort_param->get_arg;
       QFILE_LIST_ID *input_file = sort_info_p->input_file;
 
-      if (qfile_list_has_new_backing (input_file))
-	{
-	  qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_file);
-	  sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);
-	  if (sort_param->px_chunk_dist == NULL)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-		      sizeof (qfile::chunk_distributor));
-	      return ER_FAILED;
-	    }
-	}
-      else
-	{
-	  /* open shared sector scan — all workers atomically steal sectors from this */
-	  sort_param->px_sector_scan =
-	    (QFILE_LIST_SECTOR_SCAN_INFO *) db_private_alloc (thread_p, sizeof (QFILE_LIST_SECTOR_SCAN_INFO));
-	  if (sort_param->px_sector_scan == NULL)
-	    {
-	      return ER_FAILED;
-	    }
-	  placement_new (sort_param->px_sector_scan);
-
-	  error = qfile_open_list_sector_scan (thread_p, input_file, sort_param->px_sector_scan);
-	  if (error != NO_ERROR)
-	    {
-	      qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
-	      sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
-	      db_private_free_and_init (thread_p, sort_param->px_sector_scan);
-	      return ER_FAILED;
-	    }
-	}
+      /* #130: sort_check_parallelism demotes OLD-backed input to serial, so a
+       * parallel sort input is always NEW (Tapeset)-backed here. */
+      assert (qfile_list_has_new_backing (input_file));
+      {
+	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_file);
+	sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);
+	if (sort_param->px_chunk_dist == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		    sizeof (qfile::chunk_distributor));
+	    return ER_FAILED;
+	  }
+      }
 
       /* null out get_arg/put_arg so cleanup skips workers not yet initialized */
       for (int i = 0; i < parallel_num; i++)
@@ -5553,14 +5517,8 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 	    }
 	  placement_new (state);
 
-	  state->sector_scan = sort_param->px_sector_scan;
 	  state->tapeset_reader = NULL;
 	  state->has_tapeset_tuple = false;
-	  state->curr_page = NULL;
-	  state->curr_tfile = NULL;
-	  VPID_SET_NULL (&state->curr_vpid);
-	  state->curr_tplno = 0;
-	  state->curr_offset = 0;
 	  state->tplrec.size = 0;
 	  state->tplrec.tpl = NULL;
 	  worker_info_p->px_state = state;
@@ -5646,43 +5604,22 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
       SORT_LISTFILE_PX_ARG *px = (SORT_LISTFILE_PX_ARG *) sort_param->px_extra_arg;
       QFILE_LIST_ID *input_list = px->input_list;
 
-      if (qfile_list_has_new_backing (input_list))
-	{
-	  /* NEW (Tapeset) input: build a shared chunk_distributor; each worker gets its
-	   * own tapeset_reader below and atomically steals 64-page chunks from it.  No
-	   * OLD sector scan is opened (qfile_open_list_sector_scan is OLD-only and would
-	   * reject the NEW list -- the crash the #118 guard used to prevent).  Mirrors
-	   * the ORDER_BY branch (#122).  sort_check_parallelism has already ensured the
-	   * key builds as an A_sort_key (use_original == 0). */
-	  qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list);
-	  sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);
-	  if (sort_param->px_chunk_dist == NULL)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-		      sizeof (qfile::chunk_distributor));
-	      return ER_FAILED;
-	    }
-	}
-      else
-	{
-	  /* open shared sector scan */
-	  sort_param->px_sector_scan =
-	    (QFILE_LIST_SECTOR_SCAN_INFO *) db_private_alloc (thread_p, sizeof (QFILE_LIST_SECTOR_SCAN_INFO));
-	  if (sort_param->px_sector_scan == NULL)
-	    {
-	      return ER_FAILED;
-	    }
-	  placement_new (sort_param->px_sector_scan);
-
-	  error = qfile_open_list_sector_scan (thread_p, input_list, sort_param->px_sector_scan);
-	  if (error != NO_ERROR)
-	    {
-	      qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
-	      sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
-	      db_private_free_and_init (thread_p, sort_param->px_sector_scan);
-	      return ER_FAILED;
-	    }
-	}
+      /* NEW (Tapeset) input: build a shared chunk_distributor; each worker gets its
+       * own tapeset_reader below and atomically steals 64-page chunks from it.
+       * Mirrors the ORDER_BY branch (#122).  sort_check_parallelism has already
+       * ensured the key builds as an A_sort_key (use_original == 0) and demoted
+       * OLD-backed input to serial (#130). */
+      assert (qfile_list_has_new_backing (input_list));
+      {
+	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list);
+	sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);
+	if (sort_param->px_chunk_dist == NULL)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		    sizeof (qfile::chunk_distributor));
+	    return ER_FAILED;
+	  }
+      }
 
       /* null out get_arg so partial-init cleanup is safe */
       for (int i = 0; i < parallel_num; i++)
@@ -5722,14 +5659,8 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 	    }
 	  placement_new (state);
 
-	  state->sector_scan = sort_param->px_sector_scan;
 	  state->tapeset_reader = NULL;
 	  state->has_tapeset_tuple = false;
-	  state->curr_page = NULL;
-	  state->curr_tfile = NULL;
-	  VPID_SET_NULL (&state->curr_vpid);
-	  state->curr_tplno = 0;
-	  state->curr_offset = 0;
 	  state->tplrec.size = 0;
 	  state->tplrec.tpl = NULL;
 
@@ -5850,13 +5781,7 @@ sort_end_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
   int error = NO_ERROR;
   int parallel_num = sort_param->px_parallel_num;
 
-  /* Free shared sector scan — workers are done at this point */
-  if (sort_param->px_sector_scan != NULL)
-    {
-      qfile_close_list_sector_scan (thread_p, sort_param->px_sector_scan);
-      sort_param->px_sector_scan->~qfile_list_sector_scan_info ();
-      db_private_free_and_init (thread_p, sort_param->px_sector_scan);
-    }
+  /* Free the shared chunk distributor — workers are done at this point */
   if (sort_param->px_chunk_dist != NULL)
     {
       delete sort_param->px_chunk_dist;

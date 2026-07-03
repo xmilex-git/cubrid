@@ -923,7 +923,8 @@ extern "C"
      * conditioned, so with the gate OFF the wrong result stayed exposed for MERGEABLE_LIST too
      * (the old raw_fd_master_enabled() guard here never fired).  Only a NEW (Tapeset) input, read by
      * the correct tuple-level tapeset_reader, is safe to scan in parallel; every OLD-backed list
-     * falls back to a correct SERIAL list scan until the OLD sector reader itself is fixed (Phase3). */
+     * falls back to a correct SERIAL list scan.  #130 (Phase3) deleted the OLD sector reader,
+     * making this the permanent OLD-input path. */
     if (!is_new_backing)
       {
 	return NO_ERROR;
