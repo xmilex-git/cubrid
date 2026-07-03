@@ -64,6 +64,12 @@ struct qfile_tuple_simple_pos
       INT32 page_index;		/* Page index inside the raw-fd segment */
       INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
     };
+    struct
+    {
+      INT32 tape_idx;		/* Tape index within the Tapeset (COORD_TAPE) */
+      INT32 tape_page_offset;	/* Logical page index within the Tape */
+      INT32 tape_byte_offset;	/* Tuple byte offset inside the page */
+    };
   };
   int coord_reserved;		/* Keep simple-position size fixed */
 };
@@ -72,6 +78,12 @@ static inline bool
 qfile_tuple_simple_pos_is_raw_fd (const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
 {
   return simple_pos_p != NULL && simple_pos_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
+}
+
+static inline bool
+qfile_tuple_simple_pos_is_tape (const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
+{
+  return simple_pos_p != NULL && simple_pos_p->coord_type == QFILE_TUPLE_POSITION_COORD_TAPE;
 }
 
 static inline void
@@ -96,6 +108,17 @@ qfile_tuple_simple_pos_set_raw_fd (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, UINT64
 }
 
 static inline void
+qfile_tuple_simple_pos_set_tape (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, INT32 tape_idx, INT32 tape_page_offset,
+				 INT32 tape_byte_offset)
+{
+  simple_pos_p->coord_type = QFILE_TUPLE_POSITION_COORD_TAPE;
+  simple_pos_p->tape_idx = tape_idx;
+  simple_pos_p->tape_page_offset = tape_page_offset;
+  simple_pos_p->tape_byte_offset = tape_byte_offset;
+  simple_pos_p->coord_reserved = 0;
+}
+
+static inline void
 qfile_tuple_position_set_simple_pos (QFILE_TUPLE_POSITION * tuple_position_p,
 				     const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
 {
@@ -103,6 +126,11 @@ qfile_tuple_position_set_simple_pos (QFILE_TUPLE_POSITION * tuple_position_p,
     {
       qfile_tuple_position_set_raw_fd (tuple_position_p, simple_pos_p->raw_fd_segment_id, simple_pos_p->page_index,
 				       simple_pos_p->tuple_offset);
+    }
+  else if (qfile_tuple_simple_pos_is_tape (simple_pos_p))
+    {
+      qfile_tuple_position_set_tape (tuple_position_p, simple_pos_p->tape_idx, simple_pos_p->tape_page_offset,
+				     simple_pos_p->tape_byte_offset);
     }
   else
     {

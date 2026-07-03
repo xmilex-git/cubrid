@@ -9090,7 +9090,11 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 						  (void **) &llsidp->hlsid.memory.curr_hash_entry);
 	  if (hvalue == NULL)
 	    {
-	      if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HYBRID)
+	      /* A Tapeset scan holds its page inside the driver (curr_pgptr is a
+	       * malloc'd mirror, not a pgbuf page); it is released by
+	       * qfile_close_scan -> qfile_tapeset_scan_close, never via the legacy
+	       * tfile page-free (#101). */
+	      if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HYBRID && scan_id_p->tapeset_scan_ == NULL)
 		{
 		  qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
 		}
@@ -9131,7 +9135,14 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	      *tuple = tplrec.tpl;
 	      return S_SUCCESS;
 	    case EH_KEY_NOTFOUND:
-	      qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
+	      /* Same backing-aware release as the HYBRID branch above (#101).  HASH_FILE
+	       * is still fenced off for NEW lists (see check_hash_list_scan), so the
+	       * tapeset case is unreachable here today -- kept consistent for when #123
+	       * lifts that fence. */
+	      if (scan_id_p->tapeset_scan_ == NULL)
+		{
+		  qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
+		}
 	      scan_id_p->position = S_AFTER;
 	      return S_END;
 	    case EH_ERROR_OCCURRED:
@@ -9242,16 +9253,16 @@ check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_y
       /* bytes of 1 row = sizeof(HENTRY_HLS) + sizeof(QFILE_TUPLE_SIMPLE_POS) = 56 bytes (64bit) */
       /* HENTRY_HLS = pointer(8bytes) * 4 = 32 bytes */
       /* SIMPLE_POS = discriminator(4bytes) + fixed coordinate(16bytes) + reserved(4bytes) = 24 bytes */
-      /* HYBRID stores a VPID-coord position (qdata_alloc_hscan_value_OID) that later
-       * re-jumps via qfile_jump_scan_tuple_position.  For a NEW (Tapeset) build list the
-       * saved position is the synthetic mirror curr_vpid, which loses tape_idx -- probing
-       * it re-interprets the union as tape coords and reads the wrong tape or errors
-       * (#85). Fall back to non-hash scan instead. */
-      return qfile_list_has_new_backing (llsidp->list_id) ? HASH_METH_NOT_USE : HASH_METH_HYBRID;
+      /* HYBRID over a NEW (Tapeset) build list works since #101: the producer saves a
+       * first-class TAPE coordinate (no synthetic-VPID punning, #85) and the consumer
+       * dispatches on coord_type. */
+      return HASH_METH_HYBRID;
     }
   else
     {
-      /* HASH_FILE stores a raw VPID (SET_TFTID) for the same reason -- same guard (#85). */
+      /* HASH_FILE stores a raw VPID (SET_TFTID), which a NEW (Tapeset) list cannot
+       * provide -- guard kept (#85).  #123 replaces the extendible-hash temp file
+       * with PG-style batch spill and lifts this fence. */
       return qfile_list_has_new_backing (llsidp->list_id) ? HASH_METH_NOT_USE : HASH_METH_HASH_FILE;
     }
 

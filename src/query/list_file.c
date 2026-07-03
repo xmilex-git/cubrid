@@ -6641,9 +6641,26 @@ qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * sc
 {
   PAGE_PTR page_p;
 
+  /* Dispatch on the position's coord_type, not on scan state alone (#101): a TAPE
+   * coordinate is only meaningful against a Tapeset scan and vice versa (for a
+   * concrete S_ON jump; S_BEFORE/S_AFTER carry no coordinate).  A mismatch means
+   * the coordinate was produced against a different backing -- the #85 union
+   * punning -- so fail loudly instead of misreading the union. */
   if (scan_id_p->tapeset_scan_ != NULL)
     {
+      if (tuple_position_p->position == S_ON && !qfile_tuple_position_is_tape (tuple_position_p))
+	{
+	  assert (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+	  return S_ERROR;
+	}
       return qfile_tapeset_scan_jump (thread_p, scan_id_p, tuple_position_p, tuple_record_p, peek);
+    }
+  if (qfile_tuple_position_is_tape (tuple_position_p))
+    {
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
+      return S_ERROR;
     }
   if (qfile_tuple_position_is_raw_fd (tuple_position_p))
     {

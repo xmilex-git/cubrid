@@ -50,6 +50,7 @@
 #include "db_date.h"
 #include "thread_compat.hpp"
 #include "oid.h"
+#include "qfile_tape.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -698,7 +699,19 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
     }
 
   /* save position */
-  if (QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)) != NULL
+  if (scan_id_p->tapeset_scan_ != NULL)
+    {
+      /* NEW (Tapeset) list: the mirror curr_vpid is synthetic (volid = NULL_VOLID,
+       * pageid = page offset within the current Tape) and loses tape_idx (#85, #101).
+       * Save the scan's first-class TAPE coordinate instead. */
+      QFILE_TUPLE_POSITION tape_pos;
+
+      qfile_tapeset_scan_save_position (scan_id_p, &tape_pos);
+      assert (qfile_tuple_position_is_tape (&tape_pos));
+      qfile_tuple_simple_pos_set_tape (value->pos, tape_pos.tape_idx, tape_pos.tape_page_offset,
+				       tape_pos.tape_byte_offset);
+    }
+  else if (QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)) != NULL
       && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
       && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
       && scan_id_p->curr_vpid.pageid > QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->membuf_last)
