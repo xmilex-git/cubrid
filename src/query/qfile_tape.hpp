@@ -635,6 +635,14 @@ int qfile_close_fault_selftest (THREAD_ENTRY *thread_p);
  * (fd/file/prefix reclaimed).  Gated by env CUBRID_WM_FREEZE_OOM_SELFTEST
  * (debug).  Returns 0 on PASS. */
 int qfile_freeze_oom_selftest (THREAD_ENTRY *thread_p);
+
+/* In-server self-test of the BufFile fd-exhaustion error mapping (#125): drive
+ * the buffile create fault injector so open () reports EMFILE then ENFILE, and
+ * assert each spill append raises ER_QPROC_OUT_OF_TEMP_SPACE (parity with the
+ * legacy raw-fd is_fd_or_space_error mapping), not a generic ER_FAILED, with the
+ * census back to baseline.  Gated by env CUBRID_WM_EMFILE_FAULT_SELFTEST
+ * (debug).  Returns 0 on PASS. */
+int qfile_emfile_fault_selftest (THREAD_ENTRY *thread_p);
 #endif /* !NDEBUG */
 
 #endif /* _QFILE_TAPE_HPP_ */

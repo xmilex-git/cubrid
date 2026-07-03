@@ -1263,6 +1263,20 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  fprintf (stderr, "FREEZE_OOM_SELFTEST FAIL result=%d\n", freeze_oom_selftest_rc);
 	}
     }
+  if (getenv ("CUBRID_WM_EMFILE_FAULT_SELFTEST") != NULL)
+    {
+      /* #125: BufFile fd-exhaustion (EMFILE/ENFILE) error mapping.  Log-only (no
+       * assert) so a pre-fix run reproduces the generic ER_FAILED observably;
+       * the grep-able marker judges PASS/FAIL. */
+      int emfile_fault_selftest_rc = qfile_emfile_fault_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "EMFILE_FAULT_SELFTEST result=%d (0=PASS)\n", emfile_fault_selftest_rc);
+      fprintf (stderr, "EMFILE_FAULT_SELFTEST result=%d (0=PASS)\n", emfile_fault_selftest_rc);
+      if (emfile_fault_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "EMFILE_FAULT_SELFTEST FAIL result=%d\n", emfile_fault_selftest_rc);
+	  fprintf (stderr, "EMFILE_FAULT_SELFTEST FAIL result=%d\n", emfile_fault_selftest_rc);
+	}
+    }
 #endif /* !NDEBUG */
 
   return scan_initialize ();

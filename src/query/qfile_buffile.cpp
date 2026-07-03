@@ -97,6 +97,18 @@ namespace
     const int seen = g_fault_flush_count.fetch_add (1, std::memory_order_relaxed) + 1;
     return seen == target;
   }
+
+  /* BufFile create() fault injection (#125, debug-only).  When non-zero, the
+   * next buffile::create () short-circuits its open () and reports this errno,
+   * proving the ensure_buffile os_error mapping (EMFILE/ENFILE -> temp-space)
+   * without exhausting the real process fd table.  0 = disarmed. */
+  std::atomic<int> g_fault_create_errno {0};
+
+  int
+  fault_create_injected_errno () noexcept
+  {
+    return g_fault_create_errno.load (std::memory_order_relaxed);
+  }
 #endif /* !NDEBUG */
 
   bool
@@ -414,6 +426,12 @@ namespace qfile
     g_fault_flush_count.store (0, std::memory_order_relaxed);
     g_fault_flush_target.store (nth > 0 ? nth : 0, std::memory_order_relaxed);
   }
+
+  void
+  buffile_fault_arm_create_fail (int os_errno)
+  {
+    g_fault_create_errno.store (os_errno, std::memory_order_relaxed);
+  }
 #endif /* !NDEBUG */
 
   /* ------------------------------------------------------------------ */
@@ -563,6 +581,20 @@ namespace qfile
     std::snprintf (name, sizeof (name), "/buffile_%llu_w%u_p%ld.tmp", (unsigned long long) seq, worker_id,
 		   (long) getpid ());
     const std::string path = dirstr + name;
+
+#if !defined (NDEBUG)
+    /* #125: injected fd-exhaustion (EMFILE/ENFILE) before touching the real fd
+     * table.  No file was created, so nothing to unlink. */
+    const int injected = fault_create_injected_errno ();
+    if (injected != 0)
+      {
+	if (os_error_out != NULL)
+	  {
+	    *os_error_out = injected;
+	  }
+	return NULL;
+      }
+#endif /* !NDEBUG */
 
     const int fd = open (path.c_str (), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
     if (fd < 0)

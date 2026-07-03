@@ -349,7 +349,11 @@ namespace qfile
     m_buffile = buffile::create (thread_p, m_dir.c_str (), m_seq, m_worker_id, m_tde_algo, &os_error);
     if (m_buffile == NULL)
       {
-	if (os_error == ENOSPC || os_error == EDQUOT)
+	/* Parity with the legacy raw-fd is_fd_or_space_error mapping
+	 * (temp_page_store.cpp): fd exhaustion (EMFILE/ENFILE) is diagnosed as
+	 * out-of-temp-space, not a generic ER_FAILED, so fd starvation surfaces
+	 * as an actionable error (#125). */
+	if (os_error == EMFILE || os_error == ENFILE || os_error == ENOSPC || os_error == EDQUOT)
 	  {
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
 	  }
@@ -2391,6 +2395,92 @@ qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
 
   er_log_debug (ARG_FILE_LINE, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
   fprintf (stderr, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
+  return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* In-server self-test: BufFile fd-exhaustion error mapping (#125)     */
+/* Gated by env CUBRID_WM_EMFILE_FAULT_SELFTEST (debug-only invocation).*/
+/* ------------------------------------------------------------------ */
+/*
+ * Legacy raw-fd maps EMFILE/ENFILE/ENOSPC/EDQUOT -> ER_QPROC_OUT_OF_TEMP_SPACE
+ * (is_fd_or_space_error).  The NEW BufFile writer's ensure_buffile () must give
+ * the same diagnosis when open () fails from fd exhaustion; otherwise fd
+ * starvation surfaces as a generic ER_FAILED that no operator can act on.
+ *
+ * Drives the create-fault injector to force buffile::create () to report EMFILE
+ * (then ENFILE) on the first spill append (prefix budget 0 -> immediate spill)
+ * and asserts each raises ER_QPROC_OUT_OF_TEMP_SPACE.  Returns 0 on PASS.
+ *
+ * Fail-before-fix: without the EMFILE/ENFILE arm added to ensure_buffile's
+ * os_error switch, both injections fall through to ER_FAILED, so er_errid ()
+ * != ER_QPROC_OUT_OF_TEMP_SPACE flips this to FAIL -- the pre-fix reproduction.
+ */
+int
+qfile_emfile_fault_selftest (THREAD_ENTRY *thread_p)
+{
+  int rc = NO_ERROR;
+  const qfile::tape_backing_census_snapshot base = qfile::tape_backing_census ();
+
+  std::string dir;
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      rc = ER_FAILED;
+    }
+  else
+    {
+      const int inject_errnos[2] = { EMFILE, ENFILE };
+      static std::uint64_t seq = 125000;
+      for (int k = 0; k < 2 && rc == NO_ERROR; k++)
+	{
+	  qfile::tape_writer w (0, TDE_ALGORITHM_NONE, dir, seq++, 0);	/* budget 0 -> first append spills */
+	  char *pg = (char *) malloc (DB_PAGESIZE);
+	  if (pg == NULL)
+	    {
+	      rc = ER_FAILED;
+	      break;
+	    }
+	  std::memset (pg, 0, DB_PAGESIZE);
+
+	  er_clear ();
+	  qfile::buffile_fault_arm_create_fail (inject_errnos[k]);
+	  const int prc = w.append_page (thread_p, (PAGE_PTR) pg);	/* -> ensure_buffile -> create fails */
+	  qfile::buffile_fault_arm_create_fail (0);
+	  free (pg);
+
+	  if (prc == NO_ERROR)
+	    {
+	      rc = ER_FAILED;		/* injection never fired -> path not exercised */
+	    }
+	  else if (er_errid () != ER_QPROC_OUT_OF_TEMP_SPACE)
+	    {
+	      /* pre-fix reproduction: generic ER_FAILED instead of the temp-space
+	       * diagnosis.  Log the symptom and fail. */
+	      er_log_debug (ARG_FILE_LINE,
+			    "EMFILE_FAULT_SELFTEST no-mapping: errno=%d gave er_errid=%d (want %d)\n",
+			    inject_errnos[k], er_errid (), ER_QPROC_OUT_OF_TEMP_SPACE);
+	      fprintf (stderr,
+		       "EMFILE_FAULT_SELFTEST no-mapping: errno=%d gave er_errid=%d (want %d)\n",
+		       inject_errnos[k], er_errid (), ER_QPROC_OUT_OF_TEMP_SPACE);
+	      rc = ER_FAILED;
+	    }
+	  /* w destructs here; no buffile was ever opened, so nothing to reclaim. */
+	}
+    }
+  qfile::buffile_fault_arm_create_fail (0);
+
+  /* leak check: the failed creates leave no orphaned fd/prefix behind. */
+  if (rc == NO_ERROR)
+    {
+      const qfile::tape_backing_census_snapshot torn = qfile::tape_backing_census ();
+      if (torn.open_files != base.open_files || torn.held_prefix_pages != base.held_prefix_pages)
+	{
+	  rc = ER_FAILED;
+	}
+    }
+
+  er_log_debug (ARG_FILE_LINE, "EMFILE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
+  fprintf (stderr, "EMFILE_FAULT_SELFTEST result=%d (0=PASS)\n", rc);
   return rc;
 }
 

@@ -120,6 +120,13 @@ namespace qfile
    * to mechanically exercise the close/freeze failure-propagation contract;
    * compiled out of release (AC: fault hook excluded under NDEBUG). */
   void buffile_fault_arm_flush_fail (int nth);
+
+  /* fd-exhaustion fault injection (#125, debug-only).  Arm with an errno
+   * (EMFILE/ENFILE) to make the next buffile::create () short-circuit its
+   * open () and report that errno, so the ensure_buffile os_error -> temp-space
+   * mapping can be exercised without draining the real process fd table.
+   * 0 disarms.  Compiled out of release (NDEBUG). */
+  void buffile_fault_arm_create_fail (int os_errno);
 #endif /* !NDEBUG */
 
   /*
