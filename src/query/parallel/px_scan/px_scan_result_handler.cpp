@@ -1335,7 +1335,7 @@ namespace parallel_scan
 	  {
 	    if (agg_node->option == Q_DISTINCT)
 	      {
-		int ls_flag = QFILE_FLAG_DISTINCT | QFILE_NOT_USE_MEMBUF;
+		int ls_flag = QFILE_FLAG_DISTINCT;
 		QFILE_TUPLE_VALUE_TYPE_LIST type_list;
 		type_list.type_cnt = 1;
 		type_list.domp = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *));
@@ -1388,7 +1388,7 @@ namespace parallel_scan
 	    if (agg_node->sort_list != NULL)
 	      {
 		/* GROUP_CONCAT(ORDER BY): open list_id for value accumulation */
-		int ls_flag = QFILE_FLAG_ALL | QFILE_NOT_USE_MEMBUF;
+		int ls_flag = QFILE_FLAG_ALL;
 		QFILE_TUPLE_VALUE_TYPE_LIST type_list;
 		type_list.type_cnt = 1;
 		type_list.domp = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *));
