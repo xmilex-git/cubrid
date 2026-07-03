@@ -7448,6 +7448,22 @@ qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * x
   qfile_copy_list_id (xasl->list_id, list_id, true, QFILE_PROHIBIT_DEPENDENT);
   QFILE_FREE_AND_INIT_LIST_ID (list_id);
 
+  /* Merge join builds an OLD (appendable) output list by qfile_add_tuple
+   * (qexec_merge_list / qexec_merge_list_outer both open it via qfile_open_list);
+   * when that result feeds a parallel consumer (e.g. the GROUP BY over the join
+   * here) the OLD MERGEABLE_LIST sector reader drops rows on a list that is not
+   * itself a parallel-scan producer output (px_scan.cpp).  Promote the finished
+   * list to NEW under the gate so the tuple-level Tapeset reader is used instead.
+   * Skip a cached result file (copy-out path, OLD materialize -- #94).  This is
+   * the same site-specific NEW-promote direction as UNION ALL C-3 (43048f481):
+   * the merge output is consumed, not reopened/appended.  (#117 C-1/2) */
+  if (!QFILE_IS_FLAG_SET (ls_flag, QFILE_FLAG_RESULT_FILE)
+      && (qfile_sort_new_backing_enabled () || qfile_scan_new_backing_enabled ())
+      && qfile_list_promote_old_to_new (thread_p, xasl->list_id) != NO_ERROR)
+    {
+      GOTO_EXIT_ON_ERROR;
+    }
+
   return NO_ERROR;
 
 exit_on_error:
