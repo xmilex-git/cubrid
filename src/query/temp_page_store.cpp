@@ -3002,6 +3002,16 @@ rawfd_write_success:
       {
 	return NO_ERROR;
       }
+    if (qfile_spill_new_backing_enabled ())
+      {
+	/* #134: this leg drives alloc_page () to manufacture a RAW_FD_OVERFLOW
+	 * backing, but under the (c′) coexistence gate the membuf-overflow
+	 * branch serves PAGE_SPILL instead -- the leg would leave a fixed
+	 * spill page behind and trip the ~page_spill_file leak assert.  The
+	 * raw-fd move transfer is covered by gate-off boots. */
+	er_log_debug (ARG_FILE_LINE, "TEMPMOVE_SELFTEST: raw-fd leg skipped (CUBRID_WM_SPILL_NEW gate on)\n");
+	return NO_ERROR;
+      }
     src.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR)));
     dst.membuf = static_cast<PAGE_PTR *> (malloc (sizeof (PAGE_PTR)));
     if (src.membuf == NULL || dst.membuf == NULL)
