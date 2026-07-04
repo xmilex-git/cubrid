@@ -367,6 +367,17 @@ extern "C"
   static bool
   px_join_has_raw_fd_list_scan (XASL_NODE *xasl)
   {
+#if !defined (NDEBUG)
+    /* #132 채증용 debug 우회 (design #74 §7): the #126 repro campaign needs to
+     * drive the (c′) list through concurrent px readers with this guard OFF
+     * (debug 20/20 + release 5/5 evidence).  Env-armed, debug-only; removed
+     * together with the guard itself in 커밋 C. */
+    static const bool guard_off = getenv ("CUBRID_WM_PX_SPILL_GUARD_OFF") != NULL;
+    if (guard_off)
+      {
+	return false;
+      }
+#endif /* !NDEBUG */
     for (XASL_NODE *xptr = xasl; xptr != NULL; xptr = xptr->scan_ptr)
       {
 	for (ACCESS_SPEC_TYPE *specp = xptr->spec_list; specp != NULL; specp = specp->next)

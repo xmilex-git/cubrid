@@ -2959,6 +2959,45 @@ rawfd_write_success:
     qmgr_temp_file_move_selftest_init (&src);
     qmgr_temp_file_move_selftest_init (&dst);
 
+    /* (c′) leg (#132, design §4 D5): the page-spill handle moves by plain
+     * pointer transfer (containment ownership -- no registry reassign), and
+     * src resets to pristine MEMBUF.  No gate/master dependency. */
+    {
+      int os_error = 0;
+      qfile::page_spill_file *spill_p =
+	qfile::page_spill_file::create (static_cast<QUERY_ID> (-11), LOG_FIND_THREAD_TRAN_INDEX (thread_p), 0,
+					false, &os_error);
+      if (spill_p == NULL)
+	{
+	  return ER_FAILED;
+	}
+
+      src.backing = qmgr_temp_backing::PAGE_SPILL_OVERFLOW;
+      src.page_spill_handle = spill_p;
+      src.raw_fd_query_id = static_cast<QUERY_ID> (-11);
+      src.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+      src.raw_fd_next_pageid = 3;
+
+      qmgr_temp_file_move (&dst, &src);
+
+      if (src.page_spill_handle != NULL || src.backing != qmgr_temp_backing::MEMBUF || src.raw_fd_next_pageid != 0
+	  || src.raw_fd_query_id != NULL_QUERY_ID || dst.page_spill_handle != spill_p
+	  || dst.backing != qmgr_temp_backing::PAGE_SPILL_OVERFLOW || dst.raw_fd_next_pageid != 3
+	  || dst.raw_fd_query_id != static_cast<QUERY_ID> (-11))
+	{
+	  delete spill_p;
+	  src.page_spill_handle = NULL;
+	  dst.page_spill_handle = NULL;
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  return ER_FAILED;
+	}
+
+      delete dst.page_spill_handle;
+      dst.page_spill_handle = NULL;
+      qmgr_temp_file_move_selftest_init (&src);
+      qmgr_temp_file_move_selftest_init (&dst);
+    }
+
     if (!raw_fd_writes_enabled ())
       {
 	return NO_ERROR;

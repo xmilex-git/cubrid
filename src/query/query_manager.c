@@ -1098,6 +1098,85 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
       tfile.raw_fd_handle = NULL;
       temp_page_store::destroy_raw_fd_file (file_p);
     }
+
+  /* (c′) leg (#132): the same positioned save/jump contract against the
+   * PAGE_SPILL_OVERFLOW backing (no gate/master dependency -- the handle is
+   * driven directly). */
+  {
+    int os_error = 0;
+    qfile::page_spill_file *spill_p = qfile::page_spill_file::create (static_cast < QUERY_ID > (-10),
+								      LOG_FIND_THREAD_TRAN_INDEX (thread_p), 0,
+								      false, &os_error);
+    if (spill_p == NULL)
+      {
+	return ER_FAILED;
+      }
+
+    QMGR_TEMP_FILE tfile;
+    memset (&tfile, 0, sizeof (tfile));
+    tfile.temp_file_type = FILE_TEMP;
+    VFID_SET_NULL (&tfile.temp_vfid);
+    tfile.membuf_last = -1;
+    tfile.membuf_type = TEMP_FILE_MEMBUF_NONE;
+    tfile.backing = qmgr_temp_backing::PAGE_SPILL_OVERFLOW;
+    tfile.raw_fd_query_id = static_cast < QUERY_ID > (-10);
+    tfile.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+    tfile.page_spill_handle = spill_p;
+    tfile.raw_fd_next_pageid = 1;
+
+    PAGE_PTR page_p = spill_p->alloc_new_page (thread_p, 0);
+    if (page_p == NULL)
+      {
+	delete spill_p;
+	return ER_FAILED;
+      }
+
+    QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+    qmgr_put_page_header (page_p, &page_header);
+    constexpr int tuple_offset = QFILE_PAGE_HEADER_SIZE;
+    constexpr int tuple_length = QFILE_TUPLE_LENGTH_SIZE + 32;
+    QFILE_TUPLE tuple_p = page_p + tuple_offset;
+    QFILE_PUT_TUPLE_LENGTH (tuple_p, tuple_length);
+    for (int i = QFILE_TUPLE_LENGTH_SIZE; i < tuple_length; i++)
+      {
+	tuple_p[i] = static_cast < char > (0xa5 ^ i);
+      }
+    QFILE_PUT_TUPLE_COUNT (page_p, 1);
+    QFILE_PUT_LAST_TUPLE_OFFSET (page_p, tuple_offset);
+
+    char expected_tuple[tuple_length];
+    memcpy (expected_tuple, tuple_p, tuple_length);
+
+    spill_p->mark_dirty (page_p);
+    if (spill_p->release_page (thread_p, page_p) != NO_ERROR)	/* last unfix -> write-back */
+      {
+	tfile.page_spill_handle = NULL;
+	delete spill_p;
+	return ER_FAILED;
+      }
+
+    QFILE_TUPLE_POSITION direct_pos = {};
+    direct_pos.status = S_OPENED;
+    direct_pos.position = S_ON;
+    qfile_tuple_position_set_raw_fd (&direct_pos, spill_p->segment_id (), 0, tuple_offset);
+    direct_pos.tplno = 0;
+
+    PAGE_PTR fixed_page_p = qmgr_segment_pos_read (thread_p, &tfile, &direct_pos);
+    if (fixed_page_p == NULL || memcmp (fixed_page_p + tuple_offset, expected_tuple, tuple_length) != 0)
+      {
+	if (fixed_page_p != NULL)
+	  {
+	    temp_page_store::spill_release_fixed_page (thread_p, &tfile, fixed_page_p);
+	  }
+	tfile.page_spill_handle = NULL;
+	delete spill_p;
+	return ER_FAILED;
+      }
+
+    temp_page_store::spill_release_fixed_page (thread_p, &tfile, fixed_page_p);
+    tfile.page_spill_handle = NULL;
+    delete spill_p;
+  }
   return NO_ERROR;
 }
 #endif /* !NDEBUG */
@@ -1185,6 +1264,33 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       int segpos_selftest_rc = qmgr_segment_position_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
       fprintf (stderr, "SEGPOS_SELFTEST result=%d (0=PASS)\n", segpos_selftest_rc);
+    }
+  if (getenv ("CUBRID_WM_SPILL_SELFTEST") != NULL)
+    {
+      /* #132: (c′) page-spill 257-page random-order parity + sparse fault +
+       * TDE nonce distinctness.  New-machinery hard gate (#93 idiom). */
+      int spill_selftest_rc = qfile::page_spill_file::selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "WM_SPILL_SELFTEST result=%d (0=PASS)\n", spill_selftest_rc);
+      fprintf (stderr, "WM_SPILL_SELFTEST result=%d (0=PASS)\n", spill_selftest_rc);
+      if (spill_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "WM_SPILL_SELFTEST FAIL result=%d\n", spill_selftest_rc);
+	  fprintf (stderr, "WM_SPILL_SELFTEST FAIL result=%d\n", spill_selftest_rc);
+	  assert (spill_selftest_rc == NO_ERROR);
+	}
+    }
+  if (getenv ("CUBRID_WM_SPILL_COHERENCE_SELFTEST") != NULL)
+    {
+      /* #132: INV-1~3 direct evidence + write-back fault injection. */
+      int spill_coherence_rc = qfile::page_spill_file::coherence_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "WM_SPILL_COHERENCE_SELFTEST result=%d (0=PASS)\n", spill_coherence_rc);
+      fprintf (stderr, "WM_SPILL_COHERENCE_SELFTEST result=%d (0=PASS)\n", spill_coherence_rc);
+      if (spill_coherence_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "WM_SPILL_COHERENCE_SELFTEST FAIL result=%d\n", spill_coherence_rc);
+	  fprintf (stderr, "WM_SPILL_COHERENCE_SELFTEST FAIL result=%d\n", spill_coherence_rc);
+	  assert (spill_coherence_rc == NO_ERROR);
+	}
     }
   if (getenv ("CUBRID_BUFFILE_SELFTEST") != NULL)
     {

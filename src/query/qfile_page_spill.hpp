@@ -74,6 +74,18 @@ typedef struct fileio_page FILEIO_PAGE;
 
 namespace qfile
 {
+#if !defined (NDEBUG)
+  /* write-back fault injection (#86 idiom, debug-only): the Nth subsequent
+   * page_spill write-back fails as if the disk hit ENOSPC (er_set
+   * ER_QPROC_OUT_OF_TEMP_SPACE, no pwrite).  nth <= 0 disarms. */
+  void page_spill_fault_arm_flush_fail (int nth);
+
+  /* sparse-fault expectation (selftest-only): while armed, the INV-4 fault
+   * keeps its er_set + NULL contract but skips the debug assert so the
+   * selftest can exercise it without aborting boot. */
+  void page_spill_fault_expect_sparse (bool expected);
+#endif /* !NDEBUG */
+
   class page_spill_file
   {
     public:
@@ -119,6 +131,16 @@ namespace qfile
 
       page_spill_file (const page_spill_file &) = delete;
       page_spill_file &operator= (const page_spill_file &) = delete;
+
+#if !defined (NDEBUG)
+      /* In-server selftests (#132, design §7; env-gated in qmgr_initialize,
+       * debug-only, #93-style hard gates).  Member functions for full access
+       * to the cache internals.  Return 0 on PASS. */
+      static int selftest (THREAD_ENTRY *thread_p);	/* CUBRID_WM_SPILL_SELFTEST: 257-page random-order
+							 * parity + sparse fault + TDE nonce distinctness */
+      static int coherence_selftest (THREAD_ENTRY *thread_p);	/* CUBRID_WM_SPILL_COHERENCE_SELFTEST:
+								 * INV-1~3 direct evidence + flush-fault injection */
+#endif /* !NDEBUG */
 
     private:
       page_spill_file () = default;
