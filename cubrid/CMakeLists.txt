@@ -292,6 +292,7 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/temp_page_store.cpp
   ${QUERY_DIR}/qfile_tape.cpp
   ${QUERY_DIR}/qfile_spill_file.cpp
+  ${QUERY_DIR}/qfile_page_spill.cpp
   ${QUERY_DIR}/qfile_buffile.cpp
   ${QUERY_DIR}/qfile_chunk.cpp
   ${QUERY_DIR}/memoize.cpp
@@ -315,6 +316,7 @@ set(QUERY_HEADERS
   ${QUERY_DIR}/memoize.hpp
   ${QUERY_DIR}/qfile_tape.hpp
   ${QUERY_DIR}/qfile_spill_file.hpp
+  ${QUERY_DIR}/qfile_page_spill.hpp
   ${QUERY_DIR}/qfile_buffile.hpp
   ${QUERY_DIR}/qfile_chunk.hpp
   )

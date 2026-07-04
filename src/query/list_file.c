@@ -5254,7 +5254,11 @@ qfile_list_is_raw_fd_spilled (const QFILE_LIST_ID * list_id_p)
 {
   QMGR_TEMP_FILE *tfile_p = (list_id_p != NULL) ? QFILE_LIST_ID_TFILE_VFID (list_id_p) : NULL;
 
-  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW;
+  /* (c′) page-spill overflow re-fixes past membuf_last are real preads too
+   * (per-tfile cache holds only fixed pages), so the same use_original
+   * amplification applies (#132). */
+  return tfile_p != NULL && (tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+			     || tfile_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW);
 }
 
 /* qfile_initialize_sort_info () -
@@ -5385,6 +5389,29 @@ qfile_hashjoin_new_backing_enabled (void)
     {
       const char *env = getenv ("CUBRID_WM_HASHJOIN_NEW");
       cached = (env != NULL && env[0] == '0') ? 0 : 1;
+    }
+  return cached != 0;
+}
+
+/*
+ * qfile_spill_new_backing_enabled () - is the OLD-tier membuf overflow served
+ *   by the NEW (c′) per-tfile page-spill backing instead of raw-fd?
+ *   Coexistence gate (#132, design #74 [(c′) coherence 설계] §5 D6).
+ *   ** Default OFF (0) -- OPT-IN via CUBRID_WM_SPILL_NEW=1.  This is the
+ *   OPPOSITE polarity of the three migration gates above (those default ON
+ *   with =0 opt-out): during raw-fd/(c′) coexistence the safe side is the
+ *   proven raw-fd path.  The cutover commit (커밋 A) flips this default. **
+ *   The decision is taken once per tfile at its first spill (the backing tag
+ *   pins it); the env itself is boot-cached like its siblings.
+ */
+bool
+qfile_spill_new_backing_enabled (void)
+{
+  static int cached = -1;
+  if (cached < 0)
+    {
+      const char *env = getenv ("CUBRID_WM_SPILL_NEW");
+      cached = (env != NULL && env[0] == '1') ? 1 : 0;
     }
   return cached != 0;
 }
@@ -5947,10 +5974,10 @@ qfile_get_tuple_from_current_list (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID *
 static bool
 qfile_scan_is_raw_fd_backed (const QFILE_LIST_SCAN_ID * scan_id_p)
 {
-  QMGR_TEMP_FILE *tfile_vfid_p = QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id));
-
-  return tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-    && tfile_vfid_p->raw_fd_handle != NULL;
+  /* either coexisting fd-backed overflow tag (raw-fd / (c′) page-spill, #132);
+   * both issue dense pageids from raw_fd_next_pageid, so the dense scans below
+   * work unchanged */
+  return qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id)));
 }
 
 static PAGE_PTR
@@ -6327,12 +6354,12 @@ qfile_save_current_scan_tuple_position (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TU
     }
   tuple_position_p->status = scan_id_p->status;
   tuple_position_p->position = scan_id_p->position;
-  if (QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)) != NULL
-      && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-      && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
+  if (qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id)))
+      && scan_id_p->curr_vpid.volid == NULL_VOLID
       && scan_id_p->curr_vpid.pageid > QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->membuf_last)
     {
-      qfile_tuple_position_set_raw_fd (tuple_position_p, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle->segment_id (),
+      qfile_tuple_position_set_raw_fd (tuple_position_p,
+				       qmgr_tfile_fd_overflow_segment_id (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id))),
 				       scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
     }
   else
@@ -8105,11 +8132,12 @@ qfile_add_tuple_get_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_i
     {
       tuple_pos->status = S_OPENED;
       tuple_pos->position = S_ON;
-      if (QFILE_LIST_ID_TFILE_VFID(list_id_p) != NULL && QFILE_LIST_ID_TFILE_VFID(list_id_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-	  && QFILE_LIST_ID_TFILE_VFID(list_id_p)->raw_fd_handle != NULL && QFILE_LIST_ID_LAST_VPID(list_id_p).volid == NULL_VOLID
+      if (qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (list_id_p))
+	  && QFILE_LIST_ID_LAST_VPID(list_id_p).volid == NULL_VOLID
 	  && QFILE_LIST_ID_LAST_VPID(list_id_p).pageid > QFILE_LIST_ID_TFILE_VFID(list_id_p)->membuf_last)
 	{
-	  qfile_tuple_position_set_raw_fd (tuple_pos, QFILE_LIST_ID_TFILE_VFID(list_id_p)->raw_fd_handle->segment_id (),
+	  qfile_tuple_position_set_raw_fd (tuple_pos,
+					   qmgr_tfile_fd_overflow_segment_id (QFILE_LIST_ID_TFILE_VFID (list_id_p)),
 					   QFILE_LIST_ID_LAST_VPID(list_id_p).pageid, list_id_p->last_offset);
 	}
       else

@@ -41,6 +41,7 @@
 #include "query_hash_scan.h"
 #include "temp_page_store.hpp"
 #include "qfile_buffile.hpp"
+#include "qfile_page_spill.hpp"
 #include "qfile_tape.hpp"
 #include "stream_to_xasl.h"
 #include "session.h"
@@ -3032,6 +3033,17 @@ qmgr_free_old_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * t
 	}
       return;
     }
+  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+    {
+      /* (c′) last-unfix write-back; failure poisons the query (INV-2/INV-3, #132) */
+      const int error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
+      if (error != NO_ERROR)
+	{
+	  ASSERT_ERROR ();
+	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
+	}
+      return;
+    }
 
 
   page_type = qmgr_get_page_type (page_p, tfile_vfid_p);
@@ -3068,7 +3080,9 @@ qmgr_get_old_page_read_only (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_F
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
     }
-  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
+  if (tfile_vfid_p != NULL
+      && (tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+	  || tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW))
     {
       return temp_page_store::fix_old_page (thread_p, tfile_vfid_p, vpid_p);
     }
@@ -3134,7 +3148,9 @@ qmgr_get_old_page_simple_fix (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
     }
-  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
+  if (tfile_vfid_p != NULL
+      && (tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+	  || tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW))
     {
       return temp_page_store::fix_old_page (thread_p, tfile_vfid_p, vpid_p);
     }
@@ -3212,6 +3228,16 @@ qmgr_free_old_page_simple_fix (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TE
 	}
       return;
     }
+  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+    {
+      const int error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
+      if (error != NO_ERROR)
+	{
+	  ASSERT_ERROR ();
+	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
+	}
+      return;
+    }
 
   page_type = qmgr_get_page_type (page_p, tfile_vfid_p);
   if (page_type == QMGR_UNKNOWN_PAGE)
@@ -3249,6 +3275,22 @@ qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LO
   if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
     {
       const int error = temp_page_store::rawfd_flush_page (thread_p, tfile_vfid_p, page_p, free_page);
+      if (error != NO_ERROR)
+	{
+	  if (er_errid () == NO_ERROR)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	    }
+	  ASSERT_ERROR ();
+	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
+	}
+      return;
+    }
+  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+    {
+      /* (c′) set_dirty: DONT_FREE marks the flag only; FREE = last-unfix
+       * write-back inside the shim (INV-2, #132) */
+      const int error = temp_page_store::spill_flush_page (thread_p, tfile_vfid_p, page_p, free_page);
       if (error != NO_ERROR)
 	{
 	  if (er_errid () == NO_ERROR)
@@ -3329,6 +3371,7 @@ qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src)
   dst->raw_fd_handle = src->raw_fd_handle;
   dst->raw_fd_next_pageid = src->raw_fd_next_pageid;
   dst->raw_fd_hint = src->raw_fd_hint;
+  dst->page_spill_handle = src->page_spill_handle;	/* (c′) containment move: pointer transfer only (D5, #132) */
   dst->preserved = src->preserved;
   dst->tde_encrypted = src->tde_encrypted;
 
@@ -3348,6 +3391,7 @@ qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src)
   src->raw_fd_handle = NULL;
   src->raw_fd_next_pageid = 0;
   src->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  src->page_spill_handle = NULL;
   src->preserved = false;
   src->tde_encrypted = false;
 }
@@ -3390,12 +3434,60 @@ qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p)
   return segment_list_p != NULL && segment_list_p->segment_count > 0;
 }
 
+/*
+ * qmgr_tfile_has_fd_overflow () - does the tfile carry a live fd-backed OLD
+ *   overflow handle, under EITHER coexisting tag (legacy raw-fd or the (c′)
+ *   page-spill backing, #132)?  Guards/materialize/segment-copy sites that
+ *   keyed on RAW_FD_OVERFLOW must fire identically for PAGE_SPILL_OVERFLOW
+ *   during coexistence (design §2.4: the #126 guard stays until 커밋 C).
+ */
+bool
+qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p)
+{
+  if (tfile_p == NULL)
+    {
+      return false;
+    }
+  if (tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
+    {
+      return tfile_p->raw_fd_handle != NULL;
+    }
+  if (tfile_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+    {
+      return tfile_p->page_spill_handle != NULL;
+    }
+  return false;
+}
+
+/* segment_id of whichever overflow handle the tfile carries (0 when none).
+ * The tuple-position coordinate discriminator (COORD_RAW_FD) is shared by
+ * both backings: a position is only ever checked against the tfile it was
+ * saved from, whose backing kind is pinned at first spill, and each kind's
+ * ids are never reused within a boot -- so a stale coordinate (handle
+ * destroyed + recreated) always mismatches. */
+UINT64
+qmgr_tfile_fd_overflow_segment_id (const QMGR_TEMP_FILE * tfile_p)
+{
+  if (tfile_p == NULL)
+    {
+      return 0;
+    }
+  if (tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW && tfile_p->raw_fd_handle != NULL)
+    {
+      return tfile_p->raw_fd_handle->segment_id ();
+    }
+  if (tfile_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW && tfile_p->page_spill_handle != NULL)
+    {
+      return tfile_p->page_spill_handle->segment_id ();
+    }
+  return 0;
+}
+
 bool
 qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
 {
-  return list_id_p != NULL && list_id_p->tuple_cnt > 0 && QFILE_LIST_ID_TFILE_VFID(list_id_p) != NULL
-    && QFILE_LIST_ID_TFILE_VFID(list_id_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-    && QFILE_LIST_ID_TFILE_VFID(list_id_p)->raw_fd_handle != NULL;
+  return list_id_p != NULL && list_id_p->tuple_cnt > 0
+    && qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (list_id_p));
 }
 
 /* Class-B materialize predicate (#94): a list needs pgbuf materialization at a
@@ -3418,9 +3510,8 @@ qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p)
 int
 qmgr_segment_list_add_list_id (QMGR_SEGMENT_LIST * segment_list_p, const QFILE_LIST_ID * list_id_p)
 {
-  if (segment_list_p == NULL || list_id_p == NULL || list_id_p->tuple_cnt <= 0 || QFILE_LIST_ID_TFILE_VFID(list_id_p) == NULL
-      || QFILE_LIST_ID_TFILE_VFID(list_id_p)->backing != qmgr_temp_backing::RAW_FD_OVERFLOW
-      || QFILE_LIST_ID_TFILE_VFID(list_id_p)->raw_fd_handle == NULL)
+  if (segment_list_p == NULL || list_id_p == NULL || list_id_p->tuple_cnt <= 0
+      || !qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (list_id_p)))
     {
       return NO_ERROR;
     }
@@ -3643,9 +3734,7 @@ qmgr_copy_list_tuples_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_lis
       return NO_ERROR;
     }
 
-  if (QFILE_LIST_ID_TFILE_VFID(src_list_id_p) != NULL
-      && QFILE_LIST_ID_TFILE_VFID(src_list_id_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-      && QFILE_LIST_ID_TFILE_VFID(src_list_id_p)->raw_fd_handle != NULL)
+  if (qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (src_list_id_p)))
     {
       QMGR_SEGMENT_LIST segment_list;
       qmgr_segment_list_init (&segment_list);
@@ -3833,12 +3922,18 @@ qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
 {
   if (tfile_vfid_p == NULL || tuple_position_p == NULL || !qfile_tuple_position_is_raw_fd (tuple_position_p)
       || tuple_position_p->page_index < 0 || tuple_position_p->tuple_offset < QFILE_PAGE_HEADER_SIZE
-      || tuple_position_p->tuple_offset >= DB_PAGESIZE
-      || tfile_vfid_p->backing != qmgr_temp_backing::RAW_FD_OVERFLOW || tfile_vfid_p->raw_fd_handle == NULL
-      || tfile_vfid_p->raw_fd_handle->segment_id () != tuple_position_p->raw_fd_segment_id)
+      || tuple_position_p->tuple_offset >= DB_PAGESIZE || !qmgr_tfile_has_fd_overflow (tfile_vfid_p)
+      || qmgr_tfile_fd_overflow_segment_id (tfile_vfid_p) != tuple_position_p->raw_fd_segment_id)
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
+    }
+
+  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+    {
+      /* (c′) positioned jump: fix_page serves resident-first, so a saved
+       * position stays valid across dirty/write-back cycles (INV-1, #132) */
+      return tfile_vfid_p->page_spill_handle->fix_page (thread_p, tuple_position_p->page_index);
     }
 
   return temp_page_store::rawfd_pos_read (thread_p, *tfile_vfid_p->raw_fd_handle,
@@ -4110,6 +4205,7 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
   tfile_vfid_p->raw_fd_handle = NULL;
   tfile_vfid_p->raw_fd_next_pageid = num_buffer_pages;
   tfile_vfid_p->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  tfile_vfid_p->page_spill_handle = NULL;
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
   tfile_vfid_p->membuf_last = -1;
@@ -4226,6 +4322,7 @@ qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id)
   tfile_vfid_p->raw_fd_handle = NULL;
   tfile_vfid_p->raw_fd_next_pageid = 0;
   tfile_vfid_p->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  tfile_vfid_p->page_spill_handle = NULL;
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
 
@@ -4479,6 +4576,12 @@ qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_
     {
       temp_page_store::destroy_raw_fd_file (tfile_vfid_p->raw_fd_handle);
       tfile_vfid_p->raw_fd_handle = NULL;
+      tfile_vfid_p->raw_fd_next_pageid = 0;
+    }
+  if (tfile_vfid_p->page_spill_handle != NULL)
+    {
+      delete tfile_vfid_p->page_spill_handle;
+      tfile_vfid_p->page_spill_handle = NULL;
       tfile_vfid_p->raw_fd_next_pageid = 0;
     }
   if (query_p->temp_vfid)
@@ -4848,6 +4951,11 @@ qmgr_put_temp_file_into_list (QMGR_TEMP_FILE * temp_file_p)
     {
       temp_page_store::destroy_raw_fd_file (temp_file_p->raw_fd_handle);
       temp_file_p->raw_fd_handle = NULL;
+    }
+  if (temp_file_p->page_spill_handle != NULL)
+    {
+      delete temp_file_p->page_spill_handle;
+      temp_file_p->page_spill_handle = NULL;
     }
   temp_file_p->raw_fd_next_pageid = 0;
   temp_file_p->raw_fd_owner_tran_index = NULL_TRAN_INDEX;

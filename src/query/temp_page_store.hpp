@@ -44,7 +44,9 @@ enum class qmgr_temp_backing : int
   PGBUF_PINNED,
   PRIVATE_SPILL_FALLBACK,
   SHARED_SPILL,
-  RAW_FD_OVERFLOW
+  RAW_FD_OVERFLOW,
+  PAGE_SPILL_OVERFLOW		/* (c′) per-tfile page-spill cache, #132; coexists with RAW_FD_OVERFLOW
+				 * behind CUBRID_WM_SPILL_NEW until the cutover (#74 §5 커밋 A/B) */
 };
 
 namespace temp_page_store
@@ -170,6 +172,11 @@ namespace temp_page_store
   int rawfd_rewrite_page (THREAD_ENTRY * thread_p, raw_fd_file &file, PAGEID page_index, PAGE_PTR page_p) noexcept;
   int rawfd_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept;
   int rawfd_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept;
+
+  /* (c′) PAGE_SPILL_OVERFLOW consumer shims (#132) -- same signatures/contract
+   * as the rawfd_* pair so the qmgr dispatch branches stay symmetric. */
+  int spill_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept;
+  int spill_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept;
 
   int rawfd_single_worker_tde_positioned_read_parity (THREAD_ENTRY * thread_p) noexcept;
   int rawfd_mutation_nonce_selftest (THREAD_ENTRY * thread_p) noexcept;

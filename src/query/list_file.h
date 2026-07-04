@@ -222,6 +222,8 @@ extern bool qfile_sort_new_backing_enabled (void);
 extern int qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
 extern bool qfile_scan_new_backing_enabled (void);
 extern bool qfile_hashjoin_new_backing_enabled (void);
+/* (c′) coexistence gate (#132): default 0, OPT-IN -- opposite polarity of the three gates above. */
+extern bool qfile_spill_new_backing_enabled (void);
 extern int qfile_tapeset_import (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest, QFILE_LIST_ID * src);
 extern int qfile_save_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, QFILE_TUPLE_TYPE tuple_type, char *page_p,
 			     int *tuple_length_p);

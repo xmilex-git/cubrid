@@ -32,6 +32,7 @@
 #include "object_representation.h"
 #include "page_buffer.h"
 #include "perf_monitor.h"
+#include "qfile_page_spill.hpp"	/* (c′) PAGE_SPILL_OVERFLOW backing (#132) */
 #include "qfile_spill_file.hpp"	/* full_pwrite/full_pread (shared substrate, #132) */
 #include "query_manager.h"
 #include "system_parameter.h"
@@ -1412,6 +1413,12 @@ namespace
 	tfile_p->raw_fd_handle = NULL;
 	tfile_p->raw_fd_next_pageid = 0;
       }
+    if (tfile_p->page_spill_handle != NULL)
+      {
+	delete tfile_p->page_spill_handle;
+	tfile_p->page_spill_handle = NULL;
+	tfile_p->raw_fd_next_pageid = 0;
+      }
 
     if (!VFID_ISNULL (&tfile_p->temp_vfid))
       {
@@ -2075,6 +2082,37 @@ rawfd_write_success:
       }
 
     return NO_ERROR;
+  }
+
+  /* (c′) PAGE_SPILL_OVERFLOW consumer shims (#132) -- rawfd_flush_page /
+   * rawfd_release_fixed_page contract parity: an unknown page (e.g. a membuf
+   * page routed through the same qmgr call path) is a silent NO_ERROR. */
+  int
+  spill_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept
+  {
+    if (tfile_p == NULL || tfile_p->page_spill_handle == NULL
+	|| !tfile_p->page_spill_handle->mark_dirty (page_p))
+      {
+	return NO_ERROR;
+      }
+
+    if (free_page != (int) FREE)
+      {
+	return NO_ERROR;
+      }
+
+    return spill_release_fixed_page (thread_p, tfile_p, page_p);
+  }
+
+  int
+  spill_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept
+  {
+    if (tfile_p == NULL || tfile_p->page_spill_handle == NULL)
+      {
+	return NO_ERROR;
+      }
+
+    return tfile_p->page_spill_handle->release_page (thread_p, page_p);
   }
 
 #ifdef RAWFD_UNIT_TEST
@@ -3066,6 +3104,44 @@ rawfd_write_success:
               return tfile_p->membuf[tfile_p->membuf_last];
             }
 
+          if (qfile_spill_new_backing_enabled ())
+            {
+              /* (c′) page-spill backing (#132; opt-in gate, default 0 during
+               * coexistence).  The choice is made ONCE at the tfile's first
+               * spill; the PAGE_SPILL_OVERFLOW tag pins it thereafter. */
+              int os_error = 0;
+              if (tfile_p->page_spill_handle == NULL)
+                {
+                  tfile_p->page_spill_handle =
+                    qfile::page_spill_file::create (tfile_p->raw_fd_query_id, tfile_p->raw_fd_owner_tran_index,
+                                                    tfile_p->raw_fd_worker_id, tfile_p->tde_encrypted, &os_error);
+                }
+              if (tfile_p->page_spill_handle == NULL)
+                {
+                  qfile::spill_file::set_os_error (os_error);
+                  return NULL;
+                }
+
+              if (tfile_p->raw_fd_next_pageid <= tfile_p->membuf_last)
+                {
+                  tfile_p->raw_fd_next_pageid = tfile_p->membuf_last + 1;
+                }
+              vpid_p->volid = NULL_VOLID;
+              vpid_p->pageid = tfile_p->raw_fd_next_pageid++;
+              tfile_p->backing = qmgr_temp_backing::PAGE_SPILL_OVERFLOW;
+              PAGE_PTR spill_page_p = tfile_p->page_spill_handle->alloc_new_page (thread_p, vpid_p->pageid);
+              if (spill_page_p == NULL)
+                {
+                  delete tfile_p->page_spill_handle;
+                  tfile_p->page_spill_handle = NULL;
+                  tfile_p->raw_fd_next_pageid = 0;
+                  return NULL;
+                }
+              QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+              put_page_header (spill_page_p, &page_header);
+              return spill_page_p;
+            }
+
           if (!raw_fd_writes_enabled ())
             {
               er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
@@ -3130,6 +3206,27 @@ rawfd_write_success:
           return raw_page_p;
         }
 
+      case qmgr_temp_backing::PAGE_SPILL_OVERFLOW:
+        /* mid-run gate flip cannot happen (env is boot-cached) but keep the
+         * re-check shape of the RAW_FD_OVERFLOW case above (#132). */
+        if (!qfile_spill_new_backing_enabled () || tfile_p->page_spill_handle == NULL)
+          {
+            er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
+            return NULL;
+          }
+        vpid_p->volid = NULL_VOLID;
+        vpid_p->pageid = tfile_p->raw_fd_next_pageid++;
+        {
+          PAGE_PTR spill_page_p = tfile_p->page_spill_handle->alloc_new_page (thread_p, vpid_p->pageid);
+          if (spill_page_p == NULL)
+            {
+              return NULL;
+            }
+          QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
+          put_page_header (spill_page_p, &page_header);
+          return spill_page_p;
+        }
+
       case qmgr_temp_backing::PGBUF_PINNED:
       case qmgr_temp_backing::SHARED_SPILL:
         return unreachable_backing_page (thread_p);
@@ -3179,6 +3276,17 @@ rawfd_write_success:
           }
         return rawfd_pos_read (thread_p, *tfile_p->raw_fd_handle,
                                raw_fd_page_coordinate { tfile_p->raw_fd_handle->segment_id (), vpid_p->pageid, 0 });
+
+      case qmgr_temp_backing::PAGE_SPILL_OVERFLOW:
+        if (vpid_p->volid == NULL_VOLID && vpid_p->pageid >= 0 && vpid_p->pageid <= tfile_p->membuf_last)
+          {
+            return fix_membuf_page (thread_p, tfile_p, vpid_p);
+          }
+        if (tfile_p->page_spill_handle == NULL)
+          {
+            return unreachable_backing_page (thread_p);
+          }
+        return tfile_p->page_spill_handle->fix_page (thread_p, vpid_p->pageid);
 
       case qmgr_temp_backing::PGBUF_PINNED:
       case qmgr_temp_backing::SHARED_SPILL:
@@ -3248,6 +3356,12 @@ rawfd_write_success:
       {
         destroy_raw_fd_file (tfile_p->raw_fd_handle);
         tfile_p->raw_fd_handle = NULL;
+      }
+    if (tfile_p->page_spill_handle != NULL)
+      {
+        /* containment ownership (D2, #132): delete = close + unlink + census */
+        delete tfile_p->page_spill_handle;
+        tfile_p->page_spill_handle = NULL;
       }
 
     if (tfile_p->wm_reserved_bytes == 0)

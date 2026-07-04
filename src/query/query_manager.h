@@ -82,6 +82,11 @@ typedef enum
   QMGR_TRAN_DBLINK_ABORTED	/* A dblink'ed transaction is aborted */
 } QMGR_TRAN_STATUS;
 
+namespace qfile
+{
+  class page_spill_file;	/* (c′) per-tfile page-spill backing (qfile_page_spill.hpp, #132) */
+}
+
 typedef struct qmgr_temp_file QMGR_TEMP_FILE;
 struct qmgr_temp_file
 {
@@ -101,8 +106,9 @@ struct qmgr_temp_file
   int raw_fd_owner_tran_index;
   unsigned int raw_fd_worker_id;
   temp_page_store::raw_fd_file *raw_fd_handle;
-  int raw_fd_next_pageid;
+  int raw_fd_next_pageid;	/* dense overflow pageid issue; shared by raw-fd and (c′) page-spill */
   temp_page_store::raw_fd_access_hint raw_fd_hint;
+  qfile::page_spill_file *page_spill_handle;	/* (c′) PAGE_SPILL_OVERFLOW backing; containment-owned (D2, #132) */
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };
@@ -211,6 +217,9 @@ extern void qmgr_segment_list_init (QMGR_SEGMENT_LIST * segment_list_p);
 extern void qmgr_segment_list_clear (QMGR_SEGMENT_LIST * segment_list_p);
 extern bool qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p);
 extern bool qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p);
+/* fd-backed OLD overflow, either tag (raw-fd legacy / (c′) page-spill, #132) */
+extern bool qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p);
+extern UINT64 qmgr_tfile_fd_overflow_segment_id (const QMGR_TEMP_FILE * tfile_p);
 extern bool qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p);
 extern int qmgr_segment_list_add_list_id (QMGR_SEGMENT_LIST * segment_list_p, const QFILE_LIST_ID * list_id_p);
 extern int qmgr_segment_list_open_scan (const QMGR_SEGMENT_LIST * segment_list_p, QMGR_SEGMENT_LIST_SCAN * scan_p);

@@ -600,12 +600,12 @@ qdata_save_hscan_pos (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_SIMPLE_POS * p
       assert (qfile_tuple_position_is_tape (&tape_pos));
       qfile_tuple_simple_pos_set_tape (pos, tape_pos.tape_idx, tape_pos.tape_page_offset, tape_pos.tape_byte_offset);
     }
-  else if (QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)) != NULL
-      && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-      && QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle != NULL && scan_id_p->curr_vpid.volid == NULL_VOLID
+  else if (qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id)))
+      && scan_id_p->curr_vpid.volid == NULL_VOLID
       && scan_id_p->curr_vpid.pageid > QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->membuf_last)
     {
-      qfile_tuple_simple_pos_set_raw_fd (pos, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->raw_fd_handle->segment_id (),
+      qfile_tuple_simple_pos_set_raw_fd (pos,
+					 qmgr_tfile_fd_overflow_segment_id (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id))),
 					 scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
     }
   else
