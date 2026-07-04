@@ -17000,12 +17000,8 @@ end:
     {
       // one new list file
 #if !defined (NDEBUG)
-      int dependent_cnt = 0;
-      for (QFILE_LIST_ID * list_id_p = list_id; list_id_p != NULL; list_id_p = QFILE_LIST_ID_DEPENDENT(list_id_p))
-	{
-	  dependent_cnt++;
-	}
-      assert (thread_p->m_qlist_count.load () == qlist_enter_count + dependent_cnt);
+      /* one list file: the dependent chain was removed with qfile_connect_list (#131). */
+      assert (thread_p->m_qlist_count.load () == qlist_enter_count + 1);
 #endif
     }
   else

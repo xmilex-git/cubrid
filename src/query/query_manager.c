@@ -3393,17 +3393,9 @@ qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p)
 bool
 qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
 {
-  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
-    {
-      if (iter_p->tuple_cnt > 0 && QFILE_LIST_ID_TFILE_VFID(iter_p) != NULL
-	  && QFILE_LIST_ID_TFILE_VFID(iter_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-	  && QFILE_LIST_ID_TFILE_VFID(iter_p)->raw_fd_handle != NULL)
-	{
-	  return true;
-	}
-    }
-
-  return false;
+  return list_id_p != NULL && list_id_p->tuple_cnt > 0 && QFILE_LIST_ID_TFILE_VFID(list_id_p) != NULL
+    && QFILE_LIST_ID_TFILE_VFID(list_id_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+    && QFILE_LIST_ID_TFILE_VFID(list_id_p)->raw_fd_handle != NULL;
 }
 
 /* Class-B materialize predicate (#94): a list needs pgbuf materialization at a
@@ -3415,12 +3407,9 @@ qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
 bool
 qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p)
 {
-  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
+  if (list_id_p != NULL && list_id_p->tuple_cnt > 0 && qfile_list_has_new_backing (list_id_p))
     {
-      if (iter_p->tuple_cnt > 0 && qfile_list_has_new_backing (iter_p))
-	{
-	  return true;
-	}
+      return true;
     }
 
   return qmgr_list_has_raw_fd_segments (list_id_p);
@@ -3584,7 +3573,7 @@ qmgr_segment_list_append_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_
 static bool
 qmgr_list_is_private_spill_single_owner (const QFILE_LIST_ID * list_id_p)
 {
-  return list_id_p != NULL && QFILE_LIST_ID_DEPENDENT(list_id_p) == NULL && QFILE_LIST_ID_TFILE_VFID(list_id_p) != NULL
+  return list_id_p != NULL && QFILE_LIST_ID_TFILE_VFID(list_id_p) != NULL
     && QFILE_LIST_ID_TFILE_VFID(list_id_p)->backing == qmgr_temp_backing::PRIVATE_SPILL_FALLBACK
     && QFILE_LIST_ID_TFILE_VFID(list_id_p)->membuf == NULL;
 }
@@ -3649,30 +3638,28 @@ qmgr_copy_list_tuples_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest_lis
       return ER_FAILED;
     }
 
-  for (QFILE_LIST_ID * iter_p = src_list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
+  if (src_list_id_p->tuple_cnt <= 0)
     {
-      if (iter_p->tuple_cnt <= 0)
-	{
-	  continue;
-	}
+      return NO_ERROR;
+    }
 
-      if (QFILE_LIST_ID_TFILE_VFID(iter_p) != NULL && QFILE_LIST_ID_TFILE_VFID(iter_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-	  && QFILE_LIST_ID_TFILE_VFID(iter_p)->raw_fd_handle != NULL)
+  if (QFILE_LIST_ID_TFILE_VFID(src_list_id_p) != NULL
+      && QFILE_LIST_ID_TFILE_VFID(src_list_id_p)->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
+      && QFILE_LIST_ID_TFILE_VFID(src_list_id_p)->raw_fd_handle != NULL)
+    {
+      QMGR_SEGMENT_LIST segment_list;
+      qmgr_segment_list_init (&segment_list);
+      if (qmgr_segment_list_add_list_id (&segment_list, src_list_id_p) != NO_ERROR)
 	{
-	  QMGR_SEGMENT_LIST segment_list;
-	  qmgr_segment_list_init (&segment_list);
-	  if (qmgr_segment_list_add_list_id (&segment_list, iter_p) != NO_ERROR)
-	    {
-	      qmgr_segment_list_clear (&segment_list);
-	      return ER_FAILED;
-	    }
-	  error = qmgr_segment_list_append_to_list (thread_p, dest_list_id_p, &segment_list);
 	  qmgr_segment_list_clear (&segment_list);
+	  return ER_FAILED;
 	}
-      else
-	{
-	  error = qmgr_copy_regular_list_to_list (thread_p, dest_list_id_p, iter_p);
-	}
+      error = qmgr_segment_list_append_to_list (thread_p, dest_list_id_p, &segment_list);
+      qmgr_segment_list_clear (&segment_list);
+    }
+  else
+    {
+      error = qmgr_copy_regular_list_to_list (thread_p, dest_list_id_p, src_list_id_p);
     }
 
   return error;
@@ -3881,15 +3868,13 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 
   QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
   int error = NO_ERROR;
-  for (const QFILE_LIST_ID * iter_p = list_id_p; iter_p != NULL && error == NO_ERROR; iter_p = QFILE_LIST_ID_DEPENDENT(iter_p))
+  QFILE_LIST_SCAN_ID scan_id;
+  if (qfile_open_list_scan_raw_fd_segments (list_id_p, &scan_id) != NO_ERROR)
     {
-      QFILE_LIST_SCAN_ID scan_id;
-      if (qfile_open_list_scan_raw_fd_segments (const_cast < QFILE_LIST_ID * > (iter_p), &scan_id) != NO_ERROR)
-	{
-	  error = ER_FAILED;
-	  break;
-	}
-
+      error = ER_FAILED;
+    }
+  else
+    {
       SCAN_CODE scan_code;
       while ((scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK)) == S_SUCCESS)
 	{

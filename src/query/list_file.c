@@ -527,32 +527,6 @@ qfile_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_li
 
   memset (&dest_list_id_p->tpl_descr, 0, sizeof (QFILE_TUPLE_DESCRIPTOR));
 
-  if (QFILE_LIST_ID_DEPENDENT(src_list_id_p) != NULL)
-    {
-      switch (dep_mode)
-	{
-	case QFILE_SKIP_DEPENDENT:
-	  QFILE_LIST_ID_DEPENDENT(dest_list_id_p) = NULL;
-	  break;
-
-	case QFILE_MOVE_DEPENDENT:
-	  /* transfer ownership */
-	  assert (QFILE_LIST_ID_DEPENDENT(dest_list_id_p) == QFILE_LIST_ID_DEPENDENT(src_list_id_p));
-	  QFILE_LIST_ID_DEPENDENT(const_cast < QFILE_LIST_ID * >(src_list_id_p)) = NULL;
-	  break;
-
-	case QFILE_PROHIBIT_DEPENDENT:
-	default:
-	  /* impossible case */
-	  assert_release_error (false);
-	  return er_errid ();
-	}
-    }
-  else
-    {
-      assert (QFILE_LIST_ID_DEPENDENT(dest_list_id_p) == NULL);
-    }
-
   /* Tapeset ownership (Phase1 1A, redesign G005 #70).  The struct memcpy above
    * shallow-copied tapeset_/owns_tapeset_; resolve ownership per dependent
    * mode (single-owner model, SSOT #75 §3.2 B1):
@@ -649,12 +623,6 @@ qfile_clear_list_id (QFILE_LIST_ID * list_id_p)
   if (list_id_p->type_list.domp != NULL)
     {
       free_and_init (list_id_p->type_list.domp);
-    }
-
-  if (QFILE_LIST_ID_DEPENDENT(list_id_p) != NULL)
-    {
-      qfile_clear_list_id (QFILE_LIST_ID_DEPENDENT(list_id_p));
-      free_and_init (QFILE_LIST_ID_DEPENDENT(list_id_p));
     }
 
   /* Tapeset (Phase1 1A, redesign G005 #70): destroy it only if this list_id
@@ -2701,12 +2669,6 @@ qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 	  QFILE_LIST_ID_TAPESET (list_id_p) = NULL;
 	}
 
-      if (QFILE_LIST_ID_DEPENDENT(list_id_p) != NULL)
-	{
-	  qfile_destroy_list (thread_p, QFILE_LIST_ID_DEPENDENT(list_id_p));
-	  QFILE_FREE_AND_INIT_LIST_ID (QFILE_LIST_ID_DEPENDENT(list_id_p));
-	}
-
       qfile_clear_list_id (list_id_p);
     }
 }
@@ -3929,100 +3891,6 @@ error_exit:
   if (old_overflow_page != NULL)
     {
       qmgr_free_old_page_and_init (thread_p, old_overflow_page, QFILE_LIST_ID_TFILE_VFID(append_list_id));
-    }
-
-  assert_release_error (er_errid () != NO_ERROR);
-  return er_errid ();
-}
-
-int
-qfile_connect_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_LIST_ID * append_list_id)
-{
-  PAGE_PTR base_last_page = NULL, append_first_page = NULL;
-  QFILE_LIST_ID *base_last;
-
-  assert (thread_p != NULL);
-  assert (base_list_id != NULL);
-  assert (append_list_id != NULL);
-
-  /* Check if qfile_close_list was called */
-  assert (base_list_id->last_pgptr == NULL);
-  assert (append_list_id->last_pgptr == NULL);
-
-  /* backing-kind entry guard (production-hard) -- BEFORE the VPID/membuf asserts
-   * below, so a NEW (Tapeset) list is rejected cleanly instead of tripping a
-   * debug assert on its NULL VPIDs (SSOT round-3 (d)/(e)). */
-  {
-    int guard_rc = QFILE_GUARD_OLD_MECHANISM (base_list_id);
-    if (guard_rc == NO_ERROR)
-      {
-	guard_rc = QFILE_GUARD_OLD_MECHANISM (append_list_id);
-      }
-    if (guard_rc != NO_ERROR)
-      {
-	return guard_rc;
-      }
-  }
-  assert (base_list_id->tuple_cnt > 0);
-  assert (!VPID_ISNULL (&QFILE_LIST_ID_LAST_VPID(base_list_id)));
-
-  assert (append_list_id->tuple_cnt > 0);
-  assert (!VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(append_list_id)));
-  assert (QFILE_LIST_ID_TFILE_VFID(append_list_id)->membuf == NULL);
-
-#if !defined (NDEBUG)
-  {
-    for (QFILE_LIST_ID * list_id = QFILE_LIST_ID_DEPENDENT(base_list_id); list_id != NULL;
-	 list_id = QFILE_LIST_ID_DEPENDENT(list_id))
-      {
-	assert (list_id != append_list_id);
-      }
-  }
-#endif /* !NDEBUG */
-
-  base_last_page = qmgr_get_old_page (thread_p, &QFILE_LIST_ID_LAST_VPID(base_list_id), QFILE_LIST_ID_TFILE_VFID(base_list_id));
-  if (base_last_page == NULL)
-    {
-      goto error_exit;
-    }
-
-  append_first_page = qmgr_get_old_page (thread_p, &QFILE_LIST_ID_FIRST_VPID(append_list_id), QFILE_LIST_ID_TFILE_VFID(append_list_id));
-  if (append_first_page == NULL)
-    {
-      goto error_exit;
-    }
-
-  QFILE_PUT_NEXT_VPID (base_last_page, &QFILE_LIST_ID_FIRST_VPID(append_list_id));
-  qfile_set_dirty_page (thread_p, base_last_page, FREE, QFILE_LIST_ID_TFILE_VFID(base_list_id));
-
-  QFILE_PUT_PREV_VPID (append_first_page, &QFILE_LIST_ID_LAST_VPID(base_list_id));
-  qfile_set_dirty_page (thread_p, append_first_page, FREE, QFILE_LIST_ID_TFILE_VFID(append_list_id));
-
-  QFILE_LIST_ID_LAST_VPID(base_list_id) = QFILE_LIST_ID_LAST_VPID(append_list_id);
-
-  base_list_id->tuple_cnt += append_list_id->tuple_cnt;
-  base_list_id->page_cnt += append_list_id->page_cnt;
-  base_list_id->last_offset = append_list_id->last_offset;
-  base_list_id->lasttpl_len = append_list_id->lasttpl_len;
-
-  for (base_last = base_list_id; QFILE_LIST_ID_DEPENDENT(base_last) != NULL; base_last = QFILE_LIST_ID_DEPENDENT(base_last))
-    {
-      ;
-    }
-  QFILE_LIST_ID_DEPENDENT(base_last) = append_list_id;
-
-  ASSERT_NO_ERROR_OR_INTERRUPTED ();
-  return NO_ERROR;
-
-error_exit:
-  if (base_last_page != NULL)
-    {
-      qmgr_free_old_page_and_init (thread_p, base_last_page, QFILE_LIST_ID_TFILE_VFID(base_list_id));
-    }
-
-  if (append_first_page != NULL)
-    {
-      qmgr_free_old_page_and_init (thread_p, append_first_page, QFILE_LIST_ID_TFILE_VFID(append_list_id));
     }
 
   assert_release_error (er_errid () != NO_ERROR);

@@ -1916,47 +1916,17 @@ hjoin_merge_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
     case HASHJOIN_MERGE_CONNECT:
       {
-	bool use_connect =
-	  QFILE_LIST_ID_TFILE_VFID(single_context->list_id) != NULL && QFILE_LIST_ID_TFILE_VFID(single_context->list_id)->membuf == NULL
-	  && QFILE_LIST_ID_TFILE_VFID(context->list_id) != NULL && QFILE_LIST_ID_TFILE_VFID(context->list_id)->membuf == NULL
-	  && !qmgr_list_has_raw_fd_segments (single_context->list_id) && !qmgr_list_has_raw_fd_segments (context->list_id)
-	  && !qfile_list_has_new_backing (single_context->list_id) && !qfile_list_has_new_backing (context->list_id);
-
-#if !defined (NDEBUG)
-	QFILE_LIST_ID *single_list_id = single_context->list_id;
-#endif /* !defined (NDEBUG) */
-
-	if (use_connect)
-	  {
-	    error = qfile_connect_list (thread_p, single_context->list_id, context->list_id);
-	  }
-	else
-	  {
-	    error = qfile_append_list (thread_p, single_context->list_id, context->list_id);
-	  }
+	/* qfile_connect_list (zero-copy VPID-reparent) was deleted with the OLD
+	 * dependent-chain mechanism (#131, Phase3-4); this path now always
+	 * appends, matching HASHJOIN_MERGE_APPEND. */
+	error = qfile_append_list (thread_p, single_context->list_id, context->list_id);
 	if (error != NO_ERROR)
 	  {
 	    goto error_exit;
 	  }
 
-	if (use_connect)
-	  {
-#if !defined (NDEBUG)
-	    assert (single_context->list_id == single_list_id);
-	    if (getenv ("CUBRID_RAWFD_FAULT_INJECT_MERGE_CONNECT_AFTER") != NULL)
-	      {
-		assert_release_error (false);
-		goto error_exit;
-	      }
-#endif /* !defined (NDEBUG) */
-	    /* qfile_connect_list links the list into the single context; free through single_context->list_id. */
-	    context->list_id = NULL;
-	  }
-	else
-	  {
-	    qfile_destroy_list (thread_p, context->list_id);
-	    QFILE_FREE_AND_INIT_LIST_ID (context->list_id);
-	  }
+	qfile_destroy_list (thread_p, context->list_id);
+	QFILE_FREE_AND_INIT_LIST_ID (context->list_id);
 	break;
       }
 

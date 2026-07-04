@@ -465,7 +465,6 @@ struct qfile_list_id
   QFILE_TUPLE_DESCRIPTOR tpl_descr;	/* tuple descriptor */
   bool is_domain_resolved;	/* domains for host var is resolved or not */
   bool is_result_cached;	/* for subquery result cache */
-  QFILE_LIST_ID *dependent_list_id_;	/* Linked as dependent by qfile_connect_list; cleared together. (access via QFILE_LIST_ID_DEPENDENT) */
   /* Phase1 1A scan contract (redesign G005, issue #70).  Ordered Tape vector
    * (Tapeset) that replaces cross-file next_vpid linkage as the connection
    * structure (SSOT #75 §3.2 B1, ADR 0002).  NULL = legacy single-backing list
@@ -525,7 +524,6 @@ struct qfile_list_id
       (list_id)->tpl_descr.merge_info = NULL; \
       (list_id)->is_domain_resolved = false; \
       (list_id)->is_result_cached = false; \
-      (list_id)->dependent_list_id_ = NULL; \
       (list_id)->tapeset_ = NULL; \
       (list_id)->owns_tapeset_ = false; \
       (list_id)->backing_kind_ = QFILE_BACKING_NONE; \
@@ -539,22 +537,21 @@ struct qfile_list_id
 /*
  * QFILE_LIST_ID accessor shim  (Phase1 1A-0 — redesign G004, issue #69).
  *
- * Route EVERY access to the connection-identity (first_vpid/last_vpid),
- * backing (tfile_vfid) and dependency-chain (dependent_list_id) fields through
- * these accessors so the compiler enumerates every consumer of the F1
- * (qfile_copy_list_id / qfile_clear_list_id ownership) and F3 (Phase3 symbol
- * sweep) surfaces.  No behavior change: each accessor expands to the original
- * lvalue, so reads, writes and address-of (&...) all keep working unchanged.
+ * Route EVERY access to the connection-identity (first_vpid/last_vpid) and
+ * backing (tfile_vfid) fields through these accessors so the compiler
+ * enumerates every consumer of the F1 (qfile_copy_list_id /
+ * qfile_clear_list_id ownership) and F3 (Phase3 symbol sweep) surfaces.  No
+ * behavior change: each accessor expands to the original lvalue, so reads,
+ * writes and address-of (&...) all keep working unchanged.
  *
- * The trailing-underscore raw fields (first_vpid_/last_vpid_/tfile_vfid_/
- * dependent_list_id_) MUST NOT be accessed directly outside of these macros and
- * QFILE_CLEAR_LIST_ID (the canonical initializer).  Adding a new direct field
- * access is a compile error by design.
+ * The trailing-underscore raw fields (first_vpid_/last_vpid_/tfile_vfid_) MUST
+ * NOT be accessed directly outside of these macros and QFILE_CLEAR_LIST_ID (the
+ * canonical initializer).  Adding a new direct field access is a compile error
+ * by design.
  */
 #define QFILE_LIST_ID_FIRST_VPID(list_id)  ((list_id)->first_vpid_)
 #define QFILE_LIST_ID_LAST_VPID(list_id)   ((list_id)->last_vpid_)
 #define QFILE_LIST_ID_TFILE_VFID(list_id)  ((list_id)->tfile_vfid_)
-#define QFILE_LIST_ID_DEPENDENT(list_id)   ((list_id)->dependent_list_id_)
 #define QFILE_LIST_ID_TAPESET(list_id)     ((list_id)->tapeset_)
 #define QFILE_LIST_ID_OWNS_TAPESET(list_id) ((list_id)->owns_tapeset_)
 #define QFILE_LIST_ID_BACKING_KIND(list_id) ((list_id)->backing_kind_)
@@ -618,7 +615,7 @@ qfile_check_no_mixed_backing (const QFILE_LIST_ID * list_id)
  *
  * Generalizes the no-mixed-backing invariant from a per-list debug assert to a
  * production-hard check at every backing-SENSITIVE consume boundary: an OLD
- * mechanism (qfile_connect_list / qfile_append_list) must reject a NEW
+ * mechanism (qfile_append_list) must reject a NEW
  * (Tapeset) list, and a NEW
  * mechanism (chunk_distributor / tapeset_scan) must reject an OLD list.  The
  * entry boundary is the cheapest place (one check per operator open) to stop the
