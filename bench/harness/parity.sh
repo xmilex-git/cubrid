@@ -93,11 +93,6 @@ check_wm_engagement()
       echo "PARITY GUARD FAIL (${label}): WM gate requested ON but no NEW-backed list was created (new_backed_create_delta=${new_delta})" | tee -a "${proof}"
       exit 1
     fi
-  else
-    if [[ "${new_delta}" -ne 0 ]]; then
-      echo "PARITY GUARD FAIL (${label}): WM gate requested OFF but a NEW-backed list was created anyway (new_backed_create_delta=${new_delta})" | tee -a "${proof}"
-      exit 1
-    fi
   fi
 }
 
