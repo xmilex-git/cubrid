@@ -2236,7 +2236,10 @@ namespace parallel_scan
 
     if constexpr (F == PT_MEDIAN || F == PT_PERCENTILE_CONT || F == PT_PERCENTILE_DISC)
       {
-	/* GROUP_CONCAT(ORDER BY), MEDIAN, PERCENTILE_CONT/DISC: merge list_ids from worker into main */
+	/* GROUP_CONCAT(ORDER BY), MEDIAN, PERCENTILE_CONT/DISC: merge list_ids from worker into main
+	 * via single-owner append (qmgr_append_list_to_single_owner), same pattern as the DISTINCT
+	 * reduce above. Append order doesn't need to preserve value order: the caller re-sorts the
+	 * fully-merged list with qfile_sort_list before qdata_aggregate_interpolation reads it. (#128, #74, #78) */
 	qfile_close_list (thread_p, cur_agg_p->list_id);
 	if (cur_agg_p->list_id->tuple_cnt == 0)
 	  {
@@ -2250,62 +2253,27 @@ namespace parallel_scan
 	  {
 	    orig_agg_p->info.percentile.cur_group_percentile = cur_agg_p->info.percentile.cur_group_percentile;
 	  }
-	if (orig_agg_p->list_id->tuple_cnt > 0)
+
+	qfile_close_list (thread_p, orig_agg_p->list_id);
+	if (qmgr_append_list_to_single_owner (thread_p, orig_agg_p->list_id, cur_agg_p->list_id) != NO_ERROR)
 	  {
-	    QFILE_LIST_ID *list_id_p = (QFILE_LIST_ID *) malloc (sizeof (QFILE_LIST_ID));
-	    if (list_id_p == nullptr)
-	      {
-		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-			(size_t) sizeof (QFILE_LIST_ID));
-		m_err_messages_p->move_top_error_message_to_this ();
-		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		qfile_destroy_list (thread_p, cur_agg_p->list_id);
-		return;
-	      }
-	    if (qfile_copy_list_id (list_id_p, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT) != NO_ERROR)
-	      {
-		free_and_init (list_id_p);
-		m_err_messages_p->move_top_error_message_to_this ();
-		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		qfile_destroy_list (thread_p, cur_agg_p->list_id);
-		return;
-	      }
-	    er_clear ();
-	    if (qfile_connect_list (thread_p, orig_agg_p->list_id, list_id_p) != NO_ERROR)
-	      {
-		m_err_messages_p->move_top_error_message_to_this ();
-		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		free_and_init (list_id_p);
-	      }
-	    qfile_clear_list_id (cur_agg_p->list_id);
+	    m_err_messages_p->move_top_error_message_to_this ();
+	    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+	    qfile_destroy_list (thread_p, cur_agg_p->list_id);
+	    return;
 	  }
-	else if (orig_agg_p->list_id->type_list.type_cnt > 0)
-	  {
-	    qfile_clear_list_id (orig_agg_p->list_id);
-	    if (qfile_copy_list_id (orig_agg_p->list_id, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT) != NO_ERROR)
-	      {
-		m_err_messages_p->move_top_error_message_to_this ();
-		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-	      }
-	    qfile_clear_list_id (cur_agg_p->list_id);
-	  }
-	else
-	  {
-	    QFILE_CLEAR_LIST_ID (orig_agg_p->list_id);
-	    if (qfile_copy_list_id (orig_agg_p->list_id, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT) != NO_ERROR)
-	      {
-		m_err_messages_p->move_top_error_message_to_this ();
-		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-	      }
-	    qfile_clear_list_id (cur_agg_p->list_id);
-	  }
+	qfile_destroy_list (thread_p, cur_agg_p->list_id);
+	qfile_clear_list_id (cur_agg_p->list_id);
 	return;
       }
     else if constexpr (F == PT_GROUP_CONCAT)
       {
 	if (orig_agg_p->sort_list != NULL)
 	  {
-	    /* GROUP_CONCAT(ORDER BY), MEDIAN, PERCENTILE_CONT/DISC: merge list_ids from worker into main */
+	    /* GROUP_CONCAT(ORDER BY), MEDIAN, PERCENTILE_CONT/DISC: merge list_ids from worker into main
+	     * via single-owner append (qmgr_append_list_to_single_owner), same pattern as the DISTINCT
+	     * reduce above. Append order doesn't need to preserve value order: the caller re-sorts the
+	     * fully-merged list with qfile_sort_list before qdata_aggregate_interpolation reads it. (#128, #74, #78) */
 	    qfile_close_list (thread_p, cur_agg_p->list_id);
 	    if (cur_agg_p->list_id->tuple_cnt == 0)
 	      {
@@ -2319,55 +2287,17 @@ namespace parallel_scan
 	      {
 		orig_agg_p->info.percentile.cur_group_percentile = cur_agg_p->info.percentile.cur_group_percentile;
 	      }
-	    if (orig_agg_p->list_id->tuple_cnt > 0)
+
+	    qfile_close_list (thread_p, orig_agg_p->list_id);
+	    if (qmgr_append_list_to_single_owner (thread_p, orig_agg_p->list_id, cur_agg_p->list_id) != NO_ERROR)
 	      {
-		QFILE_LIST_ID *list_id_p = (QFILE_LIST_ID *) malloc (sizeof (QFILE_LIST_ID));
-		if (list_id_p == nullptr)
-		  {
-		    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-			    (size_t) sizeof (QFILE_LIST_ID));
-		    m_err_messages_p->move_top_error_message_to_this ();
-		    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		    qfile_destroy_list (thread_p, cur_agg_p->list_id);
-		    return;
-		  }
-		if (qfile_copy_list_id (list_id_p, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT) != NO_ERROR)
-		  {
-		    free_and_init (list_id_p);
-		    m_err_messages_p->move_top_error_message_to_this ();
-		    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		    qfile_destroy_list (thread_p, cur_agg_p->list_id);
-		    return;
-		  }
-		er_clear ();
-		if (qfile_connect_list (thread_p, orig_agg_p->list_id, list_id_p) != NO_ERROR)
-		  {
-		    m_err_messages_p->move_top_error_message_to_this ();
-		    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		    free_and_init (list_id_p);
-		  }
-		qfile_clear_list_id (cur_agg_p->list_id);
+		m_err_messages_p->move_top_error_message_to_this ();
+		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		qfile_destroy_list (thread_p, cur_agg_p->list_id);
+		return;
 	      }
-	    else if (orig_agg_p->list_id->type_list.type_cnt > 0)
-	      {
-		qfile_clear_list_id (orig_agg_p->list_id);
-		if (qfile_copy_list_id (orig_agg_p->list_id, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT) != NO_ERROR)
-		  {
-		    m_err_messages_p->move_top_error_message_to_this ();
-		    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		  }
-		qfile_clear_list_id (cur_agg_p->list_id);
-	      }
-	    else
-	      {
-		QFILE_CLEAR_LIST_ID (orig_agg_p->list_id);
-		if (qfile_copy_list_id (orig_agg_p->list_id, cur_agg_p->list_id, false, QFILE_PROHIBIT_DEPENDENT) != NO_ERROR)
-		  {
-		    m_err_messages_p->move_top_error_message_to_this ();
-		    m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		  }
-		qfile_clear_list_id (cur_agg_p->list_id);
-	      }
+	    qfile_destroy_list (thread_p, cur_agg_p->list_id);
+	    qfile_clear_list_id (cur_agg_p->list_id);
 	    return;
 	  }
 	/* GROUP_CONCAT (no ORDER BY): merge partial strings from worker into main */
