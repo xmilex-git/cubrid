@@ -920,9 +920,9 @@ qmgr_segment_position_same_coord (const QFILE_TUPLE_POSITION * lhs_p, const QFIL
       return false;
     }
 
-  if (qfile_tuple_position_is_raw_fd (lhs_p))
+  if (qfile_tuple_position_is_spill (lhs_p))
     {
-      return lhs_p->raw_fd_segment_id == rhs_p->raw_fd_segment_id && lhs_p->page_index == rhs_p->page_index
+      return lhs_p->spill_segment_id == rhs_p->spill_segment_id && lhs_p->page_index == rhs_p->page_index
 	&& lhs_p->tuple_offset == rhs_p->tuple_offset;
     }
 
@@ -972,7 +972,7 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
 
   raw_pos.status = S_OPENED;
   raw_pos.position = S_ON;
-  qfile_tuple_position_set_raw_fd (&raw_pos, 11, 22, 333);
+  qfile_tuple_position_set_spill (&raw_pos, 11, 22, 333);
   raw_pos.tplno = 9;
   qfile_tuple_position_store_to_db (&stored_pos, &raw_pos);
   qfile_tuple_position_restore_from_stored (&restored_pos, &stored_pos);
@@ -981,7 +981,7 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
       return ER_FAILED;
     }
 
-  qfile_tuple_simple_pos_set_raw_fd (&simple_pos, 11, 22, 333);
+  qfile_tuple_simple_pos_set_spill (&simple_pos, 11, 22, 333);
   qfile_tuple_position_set_simple_pos (&restored_pos, &simple_pos);
   if (!qmgr_segment_position_same_coord (&raw_pos, &restored_pos))
     {
@@ -1015,93 +1015,8 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
       return ER_FAILED;
     }
 
-  if (getenv ("CUBRID_RAWFD_ENABLE_TEST") != NULL)
-    {
-      int os_error = 0;
-      temp_page_store::raw_fd_file *file_p =
-	temp_page_store::create_raw_fd_file (thread_p, static_cast < QUERY_ID > (-4),
-					     LOG_FIND_THREAD_TRAN_INDEX (thread_p), 0, &os_error);
-      if (file_p == NULL)
-	{
-	  return ER_FAILED;
-	}
-
-      QMGR_TEMP_FILE tfile;
-      memset (&tfile, 0, sizeof (tfile));
-      tfile.temp_file_type = FILE_TEMP;
-      VFID_SET_NULL (&tfile.temp_vfid);
-      tfile.membuf_last = -1;
-      tfile.membuf_type = TEMP_FILE_MEMBUF_NONE;
-      tfile.backing = qmgr_temp_backing::RAW_FD_OVERFLOW;
-      tfile.raw_fd_query_id = static_cast < QUERY_ID > (-4);
-      tfile.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
-      tfile.raw_fd_handle = file_p;
-      tfile.raw_fd_next_pageid = 1;
-      file_p->attach_temp_file (&tfile);
-
-      PAGE_PTR page_p = (PAGE_PTR) malloc (DB_PAGESIZE);
-      if (page_p == NULL)
-	{
-	  temp_page_store::destroy_raw_fd_file (file_p);
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
-	  return ER_FAILED;
-	}
-      memset (page_p, 0, DB_PAGESIZE);
-
-      QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
-      qmgr_put_page_header (page_p, &page_header);
-      constexpr int tuple_offset = QFILE_PAGE_HEADER_SIZE;
-      constexpr int tuple_length = QFILE_TUPLE_LENGTH_SIZE + 32;
-      QFILE_TUPLE tuple_p = page_p + tuple_offset;
-      QFILE_PUT_TUPLE_LENGTH (tuple_p, tuple_length);
-      for (int i = QFILE_TUPLE_LENGTH_SIZE; i < tuple_length; i++)
-	{
-	  tuple_p[i] = static_cast < char > (0x5a ^ i);
-	}
-      QFILE_PUT_TUPLE_COUNT (page_p, 1);
-      QFILE_PUT_LAST_TUPLE_OFFSET (page_p, tuple_offset);
-
-      int error = temp_page_store::rawfd_write_page (thread_p, *file_p, 0, page_p);
-      if (error != NO_ERROR)
-	{
-	  free_and_init (page_p);
-	  temp_page_store::destroy_raw_fd_file (file_p);
-	  return error;
-	}
-
-      QFILE_TUPLE_POSITION direct_pos = {};
-      direct_pos.status = S_OPENED;
-      direct_pos.position = S_ON;
-      qfile_tuple_position_set_raw_fd (&direct_pos, file_p->segment_id (), 0, tuple_offset);
-      direct_pos.tplno = 0;
-
-      PAGE_PTR fixed_page_p = qmgr_segment_pos_read (thread_p, &tfile, &direct_pos);
-      if (fixed_page_p == NULL)
-	{
-	  free_and_init (page_p);
-	  temp_page_store::destroy_raw_fd_file (file_p);
-	  return ER_FAILED;
-	}
-
-      QFILE_TUPLE fixed_tuple_p = fixed_page_p + tuple_offset;
-      if (QFILE_GET_TUPLE_LENGTH (fixed_tuple_p) != tuple_length
-	  || memcmp (fixed_tuple_p, tuple_p, tuple_length) != 0)
-	{
-	  temp_page_store::rawfd_release_fixed_page (thread_p, &tfile, fixed_page_p);
-	  free_and_init (page_p);
-	  temp_page_store::destroy_raw_fd_file (file_p);
-	  return ER_FAILED;
-	}
-
-      temp_page_store::rawfd_release_fixed_page (thread_p, &tfile, fixed_page_p);
-      free_and_init (page_p);
-      tfile.raw_fd_handle = NULL;
-      temp_page_store::destroy_raw_fd_file (file_p);
-    }
-
-  /* (c′) leg (#132): the same positioned save/jump contract against the
-   * PAGE_SPILL_OVERFLOW backing (no gate/master dependency -- the handle is
-   * driven directly). */
+  /* (c′) leg (#132): the positioned save/jump contract against the
+   * SPILL_OVERFLOW backing (the handle is driven directly). */
   {
     int os_error = 0;
     qfile::page_spill_file *spill_p = qfile::page_spill_file::create (static_cast < QUERY_ID > (-10),
@@ -1118,11 +1033,11 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
     VFID_SET_NULL (&tfile.temp_vfid);
     tfile.membuf_last = -1;
     tfile.membuf_type = TEMP_FILE_MEMBUF_NONE;
-    tfile.backing = qmgr_temp_backing::PAGE_SPILL_OVERFLOW;
-    tfile.raw_fd_query_id = static_cast < QUERY_ID > (-10);
-    tfile.raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+    tfile.backing = qmgr_temp_backing::SPILL_OVERFLOW;
+    tfile.spill_query_id = static_cast < QUERY_ID > (-10);
+    tfile.spill_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
     tfile.page_spill_handle = spill_p;
-    tfile.raw_fd_next_pageid = 1;
+    tfile.spill_next_pageid = 1;
 
     PAGE_PTR page_p = spill_p->alloc_new_page (thread_p, 0);
     if (page_p == NULL)
@@ -1158,7 +1073,7 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
     QFILE_TUPLE_POSITION direct_pos = {};
     direct_pos.status = S_OPENED;
     direct_pos.position = S_ON;
-    qfile_tuple_position_set_raw_fd (&direct_pos, spill_p->segment_id (), 0, tuple_offset);
+    qfile_tuple_position_set_spill (&direct_pos, spill_p->segment_id (), 0, tuple_offset);
     direct_pos.tplno = 0;
 
     PAGE_PTR fixed_page_p = qmgr_segment_pos_read (thread_p, &tfile, &direct_pos);
@@ -1227,7 +1142,6 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
   csect_exit (thread_p, CSECT_QPROC_QUERY_TABLE);
 
   qfile_initialize ();
-  temp_page_store::initialize_raw_fd_boot_sweep ();
   qfile::buffile::boot_sweep ();	/* issue #88: sweep orphaned cubrid_buffile/ spills */
 
   srand48 ((long) time (NULL));
@@ -1238,21 +1152,6 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 #endif
 
 #if !defined (NDEBUG)
-  /* P1b read-accessor parity self-test (debug-only, env-gated). Exercises the raw-fd write/TDE-encrypt/pwrite ->
-   * pread/TDE-decrypt/positioned-read round-trip directly (not through the product write guard, which stays FALSE).
-   * Requires a TDE-loaded database. Result is logged; 0 == PASS. */
-  if (getenv ("CUBRID_RAWFD_SELFTEST") != NULL)
-    {
-      int rawfd_selftest_rc = temp_page_store::rawfd_single_worker_tde_positioned_read_parity (thread_p);
-      er_log_debug (ARG_FILE_LINE, "RAWFD_SELFTEST result=%d (0=PASS)\n", rawfd_selftest_rc);
-      fprintf (stderr, "RAWFD_SELFTEST result=%d (0=PASS)\n", rawfd_selftest_rc);
-    }
-  if (getenv ("CUBRID_MUTATION_NONCE_SELFTEST") != NULL)
-    {
-      int mutation_nonce_selftest_rc = temp_page_store::rawfd_mutation_nonce_selftest (thread_p);
-      er_log_debug (ARG_FILE_LINE, "MUTATION_NONCE_SELFTEST result=%d (0=PASS)\n", mutation_nonce_selftest_rc);
-      fprintf (stderr, "MUTATION_NONCE_SELFTEST result=%d (0=PASS)\n", mutation_nonce_selftest_rc);
-    }
   if (getenv ("CUBRID_TEMPMOVE_SELFTEST") != NULL)
     {
       int tempmove_selftest_rc = temp_page_store::qmgr_temp_file_move_selftest (thread_p);
@@ -1682,8 +1581,8 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   assert (query_p->list_id != NULL);
-  /* Class-B sink.  A NEW (Tapeset)-backed, non-raw-fd result never touches the
-   * OLD-legacy raw-fd/sector machinery:
+  /* Class-B sink.  A NEW (Tapeset)-backed, non-spill result never touches the
+   * OLD spill machinery:
    *  - non-cacheable (incl. holdable, #111): served to the client straight from
    *    its Tapeset (xqfile_get_list_file_page); overflow (big-tuple) runs are
    *    translated on the fly to the legacy VPID overflow chain by the serve
@@ -1700,16 +1599,16 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
    *    tuples, not the serve path's on-the-fly VPID overflow translation, so a
    *    still-overflowing cacheable result keeps the materialize fallback below
    *    for now.)
-   * Everything else -- raw-fd overflow segments, a cacheable overflow result,
+   * Everything else -- spill overflow segments, a cacheable overflow result,
    * and a cacheable holdable result -- keeps the #94 materialize fallback,
    * retained until Phase3 (#120/#74).  For plain VPID-backed lists every path
    * is a no-op. */
   tapeset_direct_fetch = (qfile_list_has_new_backing (query_p->list_id)
-			  && !qmgr_list_has_raw_fd_segments (query_p->list_id)
+			  && !qmgr_list_has_spill_segments (query_p->list_id)
 			  && !qmgr_is_allowed_result_cache (flag));
   tapeset_cache_copyout = (qfile_list_has_new_backing (query_p->list_id)
 			   && !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (query_p->list_id)
-			   && !qmgr_list_has_raw_fd_segments (query_p->list_id) && !query_p->is_holdable
+			   && !qmgr_list_has_spill_segments (query_p->list_id) && !query_p->is_holdable
 			   && qmgr_is_allowed_result_cache (flag));
   if (tapeset_cache_copyout)
     {
@@ -2115,7 +2014,7 @@ xqmgr_execute_query (THREAD_ENTRY * thread_p, const XASL_ID * xasl_id_p, QUERY_I
 	    {
 	      goto end;
 	    }
-	  /* Class-B sink: query cache entries must store a real-VPID list, never a raw-fd segment chain. */
+	  /* Class-B sink: query cache entries must store a real-VPID list, never a spill segment chain. */
 	  if (qmgr_materialize_to_pgbuf (thread_p, list_id_p) != NO_ERROR)
 	    {
 	      goto end;
@@ -2910,11 +2809,11 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 	       * (the marker-volid global page space is Tapeset-intrinsic, so VPIDs
 	       * the client fetched pre-commit stay valid).  Session teardown already
 	       * destroys an owned Tapeset (qfile_clear_list_id), and a kill-9'd
-	       * server's spilled tapes are reclaimed by the #88 boot sweep.  Raw-fd
+	       * server's spilled tapes are reclaimed by the #88 boot sweep.  Spill
 	       * overflow segments still materialize into real-VPID pgbuf pages (the
-	       * legacy VPID-wire requirement, until Phase3 deletes raw-fd). */
+	       * legacy VPID-wire requirement). */
 	      bool holdable_needs_materialize = !(qfile_list_has_new_backing (query_p->list_id)
-						  && !qmgr_list_has_raw_fd_segments (query_p->list_id));
+						  && !qmgr_list_has_spill_segments (query_p->list_id));
 	      if (holdable_needs_materialize && qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
 		{
 		  er_log_debug (ARG_FILE_LINE, "query %d holdable materialize failed !\n", query_p->query_id);
@@ -3129,24 +3028,14 @@ qmgr_free_old_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * t
       pgbuf_unfix (thread_p, page_p);
       return;
     }
-  if (tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
-    {
-      const int error = temp_page_store::rawfd_release_fixed_page (thread_p, tfile_vfid_p, page_p);
-      if (error != NO_ERROR)
-	{
-	  ASSERT_ERROR ();
-	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
-	}
-      return;
-    }
-  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+  if (tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
     {
       /* (c′) last-unfix write-back; failure poisons the query (INV-2/INV-3, #132) */
       const int error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
       if (error != NO_ERROR)
 	{
 	  ASSERT_ERROR ();
-	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
+	  qmgr_set_query_error (thread_p, tfile_vfid_p->spill_query_id);
 	}
       return;
     }
@@ -3186,9 +3075,7 @@ qmgr_get_old_page_read_only (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_F
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
     }
-  if (tfile_vfid_p != NULL
-      && (tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-	  || tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW))
+  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
     {
       return temp_page_store::fix_old_page (thread_p, tfile_vfid_p, vpid_p);
     }
@@ -3254,9 +3141,7 @@ qmgr_get_old_page_simple_fix (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
     }
-  if (tfile_vfid_p != NULL
-      && (tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-	  || tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW))
+  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
     {
       return temp_page_store::fix_old_page (thread_p, tfile_vfid_p, vpid_p);
     }
@@ -3324,23 +3209,13 @@ qmgr_free_old_page_simple_fix (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TE
       pgbuf_simple_unfix (thread_p, page_p);
       return;
     }
-  if (tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
-    {
-      const int error = temp_page_store::rawfd_release_fixed_page (thread_p, tfile_vfid_p, page_p);
-      if (error != NO_ERROR)
-	{
-	  ASSERT_ERROR ();
-	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
-	}
-      return;
-    }
-  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+  if (tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
     {
       const int error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
       if (error != NO_ERROR)
 	{
 	  ASSERT_ERROR ();
-	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
+	  qmgr_set_query_error (thread_p, tfile_vfid_p->spill_query_id);
 	}
       return;
     }
@@ -3378,21 +3253,7 @@ qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LO
 		     QMGR_TEMP_FILE * tfile_vfid_p)
 {
   QMGR_PAGE_TYPE page_type;
-  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
-    {
-      const int error = temp_page_store::rawfd_flush_page (thread_p, tfile_vfid_p, page_p, free_page);
-      if (error != NO_ERROR)
-	{
-	  if (er_errid () == NO_ERROR)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	    }
-	  ASSERT_ERROR ();
-	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
-	}
-      return;
-    }
-  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
+  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
     {
       /* (c′) set_dirty: DONT_FREE marks the flag only; FREE = last-unfix
        * write-back inside the shim (INV-2, #132) */
@@ -3404,7 +3265,7 @@ qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LO
 	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	    }
 	  ASSERT_ERROR ();
-	  qmgr_set_query_error (thread_p, tfile_vfid_p->raw_fd_query_id);
+	  qmgr_set_query_error (thread_p, tfile_vfid_p->spill_query_id);
 	}
       return;
     }
@@ -3451,7 +3312,7 @@ qmgr_get_new_page (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_FILE * tfil
  *   dst(in/out): destination temp-file descriptor; must not already own backing resources
  *   src(in/out): source temp-file descriptor
  *
- * Note: List links are intentionally not moved.  The operation adopts only spilled backing (temp-volume/raw-fd)
+ * Note: List links are intentionally not moved.  The operation adopts only spilled backing (temp-volume/spill)
  * and workmem reservation state.  Inline membuf storage is per-descriptor self-owned and is not transferred;
  * callers drain/read membuf data before or independently of this move.
  */
@@ -3471,32 +3332,23 @@ qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src)
   dst->backing = src->backing;
   dst->wm_reserved_bytes = src->wm_reserved_bytes;
   dst->wm_reserved_shard = src->wm_reserved_shard;
-  dst->raw_fd_query_id = src->raw_fd_query_id;
-  dst->raw_fd_owner_tran_index = src->raw_fd_owner_tran_index;
-  dst->raw_fd_worker_id = src->raw_fd_worker_id;
-  dst->raw_fd_handle = src->raw_fd_handle;
-  dst->raw_fd_next_pageid = src->raw_fd_next_pageid;
-  dst->raw_fd_hint = src->raw_fd_hint;
+  dst->spill_query_id = src->spill_query_id;
+  dst->spill_owner_tran_index = src->spill_owner_tran_index;
+  dst->spill_worker_id = src->spill_worker_id;
+  dst->spill_next_pageid = src->spill_next_pageid;
   dst->page_spill_handle = src->page_spill_handle;	/* (c′) containment move: pointer transfer only (D5, #132) */
   dst->preserved = src->preserved;
   dst->tde_encrypted = src->tde_encrypted;
-
-  if (dst->raw_fd_handle != NULL)
-    {
-      temp_page_store::reassign_raw_fd_owner (dst->raw_fd_handle, dst);
-    }
 
   src->temp_file_type = FILE_TEMP;
   VFID_SET_NULL (&src->temp_vfid);
   src->backing = qmgr_temp_backing::MEMBUF;
   src->wm_reserved_bytes = 0;
   src->wm_reserved_shard = -1;
-  src->raw_fd_query_id = NULL_QUERY_ID;
-  src->raw_fd_owner_tran_index = NULL_TRAN_INDEX;
-  src->raw_fd_worker_id = 0;
-  src->raw_fd_handle = NULL;
-  src->raw_fd_next_pageid = 0;
-  src->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  src->spill_query_id = NULL_QUERY_ID;
+  src->spill_owner_tran_index = NULL_TRAN_INDEX;
+  src->spill_worker_id = 0;
+  src->spill_next_pageid = 0;
   src->page_spill_handle = NULL;
   src->preserved = false;
   src->tde_encrypted = false;
@@ -3542,47 +3394,26 @@ qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p)
 
 /*
  * qmgr_tfile_has_fd_overflow () - does the tfile carry a live fd-backed OLD
- *   overflow handle, under EITHER coexisting tag (legacy raw-fd or the (c′)
- *   page-spill backing, #132)?  Guards/materialize/segment-copy sites that
- *   keyed on RAW_FD_OVERFLOW must fire identically for PAGE_SPILL_OVERFLOW
- *   during coexistence (design §2.4: the #126 guard stays until 커밋 C).
+ *   overflow handle ((c′) page-spill -- the sole overflow tag since 커밋 B
+ *   #137)?  Guards/materialize/segment-copy sites key on this predicate
+ *   (design §2.4: the #126 guard stays until 커밋 C).
  */
 bool
 qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p)
 {
-  if (tfile_p == NULL)
-    {
-      return false;
-    }
-  if (tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW)
-    {
-      return tfile_p->raw_fd_handle != NULL;
-    }
-  if (tfile_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
-    {
-      return tfile_p->page_spill_handle != NULL;
-    }
-  return false;
+  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::SPILL_OVERFLOW
+    && tfile_p->page_spill_handle != NULL;
 }
 
-/* segment_id of whichever overflow handle the tfile carries (0 when none).
- * The tuple-position coordinate discriminator (COORD_RAW_FD) is shared by
- * both backings: a position is only ever checked against the tfile it was
- * saved from, whose backing kind is pinned at first spill, and each kind's
- * ids are never reused within a boot -- so a stale coordinate (handle
- * destroyed + recreated) always mismatches. */
+/* segment_id of the tfile's overflow handle (0 when none).  A position
+ * (COORD_SPILL) is only ever checked against the tfile it was saved from,
+ * whose backing is pinned at first spill, and segment ids are never reused
+ * within a boot -- so a stale coordinate (handle destroyed + recreated)
+ * always mismatches. */
 UINT64
 qmgr_tfile_fd_overflow_segment_id (const QMGR_TEMP_FILE * tfile_p)
 {
-  if (tfile_p == NULL)
-    {
-      return 0;
-    }
-  if (tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW && tfile_p->raw_fd_handle != NULL)
-    {
-      return tfile_p->raw_fd_handle->segment_id ();
-    }
-  if (tfile_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW && tfile_p->page_spill_handle != NULL)
+  if (tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::SPILL_OVERFLOW && tfile_p->page_spill_handle != NULL)
     {
       return tfile_p->page_spill_handle->segment_id ();
     }
@@ -3590,7 +3421,7 @@ qmgr_tfile_fd_overflow_segment_id (const QMGR_TEMP_FILE * tfile_p)
 }
 
 bool
-qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
+qmgr_list_has_spill_segments (const QFILE_LIST_ID * list_id_p)
 {
   return list_id_p != NULL && list_id_p->tuple_cnt > 0
     && qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (list_id_p));
@@ -3598,10 +3429,10 @@ qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p)
 
 /* Class-B materialize predicate (#94): a list needs pgbuf materialization at a
  * Class-B sink (client fetch / list-cache publish / holdable commit) when its
- * tuples live outside the VPID-wire page chain -- either raw-fd overflow
- * segments (legacy) or a NEW (Tapeset) backing whose first_vpid is NULL.
- * qmgr_list_has_raw_fd_segments stays as-is: its other caller
- * (qfile_append_list) guards a raw-fd-specific append path. */
+ * tuples live outside the VPID-wire page chain -- either spill overflow
+ * segments or a NEW (Tapeset) backing whose first_vpid is NULL.
+ * qmgr_list_has_spill_segments stays as-is: its other caller
+ * (qfile_append_list) guards a spill-specific append path. */
 bool
 qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p)
 {
@@ -3610,7 +3441,7 @@ qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p)
       return true;
     }
 
-  return qmgr_list_has_raw_fd_segments (list_id_p);
+  return qmgr_list_has_spill_segments (list_id_p);
 }
 
 int
@@ -3683,7 +3514,7 @@ qmgr_segment_list_scan_next (THREAD_ENTRY * thread_p, QMGR_SEGMENT_LIST_SCAN * s
 	{
 	  QFILE_LIST_ID *list_id_p =
 	    const_cast < QFILE_LIST_ID * > (&scan_p->segment_list->segments[scan_p->segment_index].list_id);
-	  if (qfile_open_list_scan_raw_fd_segments (list_id_p, &scan_p->scan_id) != NO_ERROR)
+	  if (qfile_open_list_scan_spill_segments (list_id_p, &scan_p->scan_id) != NO_ERROR)
 	    {
 	      return S_ERROR;
 	    }
@@ -4026,26 +3857,18 @@ PAGE_PTR
 qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
 		       const QFILE_TUPLE_POSITION * tuple_position_p)
 {
-  if (tfile_vfid_p == NULL || tuple_position_p == NULL || !qfile_tuple_position_is_raw_fd (tuple_position_p)
+  if (tfile_vfid_p == NULL || tuple_position_p == NULL || !qfile_tuple_position_is_spill (tuple_position_p)
       || tuple_position_p->page_index < 0 || tuple_position_p->tuple_offset < QFILE_PAGE_HEADER_SIZE
       || tuple_position_p->tuple_offset >= DB_PAGESIZE || !qmgr_tfile_has_fd_overflow (tfile_vfid_p)
-      || qmgr_tfile_fd_overflow_segment_id (tfile_vfid_p) != tuple_position_p->raw_fd_segment_id)
+      || qmgr_tfile_fd_overflow_segment_id (tfile_vfid_p) != tuple_position_p->spill_segment_id)
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
     }
 
-  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW)
-    {
-      /* (c′) positioned jump: fix_page serves resident-first, so a saved
-       * position stays valid across dirty/write-back cycles (INV-1, #132) */
-      return tfile_vfid_p->page_spill_handle->fix_page (thread_p, tuple_position_p->page_index);
-    }
-
-  return temp_page_store::rawfd_pos_read (thread_p, *tfile_vfid_p->raw_fd_handle,
-					  temp_page_store::raw_fd_page_coordinate
-					  { tuple_position_p->raw_fd_segment_id, tuple_position_p->page_index,
-					    static_cast < std::size_t > (tuple_position_p->tuple_offset) });
+  /* (c′) positioned jump: fix_page serves resident-first, so a saved
+   * position stays valid across dirty/write-back cycles (INV-1, #132) */
+  return tfile_vfid_p->page_spill_handle->fix_page (thread_p, tuple_position_p->page_index);
 }
 
 int
@@ -4070,7 +3893,7 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
   QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
   int error = NO_ERROR;
   QFILE_LIST_SCAN_ID scan_id;
-  if (qfile_open_list_scan_raw_fd_segments (list_id_p, &scan_id) != NO_ERROR)
+  if (qfile_open_list_scan_spill_segments (list_id_p, &scan_id) != NO_ERROR)
     {
       error = ER_FAILED;
     }
@@ -4128,11 +3951,10 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
  * FILE_QUERY_AREA list that outlives the producing transaction, so a NEW result
  * bound for the list cache is copied out into a query-area list -- that copy is
  * by design and stays.  What changes here (vs qmgr_materialize_to_pgbuf, the #94
- * OLD-legacy path built around raw-fd segment enumeration, a Phase3 deletion
- * target) is the SOURCE: the copy is read straight from the Tapeset through the
+ * OLD-legacy path built around spill segment enumeration) is the SOURCE: the copy is read straight from the Tapeset through the
  * unified list scan (qfile_open_list_scan -> qfile_tapeset_scan_*, the #120
- * direct-read idiom), with no raw-fd/sector dependency.  The caller guarantees a
- * NEW-backed, overflow-free, non-raw-fd, non-holdable, to-be-cached list; a NEW
+ * direct-read idiom), with no spill/sector dependency.  The caller guarantees a
+ * NEW-backed, overflow-free, non-spill, non-holdable, to-be-cached list; a NEW
  * list is a single Tapeset, so there is no dependent segment chain to walk.
  */
 static int
@@ -4140,7 +3962,7 @@ qmgr_copy_new_result_to_query_area (THREAD_ENTRY * thread_p, QFILE_LIST_ID * lis
 {
   assert (list_id_p != NULL);
   assert (qfile_list_has_new_backing (list_id_p));
-  assert (!qmgr_list_has_raw_fd_segments (list_id_p));
+  assert (!qmgr_list_has_spill_segments (list_id_p));
 
   /* QFILE_FLAG_RESULT_FILE -> a permanent FILE_QUERY_AREA list (the cache is
    * enabled on this path, so qfile_open_list honors the flag). */
@@ -4305,12 +4127,10 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
   tfile_vfid_p->backing = qmgr_temp_backing::MEMBUF;
   tfile_vfid_p->wm_reserved_bytes = reserved_bytes;
   tfile_vfid_p->wm_reserved_shard = reserved_shard;
-  tfile_vfid_p->raw_fd_query_id = query_id;
-  tfile_vfid_p->raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
-  tfile_vfid_p->raw_fd_worker_id = 0;
-  tfile_vfid_p->raw_fd_handle = NULL;
-  tfile_vfid_p->raw_fd_next_pageid = num_buffer_pages;
-  tfile_vfid_p->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  tfile_vfid_p->spill_query_id = query_id;
+  tfile_vfid_p->spill_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+  tfile_vfid_p->spill_worker_id = 0;
+  tfile_vfid_p->spill_next_pageid = num_buffer_pages;
   tfile_vfid_p->page_spill_handle = NULL;
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
@@ -4422,12 +4242,10 @@ qmgr_create_result_file (THREAD_ENTRY * thread_p, QUERY_ID query_id)
   tfile_vfid_p->backing = qmgr_temp_backing::PRIVATE_SPILL_FALLBACK;
   tfile_vfid_p->wm_reserved_bytes = 0;
   tfile_vfid_p->wm_reserved_shard = -1;
-  tfile_vfid_p->raw_fd_query_id = query_id;
-  tfile_vfid_p->raw_fd_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
-  tfile_vfid_p->raw_fd_worker_id = 0;
-  tfile_vfid_p->raw_fd_handle = NULL;
-  tfile_vfid_p->raw_fd_next_pageid = 0;
-  tfile_vfid_p->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  tfile_vfid_p->spill_query_id = query_id;
+  tfile_vfid_p->spill_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
+  tfile_vfid_p->spill_worker_id = 0;
+  tfile_vfid_p->spill_next_pageid = 0;
   tfile_vfid_p->page_spill_handle = NULL;
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;
@@ -4519,9 +4337,6 @@ qmgr_free_temp_file_list (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p
 {
   QMGR_TEMP_FILE *temp = NULL;
   int rc = NO_ERROR, fd_ret = NO_ERROR;
-  int raw_fd_owner_tran_index = (tfile_vfid_p->raw_fd_owner_tran_index != NULL_TRAN_INDEX)
-    ? tfile_vfid_p->raw_fd_owner_tran_index : LOG_FIND_THREAD_TRAN_INDEX (thread_p);
-  temp_page_store::cleanup_query_raw_fd_files (raw_fd_owner_tran_index, query_id);
 
   /* make sure temp file list is not cyclic */
   assert (tfile_vfid_p->prev == NULL || tfile_vfid_p->prev->next == NULL);
@@ -4591,9 +4406,9 @@ qmgr_free_query_temp_file_helper (THREAD_ENTRY * thread_p, QMGR_QUERY_ENTRY * qu
       bool is_error = (query_p->errid < 0);
 
       tfile_vfid_p = query_p->temp_vfid;
-      if (tfile_vfid_p->raw_fd_owner_tran_index == NULL_TRAN_INDEX)
+      if (tfile_vfid_p->spill_owner_tran_index == NULL_TRAN_INDEX)
 	{
-	  tfile_vfid_p->raw_fd_owner_tran_index = tran_index;
+	  tfile_vfid_p->spill_owner_tran_index = tran_index;
 	}
       tfile_vfid_p->prev->next = NULL;
 
@@ -4675,20 +4490,13 @@ qmgr_free_list_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP_
     }
 
   rc = NO_ERROR;
-  /* Release ONLY this temp file's own raw-fd handle (close+unlink+delete). Do NOT clean the whole query's raw-fd
-   * files here: sibling temp files of the same query may still be live and being read (their handles must stay open).
-   * Whole-query raw-fd cleanup belongs to qmgr_free_temp_file_list / the longjmp boundary backstop. */
-  if (tfile_vfid_p->raw_fd_handle != NULL)
-    {
-      temp_page_store::destroy_raw_fd_file (tfile_vfid_p->raw_fd_handle);
-      tfile_vfid_p->raw_fd_handle = NULL;
-      tfile_vfid_p->raw_fd_next_pageid = 0;
-    }
+  /* Release ONLY this temp file's own spill handle (close+unlink+delete). Do NOT clean the whole query's spill
+   * files here: sibling temp files of the same query may still be live and being read (their handles must stay open). */
   if (tfile_vfid_p->page_spill_handle != NULL)
     {
       delete tfile_vfid_p->page_spill_handle;
       tfile_vfid_p->page_spill_handle = NULL;
-      tfile_vfid_p->raw_fd_next_pageid = 0;
+      tfile_vfid_p->spill_next_pageid = 0;
     }
   if (query_p->temp_vfid)
     {
@@ -5052,20 +4860,14 @@ qmgr_put_temp_file_into_list (QMGR_TEMP_FILE * temp_file_p)
     }
 
   temp_page_store::release_held_reservation (temp_file_p);
-  /* A pooled temp file must not retain a stale raw-fd handle; destroy it before the buffer is reused. */
-  if (temp_file_p->raw_fd_handle != NULL)
-    {
-      temp_page_store::destroy_raw_fd_file (temp_file_p->raw_fd_handle);
-      temp_file_p->raw_fd_handle = NULL;
-    }
+  /* A pooled temp file must not retain a stale spill handle; destroy it before the buffer is reused. */
   if (temp_file_p->page_spill_handle != NULL)
     {
       delete temp_file_p->page_spill_handle;
       temp_file_p->page_spill_handle = NULL;
     }
-  temp_file_p->raw_fd_next_pageid = 0;
-  temp_file_p->raw_fd_owner_tran_index = NULL_TRAN_INDEX;
-  temp_file_p->raw_fd_hint = temp_page_store::raw_fd_access_hint::RANDOM_REACCESS;
+  temp_file_p->spill_next_pageid = 0;
+  temp_file_p->spill_owner_tran_index = NULL_TRAN_INDEX;
   temp_file_p->backing = qmgr_temp_backing::MEMBUF;
   temp_file_p->membuf_last = -1;
 

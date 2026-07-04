@@ -432,8 +432,8 @@ struct sort_list
 typedef struct qfile_list_id QFILE_LIST_ID;
 
 /* Migration backing-kind tag (redesign G008, issue #73; Phase 2 MIGRATE).
- * During expand->migrate the OLD backing (qfile_connect_list / raw-fd / pgbuf
- * sector) and the NEW backing (Tapeset / per-worker private file / offset
+ * During expand->migrate the OLD backing (membuf / page-spill / pgbuf temp)
+ * and the NEW backing (Tapeset / per-worker private file / offset
  * arithmetic) coexist, but a SINGLE list is produced wholly by one path --
  * never a mix (operator-atomic switch).  This permanently avoids the
  * mixed-backing scan that produced garbled results and the +209%/crash dead
@@ -443,7 +443,7 @@ typedef struct qfile_list_id QFILE_LIST_ID;
 enum qfile_backing_kind
 {
   QFILE_BACKING_NONE = 0,
-  QFILE_BACKING_OLD = 1,	/* connect_list / raw-fd / pgbuf-sector */
+  QFILE_BACKING_OLD = 1,	/* membuf / page-spill / pgbuf temp */
   QFILE_BACKING_NEW = 2		/* Tapeset / per-worker private file / offset */
 };
 typedef enum qfile_backing_kind QFILE_BACKING_KIND;
@@ -696,10 +696,10 @@ extern void qfile_tuple_position_report_tape_misuse (void);
 enum qfile_tuple_position_coordinate_type
 {
   QFILE_TUPLE_POSITION_COORD_VPID = 0,
-  QFILE_TUPLE_POSITION_COORD_RAW_FD = 1,
+  QFILE_TUPLE_POSITION_COORD_SPILL = 1,
   /* Tape-relative coordinate (redesign G005, issue #70 / ADR 0002): a tuple is
    * addressed by (tape_idx, tape_page_offset, tape_byte_offset) + tplno, by
-   * pure offset arithmetic — no VPID, no raw-fd segment.  Intra-query only
+   * pure offset arithmetic — no VPID, no spill segment.  Intra-query only
    * (never stored to QFILE_TUPLE_POSITION_DB; CONNECT BY does not serialize it). */
   QFILE_TUPLE_POSITION_COORD_TAPE = 2
 };
@@ -722,9 +722,9 @@ struct qfile_tuple_position
     };
     struct
     {
-      UINT64 raw_fd_segment_id;	/* Raw-fd segment identifier */
-      INT32 page_index;		/* Page index inside the raw-fd segment */
-      INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
+      UINT64 spill_segment_id;	/* Spill segment identifier */
+      INT32 page_index;		/* Page index inside the spill segment */
+      INT32 tuple_offset;	/* Tuple offset inside the spill page */
     };
     struct
     {
@@ -752,9 +752,9 @@ struct qfile_tuple_position_db
     };
     struct
     {
-      UINT64 raw_fd_segment_id;	/* Raw-fd segment identifier */
-      INT32 page_index;		/* Page index inside the raw-fd segment */
-      INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
+      UINT64 spill_segment_id;	/* Spill segment identifier */
+      INT32 page_index;		/* Page index inside the spill segment */
+      INT32 tuple_offset;	/* Tuple offset inside the spill page */
     };
   };
   int tplno;			/* Tuple number inside the page */
@@ -764,9 +764,9 @@ struct qfile_tuple_position_db
 #define QFILE_TUPLE_POSITION_DB_BIT_SIZE (sizeof (QFILE_TUPLE_POSITION_DB) * 8)
 
 static inline bool
-qfile_tuple_position_is_raw_fd (const QFILE_TUPLE_POSITION * tuple_position_p)
+qfile_tuple_position_is_spill (const QFILE_TUPLE_POSITION * tuple_position_p)
 {
-  return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
+  return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_SPILL;
 }
 
 static inline void
@@ -779,11 +779,11 @@ qfile_tuple_position_set_vpid (QFILE_TUPLE_POSITION * tuple_position_p, const VP
 }
 
 static inline void
-qfile_tuple_position_set_raw_fd (QFILE_TUPLE_POSITION * tuple_position_p, UINT64 raw_fd_segment_id, INT32 page_index,
+qfile_tuple_position_set_spill (QFILE_TUPLE_POSITION * tuple_position_p, UINT64 spill_segment_id, INT32 page_index,
 				 INT32 tuple_offset)
 {
-  tuple_position_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
-  tuple_position_p->raw_fd_segment_id = raw_fd_segment_id;
+  tuple_position_p->coord_type = QFILE_TUPLE_POSITION_COORD_SPILL;
+  tuple_position_p->spill_segment_id = spill_segment_id;
   tuple_position_p->page_index = page_index;
   tuple_position_p->tuple_offset = tuple_offset;
 }
@@ -808,9 +808,9 @@ static inline void
 qfile_tuple_position_copy_coord (QFILE_TUPLE_POSITION * dst_p, const QFILE_TUPLE_POSITION * src_p)
 {
   dst_p->coord_type = src_p->coord_type;
-  if (qfile_tuple_position_is_raw_fd (src_p))
+  if (qfile_tuple_position_is_spill (src_p))
     {
-      qfile_tuple_position_set_raw_fd (dst_p, src_p->raw_fd_segment_id, src_p->page_index, src_p->tuple_offset);
+      qfile_tuple_position_set_spill (dst_p, src_p->spill_segment_id, src_p->page_index, src_p->tuple_offset);
     }
   else if (qfile_tuple_position_is_tape (src_p))
     {
@@ -823,9 +823,9 @@ qfile_tuple_position_copy_coord (QFILE_TUPLE_POSITION * dst_p, const QFILE_TUPLE
 }
 
 static inline bool
-qfile_tuple_position_db_is_raw_fd (const QFILE_TUPLE_POSITION_DB * tuple_position_p)
+qfile_tuple_position_db_is_spill (const QFILE_TUPLE_POSITION_DB * tuple_position_p)
 {
-  return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
+  return tuple_position_p != NULL && tuple_position_p->coord_type == QFILE_TUPLE_POSITION_COORD_SPILL;
 }
 
 static inline int
@@ -846,10 +846,10 @@ qfile_tuple_position_store_to_db (QFILE_TUPLE_POSITION_DB * stored_p, const QFIL
     }
   stored_p->status = src_p->status;
   stored_p->position = src_p->position;
-  if (qfile_tuple_position_is_raw_fd (src_p))
+  if (qfile_tuple_position_is_spill (src_p))
     {
-      stored_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
-      stored_p->raw_fd_segment_id = src_p->raw_fd_segment_id;
+      stored_p->coord_type = QFILE_TUPLE_POSITION_COORD_SPILL;
+      stored_p->spill_segment_id = src_p->spill_segment_id;
       stored_p->page_index = src_p->page_index;
       stored_p->tuple_offset = src_p->tuple_offset;
     }
@@ -870,9 +870,9 @@ qfile_tuple_position_restore_from_stored (QFILE_TUPLE_POSITION * dst_p, const QF
 {
   dst_p->status = stored_p->status;
   dst_p->position = stored_p->position;
-  if (qfile_tuple_position_db_is_raw_fd (stored_p))
+  if (qfile_tuple_position_db_is_spill (stored_p))
     {
-      qfile_tuple_position_set_raw_fd (dst_p, stored_p->raw_fd_segment_id, stored_p->page_index,
+      qfile_tuple_position_set_spill (dst_p, stored_p->spill_segment_id, stored_p->page_index,
 				       stored_p->tuple_offset);
     }
   else

@@ -145,7 +145,7 @@ namespace qfile
       /* One-shot boot sweep (issue #88): wipes this server's cubrid_buffile
        * spill subtree of any files orphaned by a kill -9'd previous run.
        * Idempotent (std::call_once); call once at server boot, mirroring
-       * temp_page_store::initialize_raw_fd_boot_sweep(). Safe to skip -- if
+       * the raw-fd sweep this replaced (커밋 B #137). Safe to skip -- if
        * never called explicitly, default_scratch_dir() below runs it lazily
        * on first use, but calling it at boot keeps the sweep off the query
        * hot path. */

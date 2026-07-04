@@ -60,9 +60,9 @@ struct qfile_tuple_simple_pos
     };
     struct
     {
-      UINT64 raw_fd_segment_id;	/* Raw-fd segment identifier */
-      INT32 page_index;		/* Page index inside the raw-fd segment */
-      INT32 tuple_offset;	/* Tuple offset inside the raw-fd page */
+      UINT64 spill_segment_id;	/* Spill segment identifier */
+      INT32 page_index;		/* Page index inside the spill segment */
+      INT32 tuple_offset;	/* Tuple offset inside the spill page */
     };
     struct
     {
@@ -75,9 +75,9 @@ struct qfile_tuple_simple_pos
 };
 
 static inline bool
-qfile_tuple_simple_pos_is_raw_fd (const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
+qfile_tuple_simple_pos_is_spill (const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
 {
-  return simple_pos_p != NULL && simple_pos_p->coord_type == QFILE_TUPLE_POSITION_COORD_RAW_FD;
+  return simple_pos_p != NULL && simple_pos_p->coord_type == QFILE_TUPLE_POSITION_COORD_SPILL;
 }
 
 static inline bool
@@ -97,11 +97,11 @@ qfile_tuple_simple_pos_set_vpid (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, const VP
 }
 
 static inline void
-qfile_tuple_simple_pos_set_raw_fd (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, UINT64 raw_fd_segment_id, INT32 page_index,
+qfile_tuple_simple_pos_set_spill (QFILE_TUPLE_SIMPLE_POS * simple_pos_p, UINT64 spill_segment_id, INT32 page_index,
 				  INT32 tuple_offset)
 {
-  simple_pos_p->coord_type = QFILE_TUPLE_POSITION_COORD_RAW_FD;
-  simple_pos_p->raw_fd_segment_id = raw_fd_segment_id;
+  simple_pos_p->coord_type = QFILE_TUPLE_POSITION_COORD_SPILL;
+  simple_pos_p->spill_segment_id = spill_segment_id;
   simple_pos_p->page_index = page_index;
   simple_pos_p->tuple_offset = tuple_offset;
   simple_pos_p->coord_reserved = 0;
@@ -122,9 +122,9 @@ static inline void
 qfile_tuple_position_set_simple_pos (QFILE_TUPLE_POSITION * tuple_position_p,
 				     const QFILE_TUPLE_SIMPLE_POS * simple_pos_p)
 {
-  if (qfile_tuple_simple_pos_is_raw_fd (simple_pos_p))
+  if (qfile_tuple_simple_pos_is_spill (simple_pos_p))
     {
-      qfile_tuple_position_set_raw_fd (tuple_position_p, simple_pos_p->raw_fd_segment_id, simple_pos_p->page_index,
+      qfile_tuple_position_set_spill (tuple_position_p, simple_pos_p->spill_segment_id, simple_pos_p->page_index,
 				       simple_pos_p->tuple_offset);
     }
   else if (qfile_tuple_simple_pos_is_tape (simple_pos_p))
@@ -250,7 +250,7 @@ extern HLS_SPILL_CURSOR *hls_spill_cursor_create (THREAD_ENTRY * thread_p);
 extern void hls_spill_cursor_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill, HLS_SPILL_CURSOR * cursor);
 
 /* Save the scan's current tuple position as a SIMPLE_POS (backing-aware:
- * TAPE / raw-fd / VPID) — shared by the HYBRID producer and the spill build. */
+ * TAPE / spill / VPID) — shared by the HYBRID producer and the spill build. */
 extern void qdata_save_hscan_pos (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_SIMPLE_POS * pos);
 
 /* work_mem accountant charge helpers for the IN_MEM/HYBRID build estimate (#123/#91). */

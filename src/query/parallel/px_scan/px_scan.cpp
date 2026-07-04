@@ -37,7 +37,7 @@
 #include "list_file.h"				/* qfile_close_list, qfile_destroy_list */
 #include "heap_file.h"				/* heap_attrinfo_end */
 #include "file_manager.h"			/* file_get_num_user_pages */
-#include "query_manager.h"			/* qmgr_list_has_raw_fd_segments (#126 guard) */
+#include "query_manager.h"			/* qmgr_list_has_spill_segments (#126 guard) */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -391,7 +391,7 @@ extern "C"
 	      {
 		continue;
 	      }
-	    if (qmgr_list_has_raw_fd_segments (list_id))
+	    if (qmgr_list_has_spill_segments (list_id))
 	      {
 		er_log_debug (ARG_FILE_LINE,
 			      "WM_PX_RAWFD_LIST_GUARD: query_id=%lld inner list carries raw-fd segments -> serial (#126)\n",

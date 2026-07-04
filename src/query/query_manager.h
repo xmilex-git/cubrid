@@ -102,20 +102,18 @@ struct qmgr_temp_file
   qmgr_temp_backing backing;
   size_t wm_reserved_bytes;
   int wm_reserved_shard;
-  QUERY_ID raw_fd_query_id;
-  int raw_fd_owner_tran_index;
-  unsigned int raw_fd_worker_id;
-  temp_page_store::raw_fd_file *raw_fd_handle;
-  int raw_fd_next_pageid;	/* dense overflow pageid issue; shared by raw-fd and (c′) page-spill */
-  temp_page_store::raw_fd_access_hint raw_fd_hint;
-  qfile::page_spill_file *page_spill_handle;	/* (c′) PAGE_SPILL_OVERFLOW backing; containment-owned (D2, #132) */
+  QUERY_ID spill_query_id;
+  int spill_owner_tran_index;
+  unsigned int spill_worker_id;
+  int spill_next_pageid;	/* dense overflow pageid issuer for the (c′) page-spill backing */
+  qfile::page_spill_file *page_spill_handle;	/* (c′) SPILL_OVERFLOW backing; containment-owned (D2, #132) */
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };
 typedef struct qmgr_segment QMGR_SEGMENT;
 struct qmgr_segment
 {
-  QFILE_LIST_ID list_id;	/* Borrowed raw-fd backing metadata; owns only copied list descriptors. */
+  QFILE_LIST_ID list_id;	/* Borrowed spill backing metadata; owns only copied list descriptors. */
 };
 
 typedef struct qmgr_segment_list QMGR_SEGMENT_LIST;
@@ -216,8 +214,8 @@ extern void qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src);
 extern void qmgr_segment_list_init (QMGR_SEGMENT_LIST * segment_list_p);
 extern void qmgr_segment_list_clear (QMGR_SEGMENT_LIST * segment_list_p);
 extern bool qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p);
-extern bool qmgr_list_has_raw_fd_segments (const QFILE_LIST_ID * list_id_p);
-/* fd-backed OLD overflow, either tag (raw-fd legacy / (c′) page-spill, #132) */
+extern bool qmgr_list_has_spill_segments (const QFILE_LIST_ID * list_id_p);
+/* fd-backed OLD overflow ((c′) page-spill; sole tag since 커밋 B #137) */
 extern bool qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p);
 extern UINT64 qmgr_tfile_fd_overflow_segment_id (const QMGR_TEMP_FILE * tfile_p);
 extern bool qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p);

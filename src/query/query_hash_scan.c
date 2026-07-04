@@ -368,10 +368,10 @@ qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *dat
     }
   else if (hash_list_scan_type == HASH_METH_HYBRID)
     {
-      if (qfile_tuple_simple_pos_is_raw_fd (data_p->pos))
+      if (qfile_tuple_simple_pos_is_spill (data_p->pos))
 	{
-	  fprintf (fp, "raw_fd_segment_id = [%llu]  page_index = [%d]  tuple_offset = [%d]",
-		   (unsigned long long) data_p->pos->raw_fd_segment_id, data_p->pos->page_index,
+	  fprintf (fp, "spill_segment_id = [%llu]  page_index = [%d]  tuple_offset = [%d]",
+		   (unsigned long long) data_p->pos->spill_segment_id, data_p->pos->page_index,
 		   data_p->pos->tuple_offset);
 	}
       else
@@ -583,7 +583,7 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
 
 /*
  * qdata_save_hscan_pos () - save the scan's current tuple position as a
- *   backing-aware SIMPLE_POS (TAPE / raw-fd / VPID).  Shared by the HYBRID
+ *   backing-aware SIMPLE_POS (TAPE / spill / VPID).  Shared by the HYBRID
  *   value producer above and the batch-spill build (#123).
  */
 void
@@ -604,7 +604,7 @@ qdata_save_hscan_pos (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_SIMPLE_POS * p
       && scan_id_p->curr_vpid.volid == NULL_VOLID
       && scan_id_p->curr_vpid.pageid > QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->membuf_last)
     {
-      qfile_tuple_simple_pos_set_raw_fd (pos,
+      qfile_tuple_simple_pos_set_spill (pos,
 					 qmgr_tfile_fd_overflow_segment_id (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id))),
 					 scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
     }
@@ -750,7 +750,7 @@ struct hls_spill_entry
   QFILE_TUPLE_SIMPLE_POS pos;
 };
 
-/* SIMPLE_POS is 8-byte aligned (raw-fd UINT64), so 4+16+4 pads to 32 */
+/* SIMPLE_POS is 8-byte aligned (spill UINT64), so 4+16+4 pads to 32 */
 static_assert (sizeof (QFILE_TUPLE_SIMPLE_POS) == 32, "SIMPLE_POS layout drift");
 static_assert (sizeof (HLS_SPILL_ENTRY) == 40, "spill entry layout drift");
 

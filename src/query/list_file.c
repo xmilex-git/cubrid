@@ -1283,11 +1283,6 @@ qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALUE_TYPE_LIST * type_lis
       return NULL;
     }
 
-  if (sort_list_p != NULL)
-    {
-      QFILE_LIST_ID_TFILE_VFID(list_id_p)->raw_fd_hint = temp_page_store::raw_fd_access_hint::SEQUENTIAL_ONCE;
-    }
-
   VFID_COPY (&(list_id_p->temp_vfid), &(QFILE_LIST_ID_TFILE_VFID(list_id_p)->temp_vfid));
   list_id_p->type_list.domp = NULL;
 
@@ -3731,7 +3726,7 @@ qfile_append_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_
   assert (append_list_id->last_pgptr == NULL);
 
   assert (append_list_id->tuple_cnt > 0);
-  if (qmgr_list_has_raw_fd_segments (base_list_id) || qmgr_list_has_raw_fd_segments (append_list_id))
+  if (qmgr_list_has_spill_segments (base_list_id) || qmgr_list_has_spill_segments (append_list_id))
     {
       return qmgr_append_list_to_list_segment_native (thread_p, base_list_id, append_list_id);
     }
@@ -5239,26 +5234,23 @@ qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * key_info_p, QFILE_TUPLE_V
   return NO_ERROR;
 }
 
-/* qfile_list_is_raw_fd_spilled () - true when an OLD-backed list has overflowed
- *   its membuf into a raw-fd temp file (#107).
+/* qfile_list_is_spill_overflowed () - true when an OLD-backed list has overflowed
+ *   its membuf into a spill temp file (#107).
  *
  *   For such a list a P_sort_key (use_original) sort re-fixes the original
  *   tuple page per SORT_REC, and every fix past membuf_last is a real pread
- *   (temp_page_store has no pgbuf in front of the raw fd) — a cyclic access
- *   pattern turns that into per-row I/O amplification.  MEMBUF-resident and
- *   PRIVATE_SPILL_FALLBACK lists are excluded: their re-fetches resolve from
- *   the membuf array / pgbuf respectively, so use_original stays profitable.
+ *   (the per-tfile page-spill cache holds only fixed pages, #132) — a cyclic
+ *   access pattern turns that into per-row I/O amplification.  MEMBUF-resident
+ *   and PRIVATE_SPILL_FALLBACK lists are excluded: their re-fetches resolve
+ *   from the membuf array / pgbuf respectively, so use_original stays
+ *   profitable.
  */
 bool
-qfile_list_is_raw_fd_spilled (const QFILE_LIST_ID * list_id_p)
+qfile_list_is_spill_overflowed (const QFILE_LIST_ID * list_id_p)
 {
   QMGR_TEMP_FILE *tfile_p = (list_id_p != NULL) ? QFILE_LIST_ID_TFILE_VFID (list_id_p) : NULL;
 
-  /* (c′) page-spill overflow re-fixes past membuf_last are real preads too
-   * (per-tfile cache holds only fixed pages), so the same use_original
-   * amplification applies (#132). */
-  return tfile_p != NULL && (tfile_p->backing == qmgr_temp_backing::RAW_FD_OVERFLOW
-			     || tfile_p->backing == qmgr_temp_backing::PAGE_SPILL_OVERFLOW);
+  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::SPILL_OVERFLOW;
 }
 
 /* qfile_initialize_sort_info () -
@@ -5286,13 +5278,13 @@ qfile_initialize_sort_info (SORT_INFO * sort_info_p, QFILE_LIST_ID * list_id_p, 
    * merely dropping use_original truncates the tuple to the key columns (#100).  If the
    * extension bails out (duplicate key column), use_original stays set and the sort fails
    * loudly on the unresolvable back-reference instead of producing truncated tuples.
-   * A raw-fd spilled OLD input gets the same treatment for performance (#107): its
+   * A spill-overflowed OLD input gets the same treatment for performance (#107): its
    * per-SORT_REC use_original re-fix is a real pread past membuf_last, and the sorted-order
    * access pattern defeats any cache smaller than the file — carrying all columns removes
    * the re-fetch entirely.  Here a bail-out is harmless: the VPID back-references stay
    * valid, so the sort falls back to the (slow but correct) re-fetch path. */
   if (sort_info_p->key_info.use_original == 1
-      && (qfile_list_has_new_backing (list_id_p) || qfile_list_is_raw_fd_spilled (list_id_p)))
+      && (qfile_list_has_new_backing (list_id_p) || qfile_list_is_spill_overflowed (list_id_p)))
     {
       bool all_columns_carried = false;
 
@@ -5388,28 +5380,6 @@ qfile_hashjoin_new_backing_enabled (void)
   if (cached < 0)
     {
       const char *env = getenv ("CUBRID_WM_HASHJOIN_NEW");
-      cached = (env != NULL && env[0] == '0') ? 0 : 1;
-    }
-  return cached != 0;
-}
-
-/*
- * qfile_spill_new_backing_enabled () - is the OLD-tier membuf overflow served
- *   by the NEW (c′) per-tfile page-spill backing instead of raw-fd?
- *   Cutover gate (#132/#135, design #74 [(c′) coherence 설계] §5 D6).
- *   Default ON, CUBRID_WM_SPILL_NEW=0 opts out to the legacy raw-fd path --
- *   the SAME polarity as the three migration gates above (커밋 A #135
- *   flipped the coexistence-era opt-in default; 절체 근거 = #133 채증
- *   캠페인).  The decision is taken once per tfile at its first spill (the
- *   backing tag pins it); the env itself is boot-cached like its siblings.
- */
-bool
-qfile_spill_new_backing_enabled (void)
-{
-  static int cached = -1;
-  if (cached < 0)
-    {
-      const char *env = getenv ("CUBRID_WM_SPILL_NEW");
       cached = (env != NULL && env[0] == '0') ? 0 : 1;
     }
   return cached != 0;
@@ -5512,9 +5482,9 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
       int px_predicted_num = (int) parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT,
 									     list_id_p->page_cnt, parallelism);
       if (px_predicted_num >= 2 && list_id_p->tuple_cnt > px_predicted_num
-	  && !qmgr_list_has_raw_fd_segments (list_id_p))
+	  && !qmgr_list_has_spill_segments (list_id_p))
 	{
-	  /* raw-fd overflow input forces serial in sort_check_parallelism (the px
+	  /* spill overflow input forces serial in sort_check_parallelism (the px
 	   * sector scan cannot see those pages) -- keep the RESULT_FILE flag then,
 	   * so a serial cached sort still writes straight into the query area. */
 	  flag &= ~QFILE_FLAG_RESULT_FILE;
@@ -5971,11 +5941,10 @@ qfile_get_tuple_from_current_list (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID *
 }
 
 static bool
-qfile_scan_is_raw_fd_backed (const QFILE_LIST_SCAN_ID * scan_id_p)
+qfile_scan_is_spill_backed (const QFILE_LIST_SCAN_ID * scan_id_p)
 {
-  /* either coexisting fd-backed overflow tag (raw-fd / (c′) page-spill, #132);
-   * both issue dense pageids from raw_fd_next_pageid, so the dense scans below
-   * work unchanged */
+  /* (c′) page-spill overflow tag (#132): dense pageids are issued from
+   * spill_next_pageid, which the dense scans below rely on */
   return qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id)));
 }
 
@@ -5991,11 +5960,11 @@ qfile_scan_fix_old_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p
 }
 
 static SCAN_CODE
-qfile_scan_first_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
+qfile_scan_first_spill_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
   QMGR_TEMP_FILE *tfile_vfid_p = QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id));
   PAGEID pageid = QFILE_LIST_ID_FIRST_VPID(&(scan_id_p->list_id)).pageid;
-  PAGEID end_pageid = tfile_vfid_p->raw_fd_next_pageid;
+  PAGEID end_pageid = tfile_vfid_p->spill_next_pageid;
 
   if (pageid == NULL_PAGEID || pageid == NULL_PAGEID_IN_PROGRESS)
     {
@@ -6039,11 +6008,11 @@ qfile_scan_first_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan
 }
 
 static SCAN_CODE
-qfile_scan_next_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
+qfile_scan_next_spill_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
   QMGR_TEMP_FILE *tfile_vfid_p = QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id));
   PAGEID next_pageid = scan_id_p->curr_vpid.pageid + 1;
-  PAGEID end_pageid = tfile_vfid_p->raw_fd_next_pageid;
+  PAGEID end_pageid = tfile_vfid_p->spill_next_pageid;
 
   if (end_pageid <= next_pageid && QFILE_LIST_ID_LAST_VPID(&(scan_id_p->list_id)).pageid >= next_pageid)
     {
@@ -6090,14 +6059,14 @@ qfile_scan_next_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_
 }
 
 static SCAN_CODE
-qfile_scan_last_raw_fd_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
+qfile_scan_last_spill_page (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
   QMGR_TEMP_FILE *tfile_vfid_p = QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id));
   PAGEID pageid = QFILE_LIST_ID_LAST_VPID(&(scan_id_p->list_id)).pageid;
 
   if (pageid == NULL_PAGEID || pageid == NULL_PAGEID_IN_PROGRESS)
     {
-      pageid = tfile_vfid_p->raw_fd_next_pageid - 1;
+      pageid = tfile_vfid_p->spill_next_pageid - 1;
     }
 
   while (pageid >= 0)
@@ -6152,9 +6121,9 @@ qfile_scan_next (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
     {
       if (scan_id_p->list_id.tuple_cnt > 0)
 	{
-	  if (qfile_scan_is_raw_fd_backed (scan_id_p))
+	  if (qfile_scan_is_spill_backed (scan_id_p))
 	    {
-	      return qfile_scan_first_raw_fd_page (thread_p, scan_id_p);
+	      return qfile_scan_first_spill_page (thread_p, scan_id_p);
 	    }
 	  page_p = qfile_scan_fix_old_page (thread_p, scan_id_p, &QFILE_LIST_ID_FIRST_VPID(&(scan_id_p->list_id)));
 	  if (page_p == NULL)
@@ -6184,9 +6153,9 @@ qfile_scan_next (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 	  scan_id_p->curr_tplno++;
 	  return S_SUCCESS;
 	}
-      else if (qfile_scan_is_raw_fd_backed (scan_id_p))
+      else if (qfile_scan_is_spill_backed (scan_id_p))
 	{
-	  return qfile_scan_next_raw_fd_page (thread_p, scan_id_p);
+	  return qfile_scan_next_spill_page (thread_p, scan_id_p);
 	}
       else if (qfile_has_next_page (scan_id_p->curr_pgptr))
 	{
@@ -6299,9 +6268,9 @@ qfile_scan_prev (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
   else if (scan_id_p->position == S_AFTER)
     {
 
-      if (qfile_scan_is_raw_fd_backed (scan_id_p))
+      if (qfile_scan_is_spill_backed (scan_id_p))
 	{
-	  return qfile_scan_last_raw_fd_page (thread_p, scan_id_p);
+	  return qfile_scan_last_spill_page (thread_p, scan_id_p);
 	}
       if (VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(&(scan_id_p->list_id))))
 	{
@@ -6357,7 +6326,7 @@ qfile_save_current_scan_tuple_position (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TU
       && scan_id_p->curr_vpid.volid == NULL_VOLID
       && scan_id_p->curr_vpid.pageid > QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id))->membuf_last)
     {
-      qfile_tuple_position_set_raw_fd (tuple_position_p,
+      qfile_tuple_position_set_spill (tuple_position_p,
 				       qmgr_tfile_fd_overflow_segment_id (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id))),
 				       scan_id_p->curr_vpid.pageid, scan_id_p->curr_offset);
     }
@@ -6458,7 +6427,7 @@ qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * sc
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_UNKNOWN_CRSPOS, 0);
       return S_ERROR;
     }
-  if (qfile_tuple_position_is_raw_fd (tuple_position_p))
+  if (qfile_tuple_position_is_spill (tuple_position_p))
     {
       if (tuple_position_p->position == S_ON)
 	{
@@ -6683,7 +6652,7 @@ qfile_open_list_scan (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
 }
 
 int
-qfile_open_list_scan_raw_fd_segments (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
+qfile_open_list_scan_spill_segments (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
   return qfile_open_list_scan_internal (list_id_p, scan_id_p);
 }
@@ -8135,7 +8104,7 @@ qfile_add_tuple_get_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_i
 	  && QFILE_LIST_ID_LAST_VPID(list_id_p).volid == NULL_VOLID
 	  && QFILE_LIST_ID_LAST_VPID(list_id_p).pageid > QFILE_LIST_ID_TFILE_VFID(list_id_p)->membuf_last)
 	{
-	  qfile_tuple_position_set_raw_fd (tuple_pos,
+	  qfile_tuple_position_set_spill (tuple_pos,
 					   qmgr_tfile_fd_overflow_segment_id (QFILE_LIST_ID_TFILE_VFID (list_id_p)),
 					   QFILE_LIST_ID_LAST_VPID(list_id_p).pageid, list_id_p->last_offset);
 	}
@@ -8424,7 +8393,7 @@ qfile_set_tuple_column_value_by_position (THREAD_ENTRY * thread_p, QFILE_LIST_ID
       return ER_FAILED;
     }
 
-  if (qfile_tuple_position_is_raw_fd (tuple_position_p))
+  if (qfile_tuple_position_is_spill (tuple_position_p))
     {
       page_p = qmgr_segment_pos_read (thread_p, QFILE_LIST_ID_TFILE_VFID(list_id_p), tuple_position_p);
       vpid.volid = NULL_VOLID;

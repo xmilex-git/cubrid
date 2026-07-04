@@ -46,7 +46,7 @@
 namespace
 {
   /* process-wide segment_id issue; shared coordinate namespace with the
-   * tuple-position raw_fd_segment_id (a stale position can never match a
+   * tuple-position spill_segment_id (a stale position can never match a
    * different file: ids are never reused within a boot). */
   std::atomic<std::uint64_t> g_page_spill_seq {0};
 
