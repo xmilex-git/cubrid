@@ -23,9 +23,8 @@
 
 #include "qfile_buffile.hpp"
 
-#include "boot_sr.h"		/* boot_db_full_name */
 #include "error_manager.h"
-#include "file_io.h"		/* FILEIO_PAGE / fileio_initialize_res / fileio_get_directory_path */
+#include "file_io.h"		/* FILEIO_PAGE */
 #include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "tde.h"
@@ -35,12 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
-#include <ctime>
-#include <mutex>
 
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -52,11 +46,6 @@ namespace
   /* Pages buffered before a batched pwrite (PostgreSQL BufFile batches its
    * buffer; here a small batch coalesces syscalls without holding much RAM). */
   constexpr int BUFFILE_BATCH_PAGES = 8;
-
-  /* Process-wide orphan-scan census (redesign G003 #68, 1C slice).  Only the
-   * new per-worker backing path touches these. */
-  std::atomic<long> g_census_open_files {0};
-  std::atomic<long> g_census_held_prefix_pages {0};
 
 #if !defined (NDEBUG)
   /* ENOSPC fault injection (#86, debug-only).  g_fault_flush_target is the
@@ -111,313 +100,13 @@ namespace
   }
 #endif /* !NDEBUG */
 
-  bool
-  full_pwrite (int fd, const void *buf, std::size_t len, off_t offset) noexcept
-  {
-    const char *ptr = static_cast<const char *> (buf);
-    while (len > 0)
-      {
-	const ssize_t written = pwrite (fd, ptr, len, offset);
-	if (written < 0)
-	  {
-	    if (errno == EINTR)
-	      {
-		continue;
-	      }
-	    return false;
-	  }
-	if (written == 0)
-	  {
-	    errno = ENOSPC;
-	    return false;
-	  }
-	ptr += written;
-	len -= static_cast<std::size_t> (written);
-	offset += written;
-      }
-    return true;
-  }
-
-  bool
-  full_pread (int fd, void *buf, std::size_t len, off_t offset) noexcept
-  {
-    char *ptr = static_cast<char *> (buf);
-    while (len > 0)
-      {
-	const ssize_t nread = pread (fd, ptr, len, offset);
-	if (nread < 0)
-	  {
-	    if (errno == EINTR)
-	      {
-		continue;
-	      }
-	    return false;
-	  }
-	if (nread == 0)
-	  {
-	    errno = EIO;
-	    return false;
-	  }
-	ptr += nread;
-	len -= static_cast<std::size_t> (nread);
-	offset += nread;
-      }
-    return true;
-  }
-
-  /* mkdir -p for the immediate scratch dir tree.  Tolerates existing dirs. */
-  bool
-  mkdir_p (const std::string &path) noexcept
-  {
-    if (path.empty ())
-      {
-	return false;
-      }
-    std::string acc;
-    for (std::size_t i = 0; i < path.size (); i++)
-      {
-	acc.push_back (path[i]);
-	if (path[i] == '/' && acc.size () > 1)
-	  {
-	    if (mkdir (acc.c_str (), 0700) != 0 && errno != EEXIST)
-	      {
-		return false;
-	      }
-	  }
-      }
-    if (mkdir (path.c_str (), 0700) != 0 && errno != EEXIST)
-      {
-	return false;
-      }
-    return true;
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* Boot-time orphan sweep for cubrid_buffile/ (issue #88).  Mirrors the   */
-  /* raw-fd boot sweep in temp_page_store.cpp: a persistent per-database    */
-  /* server_id (survives restarts) namespaces this server's spill subtree, */
-  /* so boot can safely wipe ONLY that subtree -- files left behind by a    */
-  /* kill -9'd previous run of *this* server -- without touching another   */
-  /* live server's spills (a different server_id / different db_root).     */
-  /* ------------------------------------------------------------------ */
-
-  constexpr const char *BUFFILE_SERVER_ID_FILE = ".server-id";
-
-  std::string
-  sanitize_path_component (const char *input)
-  {
-    std::string out;
-    if (input == NULL || input[0] == '\0')
-      {
-	return "unknown";
-      }
-    for (const char *p = input; *p != '\0'; p++)
-      {
-	const unsigned char ch = static_cast<unsigned char> (*p);
-	if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')
-	  {
-	    out.push_back (static_cast<char> (ch));
-	  }
-	else
-	  {
-	    out.push_back ('_');
-	  }
-      }
-    return out.empty () ? std::string ("unknown") : out;
-  }
-
-  std::string
-  read_small_file (const std::string &path)
-  {
-    FILE *fp = fopen (path.c_str (), "r");
-    if (fp == NULL)
-      {
-	return std::string ();
-      }
-    char buffer[128];
-    const std::size_t nread = fread (buffer, 1, sizeof (buffer) - 1, fp);
-    fclose (fp);
-    buffer[nread] = '\0';
-    std::string value (buffer);
-    while (!value.empty () && (value[value.size () - 1] == '\n' || value[value.size () - 1] == '\r'))
-      {
-	value.erase (value.size () - 1);
-      }
-    return value;
-  }
-
-  bool
-  write_small_file (const std::string &path, const std::string &value)
-  {
-    FILE *fp = fopen (path.c_str (), "w");
-    if (fp == NULL)
-      {
-	return false;
-      }
-    const bool ok = fwrite (value.c_str (), 1, value.size (), fp) == value.size () && fputc ('\n', fp) != EOF;
-    fclose (fp);
-    return ok;
-  }
-
-  /* Recursively unlink every file/dir *under* `dir`, keeping `dir` itself. */
-  bool
-  unlink_tree_files_only (const std::string &dir)
-  {
-    DIR *dp = opendir (dir.c_str ());
-    if (dp == NULL)
-      {
-	return false;
-      }
-    bool ok = true;
-    struct dirent *entry = NULL;
-    while ((entry = readdir (dp)) != NULL)
-      {
-	if (strcmp (entry->d_name, ".") == 0 || strcmp (entry->d_name, "..") == 0)
-	  {
-	    continue;
-	  }
-	const std::string child = dir + "/" + entry->d_name;
-	struct stat st;
-	if (lstat (child.c_str (), &st) != 0)
-	  {
-	    ok = false;
-	    continue;
-	  }
-	if (S_ISDIR (st.st_mode))
-	  {
-	    ok = unlink_tree_files_only (child) && ok;
-	    if (rmdir (child.c_str ()) != 0 && errno != ENOENT)
-	      {
-		ok = false;
-	      }
-	  }
-	else if (unlink (child.c_str ()) != 0 && errno != ENOENT)
-	  {
-	    ok = false;
-	  }
-      }
-    closedir (dp);
-    return ok;
-  }
-
-  std::uint64_t
-  make_boot_incarnation () noexcept
-  {
-    const std::uint64_t now = static_cast<std::uint64_t> (time (NULL));
-    const std::uint64_t pid = static_cast<std::uint64_t> (getpid ());
-    return (now << 16) ^ pid;
-  }
-
-  struct buffile_dir_state
-  {
-    std::once_flag once;
-    std::string server_subtree;	/* <root>/cubrid_buffile/<db_name>/<server_id> */
-    bool sweep_ok { false };
-  };
-
-  buffile_dir_state g_buffile_dirs;
-
-  /* Resolve the disk-backed root (no /tmp or $TMP fallback, issue #88 D2:
-   * both can be tmpfs and a spill file on tmpfs defeats the point of
-   * spilling -- risks host OOM).  Priority: $CUBRID_TMP, else the database
-   * volume directory.  Empty return means "no usable disk-backed base". */
-  std::string
-  buffile_root_base ()
-  {
-    const char *cubrid_tmp = getenv ("CUBRID_TMP");
-    if (cubrid_tmp != NULL && cubrid_tmp[0] != '\0')
-      {
-	return cubrid_tmp;
-      }
-    const char *db_full = boot_db_full_name ();
-    if (db_full != NULL && db_full[0] != '\0')
-      {
-	char dir_buf[PATH_MAX];
-	const char *dir = fileio_get_directory_path (dir_buf, db_full);
-	if (dir != NULL && dir[0] != '\0')
-	  {
-	    return dir;
-	  }
-      }
-    return std::string ();
-  }
-
-  void
-  init_buffile_dirs ()
-  {
-    const std::string root_base = buffile_root_base ();
-    if (root_base.empty ())
-      {
-	g_buffile_dirs.sweep_ok = false;
-	return;
-      }
-
-    const std::string db_name = sanitize_path_component (boot_db_name ());
-    const std::string db_root = root_base + "/cubrid_buffile/" + db_name;
-    bool ok = mkdir_p (db_root);
-
-    const std::string server_id_path = db_root + "/" + BUFFILE_SERVER_ID_FILE;
-    std::string server_id = sanitize_path_component (read_small_file (server_id_path).c_str ());
-    if (server_id == "unknown")
-      {
-	server_id = "sid_" + std::to_string (make_boot_incarnation ());
-	ok = write_small_file (server_id_path, server_id) && ok;
-      }
-
-    g_buffile_dirs.server_subtree = db_root + "/" + server_id;
-    ok = mkdir_p (g_buffile_dirs.server_subtree) && ok;
-    if (ok)
-      {
-	ok = unlink_tree_files_only (g_buffile_dirs.server_subtree);
-      }
-    g_buffile_dirs.sweep_ok = ok;
-  }
 }				/* anonymous namespace */
 
 namespace qfile
 {
-  /* ------------------------------------------------------------------ */
-  /* tape_backing_census (orphan-scan hook, redesign G003 #68 / 1C)     */
-  /* ------------------------------------------------------------------ */
-
-  tape_backing_census_snapshot
-  tape_backing_census ()
-  {
-    tape_backing_census_snapshot s;
-    s.open_files = g_census_open_files.load (std::memory_order_relaxed);
-    s.held_prefix_pages = g_census_held_prefix_pages.load (std::memory_order_relaxed);
-    return s;
-  }
-
-  void
-  tape_backing_census_file_opened ()
-  {
-    g_census_open_files.fetch_add (1, std::memory_order_relaxed);
-  }
-
-  void
-  tape_backing_census_file_closed ()
-  {
-    g_census_open_files.fetch_sub (1, std::memory_order_relaxed);
-  }
-
-  void
-  tape_backing_census_prefix_added (long pages)
-  {
-    if (pages > 0)
-      {
-	g_census_held_prefix_pages.fetch_add (pages, std::memory_order_relaxed);
-      }
-  }
-
-  void
-  tape_backing_census_prefix_removed (long pages)
-  {
-    if (pages > 0)
-      {
-	g_census_held_prefix_pages.fetch_sub (pages, std::memory_order_relaxed);
-      }
-  }
+  /* tape_backing_census, full_pwrite/full_pread, mkdir_p and the boot-sweep
+   * scratch-tree machinery moved to the shared spill-file substrate
+   * (qfile_spill_file.cpp; Phase3 (c′) extraction, #132). */
 
 #if !defined (NDEBUG)
   void
@@ -479,11 +168,8 @@ namespace qfile
     return NO_ERROR;
   }
 
-  buffile::buffile (int fd, const std::string &path, TDE_ALGORITHM tde_algo, int disk_pagesize)
-    : m_fd (fd)
-    , m_path (path)
-    , m_tde_algo (tde_algo)
-    , m_disk_pagesize (disk_pagesize)
+  buffile::buffile ()
+    : m_file ()
     , m_pages_on_disk (0)
     , m_batch_raw (NULL)
     , m_batch (NULL)
@@ -497,10 +183,6 @@ namespace qfile
 #endif /* NDEBUG */
     , m_metrics ()
   {
-    if (m_fd >= 0)
-      {
-	tape_backing_census_file_opened ();
-      }
   }
 
   /* Producer-side pgbuf-bypass gate (issue #93): a BufFile reads/writes only
@@ -517,16 +199,7 @@ namespace qfile
 
   buffile::~buffile ()
   {
-    if (m_fd >= 0)
-      {
-	tape_backing_census_file_closed ();
-	::close (m_fd);
-	m_fd = -1;
-      }
-    if (!m_path.empty ())
-      {
-	(void) ::unlink (m_path.c_str ());
-      }
+    /* fd close + unlink + census are the substrate dtor's (m_file). */
     free (m_batch_raw);
     free (m_plain_raw);
   }
@@ -534,19 +207,13 @@ namespace qfile
   void
   buffile::boot_sweep ()
   {
-    std::call_once (g_buffile_dirs.once, init_buffile_dirs);
+    spill_scratch_boot_sweep ();
   }
 
   bool
   buffile::default_scratch_dir (std::string &out)
   {
-    std::call_once (g_buffile_dirs.once, init_buffile_dirs);
-    if (!g_buffile_dirs.sweep_ok || g_buffile_dirs.server_subtree.empty ())
-      {
-	return false;
-      }
-    out = g_buffile_dirs.server_subtree;
-    return true;
+    return spill_scratch_default_dir (out);
   }
 
   buffile *
@@ -567,20 +234,9 @@ namespace qfile
 	return NULL;
       }
 
-    std::string dirstr (dir);
-    if (!mkdir_p (dirstr))
-      {
-	if (os_error_out != NULL)
-	  {
-	    *os_error_out = errno;
-	  }
-	return NULL;
-      }
-
     char name[256];
-    std::snprintf (name, sizeof (name), "/buffile_%llu_w%u_p%ld.tmp", (unsigned long long) seq, worker_id,
+    std::snprintf (name, sizeof (name), "buffile_%llu_w%u_p%ld.tmp", (unsigned long long) seq, worker_id,
 		   (long) getpid ());
-    const std::string path = dirstr + name;
 
 #if !defined (NDEBUG)
     /* #125: injected fd-exhaustion (EMFILE/ENFILE) before touching the real fd
@@ -596,23 +252,9 @@ namespace qfile
       }
 #endif /* !NDEBUG */
 
-    const int fd = open (path.c_str (), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
-    if (fd < 0)
-      {
-	const int saved = errno;
-	if (os_error_out != NULL)
-	  {
-	    *os_error_out = saved;
-	  }
-	return NULL;
-      }
-
-    const int disk_pagesize = (tde_algo != TDE_ALGORITHM_NONE) ? IO_PAGESIZE : DB_PAGESIZE;
-    buffile *bf = new buffile (fd, path, tde_algo, disk_pagesize);
+    buffile *bf = new buffile ();
     if (bf == NULL)
       {
-	::close (fd);
-	(void) ::unlink (path.c_str ());
 	if (os_error_out != NULL)
 	  {
 	    *os_error_out = ENOMEM;
@@ -620,8 +262,14 @@ namespace qfile
 	return NULL;
       }
 
+    if (bf->m_file.create (dir, name, tde_algo, os_error_out) != NO_ERROR)
+      {
+	delete bf;
+	return NULL;
+      }
+
     /* aligned batch write buffer */
-    const std::size_t batch_bytes = (std::size_t) BUFFILE_BATCH_PAGES * (std::size_t) disk_pagesize;
+    const std::size_t batch_bytes = (std::size_t) BUFFILE_BATCH_PAGES * (std::size_t) bf->m_file.stride ();
     bf->m_batch_raw = static_cast<char *> (malloc (batch_bytes + MAX_ALIGNMENT));
     if (bf->m_batch_raw == NULL)
       {
@@ -668,26 +316,14 @@ namespace qfile
       {
 	return rc;
       }
-    if (!tde_is_loaded ())
-      {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TDE_CIPHER_IS_NOT_LOADED, 0);
-	return ER_TDE_CIPHER_IS_NOT_LOADED;
-      }
-
-    fileio_initialize_res (NULL, m_plain, IO_PAGESIZE);
-    m_plain->prv.pageid = page_index;
-    m_plain->prv.volid = NULL_VOLID;
-    m_plain->prv.ptype = PAGE_QRESULT;
-    std::memcpy (m_plain->page, list_page, DB_PAGESIZE);
-
-    const int error = tde_encrypt_data_page (m_plain, m_tde_algo, true, reinterpret_cast<FILEIO_PAGE *> (slot));
-    return error;
+    return spill_file::tde_stage_encrypt (list_page, page_index, m_file.tde_algo (), m_plain,
+					  reinterpret_cast<FILEIO_PAGE *> (slot));
   }
 
   int
   buffile::append_page (THREAD_ENTRY *thread_p, const PAGE_PTR list_page)
   {
-    if (m_fd < 0 || list_page == NULL)
+    if (!m_file.is_open () || list_page == NULL)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return ER_FAILED;
@@ -702,11 +338,11 @@ namespace qfile
 	  }
       }
 
-    char *slot = m_batch + (std::size_t) m_batch_pages * (std::size_t) m_disk_pagesize;
+    char *slot = m_batch + (std::size_t) m_batch_pages * (std::size_t) m_file.stride ();
     const int page_index = m_pages_on_disk + m_batch_pages;
 
     int rc;
-    if (m_tde_algo != TDE_ALGORITHM_NONE)
+    if (m_file.tde_encrypted ())
       {
 	rc = stage_tde (list_page, slot, page_index);
       }
@@ -743,19 +379,13 @@ namespace qfile
 	return ER_FAILED;
       }
 #endif /* !NDEBUG */
-    const off_t offset = (off_t) m_pages_on_disk * (off_t) m_disk_pagesize;
-    const std::size_t len = (std::size_t) m_batch_pages * (std::size_t) m_disk_pagesize;
-    if (!full_pwrite (m_fd, m_batch, len, offset))
+    const off_t offset = (off_t) m_pages_on_disk * (off_t) m_file.stride ();
+    const std::size_t len = (std::size_t) m_batch_pages * (std::size_t) m_file.stride ();
+    if (!m_file.pwrite_full (m_batch, len, offset))
       {
-	const int saved = errno;
-	if (saved == ENOSPC || saved == EDQUOT)
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
-	  }
-	else
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	  }
+	/* disk-full class errno -> ER_QPROC_OUT_OF_TEMP_SPACE, else ER_FAILED
+	 * (promoted mapping, #125/#132) */
+	spill_file::set_os_error (errno);
 	return ER_FAILED;
       }
     m_pages_on_disk += m_batch_pages;
@@ -774,16 +404,16 @@ namespace qfile
     /* Re-entrant + const: no flush here.  Pages must already be on disk
      * (append-all-then-freeze); the frozen backing is immutable so a shared fd
      * + pread serves N concurrent readers safely (ADR 0005). */
-    if (m_fd < 0 || dest == NULL || page_offset < 0 || page_offset >= m_pages_on_disk)
+    if (!m_file.is_open () || dest == NULL || page_offset < 0 || page_offset >= m_pages_on_disk)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return ER_FAILED;
       }
 
-    if (m_tde_algo == TDE_ALGORITHM_NONE)
+    if (!m_file.tde_encrypted ())
       {
 	const off_t offset = (off_t) page_offset * (off_t) DB_PAGESIZE;
-	if (!full_pread (m_fd, dest, DB_PAGESIZE, offset))
+	if (!m_file.pread_full (dest, DB_PAGESIZE, offset))
 	  {
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	    return ER_FAILED;
@@ -810,17 +440,16 @@ namespace qfile
 	return ER_TDE_CIPHER_IS_NOT_LOADED;
       }
     const off_t offset = (off_t) page_offset * (off_t) IO_PAGESIZE;
-    if (!full_pread (m_fd, scratch->cipher, IO_PAGESIZE, offset))
+    if (!m_file.pread_full (scratch->cipher, IO_PAGESIZE, offset))
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return ER_FAILED;
       }
-    const int error = tde_decrypt_data_page (scratch->cipher, m_tde_algo, true, scratch->plain);
+    const int error = spill_file::tde_read_decrypt (scratch->cipher, m_file.tde_algo (), scratch->plain, dest);
     if (error != NO_ERROR)
       {
 	return error;
       }
-    std::memcpy (dest, scratch->plain->page, DB_PAGESIZE);
     m_metrics.pages_read.fetch_add (1, std::memory_order_relaxed);
     return NO_ERROR;
   }

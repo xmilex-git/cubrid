@@ -46,6 +46,7 @@
 #ifndef _QFILE_BUFFILE_HPP_
 #define _QFILE_BUFFILE_HPP_
 
+#include "qfile_spill_file.hpp"	/* spill_file substrate + tape_backing_census (Phase3 (c′), #132) */
 #include "storage_common.h"	/* PAGE_PTR / DB_PAGESIZE / IO_PAGESIZE */
 #include "thread_compat.hpp"	/* THREAD_ENTRY */
 #include "tde.h"		/* TDE_ALGORITHM */
@@ -83,34 +84,8 @@ namespace qfile
     }
   };
 
-  /*
-   * tape_backing_census - process-wide orphan-scan hook (redesign G003, issue
-   * #68; the 1C slice, SSOT #75 §5.5 (1) / §6, ADR 0001).  Counts the two
-   * backing resources a holdable result owns: open private-file handles and
-   * RAM membuf-prefix pages held by frozen Tapes.  Two invariants are asserted
-   * against it:
-   *   - holdable reparent (a zero-copy ownership MOVE, tran -> session) leaves
-   *     BOTH counters unchanged (no copy, no flush);
-   *   - session teardown drives BOTH back to the pre-result baseline
-   *     (orphan-zero: file handles AND RAM prefix, not just files).
-   * Counters are atomic because per-worker backings open/close concurrently;
-   * they only move on the new-backing path, so legacy single-backing queries
-   * pay nothing.
-   */
-  struct tape_backing_census_snapshot
-  {
-    long open_files;		/* live private-file handles (buffile fds) */
-    long held_prefix_pages;	/* RAM membuf-prefix pages owned by frozen Tapes */
-  };
-
-  /* Read the current census (the orphan scan). */
-  tape_backing_census_snapshot tape_backing_census ();
-
-  /* Ownership-boundary hooks (called by buffile / tape ctors and dtors). */
-  void tape_backing_census_file_opened ();
-  void tape_backing_census_file_closed ();
-  void tape_backing_census_prefix_added (long pages);
-  void tape_backing_census_prefix_removed (long pages);
+  /* tape_backing_census (orphan-scan hook, #68) lives in the shared spill-file
+   * substrate now -- see qfile_spill_file.hpp (Phase3 (c′) extraction, #132). */
 
 #if !defined (NDEBUG)
   /* ENOSPC fault injection (#86, debug-only).  Arm to make the Nth subsequent
@@ -208,11 +183,11 @@ namespace qfile
       }
       bool tde_encrypted () const
       {
-	return m_tde_algo != TDE_ALGORITHM_NONE;
+	return m_file.tde_encrypted ();
       }
       const std::string &path () const
       {
-	return m_path;
+	return m_file.path ();
       }
       const buffile_metrics &metrics () const
       {
@@ -220,17 +195,14 @@ namespace qfile
       }
 
     private:
-      buffile (int fd, const std::string &path, TDE_ALGORITHM tde_algo, int disk_pagesize);
+      buffile ();
 
       int ensure_write_scratch ();
       int stage_plaintext (const PAGE_PTR list_page, char *slot);
       int stage_tde (const PAGE_PTR list_page, char *slot, int page_index);
       void refresh_pgbuf_fixes ();	/* producer-side pgbuf-bypass gate (issue #93) */
 
-      int m_fd;
-      std::string m_path;
-      TDE_ALGORITHM m_tde_algo;
-      int m_disk_pagesize;	/* DB_PAGESIZE (plaintext) or IO_PAGESIZE (TDE) on disk */
+      spill_file m_file;	/* fd/path/TDE-algo/stride + create/close+unlink+census (substrate, #132) */
       int m_pages_on_disk;	/* pages already pwritten */
 
       char *m_batch_raw;	/* aligned batch write buffer (BATCH_PAGES * m_disk_pagesize) */

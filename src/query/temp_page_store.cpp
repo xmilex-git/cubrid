@@ -32,6 +32,7 @@
 #include "object_representation.h"
 #include "page_buffer.h"
 #include "perf_monitor.h"
+#include "qfile_spill_file.hpp"	/* full_pwrite/full_pread (shared substrate, #132) */
 #include "query_manager.h"
 #include "system_parameter.h"
 #include "tde.h"
@@ -827,61 +828,10 @@ namespace
     }
   };
 
-  bool
-  full_pwrite (int fd, const void *buf, std::size_t len, off_t offset) noexcept
-  {
-    const char *ptr = static_cast<const char *> (buf);
-    while (len > 0)
-      {
-	const ssize_t written = pwrite (fd, ptr, len, offset);
-	if (written < 0)
-	  {
-	    if (errno == EINTR)
-	      {
-		continue;
-	      }
-	    return false;
-	  }
-	if (written == 0)
-	  {
-	    errno = ENOSPC;
-	    return false;
-	  }
-	ptr += written;
-	len -= static_cast<std::size_t> (written);
-	offset += written;
-      }
-
-    return true;
-  }
-
-  bool
-  full_pread (int fd, void *buf, std::size_t len, off_t offset) noexcept
-  {
-    char *ptr = static_cast<char *> (buf);
-    while (len > 0)
-      {
-	const ssize_t nread = pread (fd, ptr, len, offset);
-	if (nread < 0)
-	  {
-	    if (errno == EINTR)
-	      {
-		continue;
-	      }
-	    return false;
-	  }
-	if (nread == 0)
-	  {
-	    errno = EIO;
-	    return false;
-	  }
-	ptr += nread;
-	len -= static_cast<std::size_t> (nread);
-	offset += nread;
-      }
-
-    return true;
-  }
+  /* full_pwrite/full_pread duplicates deleted -- the shared spill-file
+   * substrate's copies are used instead (qfile_spill_file.hpp, #132). */
+  using qfile::full_pread;
+  using qfile::full_pwrite;
 
   bool
   rawfd_use_read_cache (const temp_page_store::raw_fd_file &file) noexcept

@@ -836,7 +836,10 @@ hls_spill_new_file (THREAD_ENTRY * thread_p, HLS_SPILL * spill)
     qfile::buffile::create (thread_p, spill->dir.c_str (), spill->seq_next++, 0, TDE_ALGORITHM_NONE, &os_error);
   if (bf == NULL)
     {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+      /* promoted mapping (#132): only fd-exhaustion/disk-full class errors are
+       * out-of-temp-space; anything else (e.g. EACCES) reports ER_FAILED
+       * instead of being mislabeled as temp-space exhaustion. */
+      qfile::spill_file::set_os_error (os_error);
     }
   return bf;
 }

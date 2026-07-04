@@ -349,18 +349,10 @@ namespace qfile
     m_buffile = buffile::create (thread_p, m_dir.c_str (), m_seq, m_worker_id, m_tde_algo, &os_error);
     if (m_buffile == NULL)
       {
-	/* Parity with the legacy raw-fd is_fd_or_space_error mapping
-	 * (temp_page_store.cpp): fd exhaustion (EMFILE/ENFILE) is diagnosed as
-	 * out-of-temp-space, not a generic ER_FAILED, so fd starvation surfaces
-	 * as an actionable error (#125). */
-	if (os_error == EMFILE || os_error == ENFILE || os_error == ENOSPC || os_error == EDQUOT)
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
-	  }
-	else
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	  }
+	/* fd exhaustion (EMFILE/ENFILE) is diagnosed as out-of-temp-space, not
+	 * a generic ER_FAILED, so fd starvation surfaces as an actionable
+	 * error (#125; mapping promoted into the substrate, #132). */
+	spill_file::set_os_error (os_error);
 	return ER_FAILED;
       }
     return NO_ERROR;
