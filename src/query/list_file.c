@@ -5396,13 +5396,12 @@ qfile_hashjoin_new_backing_enabled (void)
 /*
  * qfile_spill_new_backing_enabled () - is the OLD-tier membuf overflow served
  *   by the NEW (c′) per-tfile page-spill backing instead of raw-fd?
- *   Coexistence gate (#132, design #74 [(c′) coherence 설계] §5 D6).
- *   ** Default OFF (0) -- OPT-IN via CUBRID_WM_SPILL_NEW=1.  This is the
- *   OPPOSITE polarity of the three migration gates above (those default ON
- *   with =0 opt-out): during raw-fd/(c′) coexistence the safe side is the
- *   proven raw-fd path.  The cutover commit (커밋 A) flips this default. **
- *   The decision is taken once per tfile at its first spill (the backing tag
- *   pins it); the env itself is boot-cached like its siblings.
+ *   Cutover gate (#132/#135, design #74 [(c′) coherence 설계] §5 D6).
+ *   Default ON, CUBRID_WM_SPILL_NEW=0 opts out to the legacy raw-fd path --
+ *   the SAME polarity as the three migration gates above (커밋 A #135
+ *   flipped the coexistence-era opt-in default; 절체 근거 = #133 채증
+ *   캠페인).  The decision is taken once per tfile at its first spill (the
+ *   backing tag pins it); the env itself is boot-cached like its siblings.
  */
 bool
 qfile_spill_new_backing_enabled (void)
@@ -5411,7 +5410,7 @@ qfile_spill_new_backing_enabled (void)
   if (cached < 0)
     {
       const char *env = getenv ("CUBRID_WM_SPILL_NEW");
-      cached = (env != NULL && env[0] == '1') ? 1 : 0;
+      cached = (env != NULL && env[0] == '0') ? 0 : 1;
     }
   return cached != 0;
 }

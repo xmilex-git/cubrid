@@ -3155,8 +3155,8 @@ rawfd_write_success:
 
           if (qfile_spill_new_backing_enabled ())
             {
-              /* (c′) page-spill backing (#132; opt-in gate, default 0 during
-               * coexistence).  The choice is made ONCE at the tfile's first
+              /* (c′) page-spill backing (#132; default ON since 커밋 A #135,
+               * =0 opt-out).  The choice is made ONCE at the tfile's first
                * spill; the PAGE_SPILL_OVERFLOW tag pins it thereafter. */
               int os_error = 0;
               if (tfile_p->page_spill_handle == NULL)

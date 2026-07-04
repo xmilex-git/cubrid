@@ -45,8 +45,9 @@ enum class qmgr_temp_backing : int
   PRIVATE_SPILL_FALLBACK,
   SHARED_SPILL,
   RAW_FD_OVERFLOW,
-  PAGE_SPILL_OVERFLOW		/* (c′) per-tfile page-spill cache, #132; coexists with RAW_FD_OVERFLOW
-				 * behind CUBRID_WM_SPILL_NEW until the cutover (#74 §5 커밋 A/B) */
+  PAGE_SPILL_OVERFLOW		/* (c′) per-tfile page-spill cache, #132; the default OLD-tier overflow
+				 * since 커밋 A (#135).  RAW_FD_OVERFLOW remains as the
+				 * CUBRID_WM_SPILL_NEW=0 opt-out until 커밋 B (#74 §5) */
 };
 
 namespace temp_page_store
