@@ -342,7 +342,7 @@ typedef struct hashjoin_shared_probe_info
 
   /* redesign #78 2A-3: NEW (Tapeset) probe input read via chunk_distributor +
    * per-worker tapeset_reader (ADR 0003/0005/0006), built on the coordinating
-   * thread and freed at cleanup.  Only meaningful under CUBRID_WM_HASHJOIN_NEW.
+   * thread and freed at cleanup.
    * #130: the OLD sector-scan read path is deleted; hjoin_try_parallel_probe
    * forces serial for OLD-backed input, so new_dist is always built here. */
   qfile::tapeset *new_tapeset;

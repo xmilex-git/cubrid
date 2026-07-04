@@ -276,14 +276,14 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
        * consumes this list can only run its parallel split when the input is
        * NEW-backed -- the split guards (hjoin_try_parallel* + #113 px_scan
        * fallback) require qfile_list_has_new_backing on both inputs -- so an OLD
-       * lower-HJ output forced the upper split permanently serial even with the
-       * gate ON (#112).  Promote the finished list to NEW under the HJ gate:
+       * lower-HJ output forced the upper split permanently serial (#112).
+       * Promote the finished list to NEW:
        * same consumed-not-reopened NEW-promote direction as UNION ALL C-3
        * (43048f481) and merge join C-1/2 (c447d929b), reusing
        * qfile_list_promote_old_to_new (a no-op when the parallel path already
        * produced a NEW list).  Skip a to-be-cached result (copy-out keeps OLD,
        * #94).  */
-      if (!XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED) && qfile_hashjoin_new_backing_enabled ())
+      if (!XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED))
 	{
 	  error = qfile_list_promote_old_to_new (thread_p, xasl->list_id);
 	  if (error != NO_ERROR)
@@ -1985,11 +1985,10 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
    * sector_page_iterator had a confirmed row-loss bug on derived-list
    * inputs (#78 evidence (k); bug2 149510 vs 200360) and is deleted in #130.
    * If either side of the split lacks NEW (Tapeset) backing (e.g. worker pool
-   * exhaustion forced a serial OLD-backed scan upstream) or the HASHJOIN_NEW
-   * gate is off, force serial partitioning (HASHJOIN_STATUS_PARTITION) --
+   * exhaustion forced a serial OLD-backed scan upstream), force serial
+   * partitioning (HASHJOIN_STATUS_PARTITION) --
    * this is now the permanent serial fallback for OLD-backed input. */
-  if (!qfile_list_has_new_backing (outer_list_id) || !qfile_list_has_new_backing (inner_list_id)
-      || !qfile_hashjoin_new_backing_enabled ())
+  if (!qfile_list_has_new_backing (outer_list_id) || !qfile_list_has_new_backing (inner_list_id))
     {
       manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);
@@ -2119,9 +2118,8 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
    * deleted in #130.
    *
    * Decision matrix:
-   *   NEW input + HASHJOIN_NEW gate ON  -> parallel probe via chunk_distributor (correct)
-   *   NEW input + HASHJOIN_NEW gate OFF -> serial (unified list scan reads NEW correctly)
-   *   OLD input                         -> serial (permanent fallback; the OLD reader is gone)
+   *   NEW input -> parallel probe via chunk_distributor (correct)
+   *   OLD input -> serial (permanent fallback; the OLD reader is gone)
    *
    * The OLD-input serial fallback is the fix for the "session state corruption"
    * symptom: on re-execution the parallel worker pool can be exhausted (by the
@@ -2129,8 +2127,7 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
    * input to lose its NEW backing and fall back to OLD.  Without this guard the
    * hash join would use the row-losing sector reader, producing wrong results
    * (e.g. count=407 instead of 200360). */
-  if (!qfile_list_has_new_backing (single_context->probe->list_id)
-      || !qfile_hashjoin_new_backing_enabled ())
+  if (!qfile_list_has_new_backing (single_context->probe->list_id))
     {
       manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);

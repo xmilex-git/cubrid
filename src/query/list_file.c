@@ -5331,61 +5331,6 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
 }
 
 /*
- * qfile_sort_new_backing_enabled () - is SORT output migrated to the NEW
- *   (Tapeset) backing?  Migration toggle (redesign #78/#80, 2A-1b).
- *   Default ON — a default server takes the NEW Tapeset sort path.
- *   Set CUBRID_WM_SORT_NEW=0 to force OLD behavior for diagnosis.
- */
-bool
-qfile_sort_new_backing_enabled (void)
-{
-  static int cached = -1;
-  if (cached < 0)
-    {
-      const char *env = getenv ("CUBRID_WM_SORT_NEW");
-      cached = (env != NULL && env[0] == '0') ? 0 : 1;
-    }
-  return cached != 0;
-}
-
-/*
- * qfile_scan_new_backing_enabled () - is parallel-scan per-worker output
- *   migrated to the NEW (Tapeset) backing?  Migration toggle (redesign #78/#80,
- *   2A-2).  Default ON — a default server takes the NEW per-worker Tapeset
- *   scan path.  Set CUBRID_WM_SCAN_NEW=0 to force OLD behavior for diagnosis.
- */
-bool
-qfile_scan_new_backing_enabled (void)
-{
-  static int cached = -1;
-  if (cached < 0)
-    {
-      const char *env = getenv ("CUBRID_WM_SCAN_NEW");
-      cached = (env != NULL && env[0] == '0') ? 0 : 1;
-    }
-  return cached != 0;
-}
-
-/*
- * qfile_hashjoin_new_backing_enabled () - is parallel HASH JOIN allowed to read
- *   a NEW (Tapeset) input via chunk_distributor/tapeset_reader?  Migration
- *   toggle (redesign #78/#80, 2A-3).  Default ON — a default server uses the
- *   NEW chunk_distributor path for parallel PHJ probe/split.
- *   Set CUBRID_WM_HASHJOIN_NEW=0 to force OLD behavior for diagnosis.
- */
-bool
-qfile_hashjoin_new_backing_enabled (void)
-{
-  static int cached = -1;
-  if (cached < 0)
-    {
-      const char *env = getenv ("CUBRID_WM_HASHJOIN_NEW");
-      cached = (env != NULL && env[0] == '0') ? 0 : 1;
-    }
-  return cached != 0;
-}
-
-/*
  * qfile_list_make_new_backed () - convert a freshly-opened (empty) OLD list
  *   into a NEW Tapeset-backed producer list (redesign #78, 2A-1b).  Drop the
  *   empty temp file so the list carries no OLD backing (tfile_vfid/first_vpid
@@ -5500,16 +5445,16 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
     }
 
   /* 2A-1b (#78): migrate a finalized (do_close) SORT output to NEW Tapeset
-   * backing when enabled.  Capture tde_encrypted before dropping the OLD temp
+   * backing.  Capture tde_encrypted before dropping the OLD temp
    * file (the producer's BufFile re-applies TDE); the parallel path is forced
    * serial while the output is NEW (see sort_listfile) until per-worker import
    * is wired.  do_close gating keeps an open producer from being MOVE'd.
    * suppress_new_backing (#105): CONNECT BY's sort output feeds the parent-pos
    * recalc, which serialises tuple positions into QFILE_TUPLE_POSITION_DB (a
    * VPID-only format with no TAPE variant); a NEW(Tapeset) list has only TAPE
-   * coordinates, so such lists MUST stay OLD-backed regardless of the gate. */
+   * coordinates, so such lists MUST stay OLD-backed. */
   bool srlist_tde = (QFILE_LIST_ID_TFILE_VFID (srlist_id)->tde_encrypted);
-  if (do_close && !suppress_new_backing && qfile_sort_new_backing_enabled ()
+  if (do_close && !suppress_new_backing
       && qfile_list_make_new_backed (thread_p, srlist_id, srlist_tde) != NO_ERROR)
     {
       qfile_close_and_free_list_file (thread_p, srlist_id);

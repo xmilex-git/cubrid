@@ -734,10 +734,8 @@ error_exit:
 	if (qfile_list_has_new_backing (probe_list_id))
 	  {
 	    /* redesign #78 2A-3: NEW (Tapeset) probe input -> shared chunk_distributor
-	     * + per-worker tapeset_reader (ADR 0003/0005/0006).  Reached only when
-	     * CUBRID_WM_HASHJOIN_NEW is on (hjoin_try_parallel_probe forces SINGLE for
-	     * a NEW input otherwise), so the OLD sector reader (and its backing guard)
-	     * is bypassed for NEW input. */
+	     * + per-worker tapeset_reader (ADR 0003/0005/0006).  The OLD sector
+	     * reader (and its backing guard) is bypassed for NEW input. */
 	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (probe_list_id);
 	    if (shared_info.new_tapeset == nullptr)
 	      {

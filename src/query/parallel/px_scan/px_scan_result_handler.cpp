@@ -258,23 +258,22 @@ namespace parallel_scan
 	      db_private_free_and_init (thread_p, type_list.domp);
 	    }
 	}
-	/* 2A-2 (#78): opt-in (CUBRID_WM_SCAN_NEW) migration of this worker's
+	/* 2A-2 (#78): migration of this worker's
 	 * per-thread output list to the NEW per-worker Tapeset backing, so result
-	 * writes append to a private tape_writer instead of the shared raw-fd
-	 * registry (no per-page dirty-mark lock).  Per-worker list: no shared
+	 * writes append to a private tape_writer (no per-page dirty-mark lock).
+	 * Per-worker list: no shared
 	 * lock needed.  On conversion failure the list stays fully OLD (atomic
 	 * drop) and the merge mixed-backing guard turns it into a clean error. */
-	if (qfile_scan_new_backing_enabled ())
-	  {
-	    bool ld_tde = (QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p) != nullptr)
-			  && QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p)->tde_encrypted;
-	    if (qfile_list_make_new_backed (thread_p, tl.writer_result_p, ld_tde) != NO_ERROR)
-	      {
-		m_err_messages_p->move_top_error_message_to_this();
-		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		return;
-	      }
-	  }
+	{
+	  bool ld_tde = (QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p) != nullptr)
+			&& QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p)->tde_encrypted;
+	  if (qfile_list_make_new_backed (thread_p, tl.writer_result_p, ld_tde) != NO_ERROR)
+	    {
+	      m_err_messages_p->move_top_error_message_to_this();
+	      m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+	      return;
+	    }
+	}
 	size = tl.writer_result_p->type_list.type_cnt * DB_SIZEOF (DB_VALUE *);
 	tl.writer_result_p->tpl_descr.f_valp = (DB_VALUE **) malloc (size);
 	if (tl.writer_result_p->tpl_descr.f_valp == NULL)
@@ -587,7 +586,7 @@ namespace parallel_scan
      * hence no shared raw-fd registry lock).  The downstream parallel sort
      * reads this NEW dest via chunk_distributor/tapeset_reader (see
      * external_sort.c).  segment_native (hash-gby part lists) keeps OLD path. */
-    if (!segment_native && qfile_scan_new_backing_enabled ())
+    if (!segment_native)
       {
 	bool nf_failed = false;
 	bool dest_tde = (QFILE_LIST_ID_TFILE_VFID (dest) != nullptr)
