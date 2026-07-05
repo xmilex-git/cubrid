@@ -350,11 +350,6 @@ namespace temp_page_store
      * hash-list and connect-by parent-position bytes.  reserve_held still enforces
      * reserved <= cap + worst_case_slack, with worst_case_slack = shard_count * refill_quantum.
      * (The raw-fd read-cache placeholder charge was zeroed out with the raw-fd deletion, 커밋 B #137.) */
-    constexpr bool POSITION_BUDGET_ACTIVE = true;
-    if (!POSITION_BUDGET_ACTIVE)
-      {
-	return 0;
-      }
     return WORKMEM_POSITION_SAVED_SCAN_BUDGET * projected_tuple_position_bytes
       + WORKMEM_POSITION_HASH_ENTRY_BUDGET * projected_tuple_simple_pos_bytes
       + WORKMEM_CONNECT_BY_PARENT_BUDGET * projected_tuple_position_db_bytes;

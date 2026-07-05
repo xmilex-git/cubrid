@@ -5346,9 +5346,6 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
       /* Not implemented yet */
       return 1;
     }
-
-  /* single process */
-  return 1;
 }
 
 /*
