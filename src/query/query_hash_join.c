@@ -3703,6 +3703,39 @@ error_exit:
 }
 
 /*
+ * hjoin_outer_probe_fill_empty () - append an outer-join fill-empty (unmatched) row
+ *   return: Error code (NO_ERROR if successful, error code otherwise)
+ *   thread_p(in): Thread entry.
+ *   manager(in): Hash join manager (merge_info).
+ *   context(in): Hash join context (probe / outer / inner fill records, stats).
+ *   list_id(in/out): Result list to append the fill-empty row to.
+ *   overflow_record(in/out): Scratch overflow tuple record.
+ */
+static int
+hjoin_outer_probe_fill_empty (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+			      QFILE_LIST_ID * list_id, QFILE_TUPLE_RECORD * overflow_record)
+{
+  HASHJOIN_FETCH_INFO *outer = &context->outer;
+  HASHJOIN_FETCH_INFO *inner = &context->inner;
+  HASHJOIN_FETCH_INFO *probe = context->probe;
+  HASHJOIN_STATS *stats = context->stats;
+#if HASHJOIN_PROFILE_TIME
+  HASHJOIN_START_STATS profile_start_stats = HASHJOIN_START_STATS_INITIALIZER;
+#endif /* HASHJOIN_PROFILE_TIME */
+  int error;
+
+  HJOIN_PRINT_TUPLE (probe->list_id, probe->tuple_record.tpl, HASHJOIN_PRINT_FILL_EMPTY_KEY);
+
+  HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
+  error =
+    hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record, manager->merge_info,
+				  overflow_record);
+  HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
+
+  return error;
+}
+
+/*
  * hjoin_outer_probe() -
  *   return: Error code (NO_ERROR if successful, error code otherwise)
  *   thread_p(in): Thread entry.
@@ -3790,13 +3823,7 @@ hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 	    }
 	  else if (need_skip_next)
 	    {
-	      HJOIN_PRINT_TUPLE (probe->list_id, probe->tuple_record.tpl, HASHJOIN_PRINT_FILL_EMPTY_KEY);
-
-	      HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-	      error =
-		hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record,
-					      manager->merge_info, &overflow_record);
-	      HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
+	      error = hjoin_outer_probe_fill_empty (thread_p, manager, context, list_id, &overflow_record);
 
 	      if (error != NO_ERROR)
 		{
@@ -3872,13 +3899,7 @@ hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 		  assert_release_error (false);
 		  save_error = er_errid ();
 
-		  HJOIN_PRINT_TUPLE (probe->list_id, probe->tuple_record.tpl, HASHJOIN_PRINT_FILL_EMPTY_KEY);
-
-		  HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-		  error =
-		    hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record,
-						  manager->merge_info, &overflow_record);
-		  HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
+		  error = hjoin_outer_probe_fill_empty (thread_p, manager, context, list_id, &overflow_record);
 
 		  if (error != NO_ERROR)
 		    {
@@ -3988,13 +4009,7 @@ hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
       if (!any_record_added)
 	{
-	  HJOIN_PRINT_TUPLE (probe->list_id, probe->tuple_record.tpl, HASHJOIN_PRINT_FILL_EMPTY_KEY);
-
-	  HJOIN_PROFILE_START (thread_p, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
-	  error =
-	    hjoin_merge_tuple_to_list_id (thread_p, list_id, outer->fill_record, inner->fill_record,
-					  manager->merge_info, &overflow_record);
-	  HJOIN_PROFILE_END (thread_p, &stats->profile, &profile_start_stats, HASHJOIN_PROFILE_PROBE_ADD);
+	  error = hjoin_outer_probe_fill_empty (thread_p, manager, context, list_id, &overflow_record);
 
 	  if (error != NO_ERROR)
 	    {

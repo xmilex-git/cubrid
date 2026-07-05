@@ -41,6 +41,141 @@ namespace parallel_query
   {
 
     /*
+     * hjoin_setup_input_split () - set up shared split info for one join input
+     *   return: NO_ERROR, or error code.  On error the shared_info is left
+     *           partially built for the caller error_exit cleanup path.
+     */
+    static int
+    hjoin_setup_input_split (cubthread::entry &thread_ref, HASHJOIN_MANAGER *manager,
+			     HASHJOIN_INPUT_SPLIT_INFO *input, HASHJOIN_SHARED_SPLIT_INFO *shared_info, UINT32 task_cnt)
+    {
+      int error = NO_ERROR;
+      QFILE_LIST_ID *input_list_id = input->fetch_info->list_id;
+
+      if (qfile_list_has_tapeset (input_list_id))
+	{
+	  /* #84: reached only when both split inputs are NEW-backed AND the
+	   * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
+	   * HASHJOIN_STATUS_PARTITION otherwise), mirroring the probe path.
+	   * NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
+	  shared_info->new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list_id);
+	  if (shared_info->new_tapeset == nullptr)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	      error = ER_FAILED;
+	      return error;
+	    }
+	  shared_info->new_dist = new qfile::chunk_distributor (shared_info->new_tapeset, task_cnt);
+
+	  /* redesign #78 per-worker OUTPUT tape (ADR0004): allocate per-worker
+	   * partition list slots so workers write without part_mutexes.
+	   * #109: the per-worker slot arrays are allocated HERE, on the leader,
+	   * and only filled by the workers — db_private_alloc is per-thread
+	   * (each entry owns its own lea mspace), so a worker-side allocation
+	   * would make the leader's db_private_free at merge time free a
+	   * foreign-mspace chunk (mspace_free USAGE_ERROR abort). */
+	  shared_info->worker_count = task_cnt;
+	  shared_info->worker_part_lists =
+		  (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
+	  if (shared_info->worker_part_lists == nullptr)
+	    {
+	      error = er_errid ();
+	      return error;
+	    }
+	  memset (shared_info->worker_part_lists, 0, task_cnt * sizeof (QFILE_LIST_ID **));
+
+	  for (UINT32 wi = 0; wi < task_cnt; wi++)
+	    {
+	      shared_info->worker_part_lists[wi] =
+		      (QFILE_LIST_ID **) db_private_alloc (&thread_ref,
+							   manager->context_cnt * sizeof (QFILE_LIST_ID *));
+	      if (shared_info->worker_part_lists[wi] == nullptr)
+		{
+		  error = er_errid ();
+		  return error;
+		}
+	      memset (shared_info->worker_part_lists[wi], 0, manager->context_cnt * sizeof (QFILE_LIST_ID *));
+	    }
+	}
+      else
+	{
+	  /* #84/#130: hjoin_try_parallel forces serial partitioning for
+	   * OLD-backed input and the OLD sector scan is deleted; reaching
+	   * here is a guard violation. */
+	  assert (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  error = ER_FAILED;
+	  return error;
+	}
+
+      return NO_ERROR;
+    }
+
+    /*
+     * hjoin_merge_input_split () - merge one input per-worker partition lists into
+     *   the shared part_list_id.  Sequential; all workers have completed.
+     *   return: NO_ERROR, or error code.
+     */
+    static int
+    hjoin_merge_input_split (cubthread::entry &thread_ref, HASHJOIN_MANAGER *manager,
+			     HASHJOIN_INPUT_SPLIT_INFO *input, HASHJOIN_SHARED_SPLIT_INFO *shared_info)
+    {
+      int error = NO_ERROR;
+
+      if (shared_info->worker_part_lists != nullptr)
+	{
+	  UINT32 part_cnt = manager->context_cnt;
+	  for (UINT32 wi = 0; wi < shared_info->worker_count; wi++)
+	    {
+	      if (shared_info->worker_part_lists[wi] == nullptr)
+		{
+		  continue;
+		}
+	      for (UINT32 pi = 0; pi < part_cnt; pi++)
+		{
+		  QFILE_LIST_ID *wpl = shared_info->worker_part_lists[wi][pi];
+		  if (wpl == nullptr)
+		    {
+		      continue;
+		    }
+		  if (wpl->tuple_cnt > 0)
+		    {
+		      qfile_close_list (&thread_ref, wpl);
+		      if (input->part_list_id[pi]->tuple_cnt > 0)
+			{
+			  error = qfile_append_list (&thread_ref, input->part_list_id[pi], wpl);
+			  qfile_destroy_list (&thread_ref, wpl);
+			}
+		      else
+			{
+			  qfile_destroy_list (&thread_ref, input->part_list_id[pi]);
+			  qfile_copy_list_id (input->part_list_id[pi], wpl, false, QFILE_PROHIBIT_DEPENDENT);
+			}
+		      /* NULL the slot before the error check: a jump to error_exit
+		       * must never leave hjoin_clear_shared_split_info looking at a
+		       * wpl whose contents this loop already destroyed (double-destroy). */
+		      QFILE_FREE_AND_INIT_LIST_ID (shared_info->worker_part_lists[wi][pi]);
+		      if (error != NO_ERROR)
+			{
+			  return error;
+			}
+		    }
+		  else
+		    {
+		      qfile_destroy_list (&thread_ref, wpl);
+		      QFILE_FREE_AND_INIT_LIST_ID (shared_info->worker_part_lists[wi][pi]);
+		    }
+		}
+	      db_private_free_and_init (&thread_ref, shared_info->worker_part_lists[wi]);
+	    }
+	  db_private_free_and_init (&thread_ref, shared_info->worker_part_lists);
+	  shared_info->worker_count = 0;
+	}
+
+      return error;
+    }
+
+    /*
      * build_partitions
      */
 
@@ -80,65 +215,11 @@ namespace parallel_query
 	}
 
       /* ---- outer relation split ---- */
-      {
-	QFILE_LIST_ID *outer_list_id = outer->fetch_info->list_id;
-
-	if (qfile_list_has_tapeset (outer_list_id))
-	  {
-	    /* #84: reached only when both split inputs are NEW-backed AND the
-	     * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
-	     * HASHJOIN_STATUS_PARTITION otherwise), mirroring the probe path.
-	     * NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
-	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (outer_list_id);
-	    if (shared_info.new_tapeset == nullptr)
-	      {
-		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-		error = ER_FAILED;
-		goto error_exit;
-	      }
-	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
-
-	    /* redesign #78 per-worker OUTPUT tape (ADR0004): allocate per-worker
-	     * partition list slots so workers write without part_mutexes.
-	     * #109: the per-worker slot arrays are allocated HERE, on the leader,
-	     * and only filled by the workers — db_private_alloc is per-thread
-	     * (each entry owns its own lea mspace), so a worker-side allocation
-	     * would make the leader's db_private_free at merge time free a
-	     * foreign-mspace chunk (mspace_free USAGE_ERROR abort). */
-	    shared_info.worker_count = task_cnt;
-	    shared_info.worker_part_lists =
-		    (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
-	    if (shared_info.worker_part_lists == nullptr)
-	      {
-		error = er_errid ();
-		goto error_exit;
-	      }
-	    memset (shared_info.worker_part_lists, 0, task_cnt * sizeof (QFILE_LIST_ID **));
-
-	    for (UINT32 wi = 0; wi < task_cnt; wi++)
-	      {
-		shared_info.worker_part_lists[wi] =
-			(QFILE_LIST_ID **) db_private_alloc (&thread_ref,
-							     manager->context_cnt * sizeof (QFILE_LIST_ID *));
-		if (shared_info.worker_part_lists[wi] == nullptr)
-		  {
-		    error = er_errid ();
-		    goto error_exit;
-		  }
-		memset (shared_info.worker_part_lists[wi], 0, manager->context_cnt * sizeof (QFILE_LIST_ID *));
-	      }
-	  }
-	else
-	  {
-	    /* #84/#130: hjoin_try_parallel forces serial partitioning for
-	     * OLD-backed input and the OLD sector scan is deleted; reaching
-	     * here is a guard violation. */
-	    assert (false);
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	    error = ER_FAILED;
-	    goto error_exit;
-	  }
-      }
+      error = hjoin_setup_input_split (thread_ref, manager, outer, &shared_info, task_cnt);
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -164,57 +245,10 @@ namespace parallel_query
       shared_info.new_dist = nullptr;
       shared_info.new_tapeset = nullptr;
 
-      /* redesign #78 per-worker OUTPUT tape (ADR0004): merge worker partition
-       * lists into the shared part_list_id.  Sequential — no mutex needed
-       * since all workers have completed. */
-      if (shared_info.worker_part_lists != nullptr)
+      error = hjoin_merge_input_split (thread_ref, manager, outer, &shared_info);
+      if (error != NO_ERROR)
 	{
-	  UINT32 part_cnt = manager->context_cnt;
-	  for (UINT32 wi = 0; wi < shared_info.worker_count; wi++)
-	    {
-	      if (shared_info.worker_part_lists[wi] == nullptr)
-		{
-		  continue;
-		}
-	      for (UINT32 pi = 0; pi < part_cnt; pi++)
-		{
-		  QFILE_LIST_ID *wpl = shared_info.worker_part_lists[wi][pi];
-		  if (wpl == nullptr)
-		    {
-		      continue;
-		    }
-		  if (wpl->tuple_cnt > 0)
-		    {
-		      qfile_close_list (&thread_ref, wpl);
-		      if (outer->part_list_id[pi]->tuple_cnt > 0)
-			{
-			  error = qfile_append_list (&thread_ref, outer->part_list_id[pi], wpl);
-			  qfile_destroy_list (&thread_ref, wpl);
-			}
-		      else
-			{
-			  qfile_destroy_list (&thread_ref, outer->part_list_id[pi]);
-			  qfile_copy_list_id (outer->part_list_id[pi], wpl, false, QFILE_PROHIBIT_DEPENDENT);
-			}
-		      /* NULL the slot before the error check: a jump to error_exit
-		       * must never leave hjoin_clear_shared_split_info looking at a
-		       * wpl whose contents this loop already destroyed (double-destroy). */
-		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
-		      if (error != NO_ERROR)
-			{
-			  goto error_exit;
-			}
-		    }
-		  else
-		    {
-		      qfile_destroy_list (&thread_ref, wpl);
-		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
-		    }
-		}
-	      db_private_free_and_init (&thread_ref, shared_info.worker_part_lists[wi]);
-	    }
-	  db_private_free_and_init (&thread_ref, shared_info.worker_part_lists);
-	  shared_info.worker_count = 0;
+	  goto error_exit;
 	}
 
       if (thread_is_on_trace (&thread_ref))
@@ -223,60 +257,11 @@ namespace parallel_query
 	}
 
       /* ---- inner relation split ---- */
-      {
-	QFILE_LIST_ID *inner_list_id = inner->fetch_info->list_id;
-
-	if (qfile_list_has_tapeset (inner_list_id))
-	  {
-	    /* #84: reached only when both split inputs are NEW-backed AND the
-	     * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
-	     * HASHJOIN_STATUS_PARTITION otherwise), mirroring the probe path.
-	     * NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
-	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (inner_list_id);
-	    if (shared_info.new_tapeset == nullptr)
-	      {
-		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-		error = ER_FAILED;
-		goto error_exit;
-	      }
-	    shared_info.new_dist = new qfile::chunk_distributor (shared_info.new_tapeset, task_cnt);
-
-	    /* redesign #78 per-worker OUTPUT tape (ADR0004): same as outer,
-	     * including the #109 leader-side slot array allocation. */
-	    shared_info.worker_count = task_cnt;
-	    shared_info.worker_part_lists =
-		    (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
-	    if (shared_info.worker_part_lists == nullptr)
-	      {
-		error = er_errid ();
-		goto error_exit;
-	      }
-	    memset (shared_info.worker_part_lists, 0, task_cnt * sizeof (QFILE_LIST_ID **));
-
-	    for (UINT32 wi = 0; wi < task_cnt; wi++)
-	      {
-		shared_info.worker_part_lists[wi] =
-			(QFILE_LIST_ID **) db_private_alloc (&thread_ref,
-							     manager->context_cnt * sizeof (QFILE_LIST_ID *));
-		if (shared_info.worker_part_lists[wi] == nullptr)
-		  {
-		    error = er_errid ();
-		    goto error_exit;
-		  }
-		memset (shared_info.worker_part_lists[wi], 0, manager->context_cnt * sizeof (QFILE_LIST_ID *));
-	      }
-	  }
-	else
-	  {
-	    /* #84/#130: hjoin_try_parallel forces serial partitioning for
-	     * OLD-backed input and the OLD sector scan is deleted; reaching
-	     * here is a guard violation. */
-	    assert (false);
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-	    error = ER_FAILED;
-	    goto error_exit;
-	  }
-      }
+      error = hjoin_setup_input_split (thread_ref, manager, inner, &shared_info, task_cnt);
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
 
       for (task_index = 0; task_index < task_cnt; task_index++)
 	{
@@ -299,55 +284,10 @@ namespace parallel_query
 
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
-      /* redesign #78 per-worker OUTPUT tape (ADR0004): merge inner split worker lists. */
-      if (shared_info.worker_part_lists != nullptr)
+      error = hjoin_merge_input_split (thread_ref, manager, inner, &shared_info);
+      if (error != NO_ERROR)
 	{
-	  UINT32 part_cnt = manager->context_cnt;
-	  for (UINT32 wi = 0; wi < shared_info.worker_count; wi++)
-	    {
-	      if (shared_info.worker_part_lists[wi] == nullptr)
-		{
-		  continue;
-		}
-	      for (UINT32 pi = 0; pi < part_cnt; pi++)
-		{
-		  QFILE_LIST_ID *wpl = shared_info.worker_part_lists[wi][pi];
-		  if (wpl == nullptr)
-		    {
-		      continue;
-		    }
-		  if (wpl->tuple_cnt > 0)
-		    {
-		      qfile_close_list (&thread_ref, wpl);
-		      if (inner->part_list_id[pi]->tuple_cnt > 0)
-			{
-			  error = qfile_append_list (&thread_ref, inner->part_list_id[pi], wpl);
-			  qfile_destroy_list (&thread_ref, wpl);
-			}
-		      else
-			{
-			  qfile_destroy_list (&thread_ref, inner->part_list_id[pi]);
-			  qfile_copy_list_id (inner->part_list_id[pi], wpl, false, QFILE_PROHIBIT_DEPENDENT);
-			}
-		      /* NULL the slot before the error check: a jump to error_exit
-		       * must never leave hjoin_clear_shared_split_info looking at a
-		       * wpl whose contents this loop already destroyed (double-destroy). */
-		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
-		      if (error != NO_ERROR)
-			{
-			  goto error_exit;
-			}
-		    }
-		  else
-		    {
-		      qfile_destroy_list (&thread_ref, wpl);
-		      QFILE_FREE_AND_INIT_LIST_ID (shared_info.worker_part_lists[wi][pi]);
-		    }
-		}
-	      db_private_free_and_init (&thread_ref, shared_info.worker_part_lists[wi]);
-	    }
-	  db_private_free_and_init (&thread_ref, shared_info.worker_part_lists);
-	  shared_info.worker_count = 0;
+	  goto error_exit;
 	}
 
 cleanup:

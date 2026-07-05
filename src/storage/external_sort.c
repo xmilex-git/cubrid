@@ -5144,6 +5144,183 @@ retire_all_on_error:
 }
 
 /*
+ * sort_px_reserve_workers () - reserve px workers for a parallel sort branch
+ *   return: reserved worker count, or 1 (serial) when none could be reserved
+ *   sort_param(in/out): receives the reserved px_worker_manager
+ *   parallel_num(in): requested parallel degree
+ */
+static int
+sort_px_reserve_workers (SORT_PARAM * sort_param, int parallel_num)
+{
+  /* check worker */
+  sort_param->px_worker_manager = parallel_query::worker_manager::try_reserve_workers (parallel_num);
+  if (sort_param->px_worker_manager == NULL)
+    {
+      return 1;
+    }
+  /* clamp to the actual reservation: try_reserve_workers may grant fewer than requested
+   * under worker-pool contention. Pushing parallel_num tasks then over-subscribes the pool. */
+  return sort_param->px_worker_manager->get_reserved_workers ();
+}
+
+/*
+ * sort_check_parallelism_orderby () - parallel-degree check for SORT_ORDER_BY / SORT_ORDER_WITH_LIMIT
+ *   return: parallel_num
+ */
+static int
+sort_check_parallelism_orderby (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
+{
+  int parallel_num = 1;
+  SORT_INFO *sort_info_p;
+  /* get scan id of input file */
+  sort_info_p = (SORT_INFO *) sort_param->get_arg;
+
+  /* #99 safety net: qfile_sort_list_with_func() (list_file.c) already keeps
+   * an expected-parallel SORT output out of FILE_QUERY_AREA backing, but
+   * QFILE_FLAG_DISTINCT (and any other future caller) can still route
+   * qfile_open_list() to a FILE_QUERY_AREA result file regardless of the
+   * parallel prediction.  file_manager's temp-file page allocation for a
+   * query-area list does not support concurrent same-transaction workers,
+   * so catch any output list that actually ended up FILE_QUERY_AREA here
+   * and force serial execution rather than relying solely on prediction. */
+  if (sort_info_p->output_file != NULL && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file) != NULL
+      && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file)->temp_file_type == FILE_QUERY_AREA)
+    {
+      er_log_debug (ARG_FILE_LINE, "sort: FILE_QUERY_AREA output -> serial (#99 safety net)\n");
+      return 1;
+    }
+
+  /* #130 fallback: the OLD sector-scan parallel input reader is deleted, so
+   * only a NEW (Tapeset)-backed input can be read in parallel
+   * (chunk_distributor + per-worker tapeset_reader).  Any OLD-backed input
+   * -- including raw-fd overflow spill, which the deleted sector scan could
+   * not enumerate anyway (#99) -- is demoted to a correct serial sort. */
+  if (!qfile_list_has_tapeset (sort_info_p->input_file))
+    {
+      er_log_debug (ARG_FILE_LINE, "sort: OLD-backed ORDER_BY input -> serial (#130 fallback)\n");
+      return 1;
+    }
+
+  parallel_num =
+    parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, sort_info_p->input_file->page_cnt,
+					     sort_info_p->parallelism /* hint */ );
+  if (parallel_num < 2)
+    {
+      /* single process */
+      return 1;
+    }
+  /* check tuple_cnt */
+  if (sort_info_p->input_file->tuple_cnt <= parallel_num)
+    {
+      return 1;
+    }
+
+  return sort_px_reserve_workers (sort_param, parallel_num);
+}
+
+/*
+ * sort_check_parallelism_index_leaf () - parallel-degree check for SORT_INDEX_LEAF
+ *   return: parallel_num
+ */
+static int
+sort_check_parallelism_index_leaf (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
+{
+  int parallel_num = 1;
+  SORT_ARGS *sort_args_p = (SORT_ARGS *) sort_param->get_arg;
+  int n_user_pages = 0, n_sects = 0, tmp_pg = 0, tmp_sects = 0, error_code = NO_ERROR;
+  if (sort_args_p->n_classes > 1)
+    {
+      /* not partition, partition has own indexes, this means like this :
+       * create t1; create t2 under t1; */
+      return 1;
+    }
+  /* get number of pages to sort */
+  for (int i = 0; i < sort_args_p->n_classes; i++)
+    {
+      error_code = file_get_num_user_pages (thread_p, &sort_args_p->hfids[i].vfid, &tmp_pg);
+      if (error_code != NO_ERROR)
+	{
+	  return 1;
+	}
+      error_code = file_get_num_data_sectors (thread_p, &sort_args_p->hfids[i].vfid, &tmp_sects);
+      if (error_code != NO_ERROR)
+	{
+	  return 1;
+	}
+      n_user_pages += tmp_pg;
+      n_sects += tmp_sects;
+    }
+
+  parallel_num = parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, n_user_pages,
+							  -1 /* no hint at parallel index build */ );
+
+  if (parallel_num < 2)
+    {
+      /* single process */
+      return 1;
+    }
+
+  if (n_sects < parallel_num)
+    {
+      /* no sector in some threads */
+      return 1;
+    }
+
+  return sort_px_reserve_workers (sort_param, parallel_num);
+}
+
+/*
+ * sort_check_parallelism_groupby () - parallel-degree check for SORT_GROUP_BY / SORT_ANALYTIC
+ *   return: parallel_num
+ */
+static int
+sort_check_parallelism_groupby (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
+{
+  int parallel_num = 1;
+  SORT_LISTFILE_PX_ARG *px = (SORT_LISTFILE_PX_ARG *) sort_param->px_extra_arg;
+  /* hash_eligible is GROUP_BY only (0 for ANALYTIC); skip parallelism when set */
+  if (px == NULL || px->hash_eligible)
+    {
+      return 1;
+    }
+  QFILE_LIST_ID *input_list = px->input_list;
+  /* #130 fallback: OLD-backed input -> serial (the OLD sector-scan reader is
+   * deleted; see the ORDER_BY branch above). */
+  if (input_list == NULL || !qfile_list_has_tapeset (input_list))
+    {
+      er_log_debug (ARG_FILE_LINE, "sort: OLD-backed %s input -> serial (#130 fallback)\n",
+		    (sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
+      return 1;
+    }
+  /* The NEW input is read in parallel through the shared chunk_distributor +
+   * per-worker tapeset_reader that sort_start_parallelism builds (#122).  That
+   * reader builds A_sort_key records via qfile_sort_build_key_from_tuple, which
+   * requires use_original == 0 -- every column materialized in the sort record
+   * (the #103/#100 extend_all_columns treatment that qexec_gby_* and
+   * qexec_execute_analytic apply to NEW input).  In the rare case where
+   * extend_all_columns bailed (duplicated / out-of-range key column) use_original
+   * stays 1, the A_sort_key path cannot carry the payload, so keep forcing serial:
+   * the serial sort then fails loudly on the unresolvable back-reference exactly
+   * as before, rather than mis-reading the record.  (#78 C-7/C-8) */
+  if (px->key_info == NULL || px->key_info->use_original)
+    {
+      er_log_debug (ARG_FILE_LINE,
+		    "sort: NEW-backed %s input with use_original -> serial (#122 A_sort_key guard)\n",
+		    (sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
+      return 1;
+    }
+  parallel_num =
+    parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, input_list->page_cnt,
+					     px->parallelism /* hint */ );
+  if (parallel_num < 2 || input_list->tuple_cnt < parallel_num || input_list->page_cnt < parallel_num)
+    {
+      return 1;
+    }
+
+  return sort_px_reserve_workers (sort_param, parallel_num);
+}
+
+/*
  * sort_check_parallelism () - check the number of parallel processes
  *   return: parallel_num
  *   sort_parallel_type(in):
@@ -5152,165 +5329,17 @@ retire_all_on_error:
 int
 sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 {
-  int parallel_num = 1;
-
   if (sort_param->px_type == SORT_ORDER_BY || sort_param->px_type == SORT_ORDER_WITH_LIMIT)
     {
-      SORT_INFO *sort_info_p;
-      /* get scan id of input file */
-      sort_info_p = (SORT_INFO *) sort_param->get_arg;
-
-      /* #99 safety net: qfile_sort_list_with_func() (list_file.c) already keeps
-       * an expected-parallel SORT output out of FILE_QUERY_AREA backing, but
-       * QFILE_FLAG_DISTINCT (and any other future caller) can still route
-       * qfile_open_list() to a FILE_QUERY_AREA result file regardless of the
-       * parallel prediction.  file_manager's temp-file page allocation for a
-       * query-area list does not support concurrent same-transaction workers,
-       * so catch any output list that actually ended up FILE_QUERY_AREA here
-       * and force serial execution rather than relying solely on prediction. */
-      if (sort_info_p->output_file != NULL && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file) != NULL
-	  && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file)->temp_file_type == FILE_QUERY_AREA)
-	{
-	  er_log_debug (ARG_FILE_LINE, "sort: FILE_QUERY_AREA output -> serial (#99 safety net)\n");
-	  return 1;
-	}
-
-      /* #130 fallback: the OLD sector-scan parallel input reader is deleted, so
-       * only a NEW (Tapeset)-backed input can be read in parallel
-       * (chunk_distributor + per-worker tapeset_reader).  Any OLD-backed input
-       * -- including raw-fd overflow spill, which the deleted sector scan could
-       * not enumerate anyway (#99) -- is demoted to a correct serial sort. */
-      if (!qfile_list_has_tapeset (sort_info_p->input_file))
-	{
-	  er_log_debug (ARG_FILE_LINE, "sort: OLD-backed ORDER_BY input -> serial (#130 fallback)\n");
-	  return 1;
-	}
-
-      parallel_num =
-	parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, sort_info_p->input_file->page_cnt,
-						 sort_info_p->parallelism /* hint */ );
-      if (parallel_num < 2)
-	{
-	  /* single process */
-	  return 1;
-	}
-      /* check tuple_cnt */
-      if (sort_info_p->input_file->tuple_cnt <= parallel_num)
-	{
-	  return 1;
-	}
-
-      /* check worker */
-      sort_param->px_worker_manager = parallel_query::worker_manager::try_reserve_workers (parallel_num);
-      if (sort_param->px_worker_manager == NULL)
-	{
-	  return 1;
-	}
-      else
-	{
-	  /* clamp to the actual reservation: try_reserve_workers may grant fewer than requested
-	   * under worker-pool contention. Pushing parallel_num tasks then over-subscribes the pool. */
-	  return sort_param->px_worker_manager->get_reserved_workers ();
-	}
+      return sort_check_parallelism_orderby (thread_p, sort_param);
     }
   else if (sort_param->px_type == SORT_INDEX_LEAF)
     {
-      SORT_ARGS *sort_args_p = (SORT_ARGS *) sort_param->get_arg;
-      int n_user_pages = 0, n_sects = 0, tmp_pg = 0, tmp_sects = 0, error_code = NO_ERROR;
-      if (sort_args_p->n_classes > 1)
-	{
-	  /* not partition, partition has own indexes, this means like this :
-	   * create t1; create t2 under t1; */
-	  return 1;
-	}
-      /* get number of pages to sort */
-      for (int i = 0; i < sort_args_p->n_classes; i++)
-	{
-	  error_code = file_get_num_user_pages (thread_p, &sort_args_p->hfids[i].vfid, &tmp_pg);
-	  if (error_code != NO_ERROR)
-	    {
-	      return 1;
-	    }
-	  error_code = file_get_num_data_sectors (thread_p, &sort_args_p->hfids[i].vfid, &tmp_sects);
-	  if (error_code != NO_ERROR)
-	    {
-	      return 1;
-	    }
-	  n_user_pages += tmp_pg;
-	  n_sects += tmp_sects;
-	}
-
-      parallel_num = parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, n_user_pages,
-							      -1 /* no hint at parallel index build */ );
-
-      if (parallel_num < 2)
-	{
-	  /* single process */
-	  return 1;
-	}
-
-      if (n_sects < parallel_num)
-	{
-	  /* no sector in some threads */
-	  return 1;
-	}
-
-      /* check worker */
-      sort_param->px_worker_manager = parallel_query::worker_manager::try_reserve_workers (parallel_num);
-      if (sort_param->px_worker_manager == NULL)
-	{
-	  return 1;
-	}
-      else
-	{
-	  /* clamp to the actual reservation (same as ORDER_BY branch). */
-	  return sort_param->px_worker_manager->get_reserved_workers ();
-	}
+      return sort_check_parallelism_index_leaf (thread_p, sort_param);
     }
   else if (sort_param->px_type == SORT_GROUP_BY || sort_param->px_type == SORT_ANALYTIC)
     {
-      SORT_LISTFILE_PX_ARG *px = (SORT_LISTFILE_PX_ARG *) sort_param->px_extra_arg;
-      /* hash_eligible is GROUP_BY only (0 for ANALYTIC); skip parallelism when set */
-      if (px == NULL || px->hash_eligible)
-	{
-	  return 1;
-	}
-      QFILE_LIST_ID *input_list = px->input_list;
-      /* #130 fallback: OLD-backed input -> serial (the OLD sector-scan reader is
-       * deleted; see the ORDER_BY branch above). */
-      if (input_list == NULL || !qfile_list_has_tapeset (input_list))
-	{
-	  er_log_debug (ARG_FILE_LINE, "sort: OLD-backed %s input -> serial (#130 fallback)\n",
-			(sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
-	  return 1;
-	}
-      /* The NEW input is read in parallel through the shared chunk_distributor +
-       * per-worker tapeset_reader that sort_start_parallelism builds (#122).  That
-       * reader builds A_sort_key records via qfile_sort_build_key_from_tuple, which
-       * requires use_original == 0 -- every column materialized in the sort record
-       * (the #103/#100 extend_all_columns treatment that qexec_gby_* and
-       * qexec_execute_analytic apply to NEW input).  In the rare case where
-       * extend_all_columns bailed (duplicated / out-of-range key column) use_original
-       * stays 1, the A_sort_key path cannot carry the payload, so keep forcing serial:
-       * the serial sort then fails loudly on the unresolvable back-reference exactly
-       * as before, rather than mis-reading the record.  (#78 C-7/C-8) */
-      if (px->key_info == NULL || px->key_info->use_original)
-	{
-	  er_log_debug (ARG_FILE_LINE,
-			"sort: NEW-backed %s input with use_original -> serial (#122 A_sort_key guard)\n",
-			(sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
-	  return 1;
-	}
-      parallel_num =
-	parallel_query::compute_parallel_degree (parallel_query::parallel_type::SORT, input_list->page_cnt,
-						 px->parallelism /* hint */ );
-      if (parallel_num < 2 || input_list->tuple_cnt < parallel_num || input_list->page_cnt < parallel_num)
-	{
-	  return 1;
-	}
-      sort_param->px_worker_manager = parallel_query::worker_manager::try_reserve_workers (parallel_num);
-      /* clamp to the actual reservation (same as ORDER_BY / INDEX_LEAF branches). */
-      return (sort_param->px_worker_manager == NULL) ? 1 : sort_param->px_worker_manager->get_reserved_workers ();
+      return sort_check_parallelism_groupby (thread_p, sort_param);
     }
   else
     {
