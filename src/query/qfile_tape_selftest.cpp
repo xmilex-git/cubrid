@@ -403,6 +403,20 @@ qfile_taperead_selftest (THREAD_ENTRY *thread_p)
   return rc;
 }
 
+/* #143 S3: moved from qfile_tape.cpp -- production code builds writers via
+ * qfile_producer_create_for_list only; this raw-args constructor is now
+ * selftest-only (fixed test seqs below 0x100000000ULL). */
+static void *
+qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned long long seq, unsigned int worker_id)
+{
+  std::string dir;
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      return NULL;
+    }
+  return new qfile::tape_writer (prefix_budget_pages, tde_algo, dir, (std::uint64_t) seq, worker_id);
+}
+
 /* In-server overflow round trip for the 2A-1 producer hook (ADR 0006):
  * produce a mix of small and multi-page overflow tuples through
  * qfile_add_tuple_to_list onto a NEW-backed list, freeze, then scan the
@@ -429,7 +443,7 @@ qfile_producer_overflow_roundtrip (THREAD_ENTRY *thread_p, TDE_ALGORITHM algo)
   big = (char *) malloc (BIG_LEN);
   if (writer == NULL || scratch == NULL || big == NULL)
     {
-      qfile_producer_destroy (writer);
+      delete (qfile::tape_writer *) writer;
       free (scratch);
       free (big);
       return ER_FAILED;
@@ -562,7 +576,7 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
   char *scratch = (char *) malloc (DB_PAGESIZE);
   if (scratch == NULL)
     {
-      qfile_producer_destroy (writer);
+      delete (qfile::tape_writer *) writer;
       return ER_FAILED;
     }
   QFILE_LIST_ID_PRODUCER_PAGE (&lst) = scratch;
@@ -721,7 +735,7 @@ qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
       char *scratch = (writer != NULL) ? (char *) malloc (DB_PAGESIZE) : NULL;
       if (writer == NULL || scratch == NULL)
 	{
-	  qfile_producer_destroy (writer);
+	  delete (qfile::tape_writer *) writer;
 	  free (scratch);
 	  rc = ER_FAILED;
 	}

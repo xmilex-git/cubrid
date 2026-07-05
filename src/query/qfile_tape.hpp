@@ -300,7 +300,8 @@ namespace qfile
        * Tapeset object -- the cell must be reachable after the Tapeset is
        * destroyed without dereferencing the (possibly freed) Tapeset, or it
        * would reintroduce the exact #87 D3 hazard tapeset_scan::close() was
-       * written to avoid.  Debug-only consumer: qfile_tapeset_open_scan_count(). */
+       * written to avoid.  Debug-only consumer: qfile_list_id_open_scan_count()
+       * (list_file.c), which casts and loads this cell directly. */
       using scan_count_cell = std::shared_ptr<std::atomic<int>>;
       const scan_count_cell &open_scan_cell () const
       {
@@ -562,11 +563,6 @@ void qfile_tapeset_scan_save_position (QFILE_LIST_SCAN_ID *scan_id_p, QFILE_TUPL
 /* Destroy a tapeset owned by a QFILE_LIST_ID (used by qfile_clear_list_id). */
 void qfile_tapeset_destroy (void *tapeset_ptr);
 
-/* #89 debug assert: number of tapeset_scan objects currently open against this
- * (live) Tapeset.  Caller must only call this while the Tapeset itself is
- * known to be alive (e.g. right before destroying it). */
-int qfile_tapeset_open_scan_count (void *tapeset_ptr);
-
 /* #120a/#120b client-fetch-over-Tapeset bridges: serve a NEW-backed top-level
  * result straight from its frozen Tapeset (no #94 pgbuf materialize).
  * page_count is the total logical page count across the ordered Tapes;
@@ -580,22 +576,14 @@ int qfile_tapeset_page_count (const QFILE_LIST_ID *list_id_p);
 int qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *list_id_p, int global_index,
 				    char *page_dest, int *local_offset_out);
 
-/* Phase2 2A-1 producer bridge (redesign #78): build a NEW-backed list by
- * appending its completed list-pages to a tape_writer, then freezing into a
- * single-Tape Tapeset.  Pairs with the qfile producer hook in list_file.c.
- * The writer is created without a backing list (pgbuf-bypassed) and consumed
- * (deleted) by freeze_tapeset / destroy. */
-void *qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned long long seq,
-			     unsigned int worker_id);
 /* Create a NEW-backed producer for a SORT output list (redesign #78, 2A-1b):
  * membuf prefix = work_mem pages, TDE algo from tde_encrypted, process-unique
  * BufFile sequence.  Returns an opaque writer (NULL on failure), consumed by
- * qfile_producer_freeze_tapeset / qfile_producer_destroy. */
+ * qfile_producer_freeze_tapeset / delete (qfile::tape_writer *). */
 void *qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted);
 /* redesign #78 2A-1b: import src's Tapeset backing into dest (SORT output migration). */
 int qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID *src);
 int qfile_producer_append (THREAD_ENTRY *thread_p, void *writer, const PAGE_PTR full_page);
 void *qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer);
-void qfile_producer_destroy (void *writer);
 
 #endif /* _QFILE_TAPE_HPP_ */

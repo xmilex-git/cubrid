@@ -3258,8 +3258,15 @@ qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LO
   if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
       /* (c′) set_dirty: DONT_FREE marks the flag only; FREE = last-unfix
-       * write-back inside the shim (INV-2, #132) */
-      const int error = temp_page_store::page_spill_flush_page (thread_p, tfile_vfid_p, page_p, free_page);
+       * write-back inside the shim (INV-2, #132).  An unknown page (e.g. a
+       * membuf page routed through the same qmgr call path) is a silent
+       * NO_ERROR, same as the former page_spill_flush_page bridge. */
+      int error = NO_ERROR;
+      if (tfile_vfid_p->page_spill_handle != NULL && tfile_vfid_p->page_spill_handle->mark_dirty (page_p)
+	  && free_page == (int) FREE)
+	{
+	  error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
+	}
       if (error != NO_ERROR)
 	{
 	  if (er_errid () == NO_ERROR)

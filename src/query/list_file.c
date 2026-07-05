@@ -636,7 +636,7 @@ qfile_clear_list_id (QFILE_LIST_ID * list_id_p)
    * (redesign #78).  Normal close transfers these out before clear runs. */
   if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
     {
-      qfile_producer_destroy (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p));
+      delete (qfile::tape_writer *) QFILE_LIST_ID_PRODUCER_WRITER (list_id_p);	/* unfrozen: frees the partial spill */
     }
   free (QFILE_LIST_ID_PRODUCER_PAGE (list_id_p));
 
@@ -6750,11 +6750,14 @@ qfile_close_scan (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 int
 qfile_list_id_open_scan_count (const QFILE_LIST_ID * list_id_p)
 {
+  qfile::tapeset *ts;
+
   if (list_id_p == NULL || QFILE_LIST_ID_TAPESET (list_id_p) == NULL)
     {
       return 0;
     }
-  return qfile_tapeset_open_scan_count (QFILE_LIST_ID_TAPESET (list_id_p));
+  ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (list_id_p);
+  return ts->open_scan_cell ()->load (std::memory_order_relaxed);
 }
 
 #if defined(SERVER_MODE)

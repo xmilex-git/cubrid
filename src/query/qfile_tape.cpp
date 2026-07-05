@@ -1387,37 +1387,48 @@ qfile_tapeset_scan_close (THREAD_ENTRY *thread_p, QFILE_LIST_SCAN_ID *scan_id_p)
     }
 }
 
+/* #143 S3: the cast-to-tapeset_scan -> method call -> mirror sequence repeated
+ * identically across forward/backward/jump; fold it into one internal
+ * helper so each bridge is left with only its method-specific call. */
+template <typename F>
+static SCAN_CODE
+qfile_tapeset_scan_step (QFILE_LIST_SCAN_ID *scan_id_p, F &&step)
+{
+  qfile::tapeset_scan *scan = (qfile::tapeset_scan *) scan_id_p->tapeset_scan_;
+  assert (scan != NULL);
+  SCAN_CODE code = step (scan);
+  qfile_tapeset_mirror (scan, scan_id_p);
+  return code;
+}
+
 SCAN_CODE
 qfile_tapeset_scan_forward (THREAD_ENTRY *thread_p, QFILE_LIST_SCAN_ID *scan_id_p, QFILE_TUPLE_RECORD *tuple_record_p,
 			    int peek)
 {
-  qfile::tapeset_scan *scan = (qfile::tapeset_scan *) scan_id_p->tapeset_scan_;
-  assert (scan != NULL);
-  SCAN_CODE code = scan->forward (thread_p, tuple_record_p, peek);
-  qfile_tapeset_mirror (scan, scan_id_p);
-  return code;
+  return qfile_tapeset_scan_step (scan_id_p, [&] (qfile::tapeset_scan *scan)
+    {
+      return scan->forward (thread_p, tuple_record_p, peek);
+    });
 }
 
 SCAN_CODE
 qfile_tapeset_scan_backward (THREAD_ENTRY *thread_p, QFILE_LIST_SCAN_ID *scan_id_p, QFILE_TUPLE_RECORD *tuple_record_p,
 			     int peek)
 {
-  qfile::tapeset_scan *scan = (qfile::tapeset_scan *) scan_id_p->tapeset_scan_;
-  assert (scan != NULL);
-  SCAN_CODE code = scan->backward (thread_p, tuple_record_p, peek);
-  qfile_tapeset_mirror (scan, scan_id_p);
-  return code;
+  return qfile_tapeset_scan_step (scan_id_p, [&] (qfile::tapeset_scan *scan)
+    {
+      return scan->backward (thread_p, tuple_record_p, peek);
+    });
 }
 
 SCAN_CODE
 qfile_tapeset_scan_jump (THREAD_ENTRY *thread_p, QFILE_LIST_SCAN_ID *scan_id_p,
 			 const QFILE_TUPLE_POSITION *tuple_position_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek)
 {
-  qfile::tapeset_scan *scan = (qfile::tapeset_scan *) scan_id_p->tapeset_scan_;
-  assert (scan != NULL);
-  SCAN_CODE code = scan->jump (thread_p, tuple_position_p, tuple_record_p, peek);
-  qfile_tapeset_mirror (scan, scan_id_p);
-  return code;
+  return qfile_tapeset_scan_step (scan_id_p, [&] (qfile::tapeset_scan *scan)
+    {
+      return scan->jump (thread_p, tuple_position_p, tuple_record_p, peek);
+    });
 }
 
 void
@@ -1432,13 +1443,6 @@ void
 qfile_tapeset_destroy (void *tapeset_ptr)
 {
   delete (qfile::tapeset *) tapeset_ptr;
-}
-
-int
-qfile_tapeset_open_scan_count (void *tapeset_ptr)
-{
-  qfile::tapeset *ts = (qfile::tapeset *) tapeset_ptr;
-  return (ts == NULL) ? 0 : ts->open_scan_cell ()->load (std::memory_order_relaxed);
 }
 
 /* #120a client-fetch-over-Tapeset bridges.  Serve a NEW (Tapeset)-backed
@@ -1523,17 +1527,6 @@ qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *lis
 /* ------------------------------------------------------------------ */
 
 void *
-qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned long long seq, unsigned int worker_id)
-{
-  std::string dir;
-  if (!qfile::buffile::default_scratch_dir (dir))
-    {
-      return NULL;
-    }
-  return new qfile::tape_writer (prefix_budget_pages, tde_algo, dir, (std::uint64_t) seq, worker_id);
-}
-
-void *
 qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted)
 {
   /* process-unique sequence so concurrent producers never collide on a BufFile
@@ -1541,6 +1534,7 @@ qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted)
   static std::atomic<unsigned long long> seq_gen { 0x100000000ULL };
   TDE_ALGORITHM algo = TDE_ALGORITHM_NONE;
   int budget;
+  std::string dir;
 
   (void) thread_p;
   if (tde_encrypted)
@@ -1553,7 +1547,11 @@ qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted)
     {
       budget = 4;
     }
-  return qfile_producer_create (budget, algo, (unsigned long long) seq_gen.fetch_add (1), 0);
+  if (!qfile::buffile::default_scratch_dir (dir))
+    {
+      return NULL;
+    }
+  return new qfile::tape_writer (budget, algo, dir, (std::uint64_t) seq_gen.fetch_add (1), 0);
 }
 
 /* Import all Tapes of src's frozen Tapeset into dest's Tapeset, in order
@@ -1627,8 +1625,3 @@ qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer)
   return ts;
 }
 
-void
-qfile_producer_destroy (void *writer)
-{
-  delete (qfile::tape_writer *) writer;	/* unfrozen: frees the partial spill */
-}

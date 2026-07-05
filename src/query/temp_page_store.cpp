@@ -227,25 +227,8 @@ namespace
 
 namespace temp_page_store
 {
-  /* (c′) PAGE_SPILL consumer shims (#132): an unknown page (e.g. a membuf
+  /* (c′) PAGE_SPILL consumer shim (#132): an unknown page (e.g. a membuf
    * page routed through the same qmgr call path) is a silent NO_ERROR. */
-  int
-  page_spill_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept
-  {
-    if (tfile_p == NULL || tfile_p->page_spill_handle == NULL
-	|| !tfile_p->page_spill_handle->mark_dirty (page_p))
-      {
-	return NO_ERROR;
-      }
-
-    if (free_page != (int) FREE)
-      {
-	return NO_ERROR;
-      }
-
-    return spill_release_fixed_page (thread_p, tfile_p, page_p);
-  }
-
   int
   spill_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept
   {

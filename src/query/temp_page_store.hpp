@@ -44,9 +44,8 @@ enum class qmgr_temp_backing : int
 
 namespace temp_page_store
 {
-  /* (c′) PAGE_SPILL consumer shims (#132) -- keep the qmgr dispatch
-   * branches symmetric with the pre-커밋 B rawfd_* pair contract. */
-  int page_spill_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept;
+  /* (c′) PAGE_SPILL consumer shim (#132) -- keep the qmgr dispatch
+   * branch symmetric with the pre-커밋 B rawfd_* pair contract. */
   int spill_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept;
 
   int qmgr_temp_file_move_selftest (THREAD_ENTRY * thread_p) noexcept;
