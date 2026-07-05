@@ -583,7 +583,7 @@ namespace qfile
     , m_curr_tpl (NULL)
     , m_curr_overflow (false)
     , m_overflow_run_end (-1)
-    , m_readbuf (NULL)
+    , m_cache_tick (0)
     , m_reasm_raw (NULL)
     , m_reasm (NULL)
     , m_peek_reasm_raw (NULL)
@@ -595,6 +595,14 @@ namespace qfile
 #endif /* NDEBUG */
     , m_open_scan_cell (ts ? ts->open_scan_cell () : nullptr)
   {
+    for (int i = 0; i < READ_CACHE_SLOTS; i++)
+      {
+	m_cache[i].buf = NULL;
+	m_cache[i].tape_p = NULL;
+	m_cache[i].page_offset = -1;
+	m_cache[i].valid = false;
+	m_cache[i].tick = 0;
+      }
     if (m_open_scan_cell)
       {
 	m_open_scan_cell->fetch_add (1, std::memory_order_relaxed);
@@ -603,8 +611,8 @@ namespace qfile
 
   tapeset_scan::~tapeset_scan ()
   {
-    /* A held page needs no release call: a file page lives in the scan-owned
-     * m_readbuf freed here, a prefix page is Tape-owned RAM. */
+    /* A held page needs no release call: a file page lives in a scan-owned
+     * read-cache slot freed here, a prefix page is Tape-owned RAM. */
     /* Drop this scan's reference on its OWN copy of the shared cell -- never
      * touches m_tapeset, which may already be freed (see class comment in
      * qfile_tape.hpp). */
@@ -612,8 +620,11 @@ namespace qfile
       {
 	m_open_scan_cell->fetch_sub (1, std::memory_order_relaxed);
       }
-    free (m_readbuf);
-    m_readbuf = NULL;
+    for (int i = 0; i < READ_CACHE_SLOTS; i++)
+      {
+	free (m_cache[i].buf);
+	m_cache[i].buf = NULL;
+      }
     free (m_reasm_raw);
     m_reasm_raw = NULL;
     m_reasm = NULL;
@@ -625,10 +636,11 @@ namespace qfile
   void
   tapeset_scan::release_page (THREAD_ENTRY *thread_p)
   {
-    /* Per-scan scratch: a held file page lives in the scan-owned m_readbuf and
-     * a prefix page is Tape-owned RAM -- dropping the reference needs no Tape
+    /* Per-scan scratch: a held file page lives in a scan-owned read-cache slot
+     * and a prefix page is Tape-owned RAM -- dropping the reference needs no Tape
      * call, so close() does not depend on the Tapeset (or its Tapes) being
-     * alive. */
+     * alive.  The cache buffers are NOT freed here (kept for the scan's life,
+     * freed in ~tapeset_scan); only the borrowed reference is dropped. */
     (void) thread_p;
     m_page = NULL;
     m_curr_tpl = NULL;
@@ -637,16 +649,66 @@ namespace qfile
   PAGE_PTR
   tapeset_scan::fetch_page (THREAD_ENTRY *thread_p, tape *tape_p, int page_offset)
   {
-    if (m_readbuf == NULL && page_offset >= tape_p->prefix_page_count ())
+    /* RAM pages (memory Tape, or the buffile's in-RAM prefix) are returned by
+     * read_page_into as a direct pointer -- no pread, no copy -- so they are
+     * never cached (caching them would waste a slot on a zero-cost read). */
+    if (page_offset < tape_p->prefix_page_count ())
       {
-	m_readbuf = (char *) malloc (DB_PAGESIZE);
-	if (m_readbuf == NULL)
+	return tape_p->read_page_into (thread_p, page_offset, NULL, &m_read_scratch);
+      }
+
+    /* Spilled (file-backed) page: serve from the per-scan LRU read cache.  The
+     * backing is append-all-then-freeze immutable, so a cached page can never go
+     * stale -- no invalidation.  The cache is per-reader (scan-owned): no sharing
+     * across scans (#126/K-12 shared-cache hazard avoided). */
+    m_cache_tick++;
+    for (int i = 0; i < READ_CACHE_SLOTS; i++)
+      {
+	if (m_cache[i].valid && m_cache[i].tape_p == tape_p && m_cache[i].page_offset == page_offset)
+	  {
+	    m_cache[i].tick = m_cache_tick;
+	    m_metrics.cache_hits++;
+	    return (PAGE_PTR) m_cache[i].buf;
+	  }
+      }
+
+    /* miss: evict the least-recently-used slot (or the first empty one) */
+    int victim = 0;
+    for (int i = 1; i < READ_CACHE_SLOTS; i++)
+      {
+	if (!m_cache[i].valid)
+	  {
+	    victim = i;
+	    break;
+	  }
+	if (m_cache[i].tick < m_cache[victim].tick)
+	  {
+	    victim = i;
+	  }
+      }
+    if (m_cache[victim].buf == NULL)
+      {
+	m_cache[victim].buf = (char *) malloc (DB_PAGESIZE);
+	if (m_cache[victim].buf == NULL)
 	  {
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) DB_PAGESIZE);
 	    return NULL;
 	  }
       }
-    return tape_p->read_page_into (thread_p, page_offset, m_readbuf, &m_read_scratch);
+    /* For a file page read_page_into decrypts/reads into page_dest and returns it
+     * (== buf); the prefix-RAM early-return above is never taken here. */
+    PAGE_PTR pg = tape_p->read_page_into (thread_p, page_offset, m_cache[victim].buf, &m_read_scratch);
+    if (pg == NULL)
+      {
+	m_cache[victim].valid = false;
+	return NULL;
+      }
+    m_cache[victim].tape_p = tape_p;
+    m_cache[victim].page_offset = page_offset;
+    m_cache[victim].valid = true;
+    m_cache[victim].tick = m_cache_tick;
+    m_metrics.cache_misses++;
+    return (PAGE_PTR) m_cache[victim].buf;
   }
 
   void

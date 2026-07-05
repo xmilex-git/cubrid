@@ -322,9 +322,12 @@ namespace qfile
     long jumps;			/* jump() calls that landed on a tuple */
     long copies;		/* copy-mode retrieves */
     long peeks;			/* peek-mode retrieves */
+    long cache_hits;		/* fetch_page served from the per-scan read cache (no pread) -- #144 P1-2 */
+    long cache_misses;		/* fetch_page that issued a read_page_into (a pread for file pages) */
 
     tapeset_scan_metrics ()
       : page_reads (0), pgbuf_fixes (0), tuple_reads (0), tape_advances (0), jumps (0), copies (0), peeks (0)
+      , cache_hits (0), cache_misses (0)
     {
     }
   };
@@ -338,12 +341,23 @@ namespace qfile
    * zero-tuple pages are skipped.  Backward and jump use the Tape-relative
    * coordinate (tape_idx, page_offset, byte_offset) -- no prev_vpid walk.
    *
-   * Caller-scratch contract: the scan OWNS its file-page read scratch
-   * (m_readbuf + m_read_scratch, lazily allocated on the first file page;
-   * all-RAM Tapesets never allocate).  Every page fetch -- forward, backward,
-   * AND jump -- goes through fetch_page() into that scan-owned scratch, so N
-   * scans interleaved over one frozen Tapeset (tapeset-backed derived-table/CTE
-   * self-join) each hold a private copy of their current file page.
+   * Caller-scratch contract: the scan OWNS its file-page read scratch -- a small
+   * per-scan LRU read cache (m_cache[READ_CACHE_SLOTS] + m_read_scratch, slots
+   * lazily allocated on first file page; all-RAM Tapesets never allocate).  Every
+   * page fetch -- forward, backward, AND jump -- goes through fetch_page() into
+   * that scan-owned cache, so N scans interleaved over one frozen Tapeset
+   * (tapeset-backed derived-table/CTE self-join) each keep a PRIVATE working set:
+   * the cache is per-reader, never shared (avoids the #126/K-12 shared-read-cache
+   * contamination hazard).
+   *
+   * #144 P1-2: the cache collapses repeated pread of a small hot working set of
+   * backing pages -- the PHJ probe's random tapeset jumps re-read the same
+   * OS-cached build pages millions of times (per-access pread), which is pure
+   * syscall+copy CPU.  The frozen backing is append-all-then-freeze immutable, so
+   * a cached page can never go stale -- no invalidation is ever needed.  The
+   * cache is small (READ_CACHE_SLOTS pages), purely additive (no invariant
+   * changed), and reader-local scratch NOT charged to work_mem (like the single
+   * m_readbuf it replaces, and like m_reasm).
    */
   class tapeset_scan
   {
@@ -416,7 +430,20 @@ namespace qfile
       QFILE_TUPLE m_curr_tpl;	/* == m_page + m_offset */
       bool m_curr_overflow;	/* current tuple is a reassembled overflow run */
       int m_overflow_run_end;	/* last logical page of that run (forward O(1) skip) */
-      char *m_readbuf;		/* scan-owned DB_PAGESIZE scratch for held file pages */
+      /* #144 P1-2: small per-scan LRU cache of backing (file) pages.  D4 escape
+       * hatch: small (READ_CACHE_SLOTS), additive, scan-owned; slot buffers are
+       * lazily malloc'd on first use (all-RAM Tapesets never allocate). */
+      static const int READ_CACHE_SLOTS = 8;
+      struct read_cache_slot
+      {
+	char *buf;		/* DB_PAGESIZE, lazily allocated */
+	const tape *tape_p;	/* owning Tape of the cached page (identity key) */
+	int page_offset;	/* logical page key within tape_p */
+	bool valid;
+	unsigned long tick;	/* LRU stamp (m_cache_tick at last use) */
+      };
+      read_cache_slot m_cache[READ_CACHE_SLOTS];
+      unsigned long m_cache_tick;	/* monotonic LRU clock */
       tde_read_scratch m_read_scratch;	/* scan-owned TDE decrypt scratch for fetch_page */
       char *m_reasm_raw;	/* reassembly read scratch (file continuation pages) */
       PAGE_PTR m_reasm;
