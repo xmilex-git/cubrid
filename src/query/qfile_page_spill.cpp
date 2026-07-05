@@ -17,8 +17,8 @@
  */
 
 /*
- * qfile_page_spill.cpp - per-tfile random-page spill backing (Phase3 (c′),
- * issue #74/#132).  See qfile_page_spill.hpp for the invariants.
+ * qfile_page_spill.cpp - per-tfile random-page spill backing.
+ * See qfile_page_spill.hpp for the invariants.
  */
 
 #include "qfile_page_spill.hpp"
@@ -51,7 +51,7 @@ namespace
   std::atomic<std::uint64_t> g_page_spill_seq {0};
 
 #if !defined (NDEBUG)
-  /* #86-idiom write-back fault: 1-based ordinal of the write-back to fail;
+  /* write-back fault injection: 1-based ordinal of the write-back to fail;
    * 0 = disarmed. */
   std::atomic<int> g_fault_flush_target {0};
   std::atomic<int> g_fault_flush_count {0};
@@ -142,8 +142,8 @@ namespace qfile
 
   page_spill_file::~page_spill_file ()
   {
-    /* Containment ownership (D2): the QMGR_TEMP_FILE destructor path is the
-     * only caller.  Any still-referenced slot is a consumer fix leak. */
+    /* Containment ownership: the QMGR_TEMP_FILE destructor path is the only
+     * caller.  Any still-referenced slot is a consumer fix leak. */
     for (auto &entry : m_slots)
       {
 	if (entry.second.ref > 0)
@@ -328,8 +328,8 @@ namespace qfile
 #if !defined (NDEBUG)
     if (fault_flush_should_fail ())
       {
-	/* simulated disk-full write-back (#86 idiom): same error the real
-	 * ENOSPC path raises, exercising INV-3 end to end. */
+	/* simulated disk-full write-back: same error the real ENOSPC path
+	 * raises, exercising INV-3 end to end. */
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
 	return ER_FAILED;
       }
@@ -351,7 +351,7 @@ namespace qfile
 	    return rc;
 	  }
 	/* fresh nonce per physical (re)write -- guaranteed by the
-	 * tde_encrypt_data_page primitive (design §6) */
+	 * tde_encrypt_data_page primitive */
 	rc = spill_file::tde_stage_encrypt (buf, pageid, m_file.tde_algo (), m_plain, m_cipher);
 	if (rc != NO_ERROR)
 	  {
@@ -411,7 +411,7 @@ namespace qfile
 
 #if !defined (NDEBUG)
   /* ------------------------------------------------------------------ */
-  /* in-server selftests (#132, design §7)                              */
+  /* in-server selftests                                                */
   /* ------------------------------------------------------------------ */
 
   namespace
@@ -499,8 +499,7 @@ namespace qfile
 
   /*
    * CUBRID_WM_SPILL_SELFTEST: 257-page random-order write/read parity +
-   * INV-4 sparse fault + TDE nonce distinctness incl. rewrite freshness
-   * (the rawfd positioned-read-parity port, design §6/§7).
+   * INV-4 sparse fault + TDE nonce distinctness incl. rewrite freshness.
    */
   int
   page_spill_file::selftest (THREAD_ENTRY *thread_p)
@@ -518,7 +517,7 @@ namespace qfile
     std::vector<PAGE_PTR> bufs (PAGE_COUNT, NULL);
 
     /* produce all pages resident, then release (= write-back) in a permuted
-     * order: write order != pageid order is a §3 invariant. */
+     * order: write order != pageid order is an invariant. */
     for (PAGEID page = 0; page < PAGE_COUNT && rc == NO_ERROR; page++)
       {
 	bufs[page] = psf->alloc_new_page (thread_p, page);
@@ -567,7 +566,7 @@ namespace qfile
       }
 
     /* TDE: every physical write took a fresh nonce -> 257 distinct; an
-     * in-place rewrite takes yet another fresh one (mutation contract, §6) */
+     * in-place rewrite takes yet another fresh one (mutation contract) */
     if (rc == NO_ERROR && tde)
       {
 	std::set<INT64> seen_nonces;
@@ -654,7 +653,7 @@ namespace qfile
       return static_cast<std::size_t> (pageid) < psf->m_written.size () && psf->m_written[pageid];
     };
 
-    /* INV-1: dirty 보유 중 재fix = 동일 buf, ref==2 */
+    /* INV-1: re-fix while dirty = same buf, ref==2 */
     PAGE_PTR first = psf->alloc_new_page (thread_p, 0);
     if (first == NULL)
       {
@@ -669,12 +668,12 @@ namespace qfile
 	  {
 	    rc = ER_FAILED;
 	  }
-	/* INV-2: 첫 unfix는 write-back하지 않는다 (dirty ⊆ fixed 유지) */
+	/* INV-2: the first unfix does not write back (dirty stays a subset of fixed) */
 	if (rc == NO_ERROR && (psf->release_page (thread_p, refixed) != NO_ERROR || written (0)))
 	  {
 	    rc = ER_FAILED;
 	  }
-	/* 마지막 unfix에서만 write-back */
+	/* write-back only on the last unfix */
 	if (rc == NO_ERROR && (psf->release_page (thread_p, first) != NO_ERROR || !written (0)))
 	  {
 	    rc = ER_FAILED;
@@ -689,7 +688,7 @@ namespace qfile
 	  }
       }
 
-    /* INV-2: DONT_FREE dirty 동안 디스크 이미지는 stale, fix는 신본을 본다 */
+    /* INV-2: while a DONT_FREE page is dirty the disk image is stale; fix sees the live copy */
     if (rc == NO_ERROR)
       {
 	PAGE_PTR fixed = psf->fix_page (thread_p, 0);
@@ -702,14 +701,14 @@ namespace qfile
 	    fixed[1] = static_cast<char> (fixed[1] ^ 0x77);	/* mutate */
 	    psf->mark_dirty (fixed);
 
-	    /* disk must still hold the OLD image... */
+	    /* disk must still hold the stale image... */
 	    std::vector<char> stale (DB_PAGESIZE);
 	    if (selftest_read_disk (psf->m_file, 0, stale.data (), NULL) != NO_ERROR
 		|| !selftest_check_pattern (stale.data (), 0))
 	      {
 		rc = ER_FAILED;
 	      }
-	    /* ...while a concurrent fixer sees the NEW bytes by pointer identity */
+	    /* ...while a concurrent fixer sees the mutated bytes by pointer identity */
 	    PAGE_PTR observer = psf->fix_page (thread_p, 0);
 	    if (observer != fixed || observer[1] != fixed[1])
 	      {
@@ -738,7 +737,7 @@ namespace qfile
 	  }
       }
 
-    /* INV-3: write-back 실패 주입 -> 오류 전파 (#86 관용구) */
+    /* INV-3: inject write-back failure -> error propagates */
     if (rc == NO_ERROR)
       {
 	PAGE_PTR fixed = psf->fix_page (thread_p, 0);

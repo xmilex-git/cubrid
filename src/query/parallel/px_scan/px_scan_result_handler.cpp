@@ -27,7 +27,7 @@
 #include "object_primitive.h"
 #include "query_opfunc.h"
 #include "list_file.h"
-#include "qfile_tape.hpp"	/* qfile_tapeset_import (decl moved from list_file.h, #143 S2/M3) */
+#include "qfile_tape.hpp"	/* qfile_tapeset_import */
 #include "query_manager.h"
 #include "dbtype_def.h"
 #include "object_representation.h"
@@ -259,11 +259,9 @@ namespace parallel_scan
 	      db_private_free_and_init (thread_p, type_list.domp);
 	    }
 	}
-	/* 2A-2 (#78): migration of this worker's
-	 * per-thread output list to the NEW per-worker Tapeset backing, so result
-	 * writes append to a private tape_writer (no per-page dirty-mark lock).
-	 * Per-worker list: no shared
-	 * lock needed.  On conversion failure the list stays fully OLD (atomic
+	/* Convert this worker's per-thread output list to a per-worker tapeset
+	 * backing, so result writes append to a private tape_writer with no shared
+	 * lock.  On conversion failure the list stays fully pgbuf-backed (atomic
 	 * drop) and the merge mixed-backing guard turns it into a clean error. */
 	{
 	  bool ld_tde = (QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p) != nullptr)
@@ -581,12 +579,12 @@ namespace parallel_scan
 	qfile_close_list (thread_p, dest);
       }
 
-    /* 2A-2 (#78) Option A: NEW (Tapeset) zero-copy fan-in for the per-worker
-     * scan output.  Make dest a NEW frozen Tapeset, then import each worker's
-     * frozen Tape(s) by ownership transfer (no re-read, no qmgr VPID append,
-     * hence no shared raw-fd registry lock).  The downstream parallel sort
-     * reads this NEW dest via chunk_distributor/tapeset_reader (see
-     * external_sort.c).  segment_native (hash-gby part lists) keeps OLD path. */
+    /* tapeset zero-copy fan-in for the per-worker scan output.  Make dest a
+     * frozen tapeset, then import each worker's frozen tape(s) by ownership
+     * transfer (no re-read, no qmgr VPID append).  The downstream parallel
+     * sort reads this dest via
+     * chunk_distributor/tapeset_reader.  segment_native (hash-gby part lists)
+     * keeps the pgbuf path. */
     if (!segment_native)
       {
 	bool nf_failed = false;
@@ -607,8 +605,8 @@ namespace parallel_scan
 	      {
 		if (qfile_list_has_pgbuf_backing (list_id))
 		  {
-		    /* worker stayed OLD (conversion OOM) into a NEW dest: a
-		     * mixed-backing error, never a silent wrong result. */
+		    /* worker stayed pgbuf-backed (conversion OOM) into a tapeset dest:
+		     * a mixed-backing error, never a silent wrong result. */
 		    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 		    nf_failed = true;
 		  }
@@ -1360,8 +1358,8 @@ namespace parallel_scan
 	if constexpr (F == PT_MEDIAN || F == PT_PERCENTILE_CONT || F == PT_PERCENTILE_DISC)
 	  {
 	    /* GROUP_CONCAT(ORDER BY), MEDIAN, PERCENTILE_CONT/DISC: open list_id for value accumulation.
-	     * [#127 merge] QFILE_FLAG_ALL is CBRD-26846's correctness fix (median/percentile need all values,
-	     * not DISTINCT); NOT_USE_MEMBUF dropped per temp-workmem NEW-backing (per-worker membuf is safe). */
+	     * QFILE_FLAG_ALL because median/percentile need all values, not DISTINCT;
+	     * NOT_USE_MEMBUF dropped because a per-worker membuf is safe. */
 	    int ls_flag = QFILE_FLAG_ALL;
 	    QFILE_TUPLE_VALUE_TYPE_LIST type_list;
 	    type_list.type_cnt = 1;
@@ -2209,10 +2207,9 @@ namespace parallel_scan
       {
 	if (orig_agg_p->option == Q_DISTINCT)
 	  {
-	    /* [#127 merge — temp-workmem NEW-backing DISTINCT reduce ported into CBRD-26846 finalize_node<F>]
-	     * single-owner append (qmgr_append_list_to_single_owner) replaces develop's malloc +
-	     * qfile_copy_list_id + qfile_connect_list.  Backing-agnostic; both lists must be closed first.
-	     * finalize_node is called per node and the caller advances cur_agg_p, so return (not continue). (#78, #99) */
+	    /* single-owner append (qmgr_append_list_to_single_owner) replaces malloc +
+	     * qfile_copy_list_id + qfile_connect_list (backing-agnostic; both lists must be
+	     * closed first).  finalize_node runs per node and the caller advances cur_agg_p, so return. */
 	    qfile_close_list (thread_p, cur_agg_p->list_id);
 	    if (cur_agg_p->list_id->tuple_cnt == 0)
 	      {
@@ -2239,7 +2236,7 @@ namespace parallel_scan
 	/* GROUP_CONCAT(ORDER BY), MEDIAN, PERCENTILE_CONT/DISC: merge list_ids from worker into main
 	 * via single-owner append (qmgr_append_list_to_single_owner), same pattern as the DISTINCT
 	 * reduce above. Append order doesn't need to preserve value order: the caller re-sorts the
-	 * fully-merged list with qfile_sort_list before qdata_aggregate_interpolation reads it. (#128, #74, #78) */
+	 * fully-merged list with qfile_sort_list before qdata_aggregate_interpolation reads it. */
 	qfile_close_list (thread_p, cur_agg_p->list_id);
 	if (cur_agg_p->list_id->tuple_cnt == 0)
 	  {
@@ -2273,7 +2270,7 @@ namespace parallel_scan
 	    /* GROUP_CONCAT(ORDER BY), MEDIAN, PERCENTILE_CONT/DISC: merge list_ids from worker into main
 	     * via single-owner append (qmgr_append_list_to_single_owner), same pattern as the DISTINCT
 	     * reduce above. Append order doesn't need to preserve value order: the caller re-sorts the
-	     * fully-merged list with qfile_sort_list before qdata_aggregate_interpolation reads it. (#128, #74, #78) */
+	     * fully-merged list with qfile_sort_list before qdata_aggregate_interpolation reads it. */
 	    qfile_close_list (thread_p, cur_agg_p->list_id);
 	    if (cur_agg_p->list_id->tuple_cnt == 0)
 	      {

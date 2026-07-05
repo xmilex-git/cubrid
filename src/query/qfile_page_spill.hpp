@@ -17,20 +17,17 @@
  */
 
 /*
- * qfile_page_spill.hpp - per-tfile random-page spill backing (Phase3 (c′),
- * issue #74/#132; design = #74 [(c′) coherence 설계] §2/§3).
+ * qfile_page_spill.hpp - per-tfile random-page spill backing.
  *
- * The (c′) replacement for the raw-fd OLD-tier overflow: one page_spill_file
- * per QMGR_TEMP_FILE (lazy, created at the tfile's first spill), owned by
- * CONTAINMENT (D2 -- the QMGR_TEMP_FILE member pointer is the only owner; no
- * global registry, no reaper: crash leftovers are reclaimed by the shared #88
- * boot sweep, the file lives in the same cubrid_buffile tree as buffile with
- * a `spillpg_` name prefix).  Pages are addressed by the dispatcher's dense
- * pageid (membuf_last+1 ...) at byte offset pageid * stride.
+ * One page_spill_file per QMGR_TEMP_FILE (lazy, created at the tfile's first
+ * spill), owned by CONTAINMENT (the QMGR_TEMP_FILE member pointer is the only
+ * owner; no global registry, no reaper: crash leftovers are reclaimed by the
+ * shared boot sweep, the file lives in the same cubrid_buffile tree as buffile
+ * with a `spillpg_` name prefix).  Pages are addressed by the dispatcher's
+ * dense pageid (membuf_last+1 ...) at byte offset pageid * stride.
  *
- * Cache + coherence invariants (each one preserves the current raw-fd
- * consumer contract, so consumers are unmodified -- #126 재발 방지 근거는
- * 설계 §2 참조):
+ * Cache + coherence invariants (each preserves the existing consumer contract,
+ * so consumers are unmodified):
  *   INV-1 (visibility, resident-first): fix () returns the SAME buffer
  *     pointer for a resident page (ref++), so a writer's un-flushed dirty
  *     bytes are visible to every subsequent fixer by pointer identity.
@@ -48,13 +45,11 @@
  *     random-page equivalent of buffile's freeze check -- it turns silent
  *     zero-page corruption into noise).
  *
- * Locking (D3): ONE std::mutex per file.  The guard system keeps concurrent
- * same-tfile fixers at 0~1 threads (#126 px guard / #99 serial sort /
- * connect-by copy / Class-B materialize), so the lock is uncontended; a
- * single lock domain makes lookup->refcount atomic, which is why the raw-fd
- * ABA/retry/tombstone/2-domain-shard machinery has no equivalent here.
- * There is NO global read cache (D4 -- it was a #126 prime suspect; the OS
- * page cache absorbs re-reads of the unlinked temp file).
+ * Locking: ONE std::mutex per file.  The guard system keeps concurrent
+ * same-tfile fixers at 0~1 threads (serial sort / connect-by copy /
+ * materialize), so the lock is uncontended; a single lock domain makes
+ * lookup->refcount atomic.  There is NO global read cache -- the OS page cache
+ * absorbs re-reads of the unlinked temp file.
  */
 
 #ifndef _QFILE_PAGE_SPILL_HPP_
@@ -75,8 +70,8 @@ typedef struct fileio_page FILEIO_PAGE;
 namespace qfile
 {
 #if !defined (NDEBUG)
-  /* write-back fault injection (#86 idiom, debug-only): the Nth subsequent
-   * page_spill write-back fails as if the disk hit ENOSPC (er_set
+  /* write-back fault injection (debug-only): the Nth subsequent page_spill
+   * write-back fails as if the disk hit ENOSPC (er_set
    * ER_QPROC_OUT_OF_TEMP_SPACE, no pwrite).  nth <= 0 disarms. */
   void page_spill_fault_arm_flush_fail (int nth);
 
@@ -100,7 +95,7 @@ namespace qfile
 
       /* Closes + unlinks the file (census-tracked).  Remaining resident slots
        * are freed; a slot still referenced is a fix leak -- er_log + debug
-       * assert (the raw-fd leak-log equivalent). */
+       * assert. */
       ~page_spill_file ();
 
       std::uint64_t segment_id () const
@@ -133,9 +128,9 @@ namespace qfile
       page_spill_file &operator= (const page_spill_file &) = delete;
 
 #if !defined (NDEBUG)
-      /* In-server selftests (#132, design §7; env-gated in qmgr_initialize,
-       * debug-only, #93-style hard gates).  Member functions for full access
-       * to the cache internals.  Return 0 on PASS. */
+      /* In-server selftests (env-gated in qmgr_initialize, debug-only).
+       * Member functions for full access to the cache internals.  Return 0
+       * on PASS. */
       static int selftest (THREAD_ENTRY *thread_p);	/* CUBRID_WM_SPILL_SELFTEST: 257-page random-order
 							 * parity + sparse fault + TDE nonce distinctness */
       static int coherence_selftest (THREAD_ENTRY *thread_p);	/* CUBRID_WM_SPILL_COHERENCE_SELFTEST:
@@ -158,7 +153,7 @@ namespace qfile
 
       spill_file m_file;
       std::uint64_t m_seq = 0;	/* segment_id (global atomic issue) */
-      std::mutex m_mutex;	/* per-tfile single lock (D3) */
+      std::mutex m_mutex;	/* per-tfile single lock */
       std::unordered_map<PAGEID, PAGE_PTR> m_resident;	/* pageid -> shared buffer (INV-1) */
       std::unordered_map<PAGE_PTR, slot> m_slots;	/* buffer -> {pageid, ref, dirty}; file-local,
 							 * so cross-file pointer aliasing cannot occur */

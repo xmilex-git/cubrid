@@ -19,12 +19,11 @@
 /*
  * query_workmem.hpp - work-memory (work_mem) reservation accounting.
  *
- * Split out of temp_page_store (issue #143 S2/M1): the sharded work_mem
- * accountant lives here, separate from the qmgr temp-file backing dispatcher
- * in temp_page_store.  Leaf header (forward declarations only) so consumers
- * that only account (perf, hash_scan, qfile_tape) do not pull the dispatcher.
- * The declarations stay in namespace temp_page_store to preserve every call
- * site unchanged.
+ * The sharded work_mem accountant, separate from the qmgr temp-file backing
+ * dispatcher in temp_page_store.  Leaf header (forward declarations only) so
+ * consumers that only account (perf, hash_scan, qfile_tape) do not pull the
+ * dispatcher.  The declarations stay in namespace temp_page_store to preserve
+ * every call site unchanged.
  */
 
 #ifndef _QUERY_WORKMEM_HPP_

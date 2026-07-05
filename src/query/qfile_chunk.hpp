@@ -17,16 +17,12 @@
  */
 
 /*
- * qfile_chunk.hpp - Phase2 MIGRATE R2 parallel-read distribution
- *                   (redesign G008, issue #73; measurement hook for #68).
+ * qfile_chunk.hpp - parallel-read distribution.
  *
- * Axis-2 parallel read (R2): when a frozen Tapeset feeds N downstream readers,
- * work is handed out in Chunks -- contiguous 64-page OFFSET ranges over each
- * Tape's whole logical page space ([membuf prefix in RAM] ++ [private file on
- * disk]) -- claimed via one shared atomic counter (work-stealing).  This is the
- * new-backing replacement for the old sector + per-sector-bitmap work-stealing
- * (QFILE_LIST_SECTOR_SCAN_INFO / PR #7173), which is retired at contract
- * (ADR 0003).
+ * When a frozen Tapeset feeds N downstream readers, work is handed out in
+ * Chunks -- contiguous 64-page OFFSET ranges over each Tape's whole logical
+ * page space ([membuf prefix in RAM] ++ [private file on disk]) -- claimed via
+ * one shared atomic counter (work-stealing).
  *
  * No per-sector bitmap, no occupancy map: a live list's pages are a dense
  * 0..N-1 sequence (no mid-life dealloc -- qfile_truncate_list resets the whole
@@ -40,7 +36,7 @@
  * page it owns; continuation pages are skipped by every reader that does not
  * own the tuple's first page.
  *
- * Per-Tape metadata is two scalars (ADR 0003); the distributor keeps O(n_tapes)
+ * Per-Tape metadata is two scalars; the distributor keeps O(n_tapes)
  * cumulative-chunk offsets (n_tapes == parallel degree) and resolves a global
  * chunk index to a range on the fly -- it never materializes a per-page or
  * per-chunk table, so a multi-GB spill (millions of pages) costs nothing extra.
@@ -58,10 +54,10 @@ namespace qfile
 
   /*
    * r2_metrics - measurement hook for the offset-range parallel-read
-   * distribution (redesign G003/G008, issues #68/#73; SSOT #75 §6 (3)).
-   * Records how the Tapeset's logical page space was partitioned among the N
-   * readers so a gate can assert the work-stealing stays balanced (chunk-skew
-   * coefficient of variation <= 15%) and covers every page exactly once.
+   * distribution.  Records how the Tapeset's logical page space was
+   * partitioned among the N readers so a gate can assert the work-stealing
+   * stays balanced (chunk-skew coefficient of variation <= 15%) and covers
+   * every page exactly once.
    */
   struct r2_metrics
   {
@@ -80,9 +76,9 @@ namespace qfile
 
   /*
    * chunk_distributor - 64-page offset-range atomic work-stealing over a
-   * frozen Tapeset's logical page space (ADR 0003 R2, tape-model "Parallel
-   * read").  Construct once over the Tapeset (or explicit per-Tape page
-   * counts) with the reader count; each reader repeatedly claims the next
+   * frozen Tapeset's logical page space.  Construct once over the Tapeset (or
+   * explicit per-Tape page counts) with the reader count; each reader
+   * repeatedly claims the next
    * chunk via next_chunk() until the space is exhausted.  Thread-safe through a
    * single atomic fetch_add over the global chunk index; each reader accounts
    * only its own page total (its own slot), so there is no per-page lock and no
@@ -113,9 +109,9 @@ namespace qfile
       bool next_chunk (int reader_id, range &out);
 
       /* Bump the shared chunk cursor forward past every chunk of `tape_idx`
-       * that lies ENTIRELY within [0 .. run_end_page] (ADR 0006).  Called by a
-       * reader that consumed (or skipped) an overflow run so its continuation-
-       * only chunks are not separately claimed and re-read.  A boundary chunk
+       * that lies ENTIRELY within [0 .. run_end_page].  Called by a reader
+       * that consumed (or skipped) an overflow run so its continuation-only
+       * chunks are not separately claimed and re-read.  A boundary chunk
        * that also holds post-run tuple starts is left claimable.  Forward-only
        * and lock-free (CAS); safe under concurrent readers. */
       void skip_to_after (int tape_idx, int run_end_page);

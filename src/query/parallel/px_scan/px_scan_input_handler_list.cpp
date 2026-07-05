@@ -75,9 +75,9 @@ namespace parallel_scan
 	return NO_ERROR;
       }
 
-    /* #113/#130: an OLD-backed list never opens a parallel list scan (the
-     * scan-open guard demotes it to a serial list scan) and the OLD sector
-     * reader is deleted; reaching here is a guard violation. */
+    /* a pgbuf-backed list never opens a parallel list scan (the scan-open guard
+     * demotes it to a serial list scan) and the pgbuf sector reader is deleted;
+     * reaching here is a guard violation. */
     assert (false);
     er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
     return ER_FAILED;
@@ -129,13 +129,13 @@ namespace parallel_scan
 	    return S_END;
 	  }
 
-	/* NEW Tapeset input is tuple-sourced by the worker's tapeset_reader; the
+	/* tapeset input is tuple-sourced by the worker's tapeset_reader; the
 	 * null page sentinel only drives the existing task set_page/drain loop. */
 	return S_SUCCESS;
       }
 
-    /* #113/#130: an OLD-backed list never reaches a parallel list scan; the OLD
-     * sector page walk is deleted. */
+    /* a pgbuf-backed list never reaches a parallel list scan; the pgbuf sector
+     * page walk is deleted; reaching here is a guard violation. */
     assert (false);
     er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
     return S_ERROR;

@@ -28,8 +28,8 @@
 #include "log_impl.h"
 #include "object_representation.h"
 #include "page_buffer.h"
-#include "qfile_page_spill.hpp"	/* (c′) PAGE_SPILL backing (#132) */
-#include "qfile_spill_file.hpp"	/* qfile::spill_file::set_os_error (shared substrate, #132) */
+#include "qfile_page_spill.hpp"	/* PAGE_SPILL backing */
+#include "qfile_spill_file.hpp"	/* qfile::spill_file::set_os_error (shared substrate) */
 #include "query_manager.h"
 #include "query_workmem.hpp"	/* work_mem accountant (reserve_held / release_held_reservation) */
 #include "system_parameter.h"
@@ -227,7 +227,7 @@ namespace
 
 namespace temp_page_store
 {
-  /* (c′) PAGE_SPILL consumer shim (#132): an unknown page (e.g. a membuf
+  /* PAGE_SPILL consumer shim: an unknown page (e.g. a membuf
    * page routed through the same qmgr call path) is a silent NO_ERROR. */
   int
   spill_release_fixed_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p) noexcept
@@ -339,9 +339,8 @@ namespace temp_page_store
     qmgr_temp_file_move_selftest_init (&src);
     qmgr_temp_file_move_selftest_init (&dst);
 
-    /* (c′) leg (#132, design §4 D5): the page-spill handle moves by plain
-     * pointer transfer (containment ownership -- no registry reassign), and
-     * src resets to pristine MEMBUF.  No gate/master dependency. */
+    /* the page-spill handle moves by plain pointer transfer (containment
+     * ownership -- no registry reassign), and src resets to pristine MEMBUF. */
     {
       int os_error = 0;
       qfile::page_spill_file *spill_p =
@@ -408,8 +407,7 @@ namespace temp_page_store
               return tfile_p->membuf[tfile_p->membuf_last];
             }
 
-          /* (c′) page-spill backing (#132; the sole membuf-overflow backing
-           * since 커밋 B #137).  The choice is made ONCE at the tfile's first
+          /* page-spill backing: the choice is made ONCE at the tfile's first
            * spill; the PAGE_SPILL tag pins it thereafter. */
           int os_error = 0;
           if (tfile_p->page_spill_handle == NULL)

@@ -18,7 +18,7 @@
 
 /*
  * query_workmem.cpp - work-memory (work_mem) reservation accounting.
- * Split out of temp_page_store.cpp (issue #143 S2/M1).  See query_workmem.hpp.
+ * See query_workmem.hpp.
  */
 
 #include "query_workmem.hpp"
@@ -107,7 +107,7 @@ namespace
   void
   init_accountant () noexcept
   {
-    /* The P1a cap is intentionally internal: use a conservative fraction of the data buffer so work_mem cannot grow
+    /* The cap is intentionally internal: use a conservative fraction of the data buffer so work_mem cannot grow
      * with concurrency to the size of the whole buffer pool; keep a fixed ceiling for large installations and a small
      * floor for default test databases.  This is not a GUC and is surfaced only through perf peek statistics. */
     const int page_buffer_pages = std::max (prm_get_integer_value (PRM_ID_PAGE_BUFFER_SIZE), 0);
@@ -152,8 +152,8 @@ namespace
 
 namespace temp_page_store
 {
-  /* Internal accounting helpers (issue #143 S2/M4): consumed only within this TU,
-   * so they are declared static here instead of in query_workmem.hpp -- the public
+  /* Internal accounting helpers consumed only within this TU, so they are
+   * declared static here instead of in query_workmem.hpp -- the public
    * accountant surface stays limited to cap_bytes / reserved_bytes. */
   static std::size_t headroom_bytes () noexcept;
   static std::size_t shard_count () noexcept;
@@ -220,7 +220,7 @@ namespace temp_page_store
 
     if (tfile_p->page_spill_handle != NULL)
       {
-        /* containment ownership (D2, #132): delete = close + unlink + census */
+        /* containment ownership: delete = close + unlink + census */
         delete tfile_p->page_spill_handle;
         tfile_p->page_spill_handle = NULL;
       }
@@ -346,10 +346,9 @@ namespace temp_page_store
   std::size_t
   position_budget_bytes () noexcept
   {
-    /* P4 introduces fixed-size segment-aware tuple positions.  Charge the held reservation for widened saved-scan,
+    /* Fixed-size segment-aware tuple positions.  Charge the held reservation for widened saved-scan,
      * hash-list and connect-by parent-position bytes.  reserve_held still enforces
-     * reserved <= cap + worst_case_slack, with worst_case_slack = shard_count * refill_quantum.
-     * (The raw-fd read-cache placeholder charge was zeroed out with the raw-fd deletion, 커밋 B #137.) */
+     * reserved <= cap + worst_case_slack, with worst_case_slack = shard_count * refill_quantum. */
     return WORKMEM_POSITION_SAVED_SCAN_BUDGET * projected_tuple_position_bytes
       + WORKMEM_POSITION_HASH_ENTRY_BUDGET * projected_tuple_simple_pos_bytes
       + WORKMEM_CONNECT_BY_PARENT_BUDGET * projected_tuple_position_db_bytes;

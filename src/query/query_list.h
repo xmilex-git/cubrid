@@ -431,15 +431,9 @@ struct sort_list
 
 typedef struct qfile_list_id QFILE_LIST_ID;
 
-/* Migration backing-kind tag (redesign G008, issue #73; Phase 2 MIGRATE).
- * During expand->migrate the OLD backing (membuf / page-spill / pgbuf temp)
- * and the NEW backing (Tapeset / per-worker private file / offset
- * arithmetic) coexist, but a SINGLE list is produced wholly by one path --
- * never a mix (operator-atomic switch).  This permanently avoids the
- * mixed-backing scan that produced garbled results and the +209%/crash dead
- * end (evidence FAIL-03 / FAIL-06).  The tag is the migration-limited dispatch
- * discriminator; it is deleted at contract (Phase 3) with the OLD variants.
- * NONE = not yet committed to a backing (a freshly cleared list). */
+/* Backing kind of a list.  A list is produced wholly by ONE backing, never
+ * a mix (a mixed-backing scan would return garbage).  NONE = not yet
+ * committed to a backing (freshly cleared list). */
 enum qfile_backing_kind
 {
   QFILE_BACKING_NONE = 0,
@@ -465,31 +459,26 @@ struct qfile_list_id
   QFILE_TUPLE_DESCRIPTOR tpl_descr;	/* tuple descriptor */
   bool is_domain_resolved;	/* domains for host var is resolved or not */
   bool is_result_cached;	/* for subquery result cache */
-  /* Phase1 1A scan contract (redesign G005, issue #70).  Ordered Tape vector
-   * (Tapeset) that replaces cross-file next_vpid linkage as the connection
-   * structure (SSOT #75 §3.2 B1, ADR 0002).  NULL = legacy single-backing list
-   * (no behavior change).  Opaque (qfile::tapeset *); access via the accessor
-   * macro below.  Not serialized (transient runtime structure). */
+  /* Ordered Tape vector (Tapeset) forming the list's connection structure.
+   * NULL = legacy single-backing list.  Opaque (qfile::tapeset *); access via
+   * the accessor macro below.  Not serialized (transient runtime structure). */
   void *tapeset_;		/* (access via QFILE_LIST_ID_TAPESET) */
   bool owns_tapeset_;		/* this list_id owns/free the tapeset (access via QFILE_LIST_ID_OWNS_TAPESET) */
-  bool tapeset_contains_overflow_;	/* NEW Tapeset has ADR0006 overflow tuple pages; page-parallel list scan must avoid it. */
-  /* Migration backing-kind tag (redesign G008, issue #73).  QFILE_BACKING_NONE
-   * on a cleared list; set OLD/NEW when a producer commits a backing.  Access
-   * via QFILE_LIST_ID_BACKING_KIND.  Not serialized (transient runtime tag). */
+  bool tapeset_contains_overflow_;	/* Tapeset has overflow tuple pages; page-parallel list scan must avoid it. */
+  /* Backing-kind tag.  QFILE_BACKING_NONE on a cleared list; set to the pgbuf or
+   * tapeset kind when a producer commits a backing.  Access via
+   * QFILE_LIST_ID_BACKING_KIND.  Not serialized (transient runtime tag). */
   QFILE_BACKING_KIND backing_kind_;
-  /* Phase2 2A-1 producer hook (redesign #78).  While a NEW-backed list is being
-   * PRODUCED, producer_writer_ holds the qfile::tape_writer that completed pages
-   * are appended to, and producer_page_ is the single reusable in-memory page
-   * being filled (== last_pgptr).  Both NULL for OLD production and after freeze.
-   * Opaque; access via the accessor macros.  Not serialized (transient). */
+  /* Producer hook for a tapeset-backed list being produced: producer_writer_ is
+   * the qfile::tape_writer completed pages are appended to, producer_page_ the
+   * single reusable in-memory page being filled (== last_pgptr).  Both NULL for
+   * pgbuf production and after freeze.  Opaque; not serialized (transient). */
   void *producer_writer_;	/* qfile::tape_writer * (QFILE_LIST_ID_PRODUCER_WRITER) */
   void *producer_page_;		/* scratch page being filled (QFILE_LIST_ID_PRODUCER_PAGE) */
-  /* Close-failure latch (redesign #78, issue #86).  qfile_close_list is void
-   * (its callers predate any "close can fail" concept), so a NEW-production
-   * close that loses the final page append or whose freeze flush fails records
-   * the failure here instead of returning silently.  qfile_open_list_scan then
-   * raises ER_QPROC_OUT_OF_TEMP_SPACE on a failed list rather than serving a
-   * silently truncated / empty result.  Transient runtime tag; not serialized. */
+  /* Close-failure latch: qfile_close_list is void, so a tapeset-production close
+   * that loses the final page or fails its freeze flush records it here, and
+   * qfile_open_list_scan then raises ER_QPROC_OUT_OF_TEMP_SPACE rather than
+   * serving a truncated result.  Not serialized (transient). */
   bool producer_failed_;	/* (access via QFILE_LIST_ID_PRODUCER_FAILED) */
 };
 
@@ -535,19 +524,12 @@ struct qfile_list_id
   while (0)
 
 /*
- * QFILE_LIST_ID accessor shim  (Phase1 1A-0 — redesign G004, issue #69).
- *
- * Route EVERY access to the connection-identity (first_vpid/last_vpid) and
- * backing (tfile_vfid) fields through these accessors so the compiler
- * enumerates every consumer of the F1 (qfile_copy_list_id /
- * qfile_clear_list_id ownership) and F3 (Phase3 symbol sweep) surfaces.  No
- * behavior change: each accessor expands to the original lvalue, so reads,
- * writes and address-of (&...) all keep working unchanged.
- *
- * The trailing-underscore raw fields (first_vpid_/last_vpid_/tfile_vfid_) MUST
- * NOT be accessed directly outside of these macros and QFILE_CLEAR_LIST_ID (the
- * canonical initializer).  Adding a new direct field access is a compile error
- * by design.
+ * QFILE_LIST_ID accessor shim.  Route every access to the connection-identity
+ * (first_vpid/last_vpid) and backing (tfile_vfid) fields through these
+ * accessors; each expands to the original lvalue, so reads, writes and
+ * address-of all keep working.  The trailing-underscore raw fields
+ * (first_vpid_/last_vpid_/tfile_vfid_) MUST NOT be accessed directly outside
+ * these macros and QFILE_CLEAR_LIST_ID (the canonical initializer).
  */
 #define QFILE_LIST_ID_FIRST_VPID(list_id)  ((list_id)->first_vpid_)
 #define QFILE_LIST_ID_LAST_VPID(list_id)   ((list_id)->last_vpid_)
@@ -560,26 +542,23 @@ struct qfile_list_id
 #define QFILE_LIST_ID_PRODUCER_FAILED(list_id) ((list_id)->producer_failed_)
 #define QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW(list_id) ((list_id)->tapeset_contains_overflow_)
 
-/* Synthetic marker volid for a NEW (Tapeset)-backed top-level result served
- * directly to the client without pgbuf materialization (#120a).  The client
- * fetch descriptor's first_vpid (and every synthesized next_vpid) carries this
- * volid; the pageid is a global logical page index over the result's Tapeset.
- * It is inert -- the server decides "serve from Tapeset" from the retained
- * list's backing, never routing this VPID into volume/pgbuf code -- but the
- * value stays clear of every real volid (perm/temp are >= 0; reserved auxiliary
- * volids are small negatives down to -22 and SHRT_MIN+1) so it can never be
- * mistaken for a real list-file page. */
+/* Synthetic marker volid for a tapeset-backed top-level result served directly
+ * to the client without pgbuf materialization.  The client fetch descriptor's
+ * first_vpid (and every synthesized next_vpid) carries this volid; the pageid
+ * is a global logical page index over the result's Tapeset.  It is inert -- the
+ * server routes it from the retained list's backing, never into volume/pgbuf
+ * code -- and the value stays clear of every real volid (perm/temp are >= 0;
+ * reserved auxiliary volids are small negatives down to -22 and SHRT_MIN+1) so
+ * it can never be mistaken for a real list-file page. */
 #define QFILE_TAPESET_FETCH_VOLID  ((VOLID) -1000)
 
 /*
- * No-mixed-backing invariant (redesign G008, issue #73; SSOT #75 §5.5 (7) /
- * §6).  A list "has OLD backing" when it is physically backed the legacy way
- * (a real first-page VPID, or an old temp-file handle); it "has NEW backing"
- * when it carries a Tapeset.  The migration invariant: a single list never
- * holds BOTH at once -- producers switch backing operator-atomically, so the
- * mixed-backing scan (FAIL-03/06) can never recur.  qfile_list_is_mixed_backing
- * returns true on a violation; producers assert it via
- * qfile_check_no_mixed_backing (debug-only).
+ * No-mixed-backing invariant.  A list "has pgbuf backing" when it is backed the
+ * legacy way (a real first-page VPID, or a temp-file handle) and "has tapeset
+ * backing" when it carries a Tapeset; a single list never holds BOTH at once
+ * (producers switch backing operator-atomically), so a mixed-backing scan can
+ * never recur.  qfile_list_is_mixed_backing returns true on a violation;
+ * qfile_check_no_mixed_backing asserts it (debug-only).
  */
 static inline bool
 qfile_list_has_pgbuf_backing (const QFILE_LIST_ID * list_id)
@@ -603,31 +582,21 @@ qfile_list_is_mixed_backing (const QFILE_LIST_ID * list_id)
 static inline void
 qfile_check_no_mixed_backing (const QFILE_LIST_ID * list_id)
 {
-  /* Debug-only.  Never fires today: real lists are still all OLD and the NEW
-   * backing is additive and disconnected.  Becomes load-bearing once Phase 2
-   * producers commit a NEW backing -- a single list staying one kind keeps the
-   * violation count at 0 (SSOT #75 §6 (7)). */
+  /* Debug-only assert of the no-mixed-backing invariant. */
   assert (!qfile_list_is_mixed_backing (list_id));
 }
 
 /*
- * Backing-kind ENTRY guard (SSOT #75 round-3 (d)/(e); ADR 0002/0003/0005).
- *
- * Generalizes the no-mixed-backing invariant from a per-list debug assert to a
- * production-hard check at every backing-SENSITIVE consume boundary: an OLD
- * mechanism (qfile_append_list) must reject a NEW
- * (Tapeset) list, and a NEW
- * mechanism (chunk_distributor / tapeset_scan) must reject an OLD list.  The
- * entry boundary is the cheapest place (one check per operator open) to stop the
- * worst failure class (silent wrong result, FAIL-03/06) before any garbage read,
- * so it is hardened in release builds (er_set + error), unlike the per-tuple /
- * per-page checks which stay debug-only asserts.  combine_two_list is EXEMPT
- * (scan-based, not a VPID-header bypass -- IR-8).
+ * Backing-kind ENTRY guard.  A pgbuf mechanism (qfile_append_list) must reject a
+ * tapeset list, and a tapeset mechanism (chunk_distributor / tapeset_scan) must
+ * reject a pgbuf list.  Hardened at the consume boundary in release builds
+ * (er_set + error), unlike the per-tuple/per-page debug-only asserts.
+ * combine_two_list is EXEMPT (scan-based, not a VPID-header bypass).
  *
  * qfile_backing_mechanism_violation is the pure (er_set-free) detector so a
  * bootless unit test can exercise it; qfile_backing_guard (list_file.c) is the
- * production-hard wrapper that er_sets, bumps the A~E counter and returns an
- * error code.
+ * production-hard wrapper that er_sets, bumps the counter and returns an error
+ * code.
  */
 static inline bool
 qfile_backing_mechanism_violation (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism)
@@ -652,34 +621,32 @@ extern "C"
 {
 #endif
 /* Production-hard entry guard: returns NO_ERROR or an error code (er_set on
- * violation; an OLD mechanism touching a NEW list also bumps the A~E counter). */
+ * violation; a pgbuf mechanism touching a tapeset list also bumps the
+ * pgbuf-touch counter). */
 extern int qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism, const char *file,
 				int line);
 
-/* A~E runtime counter: "a NEW-backed list was touched by an OLD scan-bypass
- * path" (evidence §H-3 inventory A~E).  MUST read 0 on a migrated NEW operator
- * (SSOT #75 §6).  Process-wide; reset is for tests. */
+/* Counter: a tapeset-backed list was touched by a pgbuf scan-bypass path.
+ * MUST read 0 on a migrated tapeset operator.  Process-wide; reset is for tests. */
 extern void qfile_ae_record_pgbuf_touch (void);
 extern long qfile_ae_pgbuf_touch_count (void);
 extern void qfile_ae_reset_pgbuf_touch_count (void);
 
-/* Sibling counter: a list was actually converted to NEW(Tapeset) backing
- * (qfile_list_make_tapeset_backed()).  Process-wide; reset is for tests. Both
+/* Sibling counter: a list was actually converted to tapeset backing
+ * (qfile_list_make_tapeset_backed()).  Process-wide; reset is for tests.  Both
  * counters are also exposed via `cubrid statdump` (PSTAT_QF_NEW_BACKED_CREATE /
- * PSTAT_QF_OLD_TOUCH_ON_NEW, redesign #78/#92). */
+ * PSTAT_QF_OLD_TOUCH_ON_NEW). */
 extern void qfile_tapeset_backed_record_create (void);
 extern long qfile_tapeset_backed_create_count (void);
 extern void qfile_tapeset_backed_reset_create_count (void);
 
-/* #120 client-fetch routing census (statdump PSTAT_QF_CLIENT_FETCH_SERVE /
+/* Client-fetch routing census (statdump PSTAT_QF_CLIENT_FETCH_SERVE /
  * PSTAT_QF_CLIENT_FETCH_MATERIALIZE): Tapeset direct serves of client fetch
- * requests vs actual Class-B pgbuf materializations.  The "materialize firing
- * 0" acceptance (#120) is asserted from statdump deltas of these. */
+ * requests vs actual pgbuf materializations. */
 extern void qfile_client_fetch_record_serve (void);
 extern void qfile_client_fetch_record_materialize (void);
 
-/* Release-hard backstop for the store-to-DB TAPE-misuse invariant (#105).  Kept
- * out of the inline (same philosophy as qfile_backing_guard above): raises
+/* Release-hard backstop for the store-to-DB TAPE-misuse invariant: raises
  * ER_QPROC_UNKNOWN_CRSPOS so a TAPE coord that reaches
  * qfile_tuple_position_store_to_db -- which QFILE_TUPLE_POSITION_DB cannot
  * represent -- fails loudly in release instead of punning into a bogus VPID. */
@@ -697,10 +664,10 @@ enum qfile_tuple_position_coordinate_type
 {
   QFILE_TUPLE_POSITION_COORD_VPID = 0,
   QFILE_TUPLE_POSITION_COORD_SPILL = 1,
-  /* Tape-relative coordinate (redesign G005, issue #70 / ADR 0002): a tuple is
-   * addressed by (tape_idx, tape_page_offset, tape_byte_offset) + tplno, by
-   * pure offset arithmetic — no VPID, no spill segment.  Intra-query only
-   * (never stored to QFILE_TUPLE_POSITION_DB; CONNECT BY does not serialize it). */
+  /* Tape-relative coordinate: a tuple is addressed by (tape_idx,
+   * tape_page_offset, tape_byte_offset) + tplno, by pure offset arithmetic — no
+   * VPID, no spill segment.  Intra-query only (never stored to
+   * QFILE_TUPLE_POSITION_DB; CONNECT BY does not serialize it). */
   QFILE_TUPLE_POSITION_COORD_TAPE = 2
 };
 typedef enum qfile_tuple_position_coordinate_type QFILE_TUPLE_POSITION_COORDINATE_TYPE;
@@ -831,13 +798,11 @@ qfile_tuple_position_db_is_spill (const QFILE_TUPLE_POSITION_DB * tuple_position
 static inline int
 qfile_tuple_position_store_to_db (QFILE_TUPLE_POSITION_DB * stored_p, const QFILE_TUPLE_POSITION * src_p)
 {
-  /* QFILE_TUPLE_POSITION_DB has no TAPE variant (COORD_TAPE is intra-query only, see the
-   * enum comment) -- a TAPE-coord src_p would otherwise fall through to the VPID branch
-   * below and get its tape_idx/tape_page_offset punned into vpid.pageid/volid (#85, #105).
-   * The part-1 CONNECT BY guard (#105) keeps a NEW(Tapeset) list from ever reaching the
-   * parent-pos recalc, so this never fires in normal operation.  It is the release-hard
-   * backstop: debug aborts on the assert; release raises ER_QPROC_UNKNOWN_CRSPOS and
-   * refuses the punning store (returns error) instead of silently persisting a bogus VPID. */
+  /* QFILE_TUPLE_POSITION_DB has no TAPE variant (COORD_TAPE is intra-query only, see
+   * the enum comment): a TAPE-coord src_p would otherwise fall through to the VPID
+   * branch below and get its tape offsets punned into vpid.pageid/volid.  Release-hard
+   * backstop -- debug aborts on the assert, release raises ER_QPROC_UNKNOWN_CRSPOS and
+   * refuses the store (returns error) instead of persisting a bogus VPID. */
   if (qfile_tuple_position_is_tape (src_p))
     {
       assert (false);
@@ -901,10 +866,9 @@ struct qfile_list_scan_id
   int curr_tplno;		/* current tuple number */
   QFILE_TUPLE_RECORD tplrec;	/* used for overflow tuple peeking */
   QFILE_LIST_ID list_id;	/* list file identifier */
-  /* Phase1 1A scan contract (redesign G005, issue #70).  When the scanned
-   * list_id carries a Tapeset (QFILE_LIST_ID_TAPESET != NULL), this holds the
-   * offset-arithmetic multi-Tape scan driver (qfile::tapeset_scan *).  NULL =
-   * legacy single-backing scan (no behavior change). */
+  /* When the scanned list_id carries a Tapeset (QFILE_LIST_ID_TAPESET != NULL),
+   * this holds the offset-arithmetic multi-Tape scan driver
+   * (qfile::tapeset_scan *).  NULL = legacy single-backing scan. */
   void *tapeset_scan_;
 };
 

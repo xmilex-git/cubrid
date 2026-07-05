@@ -17,26 +17,23 @@
  */
 
 /*
- * qfile_spill_file.hpp - shared spill-file substrate (Phase3 (c′), issue #74/#132).
+ * qfile_spill_file.hpp - shared spill-file substrate.
  *
- * The pieces every private spill backing needs, extracted from qfile_buffile
- * so the append-only buffile and the random-page page_spill_file variants
- * share ONE file substrate instead of carrying two copies (raw-fd being the
- * second copy this extraction exists to retire):
+ * The pieces every private spill backing needs, shared by the append-only
+ * buffile and the random-page page_spill_file so the two variants use ONE
+ * file substrate instead of each carrying its own copy:
  *   - fd/path/TDE-algo/stride ownership + the create factory core
  *     (open (O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC, 0600), os_error out),
  *   - dtor close+unlink+census,
  *   - EINTR-looped positional I/O (full_pwrite / full_pread),
- *   - the per-server scratch tree + boot orphan sweep (issue #88),
- *   - the tape_backing_census orphan-scan hooks (issue #68),
+ *   - the per-server scratch tree + boot orphan sweep,
+ *   - the tape_backing_census orphan-scan hooks,
  *   - per-page TDE staging helpers (fresh nonce per physical write --
  *     guaranteed by the tde_encrypt_data_page primitive itself),
- *   - the fd-exhaustion/disk-full errno -> ER_QPROC_OUT_OF_TEMP_SPACE
- *     mapping, promoted from per-caller copies (#125).
+ *   - the fd-exhaustion/disk-full errno -> ER_QPROC_OUT_OF_TEMP_SPACE mapping.
  *
- * This is a mechanical extraction (composition, not inheritance -- no
- * virtuals, no indirect calls): buffile's public API, invariant comments and
- * hot-path shape are unchanged (design #74 [(c′) coherence 설계] §1, D1).
+ * Composition, not inheritance (no virtuals, no indirect calls): each backing
+ * owns a spill_file by value, keeping its public API and hot-path shape intact.
  */
 
 #ifndef _QFILE_SPILL_FILE_HPP_
@@ -57,8 +54,7 @@ typedef struct fileio_page FILEIO_PAGE;
 namespace qfile
 {
   /*
-   * tape_backing_census - process-wide orphan-scan hook (redesign G003, issue
-   * #68; the 1C slice, SSOT #75 §5.5 (1) / §6, ADR 0001).  Counts the two
+   * tape_backing_census - process-wide orphan-scan hook.  Counts the two
    * backing resources a holdable result owns: open private-file handles and
    * RAM membuf-prefix pages held by frozen Tapes.  Two invariants are asserted
    * against it:
@@ -67,7 +63,7 @@ namespace qfile
    *   - session teardown drives BOTH back to the pre-result baseline
    *     (orphan-zero: file handles AND RAM prefix, not just files).
    * Counters are atomic because per-worker backings open/close concurrently;
-   * they only move on the new-backing path, so legacy single-backing queries
+   * they only move on the per-worker backing path, so single-backing queries
    * pay nothing.
    */
   struct tape_backing_census_snapshot
@@ -90,18 +86,18 @@ namespace qfile
   bool full_pwrite (int fd, const void *buf, std::size_t len, off_t offset) noexcept;
   bool full_pread (int fd, void *buf, std::size_t len, off_t offset) noexcept;
 
-  /* One-shot boot sweep of this server's cubrid_buffile spill subtree (issue
-   * #88): wipes files orphaned by a kill -9'd previous run.  Idempotent
-   * (std::call_once).  spill_scratch_default_dir () runs it lazily on first
-   * use; calling it at boot keeps the sweep off the query hot path. */
+  /* One-shot boot sweep of this server's cubrid_buffile spill subtree: wipes
+   * files orphaned by a kill -9'd previous run.  Idempotent (std::call_once).
+   * spill_scratch_default_dir () runs it lazily on first use; calling it at
+   * boot keeps the sweep off the query hot path. */
   void spill_scratch_boot_sweep ();
 
   /* Resolve the per-server default scratch directory: $CUBRID_TMP, else the
    * database volume directory, then <base>/cubrid_buffile/<db>/<server_id>
    * (server_id persists across restarts in a per-db marker file, so boot
-   * sweeps only this server's own subtree; issue #88).  No /tmp or $TMP
-   * fallback -- both can be tmpfs, which would defeat spilling.  Returns
-   * false if no disk-backed base can be formed. */
+   * sweeps only this server's own subtree).  No /tmp or $TMP fallback -- both
+   * can be tmpfs, which would defeat spilling.  Returns false if no disk-backed
+   * base can be formed. */
   bool spill_scratch_default_dir (std::string &out);
 
   /*
@@ -160,16 +156,15 @@ namespace qfile
 	return full_pread (m_fd, buf, len, offset);
       }
 
-      /* Promoted os_error -> er_set mapping (#125; was copied per caller):
-       * fd exhaustion / disk-full class errno (EMFILE/ENFILE/ENOSPC/EDQUOT)
-       * is diagnosed as ER_QPROC_OUT_OF_TEMP_SPACE -- an actionable temp-space
-       * error -- anything else as generic ER_FAILED. */
+      /* os_error -> er_set mapping: fd exhaustion / disk-full class errno
+       * (EMFILE/ENFILE/ENOSPC/EDQUOT) is diagnosed as ER_QPROC_OUT_OF_TEMP_SPACE
+       * -- an actionable temp-space error -- anything else as generic ER_FAILED. */
       static void set_os_error (int os_error);
 
       /* Stage one DB_PAGESIZE list page for an encrypted write: wrap it in an
        * IO_PAGESIZE FILEIO_PAGE (plain_scratch) and encrypt into cipher_out.
        * tde_encrypt_data_page (…, is_temp=true, …) takes a FRESH nonce on
-       * every call, so each physical (re)write is uniquely keyed (SSOT §5 (3)). */
+       * every call, so each physical (re)write is uniquely keyed. */
       static int tde_stage_encrypt (const PAGE_PTR list_page, int page_index, TDE_ALGORITHM tde_algo,
 				    FILEIO_PAGE *plain_scratch, FILEIO_PAGE *cipher_out);
 

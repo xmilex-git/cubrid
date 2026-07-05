@@ -2382,15 +2382,12 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
       qfile_clear_list_id (xasl->list_id);
     }
 
-  /* E-1 (#79): close this node's scans BEFORE clearing children so that any
-   * tapeset_reader / tapeset_scan on a child's list_id is released before the
-   * child's tapeset is destroyed.  OLD backing is protected by pgbuf
-   * refcounting, but NEW Tapeset backing has no such protection — destroying
-   * a Tapeset while an active tapeset_reader references it is use-after-free.
-   *
-   * scan_end_scan / scan_close_scan are idempotent (return immediately when
-   * status is S_ENDED / S_CLOSED), so the per-proc-type calls later in the
-   * switch block become harmless no-ops. */
+  /* Close this node's scans BEFORE clearing children so that any tapeset_reader /
+   * tapeset_scan on a child's list_id is released before the child's tapeset is
+   * destroyed: pgbuf backing is protected by pgbuf refcounting, but tapeset
+   * backing has none, so destroying a Tapeset while an active tapeset_reader
+   * references it is use-after-free.  scan_end_scan / scan_close_scan are
+   * idempotent, so the per-proc-type calls later in the switch become no-ops. */
   if (xasl->curr_spec)
     {
       scan_end_scan (thread_p, &xasl->curr_spec->s_id);
@@ -2939,8 +2936,8 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
   /* Final teardown of correlated DBLink CCI handles (parallel aptr path). */
   qexec_final_close_dblink_specs (xasl);
 
-  /* E-1 (#79): close scans before clearing children — same rationale as the
-   * non-parallel path (see comment in qexec_clear_xasl). */
+  /* Close scans before clearing children — same rationale as the non-parallel
+   * path (see comment in qexec_clear_xasl). */
   if (xasl->curr_spec)
     {
       scan_end_scan (thread_p, &xasl->curr_spec->s_id);
@@ -5677,13 +5674,13 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
    * Now load up the sort module and set it off...
    */
   gbstate.key_info.use_original = (gbstate.key_info.nkeys != list_id->type_list.type_cnt);
-  /* When the input list is NEW-backed, VPID back-references are invalid (#80).  Carry the
+  /* When the input list is tapeset-backed, VPID back-references are invalid.  Carry the
    * non-key columns inside the sort records instead of just dropping use_original — a plain
    * A_sort_key materializes only the group columns, so the aggregate regu vars would read
-   * past the truncated reconstructed tuple (#100).  A spill-overflowed OLD input gets the
-   * same treatment for performance (#107): the per-SORT_REC use_original re-fix is a real
-   * pread past membuf_last, amplified per-row by the sorted-order access pattern; a
-   * bail-out here is harmless (VPID back-references stay valid — slow but correct). */
+   * past the truncated reconstructed tuple.  A spill-overflowed pgbuf input gets the same
+   * treatment for performance: the per-SORT_REC use_original re-fix is a real pread past
+   * membuf_last, amplified per-row by the sorted-order access pattern; a bail-out here is
+   * harmless (VPID back-references stay valid — slow but correct). */
   if (gbstate.key_info.use_original == 1
       && (qfile_list_has_tapeset (list_id) || qfile_list_is_page_spilled (list_id)))
     {
@@ -7447,15 +7444,14 @@ qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * x
   qfile_copy_list_id (xasl->list_id, list_id, true, QFILE_PROHIBIT_DEPENDENT);
   QFILE_FREE_AND_INIT_LIST_ID (list_id);
 
-  /* Merge join builds an OLD (appendable) output list by qfile_add_tuple
+  /* Merge join builds a pgbuf (appendable) output list by qfile_add_tuple
    * (qexec_merge_list / qexec_merge_list_outer both open it via qfile_open_list);
    * when that result feeds a parallel consumer (e.g. the GROUP BY over the join
-   * here) the OLD MERGEABLE_LIST sector reader drops rows on a list that is not
+   * here) the pgbuf MERGEABLE_LIST sector reader drops rows on a list that is not
    * itself a parallel-scan producer output (px_scan.cpp).  Promote the finished
-   * list to NEW so the tuple-level Tapeset reader is used instead.
-   * Skip a cached result file (copy-out path, OLD materialize -- #94).  This is
-   * the same site-specific NEW-promote direction as UNION ALL C-3 (43048f481):
-   * the merge output is consumed, not reopened/appended.  (#117 C-1/2) */
+   * list to tapeset so the tuple-level Tapeset reader is used instead.  Skip a
+   * cached result file (copy-out path): the merge output is consumed, not
+   * reopened/appended. */
   if (!QFILE_IS_FLAG_SET (ls_flag, QFILE_FLAG_RESULT_FILE)
       && qfile_list_promote_old_to_new (thread_p, xasl->list_id) != NO_ERROR)
     {
@@ -8666,9 +8662,9 @@ qexec_execute_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl
 	{
 	  /* clear bptr subquery list files */
 #if !defined (NDEBUG)
-	  /* #89: this per-row re-clear must never race a still-open scan on a
-	   * bptr result (that would be a genuine premature-clear bug, distinct
-	   * from the #87/#89-E1 teardown ordering, which is already safe). */
+	  /* This per-row re-clear must never race a still-open scan on a bptr
+	   * result (that would be a genuine premature-clear bug, distinct from the
+	   * teardown ordering handled elsewhere). */
 	  for (XASL_NODE * chk89 = xasl->bptr_list; chk89 != NULL; chk89 = chk89->next)
 	    {
 	      assert (chk89->list_id == NULL || qfile_list_id_open_scan_count (chk89->list_id) == 0);
@@ -8748,7 +8744,7 @@ qexec_execute_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl
 	{
 	  /* clear fptr subquery list files */
 #if !defined (NDEBUG)
-	  /* #89: same rationale as the bptr assert above. */
+	  /* Same rationale as the bptr assert above. */
 	  for (XASL_NODE * chk89 = xasl->fptr_list; chk89 != NULL; chk89 = chk89->next)
 	    {
 	      assert (chk89->list_id == NULL || qfile_list_id_open_scan_count (chk89->list_id) == 0);
@@ -15175,13 +15171,13 @@ qexec_end_mainblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_
 	  GOTO_EXIT_ON_ERROR;
 	}
       QFILE_FREE_AND_INIT_LIST_ID (t_list_id);
-      /* UNION ALL builds an OLD (appendable) list; a parallel consumer (e.g. a
-       * GROUP BY over a derived UNION ALL table) reads it through the OLD
+      /* UNION ALL builds a pgbuf (appendable) list; a parallel consumer (e.g. a
+       * GROUP BY over a derived UNION ALL table) reads it through the pgbuf
        * MERGEABLE_LIST sector reader, which drops rows on a list that is not a
        * parallel-scan producer output (px_scan.cpp).  Promote the finished list
-       * to NEW so the tuple-level Tapeset reader is used instead
-       * -- UNION (distinct) is already NEW via its sort.  Skip a cached result
-       * file (copy-out path).  (#78 C-3) */
+       * to tapeset so the tuple-level Tapeset reader is used instead
+       * -- UNION (distinct) is already tapeset via its sort.  Skip a cached result
+       * file (copy-out path). */
       if (!QFILE_IS_FLAG_SET (ls_flag, QFILE_FLAG_RESULT_FILE)
 	  && qfile_list_promote_old_to_new (thread_p, xasl->list_id) != NO_ERROR)
 	{
@@ -15898,14 +15894,14 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 		  else
 		    {
 #if SERVER_MODE && !WINDOWS
-		      /* redesign #78 2A-3: skip the subquery parallel executor when the
-		       * parent is a hash/merge join (merge_infop != NULL).  Hash join aptr
-		       * entries (outer/inner scans) each need the full worker pool for their
-		       * own parallel heap scan; the subquery executor steals 1+ workers
-		       * from the pool, causing the inner scan to fall back to serial
-		       * (OLD-backed output, lost NEW backing → wrong-result via the buggy
-		       * sector_page_iterator).  Sequential aptr execution avoids the
-		       * worker exhaustion while keeping each scan fully parallel. */
+		      /* Skip the subquery parallel executor when the parent is a hash/merge
+		       * join (merge_infop != NULL).  Hash join aptr entries (outer/inner
+		       * scans) each need the full worker pool for their own parallel heap
+		       * scan; the subquery executor steals 1+ workers from the pool, causing
+		       * the inner scan to fall back to serial (pgbuf-backed output, lost
+		       * tapeset backing → wrong-result via the buggy sector_page_iterator).
+		       * Sequential aptr execution avoids the worker exhaustion while keeping
+		       * each scan fully parallel. */
 		      if (!XASL_IS_FLAGED (xasl, XASL_NO_PARALLEL_SUBQUERY) && XASL_IS_FLAGED (xasl, XASL_TOP_MOST_XASL)
 			  && xasl->px_executor == nullptr
 			  && merge_infop == NULL)
@@ -16997,7 +16993,7 @@ end:
     {
       // one new list file
 #if !defined (NDEBUG)
-      /* one list file: the dependent chain was removed with qfile_connect_list (#131). */
+      /* one list file: no dependent chain exists. */
       assert (thread_p->m_qlist_count.load () == qlist_enter_count + 1);
 #endif
     }
@@ -18006,14 +18002,14 @@ qexec_execute_cte (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_
       GOTO_EXIT_ON_ERROR;
     }
 
-  /* The CTE result is shared through the OLD list model: the recursive loop
+  /* The CTE result is shared through the pgbuf list model: the recursive loop
    * reopens the working list for append and copies list_ids cheaply through the
    * qmgr temp file pool, and sibling CTEs in the same WITH clause read this same
-   * non_recursive_part->list_id.  A frozen NEW (Tapeset) output -- e.g. a
-   * GROUP BY / ORDER BY / UNION (distinct) in the non-recursive part
-   * -- is single-owner and immutable, so a shared MOVE would
-   * strip one holder's backing.  Demote to OLD up front so every downstream
-   * copy/scan (loop, sibling reference, final hand-off) works.  (#78 C-6) */
+   * non_recursive_part->list_id.  A frozen tapeset output -- e.g. a GROUP BY /
+   * ORDER BY / UNION (distinct) in the non-recursive part -- is single-owner and
+   * immutable, so a shared MOVE would strip one holder's backing.  Demote to pgbuf
+   * up front so every downstream copy/scan (loop, sibling reference, final
+   * hand-off) works. */
   if (qfile_list_demote_new_to_old (thread_p, non_recursive_part->list_id) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
@@ -18061,10 +18057,10 @@ qexec_execute_cte (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_
 	      GOTO_EXIT_ON_ERROR;
 	    }
 
-	  /* Demote a frozen NEW (Tapeset) recursive-part output to OLD backing:
-	   * the loop below copies it into the working list via QFILE_PROHIBIT_DEPENDENT
-	   * (shared pages) and unions it into the accumulator, both of which need the
-	   * mutable OLD model.  (#78 C-6) */
+	  /* Demote a frozen tapeset recursive-part output to pgbuf backing: the loop
+	   * below copies it into the working list via QFILE_PROHIBIT_DEPENDENT (shared
+	   * pages) and unions it into the accumulator, both of which need the mutable
+	   * pgbuf model. */
 	  if (qfile_list_demote_new_to_old (thread_p, recursive_part->list_id) != NO_ERROR)
 	    {
 	      GOTO_EXIT_ON_ERROR;
@@ -18829,9 +18825,9 @@ qexec_listfile_orderby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QFILE_LIST_ID
 	  ordby_info.ordbynum_val = NULL;
 	  ordby_info.ordbynum_flag = 0;
 
-	  /* suppress_tapeset_backing=true (#105): qexec_listfile_orderby is CONNECT BY-only;
+	  /* suppress_tapeset_backing=true: qexec_listfile_orderby is CONNECT BY-only;
 	   * its sorted output (incl. the BF->DF result that feeds
-	   * qexec_recalc_tuples_parent_pos_in_list) must stay OLD-backed so parent-pos
+	   * qexec_recalc_tuples_parent_pos_in_list) must stay pgbuf-backed so parent-pos
 	   * tuple positions can be serialised into QFILE_TUPLE_POSITION_DB (VPID-only). */
 	  list_id =
 	    qfile_sort_list_with_func (thread_p, list_id, orderby_list, Q_ALL, QFILE_FLAG_ALL, NULL, NULL, NULL,
@@ -21697,11 +21693,10 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
 
   /* number of sort keys is always less than list file column count, as sort columns are included */
   analytic_state.key_info.use_original = 1;
-  /* When the input list is NEW-backed (Tapeset), page-level back-references (VPID) are invalid —
+  /* When the input list is tapeset-backed, page-level back-references (VPID) are invalid —
    * the pages are not in qmgr's temp file registry.  Carry the non-key columns inside the sort
    * records instead of just dropping use_original — a plain A_sort_key materializes only the sort
-   * key columns and qexec_analytic_put_next would then read past a truncated tuple (#100 class
-   * bug; #103). */
+   * key columns and qexec_analytic_put_next would then read past a truncated tuple. */
   if (analytic_state.key_info.use_original == 1 && qfile_list_has_tapeset (list_id))
     {
       bool all_columns_carried = false;
@@ -22387,7 +22382,7 @@ qexec_analytic_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 	}
       else
 	{
-	  /* A_sort_key: NEW(Tapeset)-backed input has no valid VPID back-reference (#80, #103).
+	  /* A_sort_key: tapeset-backed input has no valid VPID back-reference.
 	   * qexec_execute_analytic() carried the non-key columns as sort-record payload
 	   * (qfile_sort_key_info_extend_all_columns), so reconstruct the full-width tuple from
 	   * the sort key itself instead of following key->s.original as a page pointer. */

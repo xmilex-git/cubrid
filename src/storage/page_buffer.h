@@ -278,21 +278,16 @@ extern PAGE_PTR pgbuf_fix_debug (THREAD_ENTRY * thread_p, const VPID * vpid, PAG
 				 PGBUF_LATCH_MODE requestmode, PGBUF_LATCH_CONDITION condition, const char *caller_file,
 				 int caller_line, const char *caller_func);
 
-/* Boot-independent global count of real pgbuf_fix_debug() calls (issue #93).
- * Incremented unconditionally on every fix attempt, with no dependency on
- * pgbuf_Pool/thread-manager boot state, so it can be snapshot-diffed even
- * from a bootless unit test.  The Tapeset/BufFile pgbuf-bypass gates
- * (buffile_metrics.pgbuf_fixes / tapeset_scan_metrics.pgbuf_fixes) compare a
- * before/after delta of this counter across a producer or scan region instead
- * of reading an always-zero field. */
+/* Boot-independent global count of real pgbuf_fix_debug() calls.  Incremented
+ * unconditionally on every fix attempt, with no dependency on
+ * pgbuf_Pool/thread-manager boot state, so it can be snapshot-diffed even from
+ * a bootless unit test.  The tapeset/BufFile pgbuf-bypass gates compare a
+ * before/after delta of this counter across a producer or scan region. */
 extern INT64 pgbuf_get_fix_debug_count (void);
 
-/* TEST-ONLY (issue #93): bump the debug fix counter as if one real fix
- * happened, without requiring pgbuf_Pool/server boot.  Exists solely so the
- * bootless tapeset unit test (unit_tests/tapeset/test_tapeset_scan.cpp) can
- * prove the pgbuf-bypass gates react to this counter -- i.e. that the
- * snapshot-diff wiring is live, not a tautology -- since that test cannot
- * safely call the real pgbuf_fix() without a booted buffer pool.  Never
+/* TEST-ONLY: bump the debug fix counter as if one real fix happened, without
+ * requiring pgbuf_Pool/server boot.  Exists so the bootless tapeset unit test
+ * can exercise the pgbuf-bypass gates without a booted buffer pool.  Never
  * called from production or server-boot code. */
 extern void pgbuf_test_bump_fix_debug_count (void);
 #define pgbuf_ordered_fix(thread_p, req_vpid, fetch_mode, requestmode,\

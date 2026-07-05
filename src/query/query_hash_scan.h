@@ -168,14 +168,13 @@ struct hash_scan_key
 };
 
 /* hash list scan */
-/* PG-style batch-spill hash for the HASH_FILE tier (#123): replaces the
- * extendible-hash temp file (fhs_*) with per-batch append-only BufFiles
- * (nodeHash.c ExecHashIncreaseNumBatches idiom).  Opaque; see query_hash_scan.c. */
+/* Batch-spill hash for the HASH_FILE tier: per-batch append-only BufFiles
+ * (PostgreSQL nodeHash.c batch-split idiom).  Opaque; see query_hash_scan.c. */
 typedef struct hls_spill HLS_SPILL;
 /* Per-scan probe cursor: PROBE-side mutable state (batch/run/idx position,
  * cached page, read scratch) split out of HLS_SPILL so that concurrent
  * parallel-probe workers sharing one HLS_SPILL each get their own cursor
- * instead of racing on shared fields (#127). */
+ * instead of racing on shared fields. */
 typedef struct hls_spill_cursor HLS_SPILL_CURSOR;
 
 typedef struct hash_list_scan HASH_LIST_SCAN;
@@ -194,15 +193,15 @@ struct hash_list_scan
     } memory;
     struct
     {
-      HLS_SPILL *hash_table;	/* batch-spill hash for the HASH_FILE tier (#123) */
-      HLS_SPILL_CURSOR *cursor;	/* this scan's own probe cursor (#127) */
+      HLS_SPILL *hash_table;	/* batch-spill hash for the HASH_FILE tier */
+      HLS_SPILL_CURSOR *cursor;	/* this scan's own probe cursor */
     } spill;
   };
   HASH_METHOD hash_list_scan_type;	/* IN_MEM, HYBRID or HASH_FILE */
   unsigned int curr_hash_key;	/* current hash key */
   bool need_coerce_type;	/* Are the types of probe and build different? */
-  /* work_mem accountant charge covering the IN_MEM/HYBRID build estimate
-   * (#123/#91); released when the hash table is destroyed. */
+  /* work_mem accountant charge covering the IN_MEM/HYBRID build estimate;
+   * released when the hash table is destroyed. */
   size_t wm_bytes;
   int wm_shard;
 };
@@ -227,10 +226,10 @@ HASH_SCAN_KEY *qdata_copy_hscan_key_without_alloc (THREAD_ENTRY * thread_p, HASH
 int qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *data, const void *type_list,
 				 void *args);
 
-/* start : PG-style batch-spill hash (#123) — HASH_FILE-tier replacement.
- * Values are QFILE_TUPLE_SIMPLE_POS (coord_type-tagged), so a NEW (Tapeset)
- * build list works too (TAPE coords, #101).  Entries carry no user data
- * (hash + coordinates only), so the spill files need no TDE. */
+/* start : batch-spill hash (HASH_FILE tier).
+ * Values are QFILE_TUPLE_SIMPLE_POS (coord_type-tagged), so a tapeset build
+ * list works too (TAPE coords).  Entries carry no user data (hash + coordinates
+ * only), so the spill files need no TDE. */
 extern HLS_SPILL *hls_spill_create (THREAD_ENTRY * thread_p, INT64 tuple_cnt);
 extern int hls_spill_insert (THREAD_ENTRY * thread_p, HLS_SPILL * spill, unsigned int hash_key,
 			     const QFILE_TUPLE_SIMPLE_POS * pos);
@@ -242,7 +241,7 @@ extern EH_SEARCH hls_spill_search_next (THREAD_ENTRY * thread_p, HLS_SPILL * spi
 extern void hls_spill_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill);
 extern long hls_spill_probe_page_reads (const HLS_SPILL * spill);
 
-/* Per-scan probe cursor lifecycle (#127): create once per HASH_LIST_SCAN
+/* Per-scan probe cursor lifecycle: create once per HASH_LIST_SCAN
  * before the first probe, destroy alongside that scan's spill/table cleanup.
  * hls_spill_cursor_destroy() flushes the cursor's page-read count into
  * `spill` (pass NULL only if the spill is already gone). */
@@ -253,7 +252,7 @@ extern void hls_spill_cursor_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill
  * TAPE / spill / VPID) — shared by the HYBRID producer and the spill build. */
 extern void qdata_save_hscan_pos (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_SIMPLE_POS * pos);
 
-/* work_mem accountant charge helpers for the IN_MEM/HYBRID build estimate (#123/#91). */
+/* work_mem accountant charge helpers for the IN_MEM/HYBRID build estimate. */
 extern bool qdata_hscan_wm_reserve (HASH_LIST_SCAN * hlsid, size_t bytes);
 extern void qdata_hscan_wm_release (HASH_LIST_SCAN * hlsid);
 /* end : batch-spill hash */

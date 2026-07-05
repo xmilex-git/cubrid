@@ -869,19 +869,9 @@ extern "C"
     const bool is_buildvalue_opt = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT);
     const bool has_tapeset = qfile_list_has_tapeset (list_id);
 
-    /* #113 (wrong-result, gate-independent): the OLD sector-based parallel LIST input reader
-     * (input_handler_list / sector_page_iterator) silently DROPS ROWS on a large derived list.
-     * A serially-produced MERGE JOIN (or UNION ALL) output consumed by a parallel GROUP BY loses
-     * its disk-spilled portion -- a 5.12M-row merge-join list scanned in parallel returned only its
-     * in-membuf prefix (1,669,921 rows; the read count tracks work_mem / membuf size), determin-
-     * istically and independent of the work_mem NEW-backing gate.  This was previously seen only
-     * for BUILDVALUE_OPT (349006 / 15000000 rows, #78 2A-2f) and mitigated for UNION ALL by promot-
-     * ing the finished list to NEW under the gate (#78 C-3); but every such mitigation is gate-
-     * conditioned, so with the gate OFF the wrong result stayed exposed for MERGEABLE_LIST too
-     * (the old raw_fd_master_enabled() guard here never fired).  Only a NEW (Tapeset) input, read by
-     * the correct tuple-level tapeset_reader, is safe to scan in parallel; every OLD-backed list
-     * falls back to a correct SERIAL list scan.  #130 (Phase3) deleted the OLD sector reader,
-     * making this the permanent OLD-input path. */
+    /* Only a tapeset input, read by the tuple-level tapeset_reader, is safe to scan
+     * in parallel: the pgbuf sector reader silently drops the disk-spilled portion of
+     * a large list.  Every pgbuf-backed list falls back to a correct serial list scan. */
     if (!has_tapeset)
       {
 	return NO_ERROR;

@@ -17,7 +17,7 @@
  */
 
 /*
- * qfile_buffile.cpp - Phase1 1B per-worker private backing (redesign G006, issue #71).
+ * qfile_buffile.cpp - per-worker private backing.
  * See qfile_buffile.hpp for the design rationale.
  */
 
@@ -25,7 +25,7 @@
 
 #include "error_manager.h"
 #include "file_io.h"		/* FILEIO_PAGE */
-#include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
+#include "page_buffer.h"	/* pgbuf_get_fix_debug_count */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "tde.h"
 
@@ -48,7 +48,7 @@ namespace
   constexpr int BUFFILE_BATCH_PAGES = 8;
 
 #if !defined (NDEBUG)
-  /* ENOSPC fault injection (#86, debug-only).  g_fault_flush_target is the
+  /* ENOSPC fault injection (debug-only).  g_fault_flush_target is the
    * 1-based ordinal of the real (page-bearing) flush to fail; 0 = disarmed.
    * g_fault_flush_count counts real flushes seen since the last arm. */
   std::atomic<int> g_fault_flush_target {0};
@@ -87,9 +87,9 @@ namespace
     return seen == target;
   }
 
-  /* BufFile create() fault injection (#125, debug-only).  When non-zero, the
-   * next buffile::create () short-circuits its open () and reports this errno,
-   * proving the ensure_buffile os_error mapping (EMFILE/ENFILE -> temp-space)
+  /* BufFile create() fault injection (debug-only).  When non-zero, the next
+   * buffile::create () short-circuits its open () and reports this errno,
+   * exercising the ensure_buffile os_error mapping (EMFILE/ENFILE -> temp-space)
    * without exhausting the real process fd table.  0 = disarmed. */
   std::atomic<int> g_fault_create_errno {0};
 
@@ -105,8 +105,8 @@ namespace
 namespace qfile
 {
   /* tape_backing_census, full_pwrite/full_pread, mkdir_p and the boot-sweep
-   * scratch-tree machinery moved to the shared spill-file substrate
-   * (qfile_spill_file.cpp; Phase3 (c′) extraction, #132). */
+   * scratch-tree machinery live in the shared spill-file substrate
+   * (qfile_spill_file.cpp). */
 
 #if !defined (NDEBUG)
   void
@@ -124,7 +124,7 @@ namespace qfile
 #endif /* !NDEBUG */
 
   /* ------------------------------------------------------------------ */
-  /* tde_read_scratch (per-reader read scratch, ADR 0005)               */
+  /* tde_read_scratch (per-reader read scratch)                         */
   /* ------------------------------------------------------------------ */
 
   tde_read_scratch::tde_read_scratch ()
@@ -185,10 +185,9 @@ namespace qfile
   {
   }
 
-  /* Producer-side pgbuf-bypass gate (issue #93): a BufFile reads/writes only
-   * through pread/pwrite on its own fd and must never fix a pgbuf BCB.
-   * Snapshot-diffing the boot-independent debug counter across the object's
-   * lifetime replaces the old always-zero field with a real measurement. */
+  /* Producer-side pgbuf-bypass gate: a BufFile reads/writes only through
+   * pread/pwrite on its own fd and must never fix a pgbuf BCB.  Measured by
+   * snapshot-diffing the boot-independent debug counter over the object's life. */
   void
   buffile::refresh_pgbuf_fixes ()
   {
@@ -239,7 +238,7 @@ namespace qfile
 		   (long) getpid ());
 
 #if !defined (NDEBUG)
-    /* #125: injected fd-exhaustion (EMFILE/ENFILE) before touching the real fd
+    /* injected fd-exhaustion (EMFILE/ENFILE) before touching the real fd
      * table.  No file was created, so nothing to unlink. */
     const int injected = fault_create_injected_errno ();
     if (injected != 0)
@@ -372,9 +371,9 @@ namespace qfile
 #if !defined (NDEBUG)
     if (fault_flush_should_fail ())
       {
-	/* simulate a disk-full pwrite (#86): same error the real ENOSPC path
-	 * raises, so the close/freeze failure-propagation contract is exercised
-	 * end to end without an actual full filesystem. */
+	/* simulate a disk-full pwrite: same error the real ENOSPC path raises, so
+	 * the close/freeze failure-propagation contract is exercised end to end
+	 * without an actual full filesystem. */
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
 	return ER_FAILED;
       }
@@ -383,8 +382,7 @@ namespace qfile
     const std::size_t len = (std::size_t) m_batch_pages * (std::size_t) m_file.stride ();
     if (!m_file.pwrite_full (m_batch, len, offset))
       {
-	/* disk-full class errno -> ER_QPROC_OUT_OF_TEMP_SPACE, else ER_FAILED
-	 * (promoted mapping, #125/#132) */
+	/* disk-full class errno -> ER_QPROC_OUT_OF_TEMP_SPACE, else ER_FAILED */
 	spill_file::set_os_error (errno);
 	return ER_FAILED;
       }
@@ -403,7 +401,7 @@ namespace qfile
     (void) thread_p;
     /* Re-entrant + const: no flush here.  Pages must already be on disk
      * (append-all-then-freeze); the frozen backing is immutable so a shared fd
-     * + pread serves N concurrent readers safely (ADR 0005). */
+     * + pread serves N concurrent readers safely. */
     if (!m_file.is_open () || dest == NULL || page_offset < 0 || page_offset >= m_pages_on_disk)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);

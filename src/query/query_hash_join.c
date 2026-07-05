@@ -271,18 +271,13 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
-      /* C-15 (#119): the hash join ST/partition path builds an OLD (appendable)
-       * output list.  A nested hash join ((t1 JOIN t2) JOIN t3) whose upper join
-       * consumes this list can only run its parallel split when the input is
-       * NEW-backed -- the split guards (hjoin_try_parallel* + #113 px_scan
-       * fallback) require qfile_list_has_tapeset on both inputs -- so an OLD
-       * lower-HJ output forced the upper split permanently serial (#112).
-       * Promote the finished list to NEW:
-       * same consumed-not-reopened NEW-promote direction as UNION ALL C-3
-       * (43048f481) and merge join C-1/2 (c447d929b), reusing
+      /* The ST/partition path builds a pgbuf-paged (appendable) output list, but
+       * a nested hash join consuming it can only run its parallel split when the
+       * input is tapeset-backed (the split guards require qfile_list_has_tapeset
+       * on both inputs).  Promote the finished list to tapeset via
        * qfile_list_promote_old_to_new (a no-op when the parallel path already
-       * produced a NEW list).  Skip a to-be-cached result (copy-out keeps OLD,
-       * #94).  */
+       * produced a tapeset list).  Skip a to-be-cached result (copy-out keeps
+       * the pgbuf-paged list). */
       if (!XASL_IS_FLAGED (xasl, XASL_TO_BE_CACHED))
 	{
 	  error = qfile_list_promote_old_to_new (thread_p, xasl->list_id);
@@ -1916,9 +1911,7 @@ hjoin_merge_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN
 
     case HASHJOIN_MERGE_CONNECT:
       {
-	/* qfile_connect_list (zero-copy VPID-reparent) was deleted with the OLD
-	 * dependent-chain mechanism (#131, Phase3-4); this path now always
-	 * appends, matching HASHJOIN_MERGE_APPEND. */
+	/* connect now always appends, matching HASHJOIN_MERGE_APPEND. */
 	error = qfile_append_list (thread_p, single_context->list_id, context->list_id);
 	if (error != NO_ERROR)
 	  {
@@ -1981,13 +1974,10 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
   assert (outer_list_id != NULL);
   assert (inner_list_id != NULL);
 
-  /* #84: mirror hjoin_try_parallel_probe's OLD-input guard.  The OLD
-   * sector_page_iterator had a confirmed row-loss bug on derived-list
-   * inputs (#78 evidence (k); bug2 149510 vs 200360) and is deleted in #130.
-   * If either side of the split lacks NEW (Tapeset) backing (e.g. worker pool
-   * exhaustion forced a serial OLD-backed scan upstream), force serial
-   * partitioning (HASHJOIN_STATUS_PARTITION) --
-   * this is now the permanent serial fallback for OLD-backed input. */
+  /* Mirror hjoin_try_parallel_probe's guard: the parallel split requires
+   * tapeset backing on both inputs.  If either side is pgbuf-paged (e.g. worker
+   * pool exhaustion forced a serial scan upstream), force serial partitioning
+   * (HASHJOIN_STATUS_PARTITION). */
   if (!qfile_list_has_tapeset (outer_list_id) || !qfile_list_has_tapeset (inner_list_id))
     {
       manager->num_parallel_threads = 0;
@@ -1995,8 +1985,8 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
       return HASHJOIN_STATUS_PARTITION;
     }
 
-  /* redesign #78 2A-3: the parallel partition split now reads NEW (Tapeset) input
-   * via chunk_distributor + per-worker tapeset_reader (mirroring the probe path). */
+  /* the parallel partition split reads tapeset input via chunk_distributor +
+   * per-worker tapeset_reader (mirroring the probe path). */
 
   /* immutable */
   static const size_t stats_size = perfmon_get_number_of_statistic_values () * sizeof (UINT64);
@@ -2112,21 +2102,10 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
   assert (false);
 #endif /* defined (SERVER_MODE) */
 
-  /* redesign #78 2A-3: the parallel probe path reads NEW (Tapeset) input via
-   * chunk_distributor + tapeset_reader.  The OLD sector reader had a known
-   * row-loss bug on arbitrary derived-list inputs (#78 evidence (k)/(q)) and is
-   * deleted in #130.
-   *
-   * Decision matrix:
-   *   NEW input -> parallel probe via chunk_distributor (correct)
-   *   OLD input -> serial (permanent fallback; the OLD reader is gone)
-   *
-   * The OLD-input serial fallback is the fix for the "session state corruption"
-   * symptom: on re-execution the parallel worker pool can be exhausted (by the
-   * subquery parallel executor or a concurrent aptr scan), causing the probe
-   * input to lose its NEW backing and fall back to OLD.  Without this guard the
-   * hash join would use the row-losing sector reader, producing wrong results
-   * (e.g. count=407 instead of 200360). */
+  /* The parallel probe path needs tapeset input (chunk_distributor +
+   * tapeset_reader).  On re-execution the worker pool can be exhausted, dropping
+   * the probe input back to pgbuf backing; force serial (HASHJOIN_STATUS_SINGLE)
+   * for that case. */
   if (!qfile_list_has_tapeset (single_context->probe->list_id))
     {
       manager->num_parallel_threads = 0;
@@ -2444,8 +2423,8 @@ hjoin_clear_shared_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manag
       db_private_free_and_init (thread_p, shared_info->part_mutexes);
     }
 
-  /* redesign #78 per-worker OUTPUT tape (ADR0004): cleanup any leaked worker lists
-   * (e.g. on error path where leader merge did not run). */
+  /* clean up any leaked per-worker output lists (e.g. on an error path where
+   * the leader merge did not run). */
   if (shared_info->worker_part_lists != NULL)
     {
       for (UINT32 wi = 0; wi < shared_info->worker_count; wi++)
@@ -2711,9 +2690,9 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 
   if (list_id != NULL)
     {
-      /* Same tier contract as check_hash_list_scan (#123/#91): an in-memory
-       * tier must both fit work_mem AND secure its estimate from the work_mem
-       * accountant; on refusal it degrades to the next tier. */
+      /* Same tier contract as check_hash_list_scan: an in-memory tier must both
+       * fit work_mem AND secure its estimate from the work_mem accountant; on
+       * refusal it degrades to the next tier. */
       if ((UINT64) list_id->page_cnt * DB_PAGESIZE <= mem_limit
 	  && qdata_hscan_wm_reserve (hash_scan, (size_t) list_id->page_cnt * DB_PAGESIZE))
 	{
@@ -2765,15 +2744,15 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 
 	  hash_scan->hash_list_scan_type = HASH_METH_HASH_FILE;
 
-	  /* PG-style batch spill (#123) — replaces the extendible-hash temp file */
+	  /* batch-spill hash table (HASH_FILE tier) */
 	  hash_scan->spill.hash_table = hls_spill_create (thread_p, list_id->tuple_cnt);
 	  if (hash_scan->spill.hash_table == NULL)
 	    {
 	      goto error_exit;
 	    }
 
-	  /* per-scan probe cursor (#127): created alongside the table so every
-	   * scan of type HASH_METH_HASH_FILE always has a cursor whenever
+	  /* per-scan probe cursor: created alongside the table so every scan of
+	   * type HASH_METH_HASH_FILE always has a cursor whenever
 	   * spill.hash_table != NULL */
 	  hash_scan->spill.cursor = hls_spill_cursor_create (thread_p);
 	  if (hash_scan->spill.cursor == NULL)
@@ -2859,7 +2838,7 @@ hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan)
       break;
     }
 
-  /* release the IN_MEM/HYBRID build estimate charge (#123/#91) */
+  /* release the IN_MEM/HYBRID build estimate charge */
   qdata_hscan_wm_release (hash_scan);
 
   hash_scan->hash_list_scan_type = HASH_METH_NOT_USE;
@@ -3359,7 +3338,7 @@ hjoin_build_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
     case HASH_METH_HASH_FILE:
       assert (hash_scan->spill.hash_table != NULL);
 
-      /* batch spill (#123): backing-aware SIMPLE_POS value (TAPE/raw-fd/VPID) */
+      /* batch spill: backing-aware SIMPLE_POS value (TAPE/SPILL/VPID) */
       {
 	QFILE_TUPLE_SIMPLE_POS spill_pos;
 
@@ -4145,7 +4124,7 @@ hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
     case HASH_METH_HASH_FILE:
       assert (hash_scan->spill.hash_table != NULL);
 
-      /* batch-spill probe (#123) */
+      /* batch-spill probe */
       if (tuple_record->tpl == NULL)
 	{
 	  eh_search = hls_spill_search (thread_p, hash_scan->spill.hash_table, hash_scan->spill.cursor,

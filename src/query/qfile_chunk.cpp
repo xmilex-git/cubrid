@@ -17,8 +17,7 @@
  */
 
 /*
- * qfile_chunk.cpp - Phase2 MIGRATE R2 parallel-read distribution
- *                   (redesign G008, issue #73).  See qfile_chunk.hpp.
+ * qfile_chunk.cpp - parallel-read distribution.  See qfile_chunk.hpp.
  */
 
 #include "qfile_chunk.hpp"

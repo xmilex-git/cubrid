@@ -101,8 +101,8 @@ namespace parallel_scan
   int
   slot_iterator_list::set_page (THREAD_ENTRY *thread_p, PAGE_PTR page, QMGR_TEMP_FILE *tfile)
   {
-    /* Free previous OLD page with its own tfile, then adopt the new page.
-     * NEW Tapeset pages arrive with tfile == nullptr and are borrowed RAM or
+    /* Free previous pgbuf page with its own tfile, then adopt the new page.
+     * Tapeset pages arrive with tfile == nullptr and are borrowed RAM or
      * per-worker scratch, so qmgr_free_old_page must not see them. */
     if (m_curr_pgptr != nullptr)
       {
@@ -173,7 +173,7 @@ namespace parallel_scan
 	    const bool has_overflow_page = (QFILE_GET_OVERFLOW_PAGE_ID (m_curr_pgptr) != NULL_PAGEID);
 	    if (has_overflow_page)
 	      {
-		/* OLD backing keeps VPID-chain overflow assembly on the page walker path. */
+		/* pgbuf backing keeps VPID-chain overflow assembly on the page walker path. */
 		if (qfile_assemble_overflow_tuple (thread_p, m_curr_pgptr, &m_tplrec,
 						   QFILE_LIST_ID_TFILE_VFID (m_list_id)) != NO_ERROR)
 		  {

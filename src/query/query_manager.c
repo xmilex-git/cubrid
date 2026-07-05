@@ -121,7 +121,7 @@ struct qmgr_tran_entry
   OID_BLOCK_LIST *modified_classes_p;	/* array of class OIDs */
   pthread_mutex_t mutex;
 #if !defined (NDEBUG)
-  bool clear_wakeup_in_progress;	/* #96: reentrancy guard for the tran->session holdable handoff in
+  bool clear_wakeup_in_progress;	/* reentrancy guard for the tran->session holdable handoff in
 					 * qmgr_clear_trans_wakeup(); catches a concurrent second invocation for
 					 * the same tran_index (e.g. commit racing logtb_release_tran_index). */
 #endif
@@ -133,7 +133,7 @@ struct qmgr_temp_file_list
   pthread_mutex_t mutex;
   QMGR_TEMP_FILE *list;
   int count;
-  size_t bytes;			/* total allocation size of pooled entries (#91) */
+  size_t bytes;			/* total allocation size of pooled entries */
 };
 
 /*
@@ -1017,8 +1017,8 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
       return ER_FAILED;
     }
 
-  /* (c′) leg (#132): the positioned save/jump contract against the
-   * PAGE_SPILL backing (the handle is driven directly). */
+  /* positioned save/jump contract against the PAGE_SPILL backing (the handle is
+   * driven directly). */
   {
     int os_error = 0;
     qfile::page_spill_file *spill_p = qfile::page_spill_file::create (static_cast < QUERY_ID > (-10),
@@ -1144,7 +1144,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
   csect_exit (thread_p, CSECT_QPROC_QUERY_TABLE);
 
   qfile_initialize ();
-  qfile::buffile::boot_sweep ();	/* issue #88: sweep orphaned cubrid_buffile/ spills */
+  qfile::buffile::boot_sweep ();	/* sweep orphaned cubrid_buffile/ spills */
 
   srand48 ((long) time (NULL));
 
@@ -1168,8 +1168,8 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
     }
   if (getenv ("CUBRID_WM_SPILL_SELFTEST") != NULL)
     {
-      /* #132: (c′) page-spill 257-page random-order parity + sparse fault +
-       * TDE nonce distinctness.  New-machinery hard gate (#93 idiom). */
+      /* page-spill 257-page random-order parity + sparse fault + TDE nonce
+       * distinctness. */
       int spill_selftest_rc = qfile::page_spill_file::selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "WM_SPILL_SELFTEST result=%d (0=PASS)\n", spill_selftest_rc);
       fprintf (stderr, "WM_SPILL_SELFTEST result=%d (0=PASS)\n", spill_selftest_rc);
@@ -1182,7 +1182,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
     }
   if (getenv ("CUBRID_WM_SPILL_COHERENCE_SELFTEST") != NULL)
     {
-      /* #132: INV-1~3 direct evidence + write-back fault injection. */
+      /* INV-1~3 direct evidence + write-back fault injection. */
       int spill_coherence_rc = qfile::page_spill_file::coherence_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "WM_SPILL_COHERENCE_SELFTEST result=%d (0=PASS)\n", spill_coherence_rc);
       fprintf (stderr, "WM_SPILL_COHERENCE_SELFTEST result=%d (0=PASS)\n", spill_coherence_rc);
@@ -1200,8 +1200,8 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
       fprintf (stderr, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
       if (buffile_selftest_rc != NO_ERROR)
 	{
-	  /* issue #93: a clear, grep-able marker (gate_tapeset_scan.sh judges on
-	   * it) instead of silently discarding the return code. */
+	  /* a clear, grep-able marker instead of silently discarding the return
+	   * code. */
 	  er_log_debug (ARG_FILE_LINE, "BUFFILE_SELFTEST FAIL result=%d\n", buffile_selftest_rc);
 	  fprintf (stderr, "BUFFILE_SELFTEST FAIL result=%d\n", buffile_selftest_rc);
 	  assert (buffile_selftest_rc == NO_ERROR);
@@ -1245,9 +1245,9 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
     }
   if (getenv ("CUBRID_WM_CLOSE_FAULT_SELFTEST") != NULL)
     {
-      /* #86: close/freeze ENOSPC failure-propagation contract.  Log-only (no
-       * assert) so the pre-fix run reproduces the silent truncation without
-       * aborting boot; the grep-able marker below judges PASS/FAIL. */
+      /* close/freeze ENOSPC failure-propagation contract.  Log-only (no assert)
+       * so a reproduction run doesn't abort boot; the grep-able marker below
+       * judges PASS/FAIL. */
       int close_fault_selftest_rc = qfile_close_fault_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", close_fault_selftest_rc);
       fprintf (stderr, "CLOSE_FAULT_SELFTEST result=%d (0=PASS)\n", close_fault_selftest_rc);
@@ -1259,8 +1259,8 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
     }
   if (getenv ("CUBRID_WM_FREEZE_OOM_SELFTEST") != NULL)
     {
-      /* #95: freeze OOM ownership recovery.  Log-only (no assert) so a pre-fix
-       * run reproduces the crash/leak observably; the grep-able marker judges
+      /* freeze OOM ownership recovery.  Log-only (no assert) so a reproduction
+       * run surfaces the crash/leak observably; the grep-able marker judges
        * PASS/FAIL. */
       int freeze_oom_selftest_rc = qfile_freeze_oom_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "FREEZE_OOM_SELFTEST result=%d (0=PASS)\n", freeze_oom_selftest_rc);
@@ -1273,8 +1273,8 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
     }
   if (getenv ("CUBRID_WM_EMFILE_FAULT_SELFTEST") != NULL)
     {
-      /* #125: BufFile fd-exhaustion (EMFILE/ENFILE) error mapping.  Log-only (no
-       * assert) so a pre-fix run reproduces the generic ER_FAILED observably;
+      /* BufFile fd-exhaustion (EMFILE/ENFILE) error mapping.  Log-only (no
+       * assert) so a reproduction run surfaces the generic ER_FAILED observably;
        * the grep-able marker judges PASS/FAIL. */
       int emfile_fault_selftest_rc = qfile_emfile_fault_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "EMFILE_FAULT_SELFTEST result=%d (0=PASS)\n", emfile_fault_selftest_rc);
@@ -1516,8 +1516,8 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
   XASL_NODE *xasl_p;
   XASL_UNPACK_INFO *xasl_buf_info;
   QFILE_LIST_ID *list_id;
-  bool tapeset_direct_fetch = false;	/* #120a: serve NEW result from Tapeset (no materialize) */
-  bool tapeset_cache_copyout = false;	/* #121: persist NEW result to query area straight from Tapeset */
+  bool tapeset_direct_fetch = false;	/* serve result straight from Tapeset (no materialize) */
+  bool tapeset_cache_copyout = false;	/* persist result to query area straight from Tapeset */
 
   assert (query_p != NULL);
   assert (tran_entry_p != NULL);
@@ -1583,28 +1583,23 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   assert (query_p->list_id != NULL);
-  /* Class-B sink.  A NEW (Tapeset)-backed, non-spill result never touches the
-   * OLD spill machinery:
-   *  - non-cacheable (incl. holdable, #111): served to the client straight from
-   *    its Tapeset (xqfile_get_list_file_page); overflow (big-tuple) runs are
-   *    translated on the fly to the legacy VPID overflow chain by the serve
-   *    path (#120b), so no copy at all (#120a/#120b facade).  A holdable
-   *    result's Tapeset reparents to the session with zero copy at commit
-   *    (qmgr_clear_trans_wakeup, #111); post-commit fetches route back here
-   *    through the session-restored query entry over the SAME Tapeset-intrinsic
-   *    global page space.
-   *  - cacheable, overflow-free, non-holdable: copied out straight from its
-   *    Tapeset into a permanent FILE_QUERY_AREA list (#121 cached-persist,
-   *    redesign axis 1) -- the copy is by design, but its source is the Tapeset
-   *    (qmgr_copy_new_result_to_query_area), not the #94
-   *    qmgr_materialize_to_pgbuf OLD copy.  (The list-cache publish reads
-   *    tuples, not the serve path's on-the-fly VPID overflow translation, so a
-   *    still-overflowing cacheable result keeps the materialize fallback below
-   *    for now.)
-   * Everything else -- spill overflow segments, a cacheable overflow result,
-   * and a cacheable holdable result -- keeps the #94 materialize fallback,
-   * retained until Phase3 (#120/#74).  For plain VPID-backed lists every path
-   * is a no-op. */
+  /* Class-B sink routing.  A tapeset-backed, non-spill result never touches the
+   * pgbuf spill machinery:
+   *  - non-cacheable (incl. holdable): served to the client straight from its
+   *    Tapeset (xqfile_get_list_file_page); overflow runs are translated on the
+   *    fly to the legacy VPID overflow chain by the serve path, so no copy.  A
+   *    holdable result's Tapeset reparents to the session with zero copy at
+   *    commit (qmgr_clear_trans_wakeup); post-commit fetches route back here over
+   *    the same Tapeset-intrinsic global page space.
+   *  - cacheable, overflow-free, non-holdable: copied straight from its Tapeset
+   *    into a permanent FILE_QUERY_AREA list (qmgr_copy_new_result_to_query_area)
+   *    -- the copy is by design, but its source is the Tapeset, not the
+   *    qmgr_materialize_to_pgbuf copy.  (A still-overflowing cacheable result
+   *    keeps the materialize fallback, since the list-cache publish reads tuples
+   *    rather than the serve path's on-the-fly overflow translation.)
+   * Everything else -- spill overflow segments, a cacheable overflow result, and
+   * a cacheable holdable result -- keeps the materialize fallback.  For plain
+   * VPID-backed lists every path is a no-op. */
   tapeset_direct_fetch = (qfile_list_has_tapeset (query_p->list_id)
 			  && !qmgr_list_has_spill_segments (query_p->list_id)
 			  && !qmgr_is_allowed_result_cache (flag));
@@ -2741,7 +2736,7 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 	  assert (query_p->query_status == QUERY_COMPLETED);
 	}
     }
-  /* #96: catch a concurrent second invocation of this function for the same tran_index (e.g. this thread's own
+  /* catch a concurrent second invocation of this function for the same tran_index (e.g. this thread's own
    * commit racing a disconnect-driven logtb_release_tran_index () for the same tran). Below, each holdable
    * entry is briefly unlinked from tran_entry_p->query_entry_list_p before it is published to the session
    * (see the while loop below): materialize + session-store can't be done under tran_entry_p->mutex because
@@ -2803,17 +2798,17 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 		{
 		  er_log_debug (ARG_FILE_LINE, "query %d is completed!\n", query_p->query_id);
 		}
-	      /* Class-B sink (holdable commit).  #111 (ADR 0001 restored): a NEW
-	       * (Tapeset)-backed result reparents to the session with ZERO copy --
-	       * the list_id pointer handoff below (xsession_store_query_entry_info
-	       * -> qentry_to_sentry) moves the single-owner Tapeset intact, and the
-	       * client facade (#120a/b) keeps serving it across the commit boundary
-	       * (the marker-volid global page space is Tapeset-intrinsic, so VPIDs
-	       * the client fetched pre-commit stay valid).  Session teardown already
-	       * destroys an owned Tapeset (qfile_clear_list_id), and a kill-9'd
-	       * server's spilled tapes are reclaimed by the #88 boot sweep.  Spill
-	       * overflow segments still materialize into real-VPID pgbuf pages (the
-	       * legacy VPID-wire requirement). */
+	      /* Class-B sink (holdable commit).  A tapeset-backed result reparents
+	       * to the session with ZERO copy -- the list_id pointer handoff below
+	       * (xsession_store_query_entry_info -> qentry_to_sentry) moves the
+	       * single-owner Tapeset intact, and the client facade keeps serving it
+	       * across the commit boundary (the marker-volid global page space is
+	       * Tapeset-intrinsic, so VPIDs the client fetched pre-commit stay
+	       * valid).  Session teardown destroys an owned Tapeset
+	       * (qfile_clear_list_id), and a kill-9'd server's spilled tapes are
+	       * reclaimed by the boot sweep.  Spill overflow segments still
+	       * materialize into real-VPID pgbuf pages (the legacy VPID-wire
+	       * requirement). */
 	      bool holdable_needs_materialize = !(qfile_list_has_tapeset (query_p->list_id)
 						  && !qmgr_list_has_spill_segments (query_p->list_id));
 	      if (holdable_needs_materialize && qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
@@ -2831,7 +2826,7 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 	      else
 		{
 		  /* Session couldn't take the entry (e.g. no active session, or OOM building the session-side
-		   * entry, #96) -- list_id/temp_vfid are still owned by query_p here, so fall through to the
+		   * entry) -- list_id/temp_vfid are still owned by query_p here, so fall through to the
 		   * "destroy the query result" cleanup below instead of leaking them. */
 		  er_log_debug (ARG_FILE_LINE, "query %d holdable session store failed !\n", query_p->query_id);
 		  query_p->is_holdable = false;
@@ -3032,7 +3027,7 @@ qmgr_free_old_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * t
     }
   if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
-      /* (c′) last-unfix write-back; failure poisons the query (INV-2/INV-3, #132) */
+      /* last-unfix write-back; failure poisons the query (INV-2/INV-3) */
       const int error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
       if (error != NO_ERROR)
 	{
@@ -3257,10 +3252,9 @@ qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LO
   QMGR_PAGE_TYPE page_type;
   if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
-      /* (c′) set_dirty: DONT_FREE marks the flag only; FREE = last-unfix
-       * write-back inside the shim (INV-2, #132).  An unknown page (e.g. a
-       * membuf page routed through the same qmgr call path) is a silent
-       * NO_ERROR, same as the former page_spill_flush_page bridge. */
+      /* set_dirty: DONT_FREE marks the flag only; FREE = last-unfix write-back
+       * inside the shim (INV-2).  An unknown page (e.g. a membuf page routed
+       * through the same qmgr call path) is a silent NO_ERROR. */
       int error = NO_ERROR;
       if (tfile_vfid_p->page_spill_handle != NULL && tfile_vfid_p->page_spill_handle->mark_dirty (page_p)
 	  && free_page == (int) FREE)
@@ -3345,7 +3339,7 @@ qmgr_temp_file_move (QMGR_TEMP_FILE * dst, QMGR_TEMP_FILE * src)
   dst->spill_owner_tran_index = src->spill_owner_tran_index;
   dst->spill_worker_id = src->spill_worker_id;
   dst->spill_next_pageid = src->spill_next_pageid;
-  dst->page_spill_handle = src->page_spill_handle;	/* (c′) containment move: pointer transfer only (D5, #132) */
+  dst->page_spill_handle = src->page_spill_handle;	/* containment move: pointer transfer only */
   dst->preserved = src->preserved;
   dst->tde_encrypted = src->tde_encrypted;
 
@@ -3402,10 +3396,9 @@ qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p)
 }
 
 /*
- * qmgr_tfile_has_fd_overflow () - does the tfile carry a live fd-backed OLD
- *   overflow handle ((c′) page-spill -- the sole overflow tag since 커밋 B
- *   #137)?  Guards/materialize/segment-copy sites key on this predicate
- *   (design §2.4: the #126 guard stays until 커밋 C).
+ * qmgr_tfile_has_fd_overflow () - does the tfile carry a live fd-backed pgbuf
+ *   overflow handle (page-spill)?  Guards/materialize/segment-copy sites key on
+ *   this predicate.
  */
 bool
 qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p)
@@ -3436,12 +3429,10 @@ qmgr_list_has_spill_segments (const QFILE_LIST_ID * list_id_p)
     && qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (list_id_p));
 }
 
-/* Class-B materialize predicate (#94): a list needs pgbuf materialization at a
+/* Class-B materialize predicate: a list needs pgbuf materialization at a
  * Class-B sink (client fetch / list-cache publish / holdable commit) when its
  * tuples live outside the VPID-wire page chain -- either spill overflow
- * segments or a NEW (Tapeset) backing whose first_vpid is NULL.
- * qmgr_list_has_spill_segments stays as-is: its other caller
- * (qfile_append_list) guards a spill-specific append path. */
+ * segments or a tapeset backing whose first_vpid is NULL. */
 bool
 qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p)
 {
@@ -3875,8 +3866,8 @@ qmgr_segment_pos_read (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_vfid_p,
       return NULL;
     }
 
-  /* (c′) positioned jump: fix_page serves resident-first, so a saved
-   * position stays valid across dirty/write-back cycles (INV-1, #132) */
+  /* positioned jump: fix_page serves resident-first, so a saved position stays
+   * valid across dirty/write-back cycles (INV-1) */
   return tfile_vfid_p->page_spill_handle->fix_page (thread_p, tuple_position_p->page_index);
 }
 
@@ -3888,8 +3879,8 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
       return NO_ERROR;
     }
 
-  /* #120 routing census: a list is actually being pgbuf-materialized at a
-   * Class-B sink (statdump Num_qfile_client_fetch_materialize). */
+  /* routing census: a list is actually being pgbuf-materialized at a Class-B
+   * sink (statdump Num_qfile_client_fetch_materialize). */
   qfile_client_fetch_record_materialize ();
 
   QFILE_LIST_ID *materialized_p = qfile_open_list (thread_p, &list_id_p->type_list, list_id_p->sort_list,
@@ -3951,20 +3942,19 @@ qmgr_materialize_to_pgbuf (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 }
 
 /*
- * qmgr_copy_new_result_to_query_area () - #121: cache copy-out sourced from the Tapeset.
+ * qmgr_copy_new_result_to_query_area () - cache copy-out sourced from the Tapeset.
  *   return: NO_ERROR or ER_FAILED
- *   list_id_p(in/out): a NEW (Tapeset)-backed result to be cached; replaced in
+ *   list_id_p(in/out): a tapeset-backed result to be cached; replaced in
  *                      place with an equivalent permanent FILE_QUERY_AREA list.
  *
- * The result cache (cached-persist, redesign axis 1) must own a permanent
- * FILE_QUERY_AREA list that outlives the producing transaction, so a NEW result
- * bound for the list cache is copied out into a query-area list -- that copy is
- * by design and stays.  What changes here (vs qmgr_materialize_to_pgbuf, the #94
- * OLD-legacy path built around spill segment enumeration) is the SOURCE: the copy is read straight from the Tapeset through the
- * unified list scan (qfile_open_list_scan -> qfile_tapeset_scan_*, the #120
- * direct-read idiom), with no spill/sector dependency.  The caller guarantees a
- * NEW-backed, overflow-free, non-spill, non-holdable, to-be-cached list; a NEW
- * list is a single Tapeset, so there is no dependent segment chain to walk.
+ * The result cache must own a permanent FILE_QUERY_AREA list that outlives the
+ * producing transaction, so a tapeset result bound for the list cache is copied
+ * out into a query-area list -- that copy is by design.  Unlike
+ * qmgr_materialize_to_pgbuf, the copy is read straight from the Tapeset through
+ * the unified list scan (qfile_open_list_scan), with no spill/sector dependency.
+ * The caller guarantees a tapeset-backed, overflow-free, non-spill, non-holdable,
+ * to-be-cached list; a tapeset list is a single Tapeset, so there is no
+ * dependent segment chain to walk.
  */
 static int
 qmgr_copy_new_result_to_query_area (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
@@ -4053,12 +4043,11 @@ qmgr_allocate_tempfile_with_buffer (int num_buffer_pages)
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, size);
       return NULL;
     }
-  /* Zero only the header (struct + membuf pointer array), not the page
-   * payload: a full memset would commit work_mem of RSS up front, pure
-   * waste for a list that is immediately converted to NEW backing (#91).
-   * Page content needs no zeroing -- the pool-reuse path already hands
-   * out dirty pages, and every page header is written before it is read
-   * (qmgr_put_page_header). */
+  /* Zero only the header (struct + membuf pointer array), not the page payload:
+   * a full memset would commit work_mem of RSS up front, pure waste for a list
+   * immediately converted to tapeset backing.  Page content needs no zeroing --
+   * the pool-reuse path already hands out dirty pages, and every page header is
+   * written before it is read (qmgr_put_page_header). */
   memset (tempfile_p, 0x00, header_size);
   tempfile_p->membuf_capacity_pages = num_buffer_pages;
   tempfile_p->wm_reserved_shard = -1;
@@ -4751,12 +4740,9 @@ qmgr_initialize_temp_file_list (QMGR_TEMP_FILE_LIST * temp_file_list_p, QMGR_TEM
   temp_file_list_p->count = 0;
   temp_file_list_p->bytes = 0;
 
-  /* redesign #78: removed the boot-time pre-allocation loop that created
-   * QMGR_TEMP_FILE_FREE_LIST_SIZE (100) temp files, each work_mem-sized.
-   * With work_mem=1G that was 100 GB of RSS at server start — unusable.
-   * The free list fills lazily: qmgr_free_temp_file_list returns freed temp
-   * files to the pool for reuse; qmgr_create_new_temp_file allocates on
-   * demand when the pool is empty.  Steady-state reuse is identical. */
+  /* The free list fills lazily: qmgr_free_temp_file_list returns freed temp
+   * files to the pool for reuse; qmgr_create_new_temp_file allocates on demand
+   * when the pool is empty. */
 }
 
 /*
@@ -4806,7 +4792,7 @@ qmgr_temp_file_entry_bytes (const QMGR_TEMP_FILE * temp_file_p)
  *   The entry-count cap alone lets a burst leave count x work_mem resident
  *   forever (100 x 1G = 100 GB); bound the pool by bytes instead: a quarter
  *   of the work_mem accountant cap, floored so small configurations still
- *   get reuse (#91).
+ *   get reuse.
  */
 static size_t
 qmgr_temp_file_pool_cap_bytes (void)
@@ -4889,7 +4875,7 @@ qmgr_put_temp_file_into_list (QMGR_TEMP_FILE * temp_file_p)
       rv = pthread_mutex_lock (&temp_file_list_p->mutex);
 
       /* add to the free list; anything past the count or byte cap is freed
-       * immediately so a burst cannot leave unbounded RSS pooled (#91) */
+       * immediately so a burst cannot leave unbounded RSS pooled */
       if (temp_file_list_p->count < QMGR_TEMP_FILE_FREE_LIST_SIZE
 	  && temp_file_list_p->bytes + entry_bytes <= qmgr_temp_file_pool_cap_bytes ())
 	{

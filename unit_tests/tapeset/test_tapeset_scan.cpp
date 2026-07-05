@@ -17,15 +17,14 @@
  */
 
 /*
- * test_tapeset_scan.cpp - Synthetic N-Tape split gate (redesign G005, issue #70).
+ * test_tapeset_scan.cpp - Synthetic N-Tape split gate.
  *
- * Drives the new offset-arithmetic scan state machine (qfile::tapeset_scan)
+ * Drives the offset-arithmetic scan state machine (qfile::tapeset_scan)
  * over genuinely multi-Tape in-memory Tapesets -- no server boot, no page
  * buffer, no next_vpid.  This exercises the actually-new code (tape_idx
  * threading, page_offset arithmetic, empty-skip, cross-Tape forward/reverse/
  * jump, terminal, S_END-on-last) directly, avoiding the "passthrough-tautology"
- * gate anti-pattern (evidence #76 I-2): a legacy 1-Tape adapter would verify
- * none of this.
+ * gate anti-pattern: a legacy 1-Tape adapter would verify none of this.
  */
 
 #include "qfile_tape.hpp"
@@ -33,7 +32,7 @@
 #include "list_file.h"
 #include "object_representation.h"
 #include "error_code.h"
-#include "page_buffer.h"	/* pgbuf_get_fix_debug_count / pgbuf_test_bump_fix_debug_count (issue #93) */
+#include "page_buffer.h"	/* pgbuf_get_fix_debug_count / pgbuf_test_bump_fix_debug_count */
 
 #include <cstdio>
 #include <cstdlib>
@@ -120,10 +119,10 @@ namespace
     expected = { 0, 1, 2, 3, 4, 5, 6, 7 };
   }
 
-  /* ---- Phase1 1B (issue #71) file-backed helpers ------------------- */
+  /* ---- file-backed helpers ------------------- */
 
   /* A DB_PAGESIZE list page (the BufFile reads/writes full 16KB pages, unlike
-   * the 1A in-RAM tapes that only needed a small header buffer). */
+   * the in-RAM tapes that only needed a small header buffer). */
   char *
   make_db_page (const std::vector<int> &ids)
   {
@@ -154,7 +153,7 @@ namespace
   /* Scratch dir for file-backed test Tapes: $CUBRID_TMP if set, else $TMP,
    * else /tmp as a last resort -- mirrors qfile::buffile::default_scratch_dir
    * (qfile_buffile.cpp), minus the DB-volume-directory step that needs a
-   * booted server (issue #93: this test previously hardcoded /tmp). */
+   * booted server. */
   const char *
   test_scratch_dir ()
   {
@@ -278,7 +277,7 @@ namespace
 	return 3;
       }
 
-    /* issue #93: pages_read must be real -- exactly one read_page() call per
+    /* pages_read must be real -- exactly one read_page() call per
      * spilled file page touched by the single forward pass just completed
      * (no overflow tuples in this fixture, so no page is read twice). */
     {
@@ -683,9 +682,8 @@ namespace
     return 0;
   }
 
-  /* measurement hooks (issue #68, 1A-reachable slice): the scan exposes real
-   * operation counters; assert the pgbuf-bypass invariant (scan does 0 pgbuf
-   * fixes) and the forward/copy counts. */
+  /* measurement hooks: the scan exposes real operation counters; assert the
+   * pgbuf-bypass invariant (scan does 0 pgbuf fixes) and the forward/copy counts. */
   int
   run_metrics ()
   {
@@ -738,11 +736,11 @@ namespace
     return 0;
   }
 
-  /* G20 anti-tautology (issue #93): pgbuf_fixes must react to an actual fix,
-   * not just stay at its zero-initialized value forever.  Before this issue,
-   * nothing in src/ ever wrote a nonzero value to pgbuf_fixes, so G7/G8/G10/
-   * G18's "!= 0" checks could never fail regardless of whether the
-   * pgbuf-bypass invariant actually held.  A bootless unit test can't safely
+  /* G20 anti-tautology: pgbuf_fixes must react to an actual fix, not just stay
+   * at its zero-initialized value forever.  If nothing ever wrote a nonzero
+   * value to pgbuf_fixes, G7/G8/G10/G18's "!= 0" checks could never fail
+   * regardless of whether the pgbuf-bypass invariant actually held.  A bootless
+   * unit test can't safely
    * call the real pgbuf_fix() (it needs a booted page buffer pool), so this
    * bumps the same boot-independent debug counter the real pgbuf_fix_debug()
    * entry point bumps (pgbuf_get_fix_debug_count(), page_buffer.h) and
@@ -781,7 +779,7 @@ namespace
     return 0;
   }
 
-  /* ---- Phase1 1C (issue #72) holdable-reparent helpers ------------- */
+  /* ---- holdable-reparent helpers ------------- */
   /*
    * Bootless mirrors of qfile_copy_list_id's tapeset-ownership branches and
    * qfile_clear_list_id's tapeset teardown.  The production functions call
@@ -824,7 +822,7 @@ namespace
   /* G11: holdable reparent (MOVE) is a zero-copy ownership move tran->session,
    * parity holds across the commit boundary, and session teardown is
    * orphan-zero -- the private file handle AND the RAM prefix both return to
-   * baseline (SSOT #75 §5.5 (1) / §6, ADR 0001). */
+   * baseline. */
   int
   run_reparent_orphan_zero ()
   {
@@ -1072,9 +1070,9 @@ namespace
     return 0;
   }
 
-  /* ---- Phase2 MIGRATE (issue #73) R2 + no-mixed-backing gates --------- */
+  /* ---- work-stealing + no-mixed-backing gates --------- */
 
-  /* G14: R2 offset-range work-stealing (qfile::chunk_distributor, ADR 0003).
+  /* G14: offset-range work-stealing (qfile::chunk_distributor).
    *  (a) coverage under REAL concurrency: over a skewed multi-Tape page space
    *      (huge + tiny + empty Tapes), N reader threads claim chunks via the
    *      shared atomic; every page is claimed exactly once -- no gap, no
@@ -1221,10 +1219,10 @@ namespace
   }
 
   /* G15: no-mixed-backing invariant (qfile_list_is_mixed_backing).  The check
-   * must DISCRIMINATE: pass a clean OLD list and a clean NEW list, catch a
-   * synthetic mixed list (the FAIL-03/06 shape).  We drive the predicate
-   * directly; qfile_check_no_mixed_backing wraps this same predicate in a
-   * debug assert, which a bootless run cannot trip without aborting. */
+   * must DISCRIMINATE: pass a clean pgbuf list and a clean tapeset list, catch a
+   * synthetic mixed list.  We drive the predicate directly;
+   * qfile_check_no_mixed_backing wraps this same predicate in a debug assert,
+   * which a bootless run cannot trip without aborting. */
   int
   run_no_mixed_backing ()
   {
@@ -1239,7 +1237,7 @@ namespace
 	return 1;
       }
 
-    /* clean OLD: real first-page VPID, no Tapeset */
+    /* clean pgbuf: real first-page VPID, no Tapeset */
     QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
     QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
     QFILE_LIST_ID_BACKING_KIND (&lst) = QFILE_BACKING_PGBUF;
@@ -1248,7 +1246,7 @@ namespace
 	return 2;
       }
 
-    /* clean NEW: a Tapeset, no old identity */
+    /* clean tapeset: a Tapeset, no pgbuf identity */
     qfile::tapeset ts_new;
     QFILE_CLEAR_LIST_ID (&lst);
     QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
@@ -1258,7 +1256,7 @@ namespace
 	return 3;
       }
 
-    /* mixed (the violation): old VPID + Tapeset -> MUST be detected */
+    /* mixed (the violation): pgbuf VPID + Tapeset -> MUST be detected */
     QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
     QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
     if (!qfile_list_is_mixed_backing (&lst))
@@ -1266,7 +1264,7 @@ namespace
 	return 4;
       }
 
-    /* mixed via the other OLD signal (tfile_vfid) + Tapeset */
+    /* mixed via the other pgbuf signal (tfile_vfid) + Tapeset */
     QFILE_CLEAR_LIST_ID (&lst);
     QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
     QFILE_LIST_ID_TFILE_VFID (&lst) = (struct qmgr_temp_file *) &lst;	/* non-null sentinel, never dereferenced */
@@ -1275,7 +1273,7 @@ namespace
 	return 5;
       }
 
-    /* drop the Tapeset -> clean OLD again (not mixed) */
+    /* drop the Tapeset -> clean pgbuf again (not mixed) */
     QFILE_LIST_ID_TAPESET (&lst) = NULL;
     if (qfile_list_is_mixed_backing (&lst) || !qfile_list_has_pgbuf_backing (&lst))
       {
@@ -1284,7 +1282,7 @@ namespace
     return 0;
   }
 
-  /* ---- 2A-0 overflow + concurrent-read + backing-guard (ADR 0005/0006) ---- */
+  /* ---- overflow + concurrent-read + backing-guard ---- */
 
   static char
   overflow_byte (int id, int i)
@@ -1350,7 +1348,7 @@ namespace
     QFILE_CLEAR_LIST_ID (&lst);
     qfile::tapeset ts_new;
 
-    /* clean OLD: OK into an OLD mechanism, REJECTED by a NEW mechanism. */
+    /* clean pgbuf: OK into a pgbuf mechanism, REJECTED by a tapeset mechanism. */
     QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
     QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
     if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_PGBUF))
@@ -1362,7 +1360,7 @@ namespace
 	return 2;
       }
 
-    /* clean NEW: OK into a NEW mechanism, REJECTED by an OLD mechanism. */
+    /* clean tapeset: OK into a tapeset mechanism, REJECTED by a pgbuf mechanism. */
     QFILE_CLEAR_LIST_ID (&lst);
     QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
     if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_TAPESET))
@@ -1401,11 +1399,12 @@ namespace
     return 0;
   }
 
-  /* G17: overflow-continuation run reassembled across a Chunk boundary (ADR
-   * 0006).  Layout (memory tape): off0 {0,1} | off1..3 overflow(99) | off4 {2,3}.
-   * R1 forward/backward/jump reassemble the run as one tuple; R2 readers
-   * (chunk_pages=2 so the run crosses chunk[0,1]->chunk[2,3]) read it exactly
-   * once -- the first-page owner reassembles, the others skip. */
+  /* G17: overflow-continuation run reassembled across a Chunk boundary.
+   * Layout (memory tape): off0 {0,1} | off1..3 overflow(99) | off4 {2,3}.
+   * tapeset_scan forward/backward/jump reassemble the run as one tuple;
+   * tapeset_reader readers (chunk_pages=2 so the run crosses
+   * chunk[0,1]->chunk[2,3]) read it exactly once -- the first-page owner
+   * reassembles, the others skip. */
   int
   run_overflow_crosschunk ()
   {
@@ -1431,7 +1430,7 @@ namespace
 		     && (tpl)[16] == overflow_byte (big_id, 16) \
 		     && (tpl)[tuple_len - 1] == overflow_byte (big_id, tuple_len - 1))
 
-    /* R1 forward (copy). */
+    /* scan forward (copy). */
     {
       qfile::tapeset_scan scan (&ts);
       QFILE_TUPLE_RECORD tr = { buf, cap };
@@ -1454,7 +1453,7 @@ namespace
 	}
     }
 
-    /* R1 backward from S_AFTER. */
+    /* scan backward from S_AFTER. */
     if (rc == 0)
       {
 	qfile::tapeset_scan scan (&ts);
@@ -1482,7 +1481,7 @@ namespace
 	  }
       }
 
-    /* R1 jump: save at the overflow tuple, step away, jump back, resume. */
+    /* scan jump: save at the overflow tuple, step away, jump back, resume. */
     if (rc == 0)
       {
 	qfile::tapeset_scan scan (&ts);
@@ -1508,7 +1507,7 @@ namespace
 	scan.close (NULL);
       }
 
-    /* R2: chunk_pages=2, N readers; run [1..3] crosses chunk[0,1]->chunk[2,3]. */
+    /* reader phase: chunk_pages=2, N readers; run [1..3] crosses chunk[0,1]->chunk[2,3]. */
     if (rc == 0)
       {
 	const int N = 4;
@@ -1579,11 +1578,11 @@ namespace
 
   /* G19: PEEK x overflow -- a normal-tuple PEEK immediately followed by an
    * overflow-tuple PEEK must not db_private_realloc() the borrowed page
-   * pointer a PEEK leaves in tuple_record_p (CBRD #83).  The caller record
-   * starts {NULL,0} exactly like the real scan_id_p->tplrec convention;
-   * PEEK must never grow it (tr.size stays 0 throughout) and the caller
-   * never frees tr.tpl.  Run under ASAN so the "freed once, by scan/reader
-   * close, never by caller" contract is enforced by LeakSanitizer too. */
+   * pointer a PEEK leaves in tuple_record_p.  The caller record starts {NULL,0}
+   * exactly like the real scan_id_p->tplrec convention; PEEK must never grow it
+   * (tr.size stays 0 throughout) and the caller never frees tr.tpl.  Run under
+   * ASAN so the "freed once, by scan/reader close, never by caller" contract is
+   * enforced by LeakSanitizer too. */
   int
   run_overflow_peek ()
   {
@@ -1607,7 +1606,7 @@ namespace
 		     && (tpl)[16] == overflow_byte (big_id, 16) \
 		     && (tpl)[tuple_len - 1] == overflow_byte (big_id, tuple_len - 1))
 
-    /* R1 forward, PEEK throughout: normal PEEK(0), PEEK(1), then overflow PEEK. */
+    /* scan forward, PEEK throughout: normal PEEK(0), PEEK(1), then overflow PEEK. */
     {
       qfile::tapeset_scan scan (&ts);
       QFILE_TUPLE_RECORD tr = { NULL, 0 };
@@ -1638,7 +1637,7 @@ namespace
 	}
     }
 
-    /* R2: reader-side PEEK; chunk_pages=2 crosses the overflow run so the
+    /* reader phase: reader-side PEEK; chunk_pages=2 crosses the overflow run so the
      * first-page-owner reader reassembles via tapeset_reader::reassemble(). */
     if (rc == 0)
       {
@@ -1714,7 +1713,7 @@ namespace
   /* G18: N reader threads read the SAME spilled (file-backed) Tapeset
    * concurrently via tapeset_reader.  A non-re-entrant read (shared scratch)
    * would corrupt pages -> wrong/missing/dup tuple ids; we assert exact
-   * coverage and scan-side pgbuf-bypass (ADR 0005). */
+   * coverage and scan-side pgbuf-bypass. */
   int
   run_concurrent_file_readers ()
   {
@@ -1778,7 +1777,7 @@ namespace
 	  }
 	if (pgbuf[r] != 0)
 	  {
-	    return 2;	/* scan-side pgbuf-bypass (ADR 0005/0003) */
+	    return 2;	/* scan-side pgbuf-bypass */
 	  }
       }
     std::sort (merged.begin (), merged.end ());
@@ -1790,13 +1789,11 @@ namespace
     return 0;
   }
 
-  /* G21: qfile_tapeset_import (issue #90/#78 R10) -- normal per-tape
-   * move-and-null transfer appends src's Tapes after dest's existing ones,
-   * accumulates tuple_cnt/page_cnt and propagates tapeset_contains_overflow_, and
-   * leaves src's Tapeset structurally empty: the "do not reuse src as a Tape
-   * source" contract this fix establishes (previously src kept unowned
-   * dangling Tape pointers after import).  Also covers the dest==src
-   * self-import guard. */
+  /* G21: qfile_tapeset_import -- normal per-tape move-and-null transfer appends
+   * src's Tapes after dest's existing ones, accumulates tuple_cnt/page_cnt and
+   * propagates tapeset_contains_overflow_, and leaves src's Tapeset structurally
+   * empty (the "do not reuse src as a Tape source" contract).  Also covers the
+   * dest==src self-import guard. */
   int
   run_tapeset_import ()
   {
@@ -1893,15 +1890,13 @@ namespace
     return 0;
   }
 
-  /* G22 (#87): two tapeset_scans interleaved over the SAME spilled Tapeset
-   * must each see their own exact tuple sequence.  Before per-scan scratch,
-   * the file-page read buffer was tape-owned (one per buffile_tape): scan B's
-   * page fetch overwrote the page scan A was positioned ON, so A's next
-   * forward read tuple count/length from B's page -- silent wrong ids.  Spill
-   * is mandatory for the repro: RAM prefix pages are stable per-page
-   * allocations and never clobber (a prefix-only fixture is a tautology).
-   * A is staggered 3 tuples ahead so the two scans sit on DIFFERENT file
-   * pages while alternating. */
+  /* G22: two tapeset_scans interleaved over the SAME spilled Tapeset must each
+   * see their own exact tuple sequence.  With a tape-owned (shared) file-page
+   * read buffer, scan B's page fetch would overwrite the page scan A sits ON,
+   * so per-scan scratch is required.  Spill is mandatory for the repro: RAM
+   * prefix pages are stable per-page allocations and never clobber (a
+   * prefix-only fixture is a tautology).  A is staggered 3 tuples ahead so the
+   * two scans sit on DIFFERENT file pages while alternating. */
   int
   run_interleaved_dual_scan ()
   {

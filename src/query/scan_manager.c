@@ -4156,14 +4156,14 @@ scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
       /* create hash table */
       if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HASH_FILE)
 	{
-	  /* PG-style batch spill (#123) — replaces the extendible-hash temp file */
+	  /* batch-spill hash table (HASH_FILE tier) */
 	  llsidp->hlsid.spill.hash_table = hls_spill_create (thread_p, llsidp->list_id->tuple_cnt);
 	  if (llsidp->hlsid.spill.hash_table == NULL)
 	    {
 	      return S_ERROR;
 	    }
 
-	  /* per-scan probe cursor (#127), created alongside the table */
+	  /* per-scan probe cursor, created alongside the table */
 	  llsidp->hlsid.spill.cursor = hls_spill_cursor_create (thread_p);
 	  if (llsidp->hlsid.spill.cursor == NULL)
 	    {
@@ -5543,7 +5543,7 @@ scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	  llsidp->hlsid.spill.hash_table = NULL;
 	  llsidp->hlsid.spill.cursor = NULL;
 	}
-      /* release the IN_MEM/HYBRID build estimate charge (#123/#91) */
+      /* release the IN_MEM/HYBRID build estimate charge */
       qdata_hscan_wm_release (&llsidp->hlsid);
       /* free temp keys and values */
       if (llsidp->hlsid.temp_key != NULL)
@@ -8873,7 +8873,7 @@ scan_build_hash_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	    }
 	  break;
 	case HASH_METH_HASH_FILE:
-	  /* batch spill (#123): backing-aware SIMPLE_POS value (TAPE/raw-fd/VPID) */
+	  /* batch spill: backing-aware SIMPLE_POS value (TAPE/SPILL/VPID) */
 	  {
 	    QFILE_TUPLE_SIMPLE_POS spill_pos;
 
@@ -9070,7 +9070,7 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	  return S_SUCCESS;
 
 	case HASH_METH_HASH_FILE:
-	  /* batch-spill probe (#123) */
+	  /* batch-spill probe */
 	  eh_search = hls_spill_search (thread_p, llsidp->hlsid.spill.hash_table, llsidp->hlsid.spill.cursor, hash_key,
 					&spill_pos);
 	  switch (eh_search)
@@ -9109,8 +9109,8 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	    {
 	      /* A Tapeset scan holds its page inside the driver (curr_pgptr is a
 	       * malloc'd mirror, not a pgbuf page); it is released by
-	       * qfile_close_scan -> qfile_tapeset_scan_close, never via the legacy
-	       * tfile page-free (#101). */
+	       * qfile_close_scan -> qfile_tapeset_scan_close, not via the tfile
+	       * page-free. */
 	      if (llsidp->hlsid.hash_list_scan_type == HASH_METH_HYBRID && scan_id_p->tapeset_scan_ == NULL)
 		{
 		  qmgr_free_old_page_and_init (thread_p, scan_id_p->curr_pgptr, QFILE_LIST_ID_TFILE_VFID(&(scan_id_p->list_id)));
@@ -9153,7 +9153,7 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
 	      *tuple = tplrec.tpl;
 	      return S_SUCCESS;
 	    case EH_KEY_NOTFOUND:
-	      /* Backing-aware release (#101): a Tapeset scan's page is owned by the
+	      /* Backing-aware release: a Tapeset scan's page is owned by the
 	       * driver and released via qfile_close_scan. */
 	      if (scan_id_p->tapeset_scan_ == NULL)
 		{
@@ -9257,7 +9257,7 @@ check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_y
 
   /* list file size check.  Each in-memory tier must both fit work_mem AND
    * secure its estimate from the work_mem accountant (total cap across
-   * concurrent consumers, #123/#91); on refusal it degrades to the next tier.
+   * concurrent consumers); on refusal it degrades to the next tier.
    * The charge is the same quantity the size check compares, released when
    * the hash table is destroyed (scan_close_scan). */
   if (mem_limit == 0)
@@ -9277,13 +9277,13 @@ check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_y
       /* bytes of 1 row = sizeof(HENTRY_HLS) + sizeof(QFILE_TUPLE_SIMPLE_POS) = 56 bytes (64bit) */
       /* HENTRY_HLS = pointer(8bytes) * 4 = 32 bytes */
       /* SIMPLE_POS = discriminator(4bytes) + fixed coordinate(16bytes) + reserved(4bytes) = 24 bytes */
-      /* HYBRID over a NEW (Tapeset) build list works since #101: the producer saves a
-       * first-class TAPE coordinate (no synthetic-VPID punning, #85) and the consumer
-       * dispatches on coord_type. */
+      /* HYBRID over a tapeset build list works: the producer saves a first-class
+       * TAPE coordinate (no synthetic-VPID punning) and the consumer dispatches
+       * on coord_type. */
       return HASH_METH_HYBRID;
     }
-  /* HASH_FILE tier = PG-style batch spill (#123), which bounds its own memory
-   * (staging + one batch) under the accountant.  Values are coord_type-tagged
-   * SIMPLE_POS, so the #85 NEW-list fence is lifted (TAPE coords, #101). */
+  /* HASH_FILE tier = batch spill, which bounds its own memory (staging + one
+   * batch) under the accountant.  Values are coord_type-tagged SIMPLE_POS, so a
+   * tapeset build list works too (TAPE coords). */
   return HASH_METH_HASH_FILE;
 }

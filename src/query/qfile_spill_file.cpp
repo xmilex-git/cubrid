@@ -17,8 +17,8 @@
  */
 
 /*
- * qfile_spill_file.cpp - shared spill-file substrate (Phase3 (c′), issue #74/#132).
- * Mechanically extracted from qfile_buffile.cpp; see qfile_spill_file.hpp.
+ * qfile_spill_file.cpp - shared spill-file substrate.
+ * See qfile_spill_file.hpp.
  */
 
 #include "qfile_spill_file.hpp"
@@ -47,8 +47,8 @@
 
 namespace
 {
-  /* Process-wide orphan-scan census (redesign G003 #68, 1C slice).  Only the
-   * new per-worker backing path touches these. */
+  /* Process-wide orphan-scan census.  Only the per-worker backing path
+   * touches these. */
   std::atomic<long> g_census_open_files {0};
   std::atomic<long> g_census_held_prefix_pages {0};
 
@@ -80,8 +80,7 @@ namespace
   }
 
   /* ------------------------------------------------------------------ */
-  /* Boot-time orphan sweep for cubrid_buffile/ (issue #88).  Mirrors the   */
-  /* raw-fd boot sweep in temp_page_store.cpp: a persistent per-database    */
+  /* Boot-time orphan sweep for cubrid_buffile/.  A persistent per-database */
   /* server_id (survives restarts) namespaces this server's spill subtree, */
   /* so boot can safely wipe ONLY that subtree -- files left behind by a    */
   /* kill -9'd previous run of *this* server -- without touching another   */
@@ -204,10 +203,10 @@ namespace
 
   buffile_dir_state g_buffile_dirs;
 
-  /* Resolve the disk-backed root (no /tmp or $TMP fallback, issue #88 D2:
-   * both can be tmpfs and a spill file on tmpfs defeats the point of
-   * spilling -- risks host OOM).  Priority: $CUBRID_TMP, else the database
-   * volume directory.  Empty return means "no usable disk-backed base". */
+  /* Resolve the disk-backed root (no /tmp or $TMP fallback: both can be
+   * tmpfs and a spill file on tmpfs defeats the point of spilling -- risks
+   * host OOM).  Priority: $CUBRID_TMP, else the database volume directory.
+   * Empty return means "no usable disk-backed base". */
   std::string
   buffile_root_base ()
   {
@@ -264,7 +263,7 @@ namespace
 namespace qfile
 {
   /* ------------------------------------------------------------------ */
-  /* tape_backing_census (orphan-scan hook, redesign G003 #68 / 1C)     */
+  /* tape_backing_census (orphan-scan hook)                             */
   /* ------------------------------------------------------------------ */
 
   tape_backing_census_snapshot
@@ -365,7 +364,7 @@ namespace qfile
   }
 
   /* ------------------------------------------------------------------ */
-  /* scratch tree + boot sweep (issue #88)                              */
+  /* scratch tree + boot sweep                                          */
   /* ------------------------------------------------------------------ */
 
   void
@@ -473,7 +472,7 @@ namespace qfile
   }
 
   /* ------------------------------------------------------------------ */
-  /* per-page TDE staging (fresh nonce per encrypt; SSOT §5 (3))        */
+  /* per-page TDE staging (fresh nonce per encrypt)                     */
   /* ------------------------------------------------------------------ */
 
   int

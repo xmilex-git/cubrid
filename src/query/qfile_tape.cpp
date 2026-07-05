@@ -17,7 +17,7 @@
  */
 
 /*
- * qfile_tape.cpp - Phase1 1A scan contract (redesign G005, issue #70).
+ * qfile_tape.cpp - Tape/Tapeset scan implementation.
  * See qfile_tape.hpp for the design rationale.
  */
 
@@ -27,17 +27,17 @@
 #include "memory_alloc.h"
 #include "object_representation.h"	/* OR_GET_INT used by the QFILE_GET_* page macros */
 #include "list_file.h"		/* qfile_copy_list_id / qfile_clear_list_id / QFILE_MOVE_DEPENDENT */
-#include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
+#include "page_buffer.h"	/* pgbuf_get_fix_debug_count */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "file_io.h"		/* PEEK */
-#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held (#91) */
+#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held */
 
 #include <cassert>
 #include <cerrno>		/* ENOSPC/EDQUOT (ensure_buffile os_error mapping) */
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>		/* stat (orphan-zero on-disk check) */
-#include <thread>		/* N-reader concurrent selftest (ADR 0005) */
+#include <thread>		/* N-reader concurrent selftest */
 #include <algorithm>		/* std::sort (coverage check) */
 #include <atomic>		/* process-unique producer BufFile sequence */
 
@@ -48,12 +48,12 @@ namespace qfile
 #if !defined (NDEBUG)
   namespace
   {
-    /* freeze() allocation fault injection (#95, debug-only).  Simulates the
+    /* freeze() allocation fault injection (debug-only).  Simulates the
      * SERVER_MODE noexcept-new returning NULL at a tape allocation without
      * exhausting real memory, so the OOM ownership-recovery path is exercised
      * deterministically.  g_fault_alloc_target is the 1-based ordinal of the
      * tape allocation to fail (0 = disarmed); g_fault_alloc_count counts tape
-     * allocations seen since the last arm.  Reuses the #86 fault-hook shape. */
+     * allocations seen since the last arm. */
     std::atomic<int> g_fault_alloc_target {0};
     std::atomic<int> g_fault_alloc_count {0};
 
@@ -98,7 +98,7 @@ namespace qfile
 #endif /* !NDEBUG */
 
   /* ------------------------------------------------------------------ */
-  /* tape (work_mem charge lifetime, #91)                               */
+  /* tape (work_mem charge lifetime)                                    */
   /* ------------------------------------------------------------------ */
 
   tape::~tape ()
@@ -216,7 +216,7 @@ namespace qfile
     if (m_buffile == NULL || page_dest == NULL)
       {
 	/* a spilled offset with no backing / no caller scratch is a caller bug,
-	 * not a silent S_END (#90) */
+	 * not a silent S_END */
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	return NULL;
       }
@@ -234,7 +234,7 @@ namespace qfile
   }
 
   /* ------------------------------------------------------------------ */
-  /* tape_writer (membuf Option-A producer)                             */
+  /* tape_writer (membuf producer)                                      */
   /* ------------------------------------------------------------------ */
 
   tape_writer::tape_writer (int prefix_budget_pages, TDE_ALGORITHM tde_algo, const std::string &dir,
@@ -273,7 +273,7 @@ namespace qfile
    * atomic reservation per WM_PREFIX_RESERVE_BATCH_PAGES pages, not per
    * page).  A failed reservation is a soft degrade, never a hard OOM: the
    * prefix budget shrinks to what is already reserved and subsequent pages
-   * spill to the BufFile early (#91). */
+   * spill to the BufFile early. */
   static const int WM_PREFIX_RESERVE_BATCH_PAGES = 64;
 
   bool
@@ -351,7 +351,7 @@ namespace qfile
       {
 	/* fd exhaustion (EMFILE/ENFILE) is diagnosed as out-of-temp-space, not
 	 * a generic ER_FAILED, so fd starvation surfaces as an actionable
-	 * error (#125; mapping promoted into the substrate, #132). */
+	 * error. */
 	spill_file::set_os_error (os_error);
 	return ER_FAILED;
       }
@@ -361,10 +361,10 @@ namespace qfile
   int
   tape_writer::append_page (THREAD_ENTRY *thread_p, const PAGE_PTR list_page)
   {
-    /* Single latch point (#86): any failed append -- lost prefix page, spill
-     * flush ENOSPC, buffile-create error -- sets the sticky flag so freeze ()
-     * cannot later hand back a silently truncated Tape.  Only the error path
-     * writes the flag, so the steady-state append costs nothing extra. */
+    /* Single latch point: any failed append -- lost prefix page, spill flush
+     * ENOSPC, buffile-create error -- sets the sticky flag so freeze () cannot
+     * later hand back a silently truncated Tape.  Only the error path writes
+     * the flag, so the steady-state append costs nothing extra. */
     const int rc = append_page_impl (thread_p, list_page);
     if (rc != NO_ERROR)
       {
@@ -412,8 +412,8 @@ namespace qfile
 	return NULL;
       }
 
-    /* Sticky-error gate (#86): a prior append lost a page, so any Tape built
-     * here would be silently short.  Refuse -- return NULL before touching
+    /* Sticky-error gate: a prior append lost a page, so any Tape built here
+     * would be silently short.  Refuse -- return NULL before touching
      * ownership so the caller's teardown (delete w / ~tape_writer) reclaims
      * the partial spill exactly as on a freeze-flush failure. */
     if (m_failed)
@@ -430,7 +430,7 @@ namespace qfile
 #if !defined (NDEBUG)
 	if (fault_alloc_should_fail ())
 	  {
-	    mt = NULL;		/* simulate noexcept-new OOM (#95) */
+	    mt = NULL;		/* simulate noexcept-new OOM */
 	  }
 	else
 #endif
@@ -439,10 +439,10 @@ namespace qfile
 	  }
 	if (mt == NULL)
 	  {
-	    /* SERVER_MODE new is noexcept and returns NULL on OOM (#95): the
-	     * prefix pages are still ours and untouched.  Latch + return NULL
-	     * WITHOUT transferring ownership -- caller's delete w -> ~tape_writer
-	     * frees the prefix.  (No NULL-deref, no lost pages.) */
+	    /* SERVER_MODE new is noexcept and returns NULL on OOM: the prefix
+	     * pages are still ours and untouched.  Latch + return NULL WITHOUT
+	     * transferring ownership -- caller's delete w -> ~tape_writer frees
+	     * the prefix.  (No NULL-deref, no lost pages.) */
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (memory_tape));
 	    m_failed = true;
 	    return NULL;
@@ -468,7 +468,7 @@ namespace qfile
 #if !defined (NDEBUG)
     if (fault_alloc_should_fail ())
       {
-	bt = NULL;		/* simulate noexcept-new OOM (#95) */
+	bt = NULL;		/* simulate noexcept-new OOM */
       }
     else
 #endif
@@ -477,9 +477,9 @@ namespace qfile
       }
     if (bt == NULL)
       {
-	/* SERVER_MODE new is noexcept and returns NULL on OOM (#95): the ctor
-	 * never ran, so m_prefix was NOT moved and m_buffile is still ours.
-	 * Latch + return NULL BEFORE touching ownership -- caller's delete w ->
+	/* SERVER_MODE new is noexcept and returns NULL on OOM: the ctor never
+	 * ran, so m_prefix was NOT moved and m_buffile is still ours.  Latch +
+	 * return NULL BEFORE touching ownership -- caller's delete w ->
 	 * ~tape_writer frees the prefix and closes/unlinks the spill file.
 	 * (No NULL-deref, no orphaned fd/file, no lost pages.) */
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (buffile_tape));
@@ -560,10 +560,9 @@ namespace qfile
   /* tapeset_scan                                                       */
   /* ------------------------------------------------------------------ */
 
-  /* Scan-side pgbuf-bypass gate (issue #93): tapeset_scan/tapeset_reader read
-   * pages only via tape::read_page_into and must never fix a
-   * pgbuf BCB.  Snapshot-diffing the boot-independent debug counter replaces
-   * the old always-zero field with a real measurement. */
+  /* Scan-side pgbuf-bypass gate: tapeset_scan/tapeset_reader read pages only
+   * via tape::read_page_into and must never fix a pgbuf BCB.  Snapshot-diff
+   * the boot-independent debug counter to measure it. */
   static void
   refresh_pgbuf_fixes (tapeset_scan_metrics &metrics, long baseline)
   {
@@ -604,11 +603,11 @@ namespace qfile
 
   tapeset_scan::~tapeset_scan ()
   {
-    /* A held page needs no release call (#87): a file page lives in the
-     * scan-owned m_readbuf freed here, a prefix page is Tape-owned RAM. */
-    /* #89: drop this scan's reference on its OWN copy of the shared cell --
-     * never touches m_tapeset, which may already be freed (see class comment
-     * in qfile_tape.hpp / D3 in #87). */
+    /* A held page needs no release call: a file page lives in the scan-owned
+     * m_readbuf freed here, a prefix page is Tape-owned RAM. */
+    /* Drop this scan's reference on its OWN copy of the shared cell -- never
+     * touches m_tapeset, which may already be freed (see class comment in
+     * qfile_tape.hpp). */
     if (m_open_scan_cell)
       {
 	m_open_scan_cell->fetch_sub (1, std::memory_order_relaxed);
@@ -626,10 +625,10 @@ namespace qfile
   void
   tapeset_scan::release_page (THREAD_ENTRY *thread_p)
   {
-    /* Per-scan scratch (#87): a held file page lives in the scan-owned
-     * m_readbuf and a prefix page is Tape-owned RAM -- dropping the reference
-     * needs no Tape call, so close() does not depend on the Tapeset (or its
-     * Tapes) being alive (#89). */
+    /* Per-scan scratch: a held file page lives in the scan-owned m_readbuf and
+     * a prefix page is Tape-owned RAM -- dropping the reference needs no Tape
+     * call, so close() does not depend on the Tapeset (or its Tapes) being
+     * alive. */
     (void) thread_p;
     m_page = NULL;
     m_curr_tpl = NULL;
@@ -670,9 +669,9 @@ namespace qfile
   SCAN_CODE
   tapeset_scan::retrieve (THREAD_ENTRY *thread_p, QFILE_TUPLE_RECORD *tuple_record_p, int peek)
   {
-    /* Overflow START page: reassemble the contiguous run as one tuple
-     * (ADR 0006).  We must be positioned ON the run's first page (forward /
-     * backward / jump all land there); a continuation page here is a bug. */
+    /* Overflow START page: reassemble the contiguous run as one tuple.  We
+     * must be positioned ON the run's first page (forward / backward / jump
+     * all land there); a continuation page here is a bug. */
     if (qfile_overflow_is_overflow_page (m_page))
       {
 	if (qfile_overflow_first_page (m_page) != m_page_offset)
@@ -707,7 +706,7 @@ namespace qfile
 	     * callers don't free tuple_record_p->tpl, and a prior normal-tuple
 	     * PEEK may have left tuple_record_p->tpl pointing at borrowed page
 	     * memory with size == 0 -- reallocating THAT would corrupt the
-	     * private heap (#83). */
+	     * private heap. */
 	    if (tuple_len > m_peek_reasm_cap)
 	      {
 		char *area = (char *) realloc (m_peek_reasm_raw, tuple_len);
@@ -876,7 +875,7 @@ namespace qfile
 		return retrieve (thread_p, tuple_record_p, peek);
 	      }
 	    /* zero-tuple page or overflow continuation (start already consumed in
-	     * sequential R1) -- skip; nothing to release (scan-owned scratch). */
+	     * the sequential scan) -- skip; nothing to release (scan-owned scratch). */
 	  }
       }
 
@@ -960,7 +959,7 @@ namespace qfile
 	      {
 		/* Backward reaches the run's last (continuation) page first;
 		 * reposition to its START page and reassemble the whole run as one
-		 * tuple (ADR 0006).  The next backward step then skips to start-1. */
+		 * tuple.  The next backward step then skips to start-1. */
 		const int first = qfile_overflow_first_page (page);
 		PAGE_PTR start_pg = fetch_page (thread_p, tape_p, first);
 		if (start_pg == NULL)
@@ -1042,7 +1041,7 @@ namespace qfile
   }
 
   /* ------------------------------------------------------------------ */
-  /* tapeset_reader (R2 per-participant concurrent read, ADR 0005/0006) */
+  /* tapeset_reader (per-participant concurrent read)                   */
   /* ------------------------------------------------------------------ */
 
   tapeset_reader::tapeset_reader (tapeset *ts, chunk_distributor *dist, int reader_id)
@@ -1114,7 +1113,7 @@ namespace qfile
       {
 	/* Overflow-PEEK reassembles into a reader-owned buffer (freed by
 	 * ~tapeset_reader()), never into the caller's record -- same rationale
-	 * as tapeset_scan::retrieve's overflow-PEEK branch (#83). */
+	 * as tapeset_scan::retrieve's overflow-PEEK branch. */
 	if (tuple_len > m_peek_reasm_cap)
 	  {
 	    char *area = (char *) realloc (m_peek_reasm_raw, tuple_len);
@@ -1275,7 +1274,7 @@ namespace qfile
 }				/* namespace qfile */
 
 /* ------------------------------------------------------------------ */
-/* Overflow-continuation page-header helpers (ADR 0006)               */
+/* Overflow-continuation page-header helpers.                         */
 /* ------------------------------------------------------------------ */
 
 void
@@ -1355,8 +1354,8 @@ qfile_tapeset_scan_open (QFILE_LIST_SCAN_ID *scan_id_p)
       scan_id_p->tapeset_scan_ = NULL;
       return NO_ERROR;
     }
-  /* backing-kind entry guard (production-hard): a NEW (Tapeset) scan never runs
-   * over a list that also carries OLD backing (SSOT #75 round-3 (d)/(e)). */
+  /* backing-kind entry guard (production-hard): a tapeset scan never runs over
+   * a list that also carries pgbuf backing. */
   {
     int guard_rc = QFILE_GUARD_TAPESET_MECHANISM (&scan_id_p->list_id);
     if (guard_rc != NO_ERROR)
@@ -1387,9 +1386,8 @@ qfile_tapeset_scan_close (THREAD_ENTRY *thread_p, QFILE_LIST_SCAN_ID *scan_id_p)
     }
 }
 
-/* #143 S3: the cast-to-tapeset_scan -> method call -> mirror sequence repeated
- * identically across forward/backward/jump; fold it into one internal
- * helper so each bridge is left with only its method-specific call. */
+/* Shared cast-to-tapeset_scan -> method call -> mirror sequence for the
+ * forward/backward/jump bridges; each bridge supplies only its method call. */
 template <typename F>
 static SCAN_CODE
 qfile_tapeset_scan_step (QFILE_LIST_SCAN_ID *scan_id_p, F &&step)
@@ -1445,13 +1443,13 @@ qfile_tapeset_destroy (void *tapeset_ptr)
   delete (qfile::tapeset *) tapeset_ptr;
 }
 
-/* #120a client-fetch-over-Tapeset bridges.  Serve a NEW (Tapeset)-backed
- * top-level result straight from its frozen Tapes for the VPID-page client
- * fetch protocol, without the #94 pgbuf materialize (full OLD copy).  The
- * Tapeset's ordered Tapes form one dense logical page sequence
- * 0..page_count()-1 (offset arithmetic, ADR 0003); the client addresses pages
- * by that global index (see QFILE_TAPESET_FETCH_VOLID).  Overflow-free lists
- * only -- the caller keeps materialize for NEW_CONTAINS_OVERFLOW (#120b). */
+/* Client-fetch-over-Tapeset bridges.  Serve a tapeset-backed top-level result
+ * straight from its frozen Tapes for the VPID-page client fetch protocol,
+ * without the pgbuf materialize (full pgbuf copy).  The Tapeset's ordered
+ * Tapes form one dense logical page sequence 0..page_count()-1 (offset
+ * arithmetic); the client addresses pages by that global index (see
+ * QFILE_TAPESET_FETCH_VOLID).  Overflow-free lists only -- the caller keeps
+ * materialize for the overflow-containing case. */
 int
 qfile_tapeset_page_count (const QFILE_LIST_ID *list_id_p)
 {
@@ -1496,9 +1494,9 @@ qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *lis
       const int n = tp->total_page_count ();
       if (remaining < n)
 	{
-	  /* Re-entrant read into caller scratch (ADR 0005); a RAM prefix page is
-	   * returned in place (pg != page_dest), a file page is read into
-	   * page_dest.  TDE decrypt uses the local scratch (freed on return). */
+	  /* Re-entrant read into caller scratch; a RAM prefix page is returned
+	   * in place (pg != page_dest), a file page is read into page_dest.  TDE
+	   * decrypt uses the local scratch (freed on return). */
 	  qfile::tde_read_scratch tde;
 	  PAGE_PTR pg = tp->read_page_into (thread_p, remaining, page_dest, &tde);
 	  if (pg == NULL)
@@ -1511,7 +1509,7 @@ qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *lis
 	    }
 	  if (local_offset_out != NULL)
 	    {
-	      *local_offset_out = remaining;	/* tape-local logical offset (#120b D2) */
+	      *local_offset_out = remaining;	/* tape-local logical offset */
 	    }
 	  return NO_ERROR;
 	}
@@ -1523,7 +1521,7 @@ qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *lis
 }
 
 /* ------------------------------------------------------------------ */
-/* Phase2 2A-1 producer bridge (redesign #78)                          */
+/* producer bridge                                                    */
 /* ------------------------------------------------------------------ */
 
 void *
@@ -1555,10 +1553,10 @@ qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted)
 }
 
 /* Import all Tapes of src's frozen Tapeset into dest's Tapeset, in order
- * (redesign #78, 2A-1b parallel fan-in).  Ownership of the Tapes transfers to
- * dest; src's Tapeset keeps the (now-unowned) vector so destroying src frees
- * only its container, not the moved Tapes.  dest's tuple/page counts
- * accumulate src's.  dest must be a NEW (frozen Tapeset) list. */
+ * (parallel fan-in).  Ownership of the Tapes transfers to dest; src's Tapeset
+ * keeps the (now-unowned) vector so destroying src frees only its container,
+ * not the moved Tapes.  dest's tuple/page counts accumulate src's.  dest must
+ * be a frozen Tapeset list. */
 int
 qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID *src)
 {

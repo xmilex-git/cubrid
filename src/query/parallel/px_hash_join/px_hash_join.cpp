@@ -54,10 +54,8 @@ namespace parallel_query
 
       if (qfile_list_has_tapeset (input_list_id))
 	{
-	  /* #84: reached only when both split inputs are NEW-backed AND the
-	   * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
-	   * HASHJOIN_STATUS_PARTITION otherwise), mirroring the probe path.
-	   * NEW (Tapeset): chunk_distributor + per-worker tapeset_reader. */
+	  /* tapeset-backed input: chunk_distributor + per-worker tapeset_reader.
+	   * The serial partition path handles the non-tapeset case. */
 	  shared_info->new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list_id);
 	  if (shared_info->new_tapeset == nullptr)
 	    {
@@ -67,13 +65,10 @@ namespace parallel_query
 	    }
 	  shared_info->new_dist = new qfile::chunk_distributor (shared_info->new_tapeset, task_cnt);
 
-	  /* redesign #78 per-worker OUTPUT tape (ADR0004): allocate per-worker
-	   * partition list slots so workers write without part_mutexes.
-	   * #109: the per-worker slot arrays are allocated HERE, on the leader,
-	   * and only filled by the workers — db_private_alloc is per-thread
-	   * (each entry owns its own lea mspace), so a worker-side allocation
-	   * would make the leader's db_private_free at merge time free a
-	   * foreign-mspace chunk (mspace_free USAGE_ERROR abort). */
+	  /* Per-worker OUTPUT partition slots let workers write without part_mutexes.
+	   * Allocate them HERE on the leader, not the workers: db_private_alloc is
+	   * per-thread, so a worker-side alloc would make the leader's merge-time free
+	   * hit a foreign mspace. */
 	  shared_info->worker_count = task_cnt;
 	  shared_info->worker_part_lists =
 		  (QFILE_LIST_ID ***) db_private_alloc (&thread_ref, task_cnt * sizeof (QFILE_LIST_ID **));
@@ -99,9 +94,8 @@ namespace parallel_query
 	}
       else
 	{
-	  /* #84/#130: hjoin_try_parallel forces serial partitioning for
-	   * OLD-backed input and the OLD sector scan is deleted; reaching
-	   * here is a guard violation. */
+	  /* The partition path forces serial for pgbuf-backed input and the
+	   * pgbuf sector scan is deleted; reaching here is a guard violation. */
 	  assert (false);
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	  error = ER_FAILED;
@@ -291,7 +285,7 @@ namespace parallel_query
 	}
 
 cleanup:
-      /* redesign #78 2A-3: release the NEW-input distributor. */
+      /* release the tapeset-input distributor. */
       delete shared_info.new_dist;
       shared_info.new_dist = nullptr;
 
@@ -673,9 +667,8 @@ error_exit:
 
 	if (qfile_list_has_tapeset (probe_list_id))
 	  {
-	    /* redesign #78 2A-3: NEW (Tapeset) probe input -> shared chunk_distributor
-	     * + per-worker tapeset_reader (ADR 0003/0005/0006).  The OLD sector
-	     * reader (and its backing guard) is bypassed for NEW input. */
+	    /* tapeset probe input -> shared chunk_distributor + per-worker
+	     * tapeset_reader.  The pgbuf sector reader is bypassed for tapeset input. */
 	    shared_info.new_tapeset = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (probe_list_id);
 	    if (shared_info.new_tapeset == nullptr)
 	      {
@@ -695,9 +688,8 @@ error_exit:
 	  }
 	else
 	  {
-	    /* #130: hjoin_try_parallel_probe forces serial for OLD-backed input
-	     * and the OLD sector scan is deleted; reaching here is a guard
-	     * violation. */
+	    /* the probe path forces serial for pgbuf-backed input and the pgbuf
+	     * sector scan is deleted; reaching here is a guard violation. */
 	    assert (false);
 	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	    error = ER_FAILED;
@@ -780,7 +772,7 @@ error_exit:
       ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
 cleanup:
-      /* redesign #78 2A-3: release the NEW-input distributor. */
+      /* release the tapeset-input distributor. */
       delete shared_info.new_dist;
       shared_info.new_dist = nullptr;
 

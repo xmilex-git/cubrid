@@ -305,19 +305,16 @@ typedef struct hashjoin_shared_split_info
   // *INDENT-OFF*
   std::mutex *part_mutexes;
 
-  /* redesign #78 2A-3: NEW (Tapeset) split input read via chunk_distributor +
-   * per-worker tapeset_reader, mirroring the probe path (HASHJOIN_SHARED_PROBE_INFO).
-   * Created/destroyed per split-run (outer, then inner) in build_partitions.
-   * #130: the OLD sector-scan read path is deleted; hjoin_try_parallel forces
-   * serial partitioning for OLD-backed input, so new_dist is always built here. */
+  /* Tapeset split input, read in parallel via chunk_distributor + per-worker
+   * tapeset_reader (mirrors the probe path).  Built/destroyed per split-run
+   * (outer, then inner) in build_partitions. */
   qfile::tapeset *new_tapeset;
   qfile::chunk_distributor *new_dist;
 
-  /* redesign #78 per-worker OUTPUT tape (ADR0004): when NEW-input split is active,
-   * each worker writes to its own partition lists without part_mutexes.  After all
-   * workers complete, the leader sequentially merges worker lists into part_list_id.
-   * worker_part_lists[worker_index][part_index] = worker's temp partition list.
-   * Allocated/freed per split-run in build_partitions; NULL on OLD path. */
+  /* Per-worker output partition lists: each worker writes its own lists without
+   * part_mutexes, then the leader merges them into part_list_id.
+   * worker_part_lists[worker_index][part_index].  Allocated/freed per split-run;
+   * NULL on the serial pgbuf-paged path. */
   QFILE_LIST_ID ***worker_part_lists;
   UINT32 worker_count;
 
@@ -340,11 +337,8 @@ typedef struct hashjoin_shared_probe_info
   std::mutex stats_mutex;
   HASHJOIN_RANGE_STATS probe_range;
 
-  /* redesign #78 2A-3: NEW (Tapeset) probe input read via chunk_distributor +
-   * per-worker tapeset_reader (ADR 0003/0005/0006), built on the coordinating
-   * thread and freed at cleanup.
-   * #130: the OLD sector-scan read path is deleted; hjoin_try_parallel_probe
-   * forces serial for OLD-backed input, so new_dist is always built here. */
+  /* Tapeset probe input, read in parallel via chunk_distributor + per-worker
+   * tapeset_reader; built on the coordinating thread and freed at cleanup. */
   qfile::tapeset *new_tapeset;
   qfile::chunk_distributor *new_dist;
 

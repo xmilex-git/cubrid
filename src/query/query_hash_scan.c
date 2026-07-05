@@ -52,7 +52,7 @@
 #include "oid.h"
 #include "qfile_tape.hpp"
 #include "qfile_buffile.hpp"
-#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held (#91/#123) */
+#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held */
 
 #include <algorithm>
 #include <atomic>
@@ -65,8 +65,7 @@
 static bool safe_memcpy (void *data, void *source, int size);
 static DB_VALUE_COMPARE_RESULT qdata_hscan_key_compare (HASH_SCAN_KEY * ckey1, HASH_SCAN_KEY * ckey2, int *diff_pos);
 /* Key hash for the HASH_FILE tier, reused by hls_spill through
- * qdata_hash_scan_key (HASH_METH_HASH_FILE); relocated here from the
- * deleted fhs extendible-hash machinery (#129/#123). */
+ * qdata_hash_scan_key (HASH_METH_HASH_FILE). */
 static unsigned int hls_spill_hash (void *original_key_p);
 static unsigned int hls_spill_hash_four_bytes_type (char *key_p);
 
@@ -584,15 +583,15 @@ qdata_alloc_hscan_value_OID (cubthread::entry * thread_p, QFILE_LIST_SCAN_ID * s
 /*
  * qdata_save_hscan_pos () - save the scan's current tuple position as a
  *   backing-aware SIMPLE_POS (TAPE / spill / VPID).  Shared by the HYBRID
- *   value producer above and the batch-spill build (#123).
+ *   value producer above and the batch-spill build.
  */
 void
 qdata_save_hscan_pos (QFILE_LIST_SCAN_ID * scan_id_p, QFILE_TUPLE_SIMPLE_POS * pos)
 {
   if (scan_id_p->tapeset_scan_ != NULL)
     {
-      /* NEW (Tapeset) list: the mirror curr_vpid is synthetic (volid = NULL_VOLID,
-       * pageid = page offset within the current Tape) and loses tape_idx (#85, #101).
+      /* Tapeset list: the mirror curr_vpid is synthetic (volid = NULL_VOLID,
+       * pageid = page offset within the current Tape) and loses tape_idx.
        * Save the scan's first-class TAPE coordinate instead. */
       QFILE_TUPLE_POSITION tape_pos;
 
@@ -715,32 +714,28 @@ hls_spill_hash_four_bytes_type (char *key_p)
 
 
 /****************************************************************************/
-/*********** PG-style batch-spill hash (HASH_FILE tier, #123) **************/
+/*********** batch-spill hash (HASH_FILE tier) *****************************/
 /****************************************************************************/
-/* Replaces the extendible-hash temp file (fhs_*, pgbuf pages + global temp
- * file machinery) with per-batch append-only BufFiles, borrowing the
- * PostgreSQL nodeHash.c idiom (ExecHashGetBucketAndBatch batch split by hash
- * bits; ExecHashIncreaseNumBatches growth when a batch exceeds its memory
- * target).  Shape is symmetric with the PHJ partition spill (#91-accounted).
+/* Per-batch append-only BufFiles, borrowing the PostgreSQL nodeHash.c idiom
+ * (ExecHashGetBucketAndBatch batch split by hash bits; ExecHashIncreaseNumBatches
+ * growth when a batch exceeds its memory target).  Symmetric with the PHJ
+ * partition spill.
  *
  * Build:    entries (hash_key, QFILE_TUPLE_SIMPLE_POS) are appended to
  *           nbatch BufFiles, batchno = hash & (nbatch - 1).  nbatch is sized
- *           up front from the exact list tuple_cnt (materialized list), so
- *           PG's mid-build doubling reduces to exact sizing here.
+ *           up front from the exact list tuple_cnt (materialized list).
  * Finalize: each batch is loaded whole (<= target, work_mem-accounted),
  *           sorted by hash, written back as a sorted run + an in-memory
  *           page-fence index (first hash per page).  An overweight batch
- *           (hash skew or accountant pressure) is range-bisected by hash --
- *           the lazy per-batch form of ExecHashIncreaseNumBatches; when
- *           bisection cannot help (depth cap: all-equal hashes), we soft-
- *           reserve and overshoot, mirroring PG's growEnabled=false escape.
+ *           (hash skew or accountant pressure) is range-bisected by hash;
+ *           when bisection cannot help (depth cap: all-equal hashes), we
+ *           soft-reserve and overshoot.
  * Probe:    batchno -> run by hash range -> fence binary search -> one
  *           read_page -> in-page binary search; duplicates are adjacent.
  *
- * Values are coord_type-tagged SIMPLE_POS, so NEW (Tapeset) build lists work
- * (TAPE coords, #101).  Entries carry no user data (hash + coordinates), so
- * spill files need no TDE -- an improvement over fhs, which wrote key values
- * into temp pages. */
+ * Values are coord_type-tagged SIMPLE_POS, so tapeset build lists work
+ * (TAPE coords).  Entries carry no user data (hash + coordinates), so
+ * spill files need no TDE. */
 
 typedef struct hls_spill_entry HLS_SPILL_ENTRY;
 struct hls_spill_entry
@@ -793,7 +788,7 @@ struct hls_spill
   std::atomic<long> probe_page_reads;
 };
 
-/* PROBE-side mutable state (#127): each HASH_LIST_SCAN that probes a given
+/* PROBE-side mutable state: each HASH_LIST_SCAN that probes a given
  * HLS_SPILL owns exactly one of these.  In parallel probe, every worker
  * shares the same HLS_SPILL (built once) but must create its own cursor --
  * sharing a cursor across workers reintroduces the race this type fixes. */
@@ -836,9 +831,9 @@ hls_spill_new_file (THREAD_ENTRY * thread_p, HLS_SPILL * spill)
     qfile::buffile::create (thread_p, spill->dir.c_str (), spill->seq_next++, 0, TDE_ALGORITHM_NONE, &os_error);
   if (bf == NULL)
     {
-      /* promoted mapping (#132): only fd-exhaustion/disk-full class errors are
-       * out-of-temp-space; anything else (e.g. EACCES) reports ER_FAILED
-       * instead of being mislabeled as temp-space exhaustion. */
+      /* only fd-exhaustion/disk-full class errors are out-of-temp-space;
+       * anything else (e.g. EACCES) reports ER_FAILED instead of being
+       * mislabeled as temp-space exhaustion. */
       qfile::spill_file::set_os_error (os_error);
     }
   return bf;
@@ -913,7 +908,7 @@ hls_spill_create (THREAD_ENTRY * thread_p, INT64 tuple_cnt)
 }
 
 /*
- * hls_spill_cursor_create () - allocate a per-scan PROBE cursor (#127).
+ * hls_spill_cursor_create () - allocate a per-scan PROBE cursor.
  *   Call once per HASH_LIST_SCAN before its first hls_spill_search(); in
  *   parallel probe, each worker creates its own even though they share one
  *   HLS_SPILL.
@@ -1460,7 +1455,7 @@ hls_spill_destroy (THREAD_ENTRY * thread_p, HLS_SPILL * spill)
 
 /*
  * qdata_hscan_wm_reserve () / qdata_hscan_wm_release () - work_mem accountant
- *   charge covering the IN_MEM/HYBRID build estimate (#123/#91).  The charge
+ *   charge covering the IN_MEM/HYBRID build estimate.  The charge
  *   is the same quantity check_hash_list_scan compares against work_mem, so
  *   the comparison and the accounting can never disagree.
  */

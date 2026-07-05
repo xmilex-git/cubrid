@@ -2120,7 +2120,7 @@ pgbuf_monitor_sum_pg_unfix (bool reset)
 }
 
 #if !defined (NDEBUG)
-/* issue #93: boot-independent fix counter (see page_buffer.h). */
+/* Boot-independent fix counter (see page_buffer.h). */
 static std::atomic<INT64> pgbuf_Fix_debug_count { 0 };
 
 INT64

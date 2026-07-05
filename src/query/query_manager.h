@@ -84,7 +84,7 @@ typedef enum
 
 namespace qfile
 {
-  class page_spill_file;	/* (c′) per-tfile page-spill backing (qfile_page_spill.hpp, #132) */
+  class page_spill_file;	/* per-tfile page-spill backing */
 }
 
 typedef struct qmgr_temp_file QMGR_TEMP_FILE;
@@ -105,8 +105,8 @@ struct qmgr_temp_file
   QUERY_ID spill_query_id;
   int spill_owner_tran_index;
   unsigned int spill_worker_id;
-  int spill_next_pageid;	/* dense overflow pageid issuer for the (c′) page-spill backing */
-  qfile::page_spill_file *page_spill_handle;	/* (c′) PAGE_SPILL backing; containment-owned (D2, #132) */
+  int spill_next_pageid;	/* dense overflow pageid issuer for the page-spill backing */
+  qfile::page_spill_file *page_spill_handle;	/* PAGE_SPILL backing; containment-owned */
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };
@@ -215,7 +215,7 @@ extern void qmgr_segment_list_init (QMGR_SEGMENT_LIST * segment_list_p);
 extern void qmgr_segment_list_clear (QMGR_SEGMENT_LIST * segment_list_p);
 extern bool qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p);
 extern bool qmgr_list_has_spill_segments (const QFILE_LIST_ID * list_id_p);
-/* fd-backed OLD overflow ((c′) page-spill; sole tag since 커밋 B #137) */
+/* fd-backed pgbuf overflow (page-spill) */
 extern bool qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p);
 extern UINT64 qmgr_tfile_fd_overflow_segment_id (const QMGR_TEMP_FILE * tfile_p);
 extern bool qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p);

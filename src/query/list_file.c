@@ -44,7 +44,7 @@
 #include "perf_monitor.h"
 #include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
 #include "query_manager.h"
-#include "qfile_tape.hpp"	/* Phase1 1A scan contract (redesign G005, issue #70) */
+#include "qfile_tape.hpp"
 #include "query_opfunc.h"
 #include "stream_to_xasl.h"
 #include "thread_entry.hpp"
@@ -527,9 +527,8 @@ qfile_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_li
 
   memset (&dest_list_id_p->tpl_descr, 0, sizeof (QFILE_TUPLE_DESCRIPTOR));
 
-  /* Tapeset ownership (Phase1 1A, redesign G005 #70).  The struct memcpy above
-   * shallow-copied tapeset_/owns_tapeset_; resolve ownership per dependent
-   * mode (single-owner model, SSOT #75 §3.2 B1):
+  /* Tapeset ownership resolution per dependent mode (single-owner model).  The
+   * struct memcpy above shallow-copied tapeset_/owns_tapeset_:
    *   SKIP    (scan-open)     -> borrow: read the Tapes, never own/free them.
    *   MOVE    (holdable)      -> transfer ownership; clear the source.
    *   PROHIBIT (cached copy-out) -> tuples are copied out, the Tape handles are
@@ -555,12 +554,11 @@ qfile_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_li
 	}
     }
 
-  /* Producer (redesign #78 NEW production): a live (unfrozen) producer must
-   * never be copied -- it belongs to exactly one in-flight production and is
-   * torn down by freeze()/close(), never by a copy.  The struct memcpy above
-   * also shallow-copied producer_writer_/producer_page_; SKIP (scan-open,
-   * borrow) and PROHIBIT (cached copy-out) must not carry it, or teardown of
-   * both src and dest would double-destroy the writer. */
+  /* A live (unfrozen) tapeset producer must never be copied: it belongs to one
+   * in-flight production torn down by freeze()/close().  SKIP (borrow) and
+   * PROHIBIT (copy-out) must not carry the shallow-copied
+   * producer_writer_/producer_page_, or teardown of both src and dest would
+   * double-destroy the writer. */
   assert (QFILE_LIST_ID_PRODUCER_WRITER (src_list_id_p) == NULL);
   if (dep_mode == QFILE_SKIP_DEPENDENT || dep_mode == QFILE_PROHIBIT_DEPENDENT)
     {
@@ -625,15 +623,15 @@ qfile_clear_list_id (QFILE_LIST_ID * list_id_p)
       free_and_init (list_id_p->type_list.domp);
     }
 
-  /* Tapeset (Phase1 1A, redesign G005 #70): destroy it only if this list_id
-   * owns it (a borrowing scan copy must not free the producer's Tapes). */
+  /* Destroy the Tapeset only if this list_id owns it (a borrowing scan copy
+   * must not free the producer's Tapes). */
   if (QFILE_LIST_ID_TAPESET (list_id_p) != NULL && QFILE_LIST_ID_OWNS_TAPESET (list_id_p))
     {
       qfile_tapeset_destroy (QFILE_LIST_ID_TAPESET (list_id_p));
     }
 
-  /* Aborted NEW production (close never reached): free the writer + scratch
-   * (redesign #78).  Normal close transfers these out before clear runs. */
+  /* Aborted tapeset production (close never reached): free the writer + scratch.
+   * Normal close transfers these out before clear runs. */
   if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
     {
       delete (qfile::tape_writer *) QFILE_LIST_ID_PRODUCER_WRITER (list_id_p);	/* unfrozen: frees the partial spill */
@@ -1380,15 +1378,14 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
     {
       if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
 	{
-	  /* NEW production (redesign #78): append the final page, freeze the
-	   * tape_writer into a single-Tape Tapeset, mark backing NEW.  No qmgr. */
+	  /* Tapeset production: append the final page, freeze the tape_writer into
+	   * a single-Tape Tapeset, mark backing tapeset.  No qmgr. */
 	  void *writer = QFILE_LIST_ID_PRODUCER_WRITER (list_id_p);
 	  int append_rc = NO_ERROR;
 	  if (list_id_p->last_pgptr != NULL)
 	    {
-	      /* Final (possibly full) page.  A lost append is no longer swallowed
-	       * (#86): the error latches the writer so freeze below returns NULL
-	       * rather than a silently truncated Tape. */
+	      /* Final (possibly full) page.  A lost append latches the writer so
+	       * freeze below returns NULL rather than a silently truncated Tape. */
 	      append_rc = qfile_producer_append (thread_p, writer, list_id_p->last_pgptr);
 	    }
 	  void *ts = qfile_producer_freeze_tapeset (thread_p, writer);
@@ -1408,11 +1405,10 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 	  else
 	    {
 	      /* Append lost the final page, or the freeze flush hit ENOSPC: the
-	       * list has no backing.  qfile_close_list is void (its callers predate
-	       * "close can fail"), so latch the failure on the list -- the next
-	       * qfile_open_list_scan raises ER_QPROC_OUT_OF_TEMP_SPACE instead of
-	       * serving a silently truncated / empty result (#86).  The error
-	       * already set by append/freeze is left intact. */
+	       * list has no backing.  qfile_close_list is void, so latch the failure
+	       * on the list -- the next qfile_open_list_scan raises
+	       * ER_QPROC_OUT_OF_TEMP_SPACE instead of serving a silently truncated /
+	       * empty result.  The error already set by append/freeze is left intact. */
 	      QFILE_LIST_ID_PRODUCER_FAILED (list_id_p) = true;
 	    }
 	  return;
@@ -1427,21 +1423,20 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 }
 
 /*
- * qfile_list_demote_new_to_old () - Rewrite a NEW (Tapeset)-backed list as an
- *   OLD temp-file-backed list carrying identical tuples, so callers that need
- *   mutable semantics (append / reopen-as-append / the recursive-CTE shared
- *   copy model) can operate on it.  No-op for an already OLD-backed list.
+ * qfile_list_demote_new_to_old () - Rewrite a tapeset-backed list as a
+ *   temp-file-backed (pgbuf) list carrying identical tuples, so callers that
+ *   need mutable semantics (append / reopen-as-append / the recursive-CTE
+ *   shared copy model) can operate on it.  No-op for an already temp-file-backed
+ *   list.
  *   return: NO_ERROR or ER_FAILED
  *   list_id_p(in/out): list whose backing is demoted in place
  *
- * Note: A frozen NEW Tapeset is single-owner and immutable -- UNION ALL
- *   (qfile_union_list) and recursive CTE accumulation (qexec_execute_cte) both
- *   rely on the OLD model where a list can be reopened for append and its pages
- *   are shared through cheap list_id copies.  Rather than teach every mutating
- *   path a NEW variant, this materialises the tuples back into an OLD list (the
- *   scan below routes through the Tapeset reader transparently) and swaps the
- *   backing using the same idiom as qfile_sort_list_with_func's sorted-output
- *   swap.  (#78 C-3/C-6; sibling of #105's CONNECT BY force-OLD.)
+ * Note: A frozen Tapeset is single-owner and immutable; UNION ALL
+ *   (qfile_union_list) and recursive CTE accumulation (qexec_execute_cte) rely
+ *   on the temp-file model where a list can be reopened for append and its pages
+ *   shared through cheap list_id copies.  This materialises the tuples back into
+ *   a temp-file list (the scan routes through the Tapeset reader transparently)
+ *   and swaps the backing.
  */
 int
 qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
@@ -1468,9 +1463,9 @@ qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p
     }
   qfile_close_list (thread_p, old_list_p);
 
-  /* Replace the NEW backing with the freshly materialised OLD backing.
+  /* Replace the tapeset backing with the freshly materialised temp-file backing.
    * qfile_destroy_list frees the Tapeset (owns_tapeset_) and NULLs it so the
-   * MOVE copy does not double-free -- identical to the sorted-output swap. */
+   * MOVE copy does not double-free. */
   qfile_destroy_list (thread_p, list_id_p);
   qfile_copy_list_id (list_id_p, old_list_p, true, QFILE_MOVE_DEPENDENT);
   QFILE_FREE_AND_INIT_LIST_ID (old_list_p);
@@ -1479,20 +1474,19 @@ qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p
 }
 
 /*
- * qfile_list_promote_old_to_new () - Rewrite an OLD temp-file-backed list as a
- *   frozen NEW (Tapeset) list carrying identical tuples.  No-op for a list that
- *   is already NEW-backed or that has no OLD temp file to migrate.
+ * qfile_list_promote_old_to_new () - Rewrite a temp-file-backed (pgbuf) list as
+ *   a frozen tapeset list carrying identical tuples.  No-op for a list that is
+ *   already tapeset-backed or that has no temp file to migrate.
  *   return: NO_ERROR or ER_FAILED
  *   list_id_p(in/out): list whose backing is promoted in place
  *
- * Note: UNION ALL builds its result by appending (an OLD-only operation), but
- *   when the result feeds a parallel consumer (e.g. a GROUP BY over a derived
- *   UNION ALL table) the OLD MERGEABLE_LIST sector reader drops rows on a list
- *   that is not itself a parallel-scan producer output (px_scan.cpp).  The NEW
- *   tuple-level tapeset_reader reads any Tapeset correctly, so promote the
- *   finished UNION ALL list to NEW under the gate -- matching UNION (distinct),
- *   whose sort output is already NEW.  TDE is inherited from the OLD temp file.
- *   (#78 C-3)
+ * Note: UNION ALL builds its result by appending (a temp-file-only operation),
+ *   but when the result feeds a parallel consumer (e.g. a GROUP BY over a
+ *   derived UNION ALL table) the pgbuf MERGEABLE_LIST sector reader drops rows
+ *   on a list that is not itself a parallel-scan producer output (px_scan.cpp).
+ *   The tuple-level tapeset_reader reads any Tapeset correctly, so promote the
+ *   finished UNION ALL list to tapeset backing.  TDE is inherited from the
+ *   temp file.
  */
 int
 qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
@@ -1524,7 +1518,7 @@ qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_
     }
   qfile_close_list (thread_p, new_list_p);	/* freeze -> single-Tape Tapeset */
 
-  qfile_destroy_list (thread_p, list_id_p);	/* free the OLD temp file */
+  qfile_destroy_list (thread_p, list_id_p);	/* free the temp file */
   qfile_copy_list_id (list_id_p, new_list_p, true, QFILE_MOVE_DEPENDENT);
   QFILE_FREE_AND_INIT_LIST_ID (new_list_p);
 
@@ -1544,10 +1538,10 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
   PAGE_PTR last_page_ptr;
   QMGR_TEMP_FILE *temp_file_p;
 
-  /* A frozen NEW (Tapeset) list cannot be reopened for append (single-owner,
-   * immutable, no temp-file VFID).  Demote it to an OLD backing first so the
-   * append path below works -- covers UNION ALL (qfile_union_list) and the
-   * recursive-CTE common-list optimisation.  (#78 C-3/C-6) */
+  /* A frozen Tapeset list cannot be reopened for append (single-owner,
+   * immutable, no temp-file VFID).  Demote it to a temp-file backing first so
+   * the append path below works -- covers UNION ALL (qfile_union_list) and the
+   * recursive-CTE common-list optimisation. */
   if (qfile_list_has_tapeset (list_id_p))
     {
       if (qfile_list_demote_new_to_old (thread_p, list_id_p) != NO_ERROR)
@@ -1622,8 +1616,8 @@ qfile_is_first_tuple (QFILE_LIST_ID * list_id_p)
 {
   if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
     {
-      /* NEW production: first_vpid stays NULL for a Tapeset-backed list, so
-       * "first tuple" == no scratch page filled yet (redesign #78). */
+      /* Tapeset production: first_vpid stays NULL for a Tapeset-backed list, so
+       * "first tuple" == no scratch page filled yet. */
       return list_id_p->last_pgptr == NULL;
     }
   return VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID(list_id_p));
@@ -1665,7 +1659,7 @@ qfile_allocate_new_page (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, PAG
   VPID new_vpid;
   if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
     {
-      /* NEW production (redesign #78): append the just-completed page to the
+      /* Tapeset production: append the just-completed page to the
        * per-worker tape_writer and reuse the single scratch page for the next.
        * No qmgr page, no VPID chain (the Tapeset addresses by offset). */
 #if defined (SERVER_MODE)
@@ -1830,17 +1824,17 @@ qfile_add_tuple_to_list_id (QFILE_LIST_ID * list_id_p, PAGE_PTR page_p, int tupl
 }
 
 /*
- * qfile_producer_add_overflow_tuple () - NEW-backing (redesign #78) overflow
- *   tuple stamping (ADR 0006).  A tuple longer than one page becomes a
- *   CONTIGUOUS run of logical pages addressed by offset (no VPID chain): a
- *   dedicated START page (overflow flag + OVERFLOW_PAGE_ID = its own logical
- *   page offset) then continuation pages (overflow flag + OVERFLOW_PAGE_ID =
- *   the start offset + LAST_TUPLE_OFFSET = the run-end offset).  Every page
- *   carries up to QFILE_MAX_TUPLE_SIZE_IN_PAGE tuple bytes at
- *   QFILE_PAGE_HEADER_SIZE -- exactly the layout the R1 tapeset_scan / R2
- *   tapeset_reader reassembly reads back.  Pages route to the per-worker
- *   tape_writer through the producer hook in qfile_allocate_new_page (no qmgr,
- *   no pgbuf, no next_vpid).  Reached only when producer_writer_ != NULL.
+ * qfile_producer_add_overflow_tuple () - tapeset-backing overflow tuple
+ *   stamping.  A tuple longer than one page becomes a CONTIGUOUS run of logical
+ *   pages addressed by offset (no VPID chain): a dedicated START page (overflow
+ *   flag + OVERFLOW_PAGE_ID = its own logical page offset) then continuation
+ *   pages (overflow flag + OVERFLOW_PAGE_ID = the start offset +
+ *   LAST_TUPLE_OFFSET = the run-end offset).  Every page carries up to
+ *   QFILE_MAX_TUPLE_SIZE_IN_PAGE tuple bytes at QFILE_PAGE_HEADER_SIZE --
+ *   exactly the layout the tapeset_scan / tapeset_reader reassembly reads back.
+ *   Pages route to the per-worker tape_writer through the producer hook in
+ *   qfile_allocate_new_page (no qmgr, no pgbuf, no next_vpid).  Reached only
+ *   when producer_writer_ != NULL.
  *   return: int (NO_ERROR or ER_FAILED)
  */
 static int
@@ -1891,7 +1885,7 @@ qfile_producer_add_overflow_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list
       memcpy ((char *) cur_page_p + QFILE_PAGE_HEADER_SIZE, (char *) tuple + copied, csz);
       if (i == 0)
 	{
-	  /* match OLD: stamp the running prev-tuple-length onto the start tuple */
+	  /* match the pgbuf layout: stamp the running prev-tuple-length onto the start tuple */
 	  QFILE_PUT_PREV_TUPLE_LENGTH ((char *) cur_page_p + QFILE_PAGE_HEADER_SIZE, list_id_p->lasttpl_len);
 	  qfile_overflow_set_start (cur_page_p, start_off);
 	}
@@ -1945,8 +1939,8 @@ qfile_add_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, QFI
   tuple_length = QFILE_GET_TUPLE_LENGTH (tuple);
   if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL && tuple_length > qfile_Max_tuple_page_size)
     {
-      /* NEW-backed overflow tuple: lay it out as a contiguous offset-addressed
-       * page run (ADR 0006 producer stamping), matching the R1/R2 reassembly. */
+      /* Tapeset-backed overflow tuple: lay it out as a contiguous offset-addressed
+       * page run (producer stamping), matching the tapeset reassembly. */
       return qfile_producer_add_overflow_tuple (thread_p, list_id_p, tuple, tuple_length);
     }
 
@@ -2049,7 +2043,7 @@ qfile_save_sort_key_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, char *tuple_p
   char *src_p;
 
   key_info_p = (SORTKEY_INFO *) (tuple_descr_p->sortkey_info);
-  nkeys = key_info_p->ncols;	/* all materialized columns, key and payload alike (#100) */
+  nkeys = key_info_p->ncols;	/* all materialized columns, key and payload alike */
   sort_rec_p = (SORT_REC *) (tuple_descr_p->sort_rec);
 
   for (i = 0; i < nkeys; i++)
@@ -2485,9 +2479,9 @@ qfile_add_overflow_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
 
   if (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL)
     {
-      /* NEW-backed output (redesign #78): reassemble the input overflow tuple
-       * into one buffer and stamp it as an offset-addressed page run (ADR 0006);
-       * no qmgr output pages, no VPID chain. */
+      /* Tapeset-backed output: reassemble the input overflow tuple into one
+       * buffer and stamp it as an offset-addressed page run; no qmgr output
+       * pages, no VPID chain. */
       char *assembled;
       int asm_off, asm_chunk, rc;
       VPID in_vpid;
@@ -2654,10 +2648,10 @@ qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 	    }
 	}
 
-      /* E-1 (#79): destroy NEW backing (Tapeset) at the same level as OLD
-       * backing above.  Previously this was deferred to qfile_clear_list_id,
-       * which runs too late when a parent's tapeset_reader still references
-       * these Tapes.  NULL-out so qfile_clear_list_id does not double-free. */
+      /* Destroy the Tapeset backing at the same level as the temp-file backing
+       * above; deferring it to qfile_clear_list_id runs too late when a parent's
+       * tapeset_reader still references these Tapes.  NULL-out so
+       * qfile_clear_list_id does not double-free. */
       if (QFILE_LIST_ID_TAPESET (list_id_p) != NULL && QFILE_LIST_ID_OWNS_TAPESET (list_id_p))
 	{
 	  qfile_tapeset_destroy (QFILE_LIST_ID_TAPESET (list_id_p));
@@ -2669,39 +2663,39 @@ qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 }
 
 /*
- * qfile_serve_tapeset_fetch_pages () - #120a/#120b: serve packed client-fetch
- *   pages straight from a NEW (Tapeset)-backed top-level result, in place of
- *   the pgbuf VPID page chain the OLD path walks.  The result's ordered Tapes
- *   form one dense logical page sequence 0..page_count-1; the client addresses
- *   it by that global index (marker volid QFILE_TAPESET_FETCH_VOLID).  Reads
- *   global pages [start_gp ..] via the Tapeset bridge into page_buf_p, packing
- *   full DB_PAGESIZE pages until the network page (IO_MAX_PAGE_SIZE) is full,
- *   and rewrites each page header's VPID links so the unchanged client cursor
- *   walks it exactly like a real VPID page chain:
+ * qfile_serve_tapeset_fetch_pages () - serve packed client-fetch pages straight
+ *   from a tapeset-backed top-level result, in place of the pgbuf VPID page
+ *   chain the legacy path walks.  The result's ordered Tapes form one dense
+ *   logical page sequence 0..page_count-1; the client addresses it by that
+ *   global index (marker volid QFILE_TAPESET_FETCH_VOLID).  Reads global pages
+ *   [start_gp ..] via the Tapeset bridge into page_buf_p, packing full
+ *   DB_PAGESIZE pages until the network page (IO_MAX_PAGE_SIZE) is full, and
+ *   rewrites each page header's VPID links so the unchanged client cursor walks
+ *   it exactly like a real VPID page chain:
  *
  *   - normal page: next_vpid -> next global index (NULL on the last page),
  *     overflow vpid cleared.
- *   - ADR0006 overflow run (#120b D2): the run's offset-run markers are
- *     TAPE-LOCAL coordinates rewritten to the legacy client wire format.  A run
- *     is contiguous within ONE tape (qfile_producer_add_overflow_tuple appends
- *     all run pages to the same writer -- D4), so local<->global translation is
- *     the constant base = gp - local_offset.  START page (first == self):
- *     becomes the legacy HEAD -- real tuple count 1 (the START page holds only
- *     this tuple by construction), last_tuple_offset = header size, overflow
- *     vpid -> next global page, next_vpid -> first page AFTER the run (what the
- *     client's post-reassembly advance follows).  CONTINUATION page: keeps
- *     tuple count -2, +12 slot rewritten from the NEW run-end marker to the
- *     legacy per-page payload size, overflow vpid -> next run page (NULL on the
- *     run's last page), next_vpid NULL (legacy continuations never carry one).
- *     The payload itself needs no translation: both formats place
+ *   - overflow run: the run's offset-run markers are TAPE-LOCAL coordinates
+ *     rewritten to the legacy client wire format.  A run is contiguous within
+ *     ONE tape (qfile_producer_add_overflow_tuple appends all run pages to the
+ *     same writer), so local<->global translation is the constant
+ *     base = gp - local_offset.  START page (first == self): becomes the legacy
+ *     HEAD -- real tuple count 1 (the START page holds only this tuple by
+ *     construction), last_tuple_offset = header size, overflow vpid -> next
+ *     global page, next_vpid -> first page AFTER the run (what the client's
+ *     post-reassembly advance follows).  CONTINUATION page: keeps tuple count
+ *     -2, +12 slot rewritten from the run-end marker to the legacy per-page
+ *     payload size, overflow vpid -> next run page (NULL on the run's last
+ *     page), next_vpid NULL (legacy continuations never carry one).  The payload
+ *     itself needs no translation: both formats place
  *     MIN(remaining, QFILE_MAX_TUPLE_SIZE_IN_PAGE) bytes at
  *     QFILE_PAGE_HEADER_SIZE, and the client resizes from the tuple length
  *     header on the HEAD page (cursor_construct_tuple_from_overflow_pages).
  *     A continuation-first fetch (the client requests each run page as its own
  *     network round-trip) re-reads the run's START page for the tuple length
- *     (D3: through the same TDE-aware bridge, caller-owned scratch).
+ *     (through the same TDE-aware bridge, caller-owned scratch).
  *   return: NO_ERROR or ER_ code
- *   list_id_p(in): the retained NEW-backed result (carries the Tapeset)
+ *   list_id_p(in): the retained tapeset-backed result (carries the Tapeset)
  *   start_gp(in): first global logical page index requested by the client
  *   page_buf_p(out): caller network page buffer (>= IO_MAX_PAGE_SIZE)
  *   page_size_p(out): bytes filled
@@ -2742,9 +2736,9 @@ qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * 
 
       if (qfile_overflow_is_overflow_page (dest))
 	{
-	  /* ADR0006 offset-run -> legacy VPID overflow chain (#120b D2). */
+	  /* offset-run -> legacy VPID overflow chain. */
 	  const int first_local = qfile_overflow_first_page (dest);
-	  const PAGEID base_gp = gp - local_off;	/* run is single-tape (D4): constant base */
+	  const PAGEID base_gp = gp - local_off;	/* run is single-tape: constant base */
 	  int run_end_local;
 	  VPID link_vpid;
 
@@ -2792,7 +2786,7 @@ qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * 
 	    }
 	  else
 	    {
-	      /* CONTINUATION page: the NEW marker in the +12 slot is the run-end
+	      /* CONTINUATION page: the tapeset marker in the +12 slot is the run-end
 	       * local offset; the legacy wire wants the per-page payload size
 	       * there, which needs the tuple length from the run's START page. */
 	      int tuple_len, payload;
@@ -2874,7 +2868,7 @@ qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * 
 	    }
 	  QFILE_PUT_OVERFLOW_VPID_NULL (dest);
 
-	  /* Trimmed size of this (non-overflow) page, mirroring the OLD packer
+	  /* Trimmed size of this (non-overflow) page, mirroring the pgbuf packer
 	   * so the reported buffer size matches the classic contract. */
 	  one_page_size = (QFILE_GET_LAST_TUPLE_OFFSET (dest)
 			   + QFILE_GET_TUPLE_LENGTH (dest + QFILE_GET_LAST_TUPLE_OFFSET (dest)));
@@ -2892,7 +2886,7 @@ qfile_serve_tapeset_fetch_pages (THREAD_ENTRY * thread_p, const QFILE_LIST_ID * 
       gp++;
     }
 
-  /* Report the trimmed size of the final page (OLD packer contract). */
+  /* Report the trimmed size of the final page (pgbuf packer contract). */
   *page_size_p += one_page_size - DB_PAGESIZE;
 
 end:
@@ -2974,13 +2968,12 @@ xqfile_get_list_file_page (THREAD_ENTRY * thread_p, QUERY_ID query_id, VOLID vol
 	  return NO_ERROR;
 	}
 
-      /* #120a/#120b: a NEW (Tapeset)-backed top-level result has no VPID page
-       * chain (first_vpid is NULL), so serve its pages straight from the
-       * Tapeset instead of the pgbuf VPID walk below.  The incoming page_id is
-       * a global logical page index (marker volid); the client got it from the
-       * synthetic first_vpid/next_vpid seeded at the sink.  ADR0006 overflow
-       * runs are translated to the legacy VPID overflow chain inside the serve
-       * (#120b D2). */
+      /* A tapeset-backed top-level result has no VPID page chain (first_vpid is
+       * NULL), so serve its pages straight from the Tapeset instead of the pgbuf
+       * VPID walk below.  The incoming page_id is a global logical page index
+       * (marker volid); the client got it from the synthetic first_vpid/next_vpid
+       * seeded at the sink.  Overflow runs are translated to the legacy VPID
+       * overflow chain inside the serve. */
       if (qfile_list_has_tapeset (query_entry_p->list_id))
 	{
 	  return qfile_serve_tapeset_fetch_pages (thread_p, query_entry_p->list_id, page_id, page_buf_p, page_size_p);
@@ -3592,17 +3585,16 @@ error:
 }
 
 /* ------------------------------------------------------------------ */
-/* Backing-kind ENTRY guard + A~E counter (SSOT #75 round-3 (d)/(e))  */
+/* Backing-kind entry guard + backing-mechanism-violation counter     */
 /* ------------------------------------------------------------------ */
 
 static std::atomic<long> qfile_Ae_pgbuf_touch (0);
 static std::atomic<long> qfile_New_backed_create (0);
 
-/* #120 client-fetch routing census: how many client fetch requests were served
+/* Client-fetch routing census: how many client fetch requests were served
  * straight from a Tapeset (qfile_serve_tapeset_fetch_pages) vs how many lists
- * were actually pgbuf-materialized at a Class-B sink (qmgr_materialize_to_pgbuf
- * past its needs-gate).  The "materialize firing 0" acceptance (#120) is
- * asserted from statdump deltas of these -- no debugger attach needed. */
+ * were actually pgbuf-materialized at a sink (qmgr_materialize_to_pgbuf past
+ * its needs-gate). */
 static std::atomic<long> qfile_Client_fetch_serve (0);
 static std::atomic<long> qfile_Client_fetch_materialize (0);
 
@@ -3640,10 +3632,10 @@ qfile_ae_reset_pgbuf_touch_count (void)
   perfmon_set_stat_to_global (PSTAT_QF_OLD_TOUCH_ON_NEW, 0);
 }
 
-/* NEW(Tapeset)-backed list creation count (redesign #78/#92): the sibling
- * "did the NEW path actually run" half of the A~E backing-kind census —
- * qfile_ae_pgbuf_touch_count() alone can only prove OLD *violated* a NEW list,
- * not that a NEW list ever existed (a rejected gate still reads old_touch==0). */
+/* Tapeset-backed list creation count: the sibling "did the tapeset path
+ * actually run" half of the backing-kind census — qfile_ae_pgbuf_touch_count()
+ * alone can only prove a pgbuf path *violated* a tapeset list, not that a
+ * tapeset list ever existed (a rejected gate still reads old_touch==0). */
 void
 qfile_tapeset_backed_record_create (void)
 {
@@ -3671,8 +3663,8 @@ qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism
     {
       return NO_ERROR;
     }
-  /* An OLD mechanism reaching a NEW (Tapeset) list is exactly an "A~E NEW-backed
-   * list touched by an OLD scan-bypass path" event; record it (SSOT #75 §6). */
+  /* A pgbuf mechanism reaching a tapeset list is a "tapeset-backed list touched
+   * by a pgbuf scan-bypass path" event; record it. */
   if (mechanism == QFILE_BACKING_PGBUF)
     {
       qfile_ae_record_pgbuf_touch ();
@@ -3683,7 +3675,7 @@ qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism
 
 /*
  * qfile_tuple_position_report_tape_misuse () - release-hard backstop for the
- *   store-to-DB TAPE-misuse invariant (#105).  Raises ER_QPROC_UNKNOWN_CRSPOS
+ *   store-to-DB TAPE-misuse invariant.  Raises ER_QPROC_UNKNOWN_CRSPOS
  *   when a TAPE-coord tuple position reaches qfile_tuple_position_store_to_db,
  *   which QFILE_TUPLE_POSITION_DB cannot represent (no TAPE variant, intra-query
  *   only).  Debug already aborts on the assert inside the inline; this makes the
@@ -3709,8 +3701,8 @@ qfile_append_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_
   assert (base_list_id != NULL);
   assert (append_list_id != NULL);
 
-  /* backing-kind entry guard (production-hard): an OLD combine never takes a NEW
-   * (Tapeset) operand (SSOT #75 round-3 (d)/(e)). */
+  /* backing-kind entry guard (production-hard): a pgbuf combine never takes a
+   * tapeset operand. */
   {
     int guard_rc = QFILE_GUARD_PGBUF_MECHANISM (base_list_id);
     if (guard_rc == NO_ERROR)
@@ -3914,13 +3906,12 @@ qfile_truncate_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id)
   list_id->last_offset = QFILE_NULL_PAGE_OFFSET;
   list_id->lasttpl_len = 0;
 
-  /* #89: NEW (Tapeset) backing is not reset by the VPID/tuple_cnt fields
-   * above -- a stale Tapeset would keep pointing at logical pages that
-   * file_temp_truncate() below throws away, corrupting a subsequent reuse of
-   * this list_id (CONNECT BY re-iteration, hash-join partition reuse,
-   * index-covering rescan).  Destroy it the same way qfile_destroy_list()
-   * does, guarded by ownership so a borrowing scan copy never frees a
-   * producer's Tapes; the next qfile_add_tuple/producer path allocates a
+  /* Tapeset backing is not reset by the VPID/tuple_cnt fields above -- a stale
+   * Tapeset would keep pointing at logical pages that file_temp_truncate() below
+   * throws away, corrupting a subsequent reuse of this list_id (CONNECT BY
+   * re-iteration, hash-join partition reuse, index-covering rescan).  Destroy it
+   * as qfile_destroy_list() does, guarded by ownership so a borrowing scan copy
+   * never frees a producer's Tapes; the next add-tuple/producer path allocates a
    * fresh Tapeset on demand. */
   if (QFILE_LIST_ID_TAPESET (list_id) != NULL && QFILE_LIST_ID_OWNS_TAPESET (list_id))
     {
@@ -4270,7 +4261,7 @@ qfile_make_sort_key (THREAD_ENTRY * thread_p, SORTKEY_INFO * key_info_p, RECDES 
   else
     {
       /* A_sort_key.  Walk all `ncols` entries (== nkeys unless the key info
-       * was extended to carry non-key payload columns, #100). */
+       * was extended to carry non-key payload columns). */
       nkeys = key_info_p->ncols;
 
       /* get sort_key body start position, align data to 8 bytes boundary */
@@ -4333,7 +4324,7 @@ qfile_make_sort_key (THREAD_ENTRY * thread_p, SORTKEY_INFO * key_info_p, RECDES 
 	{
 	  /* A Tapeset scan owns its page; the legacy stepper below would free the
 	   * mirrored page pointer through qmgr.  Step back through the driver so the
-	   * caller's retry (a forward step) re-reads the same tuple (#100). */
+	   * caller's retry (a forward step) re-reads the same tuple. */
 	  QFILE_TUPLE_RECORD dummy_record = { NULL, 0 };
 
 	  scan_status = qfile_tapeset_scan_backward (thread_p, input_scan_p, &dummy_record, PEEK);
@@ -4364,7 +4355,7 @@ qfile_generate_sort_tuple (SORTKEY_INFO * key_info_p, SORT_REC * sort_record_p, 
   char *src;
   int len;
 
-  /* rebuild all materialized columns, key and payload alike (#100) */
+  /* rebuild all materialized columns, key and payload alike */
   nkeys = key_info_p->ncols;
   size = QFILE_TUPLE_LENGTH_SIZE;
 
@@ -4448,9 +4439,9 @@ qfile_sort_px_state_free (THREAD_ENTRY * thread_p, sort_px_list_state * state)
 
 /*
  * qfile_sort_build_key_from_tuple () - build a sort key from an already-fetched tuple.
- *   Used by the NEW (Tapeset) parallel readers, which carry full-key A_sort_key
+ *   Used by the tapeset parallel readers, which carry full-key A_sort_key
  *   records only; partial-key original-address records are rejected
- *   (original_vpid stays NULL — the OLD sector path that supplied it is deleted, #130).
+ *   (original_vpid stays NULL).
  */
 static SORT_STATUS
 qfile_sort_build_key_from_tuple (SORTKEY_INFO * key_info_p, RECDES * recdes_p, QFILE_TUPLE tpl,
@@ -4499,7 +4490,7 @@ qfile_sort_build_key_from_tuple (SORTKEY_INFO * key_info_p, RECDES * recdes_p, Q
     }
   else
     {
-      /* A_sort_key: all materialized columns, key and payload alike (#100) */
+      /* A_sort_key: all materialized columns, key and payload alike */
       nkeys = key_info_p->ncols;
       data = (char *) &sort_record_p->s.offset[nkeys];
       data = PTR_ALIGN (data, MAX_ALIGNMENT);
@@ -4541,9 +4532,9 @@ qfile_sort_build_key_from_tuple (SORTKEY_INFO * key_info_p, RECDES * recdes_p, Q
 /*
  * qfile_sort_get_next_parallel () - parallel sort key builder (ORDER_BY /
  *   ORDER_WITH_LIMIT / GROUP_BY / ANALYTIC workers).  Reads this worker's share
- *   of the NEW (Tapeset)-backed input via its tapeset_reader and builds the sort
- *   key with qfile_sort_build_key_from_tuple.  An OLD-backed input never reaches
- *   here: sort_check_parallelism demotes it to a serial sort (#130).
+ *   of the tapeset-backed input via its tapeset_reader and builds the sort
+ *   key with qfile_sort_build_key_from_tuple.  A pgbuf-backed input never reaches
+ *   here: sort_check_parallelism demotes it to a serial sort.
  *
  *   recdes (in/out): sort key record descriptor
  *   arg   (in):      SORT_INFO pointer; px_state holds sort_px_list_state
@@ -4562,7 +4553,7 @@ qfile_sort_get_next_parallel (THREAD_ENTRY * thread_p, RECDES * recdes_p, void *
     {
       /* COPY (peek=0): own state->tplrec.tpl via db_private so the worker-thread
        * cleanup db_private_free is valid; PEEK would store a borrowed page pointer
-       * (reader's m_page) and freeing it corrupts the heap (#78 2A-2). */
+       * (reader's m_page) and freeing it corrupts the heap. */
       SCAN_CODE scan_status = reader->next (thread_p, &state->tplrec, 0);
       if (scan_status != S_SUCCESS)
 	{
@@ -4725,7 +4716,7 @@ qfile_put_next_sort_item (THREAD_ENTRY * thread_p, const RECDES * recdes_p, void
 	{
 	  /* A_sort_key */
 
-	  nkeys = sort_info_p->key_info.ncols;	/* all materialized columns, key and payload alike (#100) */
+	  nkeys = sort_info_p->key_info.ncols;	/* all materialized columns, key and payload alike */
 
 	  /* generate tuple descriptor */
 	  tuple_descr_p = &(sort_info_p->output_file->tpl_descr);
@@ -5130,15 +5121,15 @@ qfile_clear_sort_key_info (SORTKEY_INFO * key_info_p)
 }
 
 /* qfile_sort_key_info_extend_all_columns () - extend a partial (use_original)
- *   sort key so every input column travels inside the sort record (#100).
+ *   sort key so every input column travels inside the sort record.
  *
- *   A NEW (Tapeset)-backed list has no valid VPID back-references, so the
+ *   A tapeset-backed list has no valid VPID back-references, so the
  *   P_sort_key "bread crumbs back to the original tuple" cannot be followed
  *   (qmgr_get_old_page has nothing to resolve them against).  Instead of
  *   switching to plain A_sort_key — which materializes only the key columns
- *   and hands consumers a truncated tuple (issue #100: GROUP BY aggregate
- *   regu vars then read past the reconstructed tuple) — append every non-key
- *   column as a payload entry.  Comparison still uses only the first `nkeys`
+ *   and hands consumers a truncated tuple (GROUP BY aggregate regu vars then
+ *   read past the reconstructed tuple) — append every non-key column as a
+ *   payload entry.  Comparison still uses only the first `nkeys`
  *   entries; copy/rebuild walk all `ncols`, so qfile_generate_sort_tuple
  *   rebuilds a full-width tuple in the original column order.
  *
@@ -5234,12 +5225,12 @@ qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * key_info_p, QFILE_TUPLE_V
   return NO_ERROR;
 }
 
-/* qfile_list_is_page_spilled () - true when an OLD-backed list has overflowed
- *   its membuf into a spill temp file (#107).
+/* qfile_list_is_page_spilled () - true when a pgbuf-backed list has overflowed
+ *   its membuf into a spill temp file.
  *
  *   For such a list a P_sort_key (use_original) sort re-fixes the original
  *   tuple page per SORT_REC, and every fix past membuf_last is a real pread
- *   (the per-tfile page-spill cache holds only fixed pages, #132) — a cyclic
+ *   (the per-tfile page-spill cache holds only fixed pages) — a cyclic
  *   access pattern turns that into per-row I/O amplification.  MEMBUF-resident
  *   and PRIVATE_SPILL_FALLBACK lists are excluded: their re-fetches resolve
  *   from the membuf array / pgbuf respectively, so use_original stays
@@ -5273,12 +5264,12 @@ qfile_initialize_sort_info (SORT_INFO * sort_info_p, QFILE_LIST_ID * list_id_p, 
     {
       return NULL;
     }
-  /* When the input list is NEW-backed, VPID back-references are invalid (#85); carry the
+  /* When the input list is tapeset-backed, VPID back-references are invalid; carry the
    * non-key columns inside the sort records so the rebuilt tuple keeps its full width —
-   * merely dropping use_original truncates the tuple to the key columns (#100).  If the
+   * merely dropping use_original truncates the tuple to the key columns.  If the
    * extension bails out (duplicate key column), use_original stays set and the sort fails
    * loudly on the unresolvable back-reference instead of producing truncated tuples.
-   * A spill-overflowed OLD input gets the same treatment for performance (#107): its
+   * A spill-overflowed pgbuf input gets the same treatment for performance: its
    * per-SORT_REC use_original re-fix is a real pread past membuf_last, and the sorted-order
    * access pattern defeats any cache smaller than the file — carrying all columns removes
    * the re-fetch entirely.  Here a bail-out is harmless: the VPID back-references stay
@@ -5331,13 +5322,13 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
 }
 
 /*
- * qfile_list_make_tapeset_backed () - convert a freshly-opened (empty) OLD list
- *   into a NEW Tapeset-backed producer list (redesign #78, 2A-1b).  Drop the
- *   empty temp file so the list carries no OLD backing (tfile_vfid/first_vpid
- *   stay NULL), then attach a tape_writer (membuf prefix = work_mem; TDE per
- *   the captured flag).  Tuples produced into it route to the tape_writer via
- *   the producer hook (no qmgr, no pgbuf, no VPID); qfile_close_list freezes
- *   it into a single-Tape Tapeset.  The caller MUST close before scan/MOVE.
+ * qfile_list_make_tapeset_backed () - convert a freshly-opened (empty) temp-file
+ *   list into a Tapeset-backed producer list.  Drop the empty temp file so the
+ *   list carries no temp-file backing (tfile_vfid/first_vpid stay NULL), then
+ *   attach a tape_writer (membuf prefix = work_mem; TDE per the captured flag).
+ *   Tuples produced into it route to the tape_writer via the producer hook (no
+ *   qmgr, no pgbuf, no VPID); qfile_close_list freezes it into a single-Tape
+ *   Tapeset.  The caller MUST close before scan/MOVE.
  *   return: int (NO_ERROR or ER_FAILED)
  */
 int
@@ -5346,9 +5337,9 @@ qfile_list_make_tapeset_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id
   char *scratch;
   void *writer;
 
-  /* Build the producer FIRST; only once it succeeds do we drop the OLD temp
-   * file.  This keeps the conversion atomic: on OOM the list stays wholly OLD
-   * (functional) rather than half-converted (no backing). */
+  /* Build the producer FIRST; only once it succeeds do we drop the temp file.
+   * This keeps the conversion atomic: on OOM the list stays wholly temp-file
+   * backed (functional) rather than half-converted (no backing). */
   scratch = (char *) malloc (DB_PAGESIZE);
   if (scratch == NULL)
     {
@@ -5410,7 +5401,7 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
   qfile_close_list (thread_p, list_id_p);
 
 #if defined(SERVER_MODE)
-  /* #99: px sort workers must not write into a FILE_QUERY_AREA list -- its page
+  /* px sort workers must not write into a FILE_QUERY_AREA list -- its page
    * allocation (temp_page_store.cpp alloc_private_spill_page, via file_manager)
    * does not support concurrent same-transaction workers (file_manager.c, temp
    * file creation guarded only per-tempcache-entry), so a QUERY_CACHE hint
@@ -5444,15 +5435,15 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
       return NULL;
     }
 
-  /* 2A-1b (#78): migrate a finalized (do_close) SORT output to NEW Tapeset
-   * backing.  Capture tde_encrypted before dropping the OLD temp
-   * file (the producer's BufFile re-applies TDE); the parallel path is forced
-   * serial while the output is NEW (see sort_listfile) until per-worker import
-   * is wired.  do_close gating keeps an open producer from being MOVE'd.
-   * suppress_tapeset_backing (#105): CONNECT BY's sort output feeds the parent-pos
+  /* Migrate a finalized (do_close) SORT output to Tapeset backing.  Capture
+   * tde_encrypted before dropping the temp file (the producer's BufFile
+   * re-applies TDE); the parallel path is forced serial while the output is
+   * tapeset-backed (see sort_listfile) until per-worker import is wired.
+   * do_close gating keeps an open producer from being MOVE'd.
+   * suppress_tapeset_backing: CONNECT BY's sort output feeds the parent-pos
    * recalc, which serialises tuple positions into QFILE_TUPLE_POSITION_DB (a
-   * VPID-only format with no TAPE variant); a NEW(Tapeset) list has only TAPE
-   * coordinates, so such lists MUST stay OLD-backed. */
+   * VPID-only format with no TAPE variant); a tapeset list has only TAPE
+   * coordinates, so such lists MUST stay temp-file-backed. */
   bool srlist_tde = (QFILE_LIST_ID_TFILE_VFID (srlist_id)->tde_encrypted);
   if (do_close && !suppress_tapeset_backing
       && qfile_list_make_tapeset_backed (thread_p, srlist_id, srlist_tde) != NO_ERROR)
@@ -5888,8 +5879,8 @@ qfile_get_tuple_from_current_list (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID *
 static bool
 qfile_scan_is_spill_backed (const QFILE_LIST_SCAN_ID * scan_id_p)
 {
-  /* (c′) page-spill overflow tag (#132): dense pageids are issued from
-   * spill_next_pageid, which the dense scans below rely on */
+  /* page-spill overflow tag: dense pageids are issued from spill_next_pageid,
+   * which the dense scans below rely on */
   return qmgr_tfile_has_fd_overflow (QFILE_LIST_ID_TFILE_VFID (&(scan_id_p->list_id)));
 }
 
@@ -6351,11 +6342,11 @@ qfile_jump_scan_tuple_position (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * sc
 {
   PAGE_PTR page_p;
 
-  /* Dispatch on the position's coord_type, not on scan state alone (#101): a TAPE
+  /* Dispatch on the position's coord_type, not on scan state alone: a TAPE
    * coordinate is only meaningful against a Tapeset scan and vice versa (for a
    * concrete S_ON jump; S_BEFORE/S_AFTER carry no coordinate).  A mismatch means
-   * the coordinate was produced against a different backing -- the #85 union
-   * punning -- so fail loudly instead of misreading the union. */
+   * the coordinate was produced against a different backing (union punning) --
+   * so fail loudly instead of misreading the union. */
   if (scan_id_p->tapeset_scan_ != NULL)
     {
       if (tuple_position_p->position == S_ON && !qfile_tuple_position_is_tape (tuple_position_p))
@@ -6504,8 +6495,8 @@ qfile_start_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
   if (scan_id_p->tapeset_scan_ != NULL)
     {
-      /* Tapeset scans (redesign G005 #70) hold their page inside the driver;
-       * there is nothing to (re)fix through a tfile. */
+      /* Tapeset scans hold their page inside the driver; there is nothing to
+       * (re)fix through a tfile. */
       return NO_ERROR;
     }
   if (scan_id_p->position == S_ON && !scan_id_p->curr_pgptr)
@@ -6548,11 +6539,11 @@ qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * s
 {
   if (QFILE_LIST_ID_PRODUCER_FAILED (list_id_p))
     {
-      /* The NEW-production close of this list failed (lost final-page append or
-       * a freeze-flush ENOSPC) and latched the failure here (#86).  Opening a
-       * scan would serve a silently truncated / empty result even though
-       * tuple_cnt still reads full, so raise instead.  This is the single choke
-       * point every list scan passes through. */
+      /* The tapeset-production close of this list failed (lost final-page append
+       * or a freeze-flush ENOSPC) and latched the failure here.  Opening a scan
+       * would serve a silently truncated / empty result even though tuple_cnt
+       * still reads full, so raise instead.  This is the single choke point
+       * every list scan passes through. */
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
       return ER_FAILED;
     }
@@ -6573,10 +6564,9 @@ qfile_open_list_scan_internal (QFILE_LIST_ID * list_id_p, QFILE_LIST_SCAN_ID * s
   scan_id_p->tplrec.size = 0;
   scan_id_p->tplrec.tpl = NULL;
 
-  /* Phase1 1A scan contract (redesign G005 #70).  If the scanned list carries a
-   * Tapeset (offset-arithmetic multi-Tape connection structure), build the
-   * Tapeset scan driver; otherwise this stays NULL and the legacy
-   * single-backing scan path runs unchanged. */
+  /* If the scanned list carries a Tapeset (offset-arithmetic multi-Tape
+   * connection structure), build the Tapeset scan driver; otherwise this stays
+   * NULL and the legacy single-backing scan path runs unchanged. */
   scan_id_p->tapeset_scan_ = NULL;
   if (QFILE_LIST_ID_TAPESET (&scan_id_p->list_id) != NULL)
     {
@@ -6688,8 +6678,8 @@ qfile_end_scan_fix (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
 {
   if (scan_id_p->tapeset_scan_ != NULL)
     {
-      /* Tapeset scans (redesign G005 #70): the driver owns the page; do not
-       * touch the synthetic mirror via the legacy tfile path. */
+      /* Tapeset scans: the driver owns the page; do not touch the synthetic
+       * mirror via the legacy tfile path. */
       return;
     }
   if (scan_id_p->position == S_ON && scan_id_p->curr_pgptr)
@@ -6719,9 +6709,9 @@ qfile_close_scan (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p)
       return;
     }
 
-  /* Phase1 1A scan contract (redesign G005 #70).  A Tapeset scan holds its page
-   * inside the Tapeset driver (curr_pgptr is only a mirror); release it through
-   * the driver, not via the legacy tfile page-free below. */
+  /* A Tapeset scan holds its page inside the Tapeset driver (curr_pgptr is only
+   * a mirror); release it through the driver, not via the legacy tfile page-free
+   * below. */
   bool was_tapeset_scan = (scan_id_p->tapeset_scan_ != NULL);
   if (was_tapeset_scan)
     {

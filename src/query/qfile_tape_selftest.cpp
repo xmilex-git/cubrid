@@ -17,8 +17,8 @@
  */
 
 /*
- * qfile_tape_selftest.cpp - in-server self-tests for the tape / tapeset backing
- * (moved out of qfile_tape.cpp).  See qfile_tape_selftest.hpp.
+ * qfile_tape_selftest.cpp - in-server self-tests for the tape / tapeset backing.
+ * See qfile_tape_selftest.hpp.
  */
 
 #include "qfile_tape_selftest.hpp"
@@ -28,25 +28,25 @@
 #include "memory_alloc.h"
 #include "object_representation.h"	/* OR_GET_INT used by the QFILE_GET_* page macros */
 #include "list_file.h"		/* qfile_copy_list_id / qfile_clear_list_id / QFILE_MOVE_DEPENDENT */
-#include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
+#include "page_buffer.h"	/* pgbuf_get_fix_debug_count */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "file_io.h"		/* PEEK */
-#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held (#91) */
+#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held */
 
 #include <cassert>
 #include <cerrno>		/* ENOSPC/EDQUOT (ensure_buffile os_error mapping) */
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>		/* stat (orphan-zero on-disk check) */
-#include <thread>		/* N-reader concurrent selftest (ADR 0005) */
+#include <thread>		/* N-reader concurrent selftest */
 #include <algorithm>		/* std::sort (coverage check) */
 #include <atomic>		/* process-unique producer BufFile sequence */
 
 #include "memory_wrapper.hpp"
 
 /* ------------------------------------------------------------------ */
-/* In-server self-test: holdable reparent lifecycle (Phase1 1C, #72). */
-/* Gated by env CUBRID_WM_HELDTAPE_SELFTEST (debug-only invocation).      */
+/* In-server self-test: holdable reparent lifecycle. */
+/* Gated by env CUBRID_WM_HELDTAPE_SELFTEST (debug-only invocation). */
 /* ------------------------------------------------------------------ */
 
 namespace
@@ -270,7 +270,7 @@ qfile_heldtape_selftest (THREAD_ENTRY *thread_p)
 
 /* ------------------------------------------------------------------ */
 /* In-server self-test: N-reader CONCURRENT read of a frozen TDE Tape  */
-/* (ADR 0005, #78 2A-0).  Gated by env CUBRID_WM_TAPEREAD_SELFTEST.        */
+/* Gated by env CUBRID_WM_TAPEREAD_SELFTEST.                            */
 /* A non-re-entrant decrypt (shared member scratch) would corrupt pages */
 /* under concurrent readers -> wrong tuples; this proves per-reader     */
 /* scratch + shared fd + pread is safe on an ENCRYPTED backing.         */
@@ -403,9 +403,8 @@ qfile_taperead_selftest (THREAD_ENTRY *thread_p)
   return rc;
 }
 
-/* #143 S3: moved from qfile_tape.cpp -- production code builds writers via
- * qfile_producer_create_for_list only; this raw-args constructor is now
- * selftest-only (fixed test seqs below 0x100000000ULL). */
+/* Production code builds writers via qfile_producer_create_for_list only; this
+ * raw-args constructor is selftest-only (fixed test seqs below 0x100000000ULL). */
 static void *
 qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned long long seq, unsigned int worker_id)
 {
@@ -417,12 +416,12 @@ qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, unsigned
   return new qfile::tape_writer (prefix_budget_pages, tde_algo, dir, (std::uint64_t) seq, worker_id);
 }
 
-/* In-server overflow round trip for the 2A-1 producer hook (ADR 0006):
- * produce a mix of small and multi-page overflow tuples through
- * qfile_add_tuple_to_list onto a NEW-backed list, freeze, then scan the
- * frozen Tapeset back and verify every tuple's length, id, and payload bytes
- * -- the producer-side overflow stamping matched against the scan-side
- * reassembly (proves cross-page run layout, no VPID chain). */
+/* In-server overflow round trip for the producer hook: produce a mix of small
+ * and multi-page overflow tuples through qfile_add_tuple_to_list onto a
+ * tapeset-backed list, freeze, then scan the frozen Tapeset back and verify
+ * every tuple's length, id, and payload bytes -- the producer-side overflow
+ * stamping matched against the scan-side reassembly (proves cross-page run
+ * layout, no VPID chain). */
 static int
 qfile_producer_overflow_roundtrip (THREAD_ENTRY *thread_p, TDE_ALGORITHM algo)
 {
@@ -471,7 +470,7 @@ qfile_producer_overflow_roundtrip (THREAD_ENTRY *thread_p, TDE_ALGORITHM algo)
 
   if (rc == NO_ERROR)
     {
-      qfile_close_list (thread_p, &ov);	/* NEW branch: freeze -> tapeset, frees scratch */
+      qfile_close_list (thread_p, &ov);	/* tapeset branch: freeze -> tapeset, frees scratch */
       if (QFILE_LIST_ID_TAPESET (&ov) == NULL || QFILE_LIST_ID_BACKING_KIND (&ov) != QFILE_BACKING_TAPESET
 	  || qfile_list_is_mixed_backing (&ov) || qfile_list_has_pgbuf_backing (&ov))
 	{
@@ -541,8 +540,8 @@ qfile_producer_overflow_roundtrip (THREAD_ENTRY *thread_p, TDE_ALGORITHM algo)
 }
 
 /* ------------------------------------------------------------------ */
-/* In-server self-test: 2A-1 NEW-backing producer hook (redesign #78)  */
-/* Gated by env CUBRID_WM_PRODUCER_SELFTEST (debug-only invocation).       */
+/* In-server self-test: tapeset-backing producer hook                  */
+/* Gated by env CUBRID_WM_PRODUCER_SELFTEST (debug-only invocation).    */
 /* ------------------------------------------------------------------ */
 
 int
@@ -562,7 +561,7 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
   const int TUPLE_LEN = 16;
   const int ID_OFFSET = 8;
 
-  /* A NEW-backed list: no OLD temp-file (tfile_vfid NULL), producer_writer_ +
+  /* A tapeset-backed list: no pgbuf temp-file (tfile_vfid NULL), producer_writer_ +
    * scratch attached.  The qfile producer hook routes its completed pages to
    * the tape_writer (no qmgr, no VPID). */
   QFILE_LIST_ID lst;
@@ -594,7 +593,7 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
 
   if (rc == NO_ERROR)
     {
-      qfile_close_list (thread_p, &lst);	/* NEW branch: freeze -> tapeset_, backing_kind=NEW */
+      qfile_close_list (thread_p, &lst);	/* tapeset branch: freeze -> tapeset_, backing_kind=TAPESET */
       if (QFILE_LIST_ID_TAPESET (&lst) == NULL || QFILE_LIST_ID_BACKING_KIND (&lst) != QFILE_BACKING_TAPESET
 	  || qfile_list_is_mixed_backing (&lst) || !qfile_list_has_tapeset (&lst)
 	  || qfile_list_has_pgbuf_backing (&lst))
@@ -653,24 +652,24 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
 
 #if !defined (NDEBUG)
 /* ------------------------------------------------------------------ */
-/* In-server self-test: close/freeze ENOSPC failure propagation (#86)  */
+/* In-server self-test: close/freeze ENOSPC failure propagation      */
 /* Gated by env CUBRID_WM_CLOSE_FAULT_SELFTEST (debug-only invocation). */
 /* ------------------------------------------------------------------ */
 /*
  * Drives the buffile flush fault injector to prove the two silent-data-loss
- * holes this issue closes:
+ * holes this test guards:
  *   P1 (writer sticky error):  an append whose spill flush fails must make
  *       freeze () return NULL.  A writer must never hand back a "successful"
  *       -- but silently short -- Tape after it has lost a page.
- *   P2 (close contract):  a NEW-backed list whose freeze flush fails must be
+ *   P2 (close contract):  a tapeset-backed list whose freeze flush fails must be
  *       marked so the next scan-open raises ER_QPROC_OUT_OF_TEMP_SPACE, never
  *       silently scans 0 rows while tuple_cnt still reads full.
  * Census must return to its pre-test baseline on both failure paths (the
  * partial spill is reclaimed, not orphaned).  Returns 0 (NO_ERROR) on PASS.
  *
- * Fail-before-fix: without the sticky flag / close-mark / scan-open guard, P1
- * sees a non-NULL short Tape and P2 sees scan-open succeed with 0 rows -- both
- * flip the result to FAIL, which is exactly the pre-fix reproduction.
+ * Without the sticky flag / close-mark / scan-open guard, P1 sees a non-NULL
+ * short Tape and P2 sees scan-open succeed with 0 rows -- both flip the result
+ * to FAIL, so the test discriminates the fix.
  */
 int
 qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
@@ -715,7 +714,7 @@ qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
 	qfile::tape *t = w.freeze (thread_p);
 	if (t != NULL)
 	  {
-	    delete t;			/* pre-fix: a silently truncated Tape */
+	    delete t;			/* a silently truncated Tape */
 	    rc = ER_FAILED;
 	  }
 	/* w destructs here; the partial spill it still owns is reclaimed. */
@@ -772,8 +771,8 @@ qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
 	      int open_rc = qfile_open_list_scan (&lst, &sid);
 	      if (open_rc == NO_ERROR)
 		{
-		  /* pre-fix reproduction: a failed close left the list scannable
-		   * while tuple_cnt still reads full (%lld) but there is no backing
+		  /* A failed close left the list scannable
+		   * while tuple_cnt still reads full but there is no backing
 		   * (first_vpid + tapeset both NULL).  The next scan step would then
 		   * hand back a silently short / empty result (top-level fetch) or
 		   * fault on the NULL first page (intermediate scan) -- never a clean
@@ -816,22 +815,21 @@ qfile_close_fault_selftest (THREAD_ENTRY *thread_p)
 }
 
 /* ------------------------------------------------------------------ */
-/* In-server self-test: BufFile fd-exhaustion error mapping (#125)     */
+/* In-server self-test: BufFile fd-exhaustion error mapping          */
 /* Gated by env CUBRID_WM_EMFILE_FAULT_SELFTEST (debug-only invocation).*/
 /* ------------------------------------------------------------------ */
 /*
- * Legacy raw-fd maps EMFILE/ENFILE/ENOSPC/EDQUOT -> ER_QPROC_OUT_OF_TEMP_SPACE
- * (is_fd_or_space_error).  The NEW BufFile writer's ensure_buffile () must give
- * the same diagnosis when open () fails from fd exhaustion; otherwise fd
- * starvation surfaces as a generic ER_FAILED that no operator can act on.
+ * The BufFile writer's ensure_buffile () must map an open () failure from fd
+ * exhaustion (EMFILE/ENFILE, like ENOSPC/EDQUOT) to ER_QPROC_OUT_OF_TEMP_SPACE;
+ * otherwise fd starvation surfaces as a generic ER_FAILED that no operator can
+ * act on.
  *
  * Drives the create-fault injector to force buffile::create () to report EMFILE
  * (then ENFILE) on the first spill append (prefix budget 0 -> immediate spill)
  * and asserts each raises ER_QPROC_OUT_OF_TEMP_SPACE.  Returns 0 on PASS.
  *
- * Fail-before-fix: without the EMFILE/ENFILE arm added to ensure_buffile's
- * os_error switch, both injections fall through to ER_FAILED, so er_errid ()
- * != ER_QPROC_OUT_OF_TEMP_SPACE flips this to FAIL -- the pre-fix reproduction.
+ * Without the EMFILE/ENFILE arm in ensure_buffile's os_error switch, both
+ * injections fall through to ER_FAILED, so the test discriminates the fix.
  */
 int
 qfile_emfile_fault_selftest (THREAD_ENTRY *thread_p)
@@ -871,7 +869,7 @@ qfile_emfile_fault_selftest (THREAD_ENTRY *thread_p)
 	    }
 	  else if (er_errid () != ER_QPROC_OUT_OF_TEMP_SPACE)
 	    {
-	      /* pre-fix reproduction: generic ER_FAILED instead of the temp-space
+	      /* generic ER_FAILED instead of the temp-space
 	       * diagnosis.  Log the symptom and fail. */
 	      er_log_debug (ARG_FILE_LINE,
 			    "EMFILE_FAULT_SELFTEST no-mapping: errno=%d gave er_errid=%d (want %d)\n",
@@ -902,7 +900,7 @@ qfile_emfile_fault_selftest (THREAD_ENTRY *thread_p)
 }
 
 /* ------------------------------------------------------------------ */
-/* In-server self-test: freeze() OOM ownership recovery (#95)          */
+/* In-server self-test: freeze() OOM ownership recovery               */
 /* Gated by env CUBRID_WM_FREEZE_OOM_SELFTEST (debug-only invocation).  */
 /* ------------------------------------------------------------------ */
 /*
@@ -919,8 +917,8 @@ qfile_emfile_fault_selftest (THREAD_ENTRY *thread_p)
  *       still owns its prefix pages (prefix_pages() unchanged) and is latched
  *       failed(); after destroy the census returns to baseline (prefix freed,
  *       not lost via a premature clear).
- * Returns 0 (NO_ERROR) on PASS.  Fail-before-fix: without the NULL checks the
- * tiny path NULL-derefs and the spill path orphans the fd/file.
+ * Returns 0 (NO_ERROR) on PASS.  Without the NULL checks the tiny path
+ * NULL-derefs and the spill path orphans the fd/file.
  */
 int
 qfile_freeze_oom_selftest (THREAD_ENTRY *thread_p)

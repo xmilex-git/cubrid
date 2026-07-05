@@ -131,11 +131,11 @@ struct SUBKEY_INFO
 struct SORTKEY_INFO
 {
   int nkeys;			/* The number of columns in use today. */
-  int ncols;			/* Total number of columns materialized in an A_sort_key record (nkeys <= ncols).
-				 * Comparison always uses only the first `nkeys` entries; copy/rebuild walk all
-				 * `ncols`.  Equals `nkeys` unless extended by
-				 * qfile_sort_key_info_extend_all_columns() to carry the non-key columns as
-				 * payload (a NEW/Tapeset-backed input has no valid VPID back-references, #100). */
+  int ncols;			/* Total columns materialized in an A_sort_key record (nkeys <= ncols).
+				 * Comparison uses only the first `nkeys`; copy/rebuild walk all `ncols`.
+				 * Equals `nkeys` unless qfile_sort_key_info_extend_all_columns() carries
+				 * the non-key columns as payload (a tapeset-backed input has no valid
+				 * VPID back-references). */
   int use_original;		/* False iff the sort keys consist of all of the input record fields, i.e., if we'll
 				 * reconstruct the input records from the keys rather than look them up again in the
 				 * original file. */

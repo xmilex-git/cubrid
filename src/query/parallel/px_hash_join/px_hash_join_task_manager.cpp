@@ -237,15 +237,14 @@ namespace parallel_query
 	  assert (thread_ref.m_px_stats == nullptr);
 	}
 
-      /* redesign #78 per-worker OUTPUT tape (ADR0004): when worker_part_lists is
-       * allocated, each worker keeps its partition lists private — no mutex-
-       * protected flush to the shared part_list_id.  The leader merges after join. */
+      /* When worker_part_lists is allocated, each worker keeps its partition lists
+       * private — no mutex-protected flush to the shared part_list_id.  The leader
+       * merges after join. */
       bool use_per_worker_output = (m_shared_info->worker_part_lists != nullptr);
 
-      /* redesign #78 2A-3: per-tuple partition assignment and buffered write.
-       * Consumed by the NEW (Tapeset) tapeset_reader path.
-       * Assumes tuple_record.tpl points to the current tuple.
-       * Returns true to advance to the next tuple, false on error. */
+      /* Per-tuple partition assignment and buffered write, over the tapeset_reader
+       * path.  Assumes tuple_record.tpl points to the current tuple.  Returns true
+       * to advance to the next tuple, false on error. */
       auto process_split_tuple = [&] () -> bool
       {
 	error = hjoin_fetch_key (&thread_ref, m_split_info->fetch_info, &tuple_record, temp_key,
@@ -280,7 +279,7 @@ namespace parallel_query
 	  }
 
 	/* buffered write to partition — mutex-protected flush to shared part_list_id
-	 * only when NOT using per-worker output (ADR0004). */
+	 * only when NOT using per-worker output. */
 	if (!use_per_worker_output
 	    && temp_part_list_id[part_id] != nullptr
 	    && (QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_last == QFILE_LIST_ID_TFILE_VFID(temp_part_list_id[part_id])->membuf_npages - 1)
@@ -349,9 +348,8 @@ namespace parallel_query
 
       if (m_shared_info->new_dist != nullptr)
 	{
-	  /* NEW (Tapeset) split input: per-worker tapeset_reader over shared
-	   * chunk_distributor.  Overflow reassembly handled by the reader
-	   * (ADR 0005/0006). */
+	  /* tapeset split input: per-worker tapeset_reader over shared
+	   * chunk_distributor.  Overflow reassembly handled by the reader. */
 	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
 	  qfile::tapeset_reader *reader =
 		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);
@@ -406,14 +404,10 @@ namespace parallel_query
 	{
 	  if (use_per_worker_output)
 	    {
-	      /* redesign #78 per-worker OUTPUT tape (ADR0004): transfer ownership
-	       * of temp partition lists to this worker's slot array.  The leader
-	       * will merge them after all workers complete — no mutex.
-	       * #109: the slot array was allocated by the LEADER in
-	       * build_partitions — db_private_alloc is per-thread (per-entry lea
-	       * mspace), so a worker-side allocation could not be freed by the
-	       * leader at merge time (mspace_free USAGE_ERROR abort in release,
-	       * leftover alloc-tracker entry assert in debug).  Only fill it here. */
+	      /* Transfer ownership of temp partition lists to this worker's slot array;
+	       * the leader merges after all workers complete.  The slot array was
+	       * allocated by the leader (db_private_alloc is per-thread, so the leader
+	       * could not free a worker-side alloc at merge time); only fill it here. */
 	      QFILE_LIST_ID **slot = m_shared_info->worker_part_lists[m_index];
 	      assert (slot != nullptr);
 	      for (part_index = 0; part_index < part_cnt; part_index++)
@@ -424,7 +418,7 @@ namespace parallel_query
 	    }
 	  else
 	    {
-	      /* OLD path: final merge under mutex. */
+	      /* shared path: final merge under mutex. */
 	      for (part_index = 0; part_index < part_cnt; part_index++)
 		{
 		  if (temp_part_list_id[part_index] == nullptr)
@@ -758,9 +752,9 @@ namespace parallel_query
 	  break;
 
 	case HASH_METH_HASH_FILE:
-	  /* batch-spill hash (#123): the table is built once and shared read-only
+	  /* batch-spill hash: the table is built once and shared read-only
 	   * across probe workers, but each worker must own its own probe cursor
-	   * -- sharing a cursor across workers races (#127). */
+	   * -- sharing a cursor across workers races. */
 	  m_context->hash_scan.spill.hash_table = single_context->hash_scan.spill.hash_table;
 	  m_context->hash_scan.spill.cursor = hls_spill_cursor_create (&thread_ref);
 	  if (m_context->hash_scan.spill.cursor == NULL)
@@ -836,7 +830,7 @@ cleanup:
 	  break;
 
 	case HASH_METH_HASH_FILE:
-	  /* destroy only this worker's own cursor (#127); the table itself is skipped, per comment above */
+	  /* destroy only this worker's own cursor; the table itself is skipped, per comment above */
 	  hls_spill_cursor_destroy (&thread_ref, m_context->hash_scan.spill.hash_table, m_context->hash_scan.spill.cursor);
 	  m_context->hash_scan.spill.cursor = nullptr;
 	  m_context->hash_scan.spill.hash_table = nullptr;
@@ -918,10 +912,9 @@ cleanup:
 	  hjoin_trace_start (&thread_ref, &start_stats);
 	}
 
-      /* redesign #78 2A-3: per-probe-tuple processing (fetch key -> hash -> probe
-       * build hash table -> merge matched tuple).  Consumed by the NEW (Tapeset)
-       * tapeset_reader path.  Returns true to advance to
-       * the next tuple, false on error (has_error set). */
+      /* Per-probe-tuple processing (fetch key -> hash -> probe build hash table
+       * -> merge matched tuple), over the tapeset_reader path.  Returns true to
+       * advance to the next tuple, false on error (has_error set). */
       auto process_probe_tuple = [&] () -> bool
       {
 	if (thread_is_on_trace (&thread_ref))
@@ -1022,10 +1015,10 @@ cleanup:
 
       if (m_shared_info->new_dist != nullptr)
 	{
-	  /* NEW (Tapeset) probe input: this worker reads its share of tuples via a
+	  /* tapeset probe input: this worker reads its share of tuples via a
 	   * per-worker tapeset_reader over the shared chunk_distributor (reader id =
 	   * worker index).  Overflow reassembly and offset-based page reads happen
-	   * inside the reader (ADR 0005/0006). */
+	   * inside the reader. */
 	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
 	  qfile::tapeset_reader *reader =
 		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);
@@ -1148,9 +1141,9 @@ cleanup:
 	  hjoin_trace_start (&thread_ref, &start_stats);
 	}
 
-      /* redesign #78 2A-3: per-probe-tuple processing for outer join.
-       * Consumed by the NEW (Tapeset) tapeset_reader path.  Returns true to advance to the next tuple, false on error
-       * (has_error set).  Covers hash probe, match/NULL-fill, during_join_pred. */
+      /* Per-probe-tuple processing for outer join, over the tapeset_reader path.
+       * Returns true to advance to the next tuple, false on error (has_error set).
+       * Covers hash probe, match/NULL-fill, during_join_pred. */
       auto process_probe_tuple = [&] () -> bool
       {
 	if (thread_is_on_trace (&thread_ref))
@@ -1337,10 +1330,10 @@ cleanup:
 
       if (m_shared_info->new_dist != nullptr)
 	{
-	  /* NEW (Tapeset) probe input: this worker reads its share of tuples via a
+	  /* tapeset probe input: this worker reads its share of tuples via a
 	   * per-worker tapeset_reader over the shared chunk_distributor (reader id =
 	   * worker index).  Overflow reassembly and offset-based page reads happen
-	   * inside the reader (ADR 0005/0006). */
+	   * inside the reader. */
 	  QFILE_TUPLE_RECORD new_trec = { nullptr, 0 };
 	  qfile::tapeset_reader *reader =
 		  new qfile::tapeset_reader (m_shared_info->new_tapeset, m_shared_info->new_dist, m_index);

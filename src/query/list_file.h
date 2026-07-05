@@ -120,9 +120,9 @@ typedef enum
 #if defined (SERVER_MODE)
 struct sort_px_list_state
 {
-  /* per-worker NEW (Tapeset) reader — owned by this state.  #130: the OLD
-   * sector-scan path is deleted; a parallel sort input is always NEW-backed
-   * (sort_check_parallelism demotes OLD-backed input to serial). */
+  /* per-worker tapeset reader — owned by this state.  A parallel sort input is
+   * always tapeset-backed (sort_check_parallelism demotes pgbuf-backed input to
+   * serial). */
   void *tapeset_reader;
   bool has_tapeset_tuple;
   QFILE_TUPLE_RECORD tplrec;	/* tuple buffer (reader COPY target) */
@@ -137,7 +137,7 @@ extern int qfile_initialize (void);
 extern void qfile_finalize (void);
 extern void qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id);
 extern void qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id);
-/* #89 debug assert bridge: 0 when list_id carries no (live) Tapeset. Only
+/* debug assert bridge: 0 when list_id carries no (live) Tapeset. Only
  * meaningful to call while list_id's Tapeset, if any, is still alive. */
 extern int qfile_list_id_open_scan_count (const QFILE_LIST_ID * list_id_p);
 extern int qfile_add_tuple_to_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, QFILE_TUPLE tpl);
@@ -213,11 +213,11 @@ extern QFILE_LIST_ID *qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALU
 				       SORT_LIST * sort_list, QUERY_ID query_id, int flag,
 				       QFILE_LIST_ID * existing_list_id);
 extern int qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
-/* redesign #78 C-3/C-6: demote a NEW (Tapeset) list to OLD backing for mutable consumers. */
+/* demote a tapeset list to pgbuf backing for mutable consumers. */
 extern int qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
-/* redesign #78 C-3: promote a finished OLD UNION ALL list to NEW for parallel consumers. */
+/* promote a finished pgbuf UNION ALL list to tapeset for parallel consumers. */
 extern int qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
-/* redesign #78 2A-1b: NEW (Tapeset) SORT output migration. */
+/* tapeset SORT output migration. */
 extern int qfile_list_make_tapeset_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
 extern int qfile_save_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, QFILE_TUPLE_TYPE tuple_type, char *page_p,
 			     int *tuple_length_p);

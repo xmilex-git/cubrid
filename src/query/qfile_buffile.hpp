@@ -17,15 +17,13 @@
  */
 
 /*
- * qfile_buffile.hpp - Phase1 1B per-worker private backing (redesign G006, issue #71).
+ * qfile_buffile.hpp - per-worker private backing.
  *
- * Axis-1 backing: a Tape's spilled pages live in a per-worker PRIVATE file
+ * Backing model: a Tape's spilled pages live in a per-worker PRIVATE file
  * (PostgreSQL BufFile model) -- its own write buffer + fd, owner-only append,
  * batched flush.  It BYPASSES the shared buffer pool entirely: pages never
  * enter a pgbuf BCB, there is no server-global page registry and no per-page
- * lock (SSOT #75 §2.2, ADR 0003).  This is the deliberate departure from the
- * e21917cfd raw-fd backing whose global registry + per-tuple dirty-mark lock
- * is the measured #62 regression (Evidence #76 §C/§D).
+ * lock.
  *
  * Addressing is pure page-offset arithmetic: logical file page N is at byte
  * offset N * stride.  No directory, no sector list, no occupancy bitmap --
@@ -34,19 +32,15 @@
  *
  * TDE: the BufFile encrypts on disk only when created with a real algorithm
  * (includes_tde_class), reusing tde_encrypt_data_page / tde_decrypt_data_page
- * (fresh-nonce-per-page), exactly as the raw-fd path did (SSOT §5 (3),
- * Evidence #76 §H-5).  The membuf prefix that precedes the BufFile is plaintext
- * RAM and is NOT this class's concern (see qfile::buffile_tape / tape_writer).
- *
- * Phase 1 is EXPAND/additive: this backing is built and unit-verified here; the
- * producer wiring (sort / hash / partition operators writing into it) is
- * Phase 2 (MIGRATE), and lifecycle/reparent is Phase 1C.
+ * (fresh-nonce-per-page).  The membuf prefix that precedes the BufFile is
+ * plaintext RAM and is NOT this class's concern (see qfile::buffile_tape /
+ * tape_writer).
  */
 
 #ifndef _QFILE_BUFFILE_HPP_
 #define _QFILE_BUFFILE_HPP_
 
-#include "qfile_spill_file.hpp"	/* spill_file substrate + tape_backing_census (Phase3 (c′), #132) */
+#include "qfile_spill_file.hpp"	/* spill_file substrate + tape_backing_census */
 #include "storage_common.h"	/* PAGE_PTR / DB_PAGESIZE / IO_PAGESIZE */
 #include "thread_compat.hpp"	/* THREAD_ENTRY */
 #include "tde.h"		/* TDE_ALGORITHM */
@@ -62,11 +56,9 @@ namespace qfile
 {
   /*
    * buffile_metrics - measurement hooks for the per-worker private backing
-   * (redesign G003, issue #68; the producer side of the pgbuf-bypass hard
-   * gate).  pgbuf_fixes is the load-bearing counter: a BufFile reads/writes
-   * exclusively through pread/pwrite on its own fd and NEVER fixes a pgbuf
-   * BCB, so it MUST stay 0 (SSOT #75 §6 (6); replaces the e21917cfd raw-fd
-   * shared-pool LRU pollution that caused FAIL-09).
+   * (producer side of the pgbuf-bypass hard gate).  pgbuf_fixes is the
+   * load-bearing counter: a BufFile reads/writes exclusively through
+   * pread/pwrite on its own fd and NEVER fixes a pgbuf BCB, so it MUST stay 0.
    */
   struct buffile_metrics
   {
@@ -84,19 +76,19 @@ namespace qfile
     }
   };
 
-  /* tape_backing_census (orphan-scan hook, #68) lives in the shared spill-file
-   * substrate now -- see qfile_spill_file.hpp (Phase3 (c′) extraction, #132). */
+  /* tape_backing_census (orphan-scan hook) lives in the shared spill-file
+   * substrate -- see qfile_spill_file.hpp. */
 
 #if !defined (NDEBUG)
-  /* ENOSPC fault injection (#86, debug-only).  Arm to make the Nth subsequent
+  /* ENOSPC fault injection (debug-only).  Arm to make the Nth subsequent
    * buffile::flush that actually writes fail as if the disk hit ENOSPC (er_set
    * ER_QPROC_OUT_OF_TEMP_SPACE, no pwrite).  nth <= 0 disarms.  Also armed at
    * boot from env CUBRID_WM_FAULT_FLUSH_AT for query-level repro.  Exists only
    * to mechanically exercise the close/freeze failure-propagation contract;
-   * compiled out of release (AC: fault hook excluded under NDEBUG). */
+   * compiled out of release (NDEBUG). */
   void buffile_fault_arm_flush_fail (int nth);
 
-  /* fd-exhaustion fault injection (#125, debug-only).  Arm with an errno
+  /* fd-exhaustion fault injection (debug-only).  Arm with an errno
    * (EMFILE/ENFILE) to make the next buffile::create () short-circuit its
    * open () and report that errno, so the ensure_buffile os_error -> temp-space
    * mapping can be exercised without draining the real process fd table.
@@ -106,9 +98,9 @@ namespace qfile
 
   /*
    * tde_read_scratch - per-reader cipher/plain page buffers for the re-entrant
-   * read path (ADR 0005).  A concurrent reader owns one of these so two threads
-   * reading the same frozen TDE BufFile never share decrypt state -- the member
-   * scratch leaves buffile::read_page.  Never allocated on the plaintext path.
+   * read path.  A concurrent reader owns one of these so two threads reading
+   * the same frozen TDE BufFile never share decrypt state.  Never allocated on
+   * the plaintext path.
    */
   struct tde_read_scratch
   {
@@ -142,21 +134,19 @@ namespace qfile
       static buffile *create (THREAD_ENTRY *thread_p, const char *dir, std::uint64_t seq, unsigned int worker_id,
 			      TDE_ALGORITHM tde_algo, int *os_error_out);
 
-      /* One-shot boot sweep (issue #88): wipes this server's cubrid_buffile
-       * spill subtree of any files orphaned by a kill -9'd previous run.
-       * Idempotent (std::call_once); call once at server boot, mirroring
-       * the raw-fd sweep this replaced (커밋 B #137). Safe to skip -- if
-       * never called explicitly, default_scratch_dir() below runs it lazily
-       * on first use, but calling it at boot keeps the sweep off the query
-       * hot path. */
+      /* One-shot boot sweep: wipes this server's cubrid_buffile spill subtree
+       * of any files orphaned by a kill -9'd previous run.  Idempotent
+       * (std::call_once); call once at server boot.  Safe to skip -- if never
+       * called explicitly, default_scratch_dir() below runs it lazily on first
+       * use, but calling it at boot keeps the sweep off the query hot path. */
       static void boot_sweep ();
 
       /* Resolve the per-server default scratch directory: $CUBRID_TMP, else
        * the database volume directory, then <base>/cubrid_buffile/<db>/<server_id>
        * (server_id persists across restarts in a per-db marker file, so boot
-       * sweeps only this server's own subtree; issue #88).  No /tmp or $TMP
-       * fallback -- both can be tmpfs, which would defeat spilling.  Returns
-       * false if no disk-backed base can be formed. */
+       * sweeps only this server's own subtree).  No /tmp or $TMP fallback --
+       * both can be tmpfs, which would defeat spilling.  Returns false if no
+       * disk-backed base can be formed. */
       static bool default_scratch_dir (std::string &out);
 
       ~buffile ();		/* closes fd and unlinks the file */
@@ -173,8 +163,8 @@ namespace qfile
        * immutable, so a shared fd + pread is concurrency-safe and all mutable
        * read state is caller-supplied: `scratch` MUST be non-NULL for a TDE
        * BufFile (its cipher/plain buffers carry the pread + decrypt) and is
-       * ignored when plaintext.  const + safe for N concurrent readers
-       * (ADR 0005).  Pages must already be flushed (append-all-then-freeze). */
+       * ignored when plaintext.  const + safe for N concurrent readers.  Pages
+       * must already be flushed (append-all-then-freeze). */
       int read_page (THREAD_ENTRY *thread_p, int page_offset, PAGE_PTR dest, tde_read_scratch *scratch) const;
 
       int page_count () const
@@ -200,9 +190,9 @@ namespace qfile
       int ensure_write_scratch ();
       int stage_plaintext (const PAGE_PTR list_page, char *slot);
       int stage_tde (const PAGE_PTR list_page, char *slot, int page_index);
-      void refresh_pgbuf_fixes ();	/* producer-side pgbuf-bypass gate (issue #93) */
+      void refresh_pgbuf_fixes ();	/* producer-side pgbuf-bypass gate */
 
-      spill_file m_file;	/* fd/path/TDE-algo/stride + create/close+unlink+census (substrate, #132) */
+      spill_file m_file;	/* fd/path/TDE-algo/stride + create/close+unlink+census (substrate) */
       int m_pages_on_disk;	/* pages already pwritten */
 
       char *m_batch_raw;	/* aligned batch write buffer (BATCH_PAGES * m_disk_pagesize) */
@@ -210,13 +200,12 @@ namespace qfile
       int m_batch_pages;	/* pages currently staged in m_batch (unflushed) */
 
       /* TDE write-staging scratch (encrypt path only; allocated lazily, NULL
-       * when plaintext).  The read path no longer keeps a member scratch -- it
-       * is caller-supplied (tde_read_scratch) so N readers stay re-entrant
-       * (ADR 0005). */
+       * when plaintext).  The read path keeps no member scratch -- it is
+       * caller-supplied (tde_read_scratch) so N readers stay re-entrant. */
       char *m_plain_raw;
       FILEIO_PAGE *m_plain;	/* encrypt staging wrap buffer (write path only) */
 
-      long m_pgbuf_fix_baseline;	/* pgbuf_get_fix_debug_count() at construction (issue #93) */
+      long m_pgbuf_fix_baseline;	/* pgbuf_get_fix_debug_count() at construction */
 
       mutable buffile_metrics m_metrics;	/* mutable: pages_read is atomic-updated from const read_page() */
 
@@ -228,9 +217,8 @@ namespace qfile
 /*
  * In-server self-test of the BufFile write/flush/read round-trip, including the
  * TDE encrypt -> pwrite -> pread -> decrypt path which cannot run in the
- * bootless unit test (no loaded cipher).  Mirrors the raw-fd self-test; gated
- * by env CUBRID_WM_BUFFILE_SELFTEST in qmgr_initialize (debug-only).  Returns 0 on
- * PASS.
+ * bootless unit test (no loaded cipher).  Gated by env CUBRID_WM_BUFFILE_SELFTEST
+ * in qmgr_initialize (debug-only).  Returns 0 on PASS.
  */
 int qfile_buffile_selftest (THREAD_ENTRY *thread_p);
 

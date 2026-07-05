@@ -53,8 +53,8 @@ namespace parallel_scan
       int init_on_main (THREAD_ENTRY *thread_p, QFILE_LIST_ID *list_id, int parallelism);
 
       /*
-       * NEW backing: arms this worker's thread-local tapeset_reader and returns a null
-       * page sentinel once (#130: OLD backing never reaches a parallel list scan).
+       * tapeset backing: arms this worker's thread-local tapeset_reader and returns
+       * a null page sentinel once (pgbuf backing never reaches a parallel list scan).
        */
       SCAN_CODE get_next_page_with_fix (THREAD_ENTRY *thread_p,
 					PAGE_PTR &out_page,

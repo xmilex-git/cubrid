@@ -187,8 +187,8 @@ struct sort_param
   ORDERBY_STATS orderby_stats;
     cuberr::context * main_error_context;
   void *px_extra_arg;		/* extra parallel context; for SORT_GROUP_BY/SORT_ANALYTIC: SORT_LISTFILE_PX_ARG* */
-  bool px_output_is_new;	/* 2A-1b (#78): this SORT output migrated to NEW Tapeset backing */
-  qfile::chunk_distributor *px_chunk_dist;	/* shared NEW (Tapeset) chunk distributor for ORDER_BY workers */
+  bool px_output_is_new;	/* this SORT output is tapeset-backed */
+  qfile::chunk_distributor *px_chunk_dist;	/* shared tapeset chunk distributor for ORDER_BY workers */
 #if defined(SERVER_MODE)
   pthread_mutex_t *px_mtx;	/* px_status mutex */
   pthread_cond_t *complete_cond;	/* complete condition */
@@ -1489,10 +1489,10 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->px_type = parallel_type;
   sort_param->px_extra_arg = px_extra_arg;
   sort_param->px_chunk_dist = NULL;
-  /* 2A-1b (#78): capture whether this SORT output was converted to NEW (Tapeset)
-   * backing -- stably, before the parallel workers run -- so each worker's
-   * output matches the origin (a do_close=false sort leaves the origin OLD).
-   * Only ORDER_BY/ORDER_WITH_LIMIT carry a SORT_INFO put_arg with a qfile out. */
+  /* Capture whether this SORT output is tapeset-backed -- stably, before the
+   * parallel workers run -- so each worker's output matches the origin (a
+   * do_close=false sort leaves the origin pgbuf-paged).  Only
+   * ORDER_BY/ORDER_WITH_LIMIT carry a SORT_INFO put_arg with a qfile out. */
   sort_param->px_output_is_new =
     ((parallel_type == SORT_ORDER_BY || parallel_type == SORT_ORDER_WITH_LIMIT)
      && QFILE_LIST_ID_PRODUCER_WRITER (((SORT_INFO *) put_arg)->output_file) != NULL);
@@ -4912,17 +4912,17 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
       sort_info_p = (SORT_INFO *) px_sort_param[i].put_arg;
       if (qfile_list_has_tapeset (origin_list_id))
 	{
-	  /* 2A-1b (#78): NEW (Tapeset) fan-in -- import this worker's frozen
-	   * Tape(s) into the origin Tapeset in worker order (= globally sorted,
-	   * since sort_split_last_run partitioned the merged run in order). */
+	  /* tapeset fan-in -- import this worker's frozen Tape(s) into the origin
+	   * tapeset in worker order (= globally sorted, since sort_split_last_run
+	   * partitioned the merged run in order). */
 	  if (sort_info_p->output_file == NULL)
 	    {
 	      continue;
 	    }
 	  if (qfile_list_has_pgbuf_backing (sort_info_p->output_file))
 	    {
-	      /* worker stayed OLD (conversion OOM) feeding a NEW origin: a
-	       * mixed-backing error, never a silent data loss. */
+	      /* worker stayed pgbuf-paged (conversion OOM) feeding a tapeset
+	       * origin: a mixed-backing error, never a silent data loss. */
 	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	      error = ER_FAILED;
 	      goto cleanup;
@@ -4966,8 +4966,8 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
 	  origin_sort_info_p->output_file = origin_list_id;
 	}
     }
-  /* reopen final output file (OLD append mode only; a NEW origin is a frozen
-   * Tapeset that is never reopened for append). */
+  /* reopen final output file (pgbuf-paged append mode only; a tapeset origin is
+   * a frozen tapeset that is never reopened for append). */
   if (!qfile_list_has_tapeset (origin_list_id))
     {
       error = qfile_reopen_list_as_append_mode (thread_p, origin_list_id);
@@ -5175,14 +5175,9 @@ sort_check_parallelism_orderby (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param
   /* get scan id of input file */
   sort_info_p = (SORT_INFO *) sort_param->get_arg;
 
-  /* #99 safety net: qfile_sort_list_with_func() (list_file.c) already keeps
-   * an expected-parallel SORT output out of FILE_QUERY_AREA backing, but
-   * QFILE_FLAG_DISTINCT (and any other future caller) can still route
-   * qfile_open_list() to a FILE_QUERY_AREA result file regardless of the
-   * parallel prediction.  file_manager's temp-file page allocation for a
-   * query-area list does not support concurrent same-transaction workers,
-   * so catch any output list that actually ended up FILE_QUERY_AREA here
-   * and force serial execution rather than relying solely on prediction. */
+  /* Safety net: force serial for a FILE_QUERY_AREA output -- file_manager's
+   * query-area temp-file page allocation does not support concurrent
+   * same-transaction workers, and QFILE_FLAG_DISTINCT can route here anyway. */
   if (sort_info_p->output_file != NULL && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file) != NULL
       && QFILE_LIST_ID_TFILE_VFID (sort_info_p->output_file)->temp_file_type == FILE_QUERY_AREA)
     {
@@ -5190,11 +5185,9 @@ sort_check_parallelism_orderby (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param
       return 1;
     }
 
-  /* #130 fallback: the OLD sector-scan parallel input reader is deleted, so
-   * only a NEW (Tapeset)-backed input can be read in parallel
-   * (chunk_distributor + per-worker tapeset_reader).  Any OLD-backed input
-   * -- including raw-fd overflow spill, which the deleted sector scan could
-   * not enumerate anyway (#99) -- is demoted to a correct serial sort. */
+  /* Only a tapeset-backed input can be read in parallel (chunk_distributor +
+   * per-worker tapeset_reader); any pgbuf-paged input -- including page-spill
+   * overflow -- is demoted to a correct serial sort. */
   if (!qfile_list_has_tapeset (sort_info_p->input_file))
     {
       er_log_debug (ARG_FILE_LINE, "sort: OLD-backed ORDER_BY input -> serial (#130 fallback)\n");
@@ -5284,24 +5277,17 @@ sort_check_parallelism_groupby (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param
       return 1;
     }
   QFILE_LIST_ID *input_list = px->input_list;
-  /* #130 fallback: OLD-backed input -> serial (the OLD sector-scan reader is
-   * deleted; see the ORDER_BY branch above). */
+  /* pgbuf-paged input -> serial (see the ORDER_BY branch above). */
   if (input_list == NULL || !qfile_list_has_tapeset (input_list))
     {
       er_log_debug (ARG_FILE_LINE, "sort: OLD-backed %s input -> serial (#130 fallback)\n",
 		    (sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
       return 1;
     }
-  /* The NEW input is read in parallel through the shared chunk_distributor +
-   * per-worker tapeset_reader that sort_start_parallelism builds (#122).  That
-   * reader builds A_sort_key records via qfile_sort_build_key_from_tuple, which
-   * requires use_original == 0 -- every column materialized in the sort record
-   * (the #103/#100 extend_all_columns treatment that qexec_gby_* and
-   * qexec_execute_analytic apply to NEW input).  In the rare case where
-   * extend_all_columns bailed (duplicated / out-of-range key column) use_original
-   * stays 1, the A_sort_key path cannot carry the payload, so keep forcing serial:
-   * the serial sort then fails loudly on the unresolvable back-reference exactly
-   * as before, rather than mis-reading the record.  (#78 C-7/C-8) */
+  /* Parallel tapeset read builds A_sort_key records, which require
+   * use_original == 0.  If use_original stayed 1 (extend_all_columns bailed on
+   * a duplicated / out-of-range key column) force serial -- the serial sort
+   * fails loudly on the back-reference rather than mis-reading the record. */
   if (px->key_info == NULL || px->key_info->use_original)
     {
       er_log_debug (ARG_FILE_LINE,
@@ -5465,15 +5451,15 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
       return ER_FAILED;
     }
 
-  /* case of ORDER BY / ORDER WITH LIMIT — build the shared NEW (Tapeset) chunk
+  /* case of ORDER BY / ORDER WITH LIMIT — build the shared tapeset chunk
    * distributor; put_arg differs per type */
   if (sort_param->px_type == SORT_ORDER_BY || sort_param->px_type == SORT_ORDER_WITH_LIMIT)
     {
       SORT_INFO *sort_info_p = (SORT_INFO *) sort_param->get_arg;
       QFILE_LIST_ID *input_file = sort_info_p->input_file;
 
-      /* #130: sort_check_parallelism demotes OLD-backed input to serial, so a
-       * parallel sort input is always NEW (Tapeset)-backed here. */
+      /* sort_check_parallelism demotes pgbuf-paged input to serial, so a
+       * parallel sort input is always tapeset-backed here. */
       assert (qfile_list_has_tapeset (input_file));
       {
 	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_file);
@@ -5630,11 +5616,10 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
       SORT_LISTFILE_PX_ARG *px = (SORT_LISTFILE_PX_ARG *) sort_param->px_extra_arg;
       QFILE_LIST_ID *input_list = px->input_list;
 
-      /* NEW (Tapeset) input: build a shared chunk_distributor; each worker gets its
+      /* tapeset input: build a shared chunk_distributor; each worker gets its
        * own tapeset_reader below and atomically steals 64-page chunks from it.
-       * Mirrors the ORDER_BY branch (#122).  sort_check_parallelism has already
-       * ensured the key builds as an A_sort_key (use_original == 0) and demoted
-       * OLD-backed input to serial (#130). */
+       * Mirrors the ORDER_BY branch; sort_check_parallelism has already forced
+       * serial for pgbuf-paged input and for a key that is not an A_sort_key. */
       assert (qfile_list_has_tapeset (input_list));
       {
 	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list);
@@ -5695,7 +5680,7 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 
 	  if (sort_param->px_chunk_dist != NULL)
 	    {
-	      /* NEW input: this worker reads its stolen chunks through a tapeset_reader.
+	      /* tapeset input: this worker reads its stolen chunks through a tapeset_reader.
 	       * get_arg/px_state are already wired, so an alloc failure here is reclaimed
 	       * by the partial-init cleanup (qfile_sort_px_state_free).  Mirrors ORDER_BY. */
 	      qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list);
