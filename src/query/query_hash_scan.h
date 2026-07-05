@@ -177,6 +177,9 @@ typedef struct hls_spill HLS_SPILL;
  * instead of racing on shared fields. */
 typedef struct hls_spill_cursor HLS_SPILL_CURSOR;
 
+/* #144 P3 D2: bump arena for IN_MEM build hash values (opaque; see query_hash_scan.c). */
+typedef struct hscan_value_arena HSCAN_VALUE_ARENA;
+
 typedef struct hash_list_scan HASH_LIST_SCAN;
 struct hash_list_scan
 {
@@ -190,6 +193,13 @@ struct hash_list_scan
     {
       MHT_HLS_TABLE *hash_table;	/* memory hash table for hash list scan */
       HENTRY_HLS_PTR curr_hash_entry;	/* current hash entry */
+      /* #144 P3 D2: bump arena for the IN_MEM build's HASH_SCAN_VALUE + inline
+       * tuple copies -- replaces the per-entry db_private_alloc storm (2 allocs ×
+       * build_rows).  NULL => per-entry allocation (HYBRID / arena-create OOM /
+       * non-arena callers).  Owned by the build (single) context; freed en masse
+       * in hjoin_scan_clear.  Arena-allocated values are NEVER freed individually
+       * (mht clear uses a no-op entry callback). */
+      HSCAN_VALUE_ARENA *value_arena;
     } memory;
     struct
     {
@@ -209,6 +219,17 @@ struct hash_list_scan
 HASH_SCAN_KEY *qdata_alloc_hscan_key (THREAD_ENTRY * thread_p, int val_cnt, bool alloc_vals);
 HASH_SCAN_VALUE *qdata_alloc_hscan_value (THREAD_ENTRY * thread_p, QFILE_TUPLE tpl);
 HASH_SCAN_VALUE *qdata_alloc_hscan_value_OID (THREAD_ENTRY * thread_p, QFILE_LIST_SCAN_ID * scan_id_p);
+
+/* #144 P3 D2: per-build bump arena for IN_MEM HASH_SCAN_VALUE + inline tuple.
+ * create() returns NULL on OOM (caller falls back to per-entry alloc).
+ * alloc_value() bump-allocates one value+tuple (NULL on OOM) -- the returned
+ * value is owned by the arena and must NOT be passed to qdata_free_hscan_value.
+ * destroy() frees all blocks at once.  noop_free_hscan_entry is the mht-clear
+ * callback used when the table's values are arena-owned. */
+HSCAN_VALUE_ARENA *hscan_value_arena_create (void);
+void hscan_value_arena_destroy (HSCAN_VALUE_ARENA * arena);
+HASH_SCAN_VALUE *qdata_alloc_hscan_value_arena (HSCAN_VALUE_ARENA * arena, QFILE_TUPLE tpl);
+int qdata_noop_free_hscan_entry (const void *key, void *data, void *args);
 
 void qdata_free_hscan_key (THREAD_ENTRY * thread_p, HASH_SCAN_KEY * key, int val_count);
 void qdata_free_hscan_value (THREAD_ENTRY * thread_p, HASH_SCAN_VALUE * value);

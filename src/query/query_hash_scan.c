@@ -666,6 +666,121 @@ qdata_free_hscan_entry (const void *key, void *data, void *args)
   return NO_ERROR;
 }
 
+/*
+ * #144 P3 D2: per-build bump arena for IN_MEM HASH_SCAN_VALUE + inline tuple.
+ *
+ * The IN_MEM hash-join build previously did two db_private_alloc per row (the
+ * 8-byte value + the tuple copy) -> a ~2N-alloc mspace storm that made the
+ * in-memory build the bottleneck (P4: 33% self in mspace_malloc).  The arena
+ * bump-allocates value+tuple contiguously from large malloc'd blocks and frees
+ * every block at once in hjoin_scan_clear.  Values are arena-owned and are NEVER
+ * passed to qdata_free_hscan_value: the mht clear uses qdata_noop_free_hscan_entry
+ * (mht_clear_hls passes key=NULL, so only the value would have been freed, and
+ * the inline uint keys need no free -> no leak).  Owned by the build (single)
+ * context; probe workers only read through the shared hash table, so the arena
+ * must outlive probe (same lifetime as the shared table).  On any build error the
+ * whole arena is reclaimed by hjoin_scan_clear (no per-entry poison needed).
+ */
+struct hscan_value_arena_block
+{
+  struct hscan_value_arena_block *next;
+  size_t size;			/* usable bytes in data[] */
+  size_t used;
+  char data[1];			/* flexible array (over-allocated) */
+};
+
+struct hscan_value_arena
+{
+  struct hscan_value_arena_block *head;	/* most-recent block (bump target) */
+  size_t default_block;		/* new-block size floor */
+};
+
+#define HSCAN_ARENA_DEFAULT_BLOCK (1024ULL * 1024ULL)	/* 1MiB blocks */
+
+HSCAN_VALUE_ARENA *
+hscan_value_arena_create (void)
+{
+  HSCAN_VALUE_ARENA *arena = (HSCAN_VALUE_ARENA *) malloc (sizeof (HSCAN_VALUE_ARENA));
+  if (arena == NULL)
+    {
+      return NULL;		/* caller falls back to per-entry alloc */
+    }
+  arena->head = NULL;
+  arena->default_block = HSCAN_ARENA_DEFAULT_BLOCK;
+  return arena;
+}
+
+void
+hscan_value_arena_destroy (HSCAN_VALUE_ARENA * arena)
+{
+  if (arena == NULL)
+    {
+      return;
+    }
+  struct hscan_value_arena_block *b = arena->head;
+  while (b != NULL)
+    {
+      struct hscan_value_arena_block *next = b->next;
+      free (b);
+      b = next;
+    }
+  free (arena);
+}
+
+static char *
+hscan_value_arena_bump (HSCAN_VALUE_ARENA * arena, size_t n)
+{
+  n = (n + 7) & ~((size_t) 7);	/* 8-byte align */
+  if (arena->head == NULL || arena->head->used + n > arena->head->size)
+    {
+      size_t bsz = (n > arena->default_block) ? n : arena->default_block;
+      struct hscan_value_arena_block *b =
+	(struct hscan_value_arena_block *) malloc (offsetof (struct hscan_value_arena_block, data) + bsz);
+      if (b == NULL)
+	{
+	  return NULL;
+	}
+      b->next = arena->head;
+      b->size = bsz;
+      b->used = 0;
+      arena->head = b;
+    }
+  char *p = arena->head->data + arena->head->used;
+  arena->head->used += n;
+  return p;
+}
+
+HASH_SCAN_VALUE *
+qdata_alloc_hscan_value_arena (HSCAN_VALUE_ARENA * arena, QFILE_TUPLE tpl)
+{
+  int tuple_size = QFILE_GET_TUPLE_LENGTH (tpl);
+  char *p = hscan_value_arena_bump (arena, sizeof (HASH_SCAN_VALUE) + (size_t) tuple_size);
+  if (p == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+	      sizeof (HASH_SCAN_VALUE) + (size_t) tuple_size);
+      return NULL;
+    }
+  HASH_SCAN_VALUE *value = (HASH_SCAN_VALUE *) p;
+  value->tuple = (QFILE_TUPLE) (p + sizeof (HASH_SCAN_VALUE));	/* inline, contiguous */
+  if (!safe_memcpy (value->tuple, tpl, tuple_size))
+    {
+      return NULL;		/* arena reclaims the bumped bytes en masse */
+    }
+  return value;
+}
+
+/* mht-clear callback for arena-owned values: nothing to free per entry (the
+ * whole arena is destroyed by hjoin_scan_clear); mht_clear_hls passes key=NULL. */
+int
+qdata_noop_free_hscan_entry (const void *key, void *data, void *args)
+{
+  (void) key;
+  (void) data;
+  (void) args;
+  return NO_ERROR;
+}
+
 
 /*
  * hls_spill_hash () - Hash function

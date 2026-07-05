@@ -749,6 +749,10 @@ namespace parallel_query
 	case HASH_METH_HYBRID:
 	  m_context->hash_scan.memory.hash_table = single_context->hash_scan.memory.hash_table;
 	  m_context->hash_scan.memory.curr_hash_entry = nullptr;
+	  /* #144 P3 D2: the value arena is owned by single_context; probe workers only
+	   * read through the shared table and must never free it (they null their table
+	   * copy at cleanup and never call hjoin_scan_clear). */
+	  m_context->hash_scan.memory.value_arena = nullptr;
 	  break;
 
 	case HASH_METH_HASH_FILE:

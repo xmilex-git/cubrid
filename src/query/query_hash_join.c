@@ -2710,6 +2710,9 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 	    }
 
 	  hash_scan->memory.curr_hash_entry = NULL;
+	  /* #144 P3 D2: arena for the value+tuple bump-alloc (NULL => per-entry
+	   * fallback; freed en masse in hjoin_scan_clear). */
+	  hash_scan->memory.value_arena = hscan_value_arena_create ();
 	}
       else if ((UINT64) list_id->tuple_cnt * (sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) <= mem_limit
 	       && qdata_hscan_wm_reserve (hash_scan,
@@ -2732,6 +2735,8 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 	    }
 
 	  hash_scan->memory.curr_hash_entry = NULL;
+	  /* #144 P3 D2: HYBRID keeps per-entry OID alloc (no tuple copy) -- no arena. */
+	  hash_scan->memory.value_arena = NULL;
 	}
       else
 	{
@@ -2815,9 +2820,22 @@ hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan)
     case HASH_METH_HYBRID:
       if (hash_scan->memory.hash_table != NULL)
 	{
-	  mht_clear_hls (hash_scan->memory.hash_table, qdata_free_hscan_entry, (void *) thread_p);
-	  mht_destroy_hls (hash_scan->memory.hash_table);
-	  hash_scan->memory.hash_table = NULL;
+	  if (hash_scan->memory.value_arena != NULL)
+	    {
+	      /* #144 P3 D2: values live in the arena -> no per-entry free (mht clear
+	       * passes key=NULL; inline uint keys need none), then drop the arena. */
+	      mht_clear_hls (hash_scan->memory.hash_table, qdata_noop_free_hscan_entry, NULL);
+	      mht_destroy_hls (hash_scan->memory.hash_table);
+	      hash_scan->memory.hash_table = NULL;
+	      hscan_value_arena_destroy (hash_scan->memory.value_arena);
+	      hash_scan->memory.value_arena = NULL;
+	    }
+	  else
+	    {
+	      mht_clear_hls (hash_scan->memory.hash_table, qdata_free_hscan_entry, (void *) thread_p);
+	      mht_destroy_hls (hash_scan->memory.hash_table);
+	      hash_scan->memory.hash_table = NULL;
+	    }
 	}
       break;
 
@@ -3300,7 +3318,11 @@ hjoin_build_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
     case HASH_METH_IN_MEM:
       assert (hash_scan->memory.hash_table != NULL);
 
-      hash_value = qdata_alloc_hscan_value (thread_p, tuple_record->tpl);
+      /* #144 P3 D2: bump-allocate value+tuple from the build arena when present
+       * (falls back to per-entry alloc if arena create OOM'd). */
+      hash_value = (hash_scan->memory.value_arena != NULL)
+	? qdata_alloc_hscan_value_arena (hash_scan->memory.value_arena, tuple_record->tpl)
+	: qdata_alloc_hscan_value (thread_p, tuple_record->tpl);
       if (hash_value == NULL)
 	{
 	  assert_release_error (er_errid () != NO_ERROR);
@@ -3309,7 +3331,12 @@ hjoin_build_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
 
       if (mht_put_hls (hash_scan->memory.hash_table, (void *) &hash_scan->curr_hash_key, (void *) hash_value) == NULL)
 	{
-	  qdata_free_hscan_value (thread_p, hash_value);
+	  /* arena-owned values are reclaimed en masse in hjoin_scan_clear; only a
+	   * per-entry-allocated value is freed here. */
+	  if (hash_scan->memory.value_arena == NULL)
+	    {
+	      qdata_free_hscan_value (thread_p, hash_value);
+	    }
 
 	  assert_release_error (er_errid () != NO_ERROR);
 	  return er_errid ();
