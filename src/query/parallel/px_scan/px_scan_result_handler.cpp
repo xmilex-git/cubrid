@@ -267,7 +267,7 @@ namespace parallel_scan
 	{
 	  bool ld_tde = (QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p) != nullptr)
 			&& QFILE_LIST_ID_TFILE_VFID (tl.writer_result_p)->tde_encrypted;
-	  if (qfile_list_make_new_backed (thread_p, tl.writer_result_p, ld_tde) != NO_ERROR)
+	  if (qfile_list_make_tapeset_backed (thread_p, tl.writer_result_p, ld_tde) != NO_ERROR)
 	    {
 	      m_err_messages_p->move_top_error_message_to_this();
 	      m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
@@ -591,7 +591,7 @@ namespace parallel_scan
 	bool nf_failed = false;
 	bool dest_tde = (QFILE_LIST_ID_TFILE_VFID (dest) != nullptr)
 			&& QFILE_LIST_ID_TFILE_VFID (dest)->tde_encrypted;
-	if (qfile_list_make_new_backed (thread_p, dest, dest_tde) != NO_ERROR)
+	if (qfile_list_make_tapeset_backed (thread_p, dest, dest_tde) != NO_ERROR)
 	  {
 	    nf_failed = true;
 	  }
@@ -604,7 +604,7 @@ namespace parallel_scan
 	    assert (list_id != nullptr);
 	    if (!nf_failed && list_id->tuple_cnt > 0)
 	      {
-		if (qfile_list_has_old_backing (list_id))
+		if (qfile_list_has_pgbuf_backing (list_id))
 		  {
 		    /* worker stayed OLD (conversion OOM) into a NEW dest: a
 		     * mixed-backing error, never a silent wrong result. */

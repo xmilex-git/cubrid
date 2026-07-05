@@ -867,7 +867,7 @@ extern "C"
 
     const bool is_mergeable_list = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_MERGEABLE_LIST);
     const bool is_buildvalue_opt = ACCESS_SPEC_IS_FLAGED (spec, ACCESS_SPEC_FLAG_BUILDVALUE_OPT);
-    const bool is_new_backing = qfile_list_has_new_backing (list_id);
+    const bool has_tapeset = qfile_list_has_tapeset (list_id);
 
     /* #113 (wrong-result, gate-independent): the OLD sector-based parallel LIST input reader
      * (input_handler_list / sector_page_iterator) silently DROPS ROWS on a large derived list.
@@ -882,7 +882,7 @@ extern "C"
      * the correct tuple-level tapeset_reader, is safe to scan in parallel; every OLD-backed list
      * falls back to a correct SERIAL list scan.  #130 (Phase3) deleted the OLD sector reader,
      * making this the permanent OLD-input path. */
-    if (!is_new_backing)
+    if (!has_tapeset)
       {
 	return NO_ERROR;
       }

@@ -174,13 +174,13 @@ extern SORTKEY_INFO *qfile_initialize_sort_key_info (SORTKEY_INFO * info, SORT_L
 						     QFILE_TUPLE_VALUE_TYPE_LIST * types);
 extern int qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * info, QFILE_TUPLE_VALUE_TYPE_LIST * types,
 						   bool * extended);
-extern bool qfile_list_is_spill_overflowed (const QFILE_LIST_ID * list_id);
+extern bool qfile_list_is_page_spilled (const QFILE_LIST_ID * list_id);
 extern void qfile_clear_sort_key_info (SORTKEY_INFO * info);
 extern QFILE_LIST_ID *qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
 						 SORT_LIST * sort_list, QUERY_OPTIONS option, int ls_flag,
 						 SORT_GET_FUNC * get_fn, SORT_PUT_FUNC * put_fn, SORT_CMP_FUNC * cmp_fn,
 						 void *extra_arg, int limit, bool do_close, int parallelism,
-						 ORDERBY_STATS * orderby_stats, bool suppress_new_backing);
+						 ORDERBY_STATS * orderby_stats, bool suppress_tapeset_backing);
 extern QFILE_LIST_ID *qfile_sort_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, SORT_LIST * sort_list,
 				       QUERY_OPTIONS option, bool do_close);
 
@@ -218,7 +218,7 @@ extern int qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID 
 /* redesign #78 C-3: promote a finished OLD UNION ALL list to NEW for parallel consumers. */
 extern int qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
 /* redesign #78 2A-1b: NEW (Tapeset) SORT output migration. */
-extern int qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
+extern int qfile_list_make_tapeset_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted);
 extern int qfile_tapeset_import (THREAD_ENTRY * thread_p, QFILE_LIST_ID * dest, QFILE_LIST_ID * src);
 extern int qfile_save_tuple (QFILE_TUPLE_DESCRIPTOR * tuple_descr_p, QFILE_TUPLE_TYPE tuple_type, char *page_p,
 			     int *tuple_length_p);

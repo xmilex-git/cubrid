@@ -34,7 +34,7 @@
 #include "query_hash_scan.h"
 #include "query_manager.h"		/* qmgr_get_old_page, qmgr_free_old_page_and_init, ... */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
-#include "query_list.h"			/* QFILE_LIST_ID_TAPESET, qfile_list_has_new_backing */
+#include "query_list.h"			/* QFILE_LIST_ID_TAPESET, qfile_list_has_tapeset */
 #include "qfile_tape.hpp"		/* qfile::tapeset, qfile::tapeset_reader */
 #include "qfile_chunk.hpp"		/* qfile::chunk_distributor */
 

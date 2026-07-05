@@ -1016,7 +1016,7 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
     }
 
   /* (c′) leg (#132): the positioned save/jump contract against the
-   * SPILL_OVERFLOW backing (the handle is driven directly). */
+   * PAGE_SPILL backing (the handle is driven directly). */
   {
     int os_error = 0;
     qfile::page_spill_file *spill_p = qfile::page_spill_file::create (static_cast < QUERY_ID > (-10),
@@ -1033,7 +1033,7 @@ qmgr_segment_position_selftest (THREAD_ENTRY * thread_p)
     VFID_SET_NULL (&tfile.temp_vfid);
     tfile.membuf_last = -1;
     tfile.membuf_type = TEMP_FILE_MEMBUF_NONE;
-    tfile.backing = qmgr_temp_backing::SPILL_OVERFLOW;
+    tfile.backing = qmgr_temp_backing::PAGE_SPILL;
     tfile.spill_query_id = static_cast < QUERY_ID > (-10);
     tfile.spill_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
     tfile.page_spill_handle = spill_p;
@@ -1603,11 +1603,11 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
    * and a cacheable holdable result -- keeps the #94 materialize fallback,
    * retained until Phase3 (#120/#74).  For plain VPID-backed lists every path
    * is a no-op. */
-  tapeset_direct_fetch = (qfile_list_has_new_backing (query_p->list_id)
+  tapeset_direct_fetch = (qfile_list_has_tapeset (query_p->list_id)
 			  && !qmgr_list_has_spill_segments (query_p->list_id)
 			  && !qmgr_is_allowed_result_cache (flag));
-  tapeset_cache_copyout = (qfile_list_has_new_backing (query_p->list_id)
-			   && !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (query_p->list_id)
+  tapeset_cache_copyout = (qfile_list_has_tapeset (query_p->list_id)
+			   && !QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW (query_p->list_id)
 			   && !qmgr_list_has_spill_segments (query_p->list_id) && !query_p->is_holdable
 			   && qmgr_is_allowed_result_cache (flag));
   if (tapeset_cache_copyout)
@@ -1652,7 +1652,7 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
 
       QFILE_LIST_ID_TAPESET (list_id) = NULL;
       QFILE_LIST_ID_OWNS_TAPESET (list_id) = false;
-      QFILE_LIST_ID_BACKING_KIND (list_id) = QFILE_BACKING_OLD;
+      QFILE_LIST_ID_BACKING_KIND (list_id) = QFILE_BACKING_PGBUF;
       QFILE_LIST_ID_TFILE_VFID (list_id) = NULL;
       list_id->page_cnt = total_pages;
       if (total_pages > 0)
@@ -2812,7 +2812,7 @@ qmgr_clear_trans_wakeup (THREAD_ENTRY * thread_p, int tran_index, bool is_tran_d
 	       * server's spilled tapes are reclaimed by the #88 boot sweep.  Spill
 	       * overflow segments still materialize into real-VPID pgbuf pages (the
 	       * legacy VPID-wire requirement). */
-	      bool holdable_needs_materialize = !(qfile_list_has_new_backing (query_p->list_id)
+	      bool holdable_needs_materialize = !(qfile_list_has_tapeset (query_p->list_id)
 						  && !qmgr_list_has_spill_segments (query_p->list_id));
 	      if (holdable_needs_materialize && qmgr_materialize_to_pgbuf (thread_p, query_p->list_id) != NO_ERROR)
 		{
@@ -3028,7 +3028,7 @@ qmgr_free_old_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TEMP_FILE * t
       pgbuf_unfix (thread_p, page_p);
       return;
     }
-  if (tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
+  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
       /* (c′) last-unfix write-back; failure poisons the query (INV-2/INV-3, #132) */
       const int error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
@@ -3075,7 +3075,7 @@ qmgr_get_old_page_read_only (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_F
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
     }
-  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
+  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
       return temp_page_store::fix_old_page (thread_p, tfile_vfid_p, vpid_p);
     }
@@ -3141,7 +3141,7 @@ qmgr_get_old_page_simple_fix (THREAD_ENTRY * thread_p, VPID * vpid_p, QMGR_TEMP_
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
       return NULL;
     }
-  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
+  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
       return temp_page_store::fix_old_page (thread_p, tfile_vfid_p, vpid_p);
     }
@@ -3209,7 +3209,7 @@ qmgr_free_old_page_simple_fix (THREAD_ENTRY * thread_p, PAGE_PTR page_p, QMGR_TE
       pgbuf_simple_unfix (thread_p, page_p);
       return;
     }
-  if (tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
+  if (tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
       const int error = temp_page_store::spill_release_fixed_page (thread_p, tfile_vfid_p, page_p);
       if (error != NO_ERROR)
@@ -3253,11 +3253,11 @@ qmgr_set_dirty_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p, int free_page, LO
 		     QMGR_TEMP_FILE * tfile_vfid_p)
 {
   QMGR_PAGE_TYPE page_type;
-  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::SPILL_OVERFLOW)
+  if (tfile_vfid_p != NULL && tfile_vfid_p->backing == qmgr_temp_backing::PAGE_SPILL)
     {
       /* (c′) set_dirty: DONT_FREE marks the flag only; FREE = last-unfix
        * write-back inside the shim (INV-2, #132) */
-      const int error = temp_page_store::spill_flush_page (thread_p, tfile_vfid_p, page_p, free_page);
+      const int error = temp_page_store::page_spill_flush_page (thread_p, tfile_vfid_p, page_p, free_page);
       if (error != NO_ERROR)
 	{
 	  if (er_errid () == NO_ERROR)
@@ -3401,7 +3401,7 @@ qmgr_segment_list_has_segments (const QMGR_SEGMENT_LIST * segment_list_p)
 bool
 qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p)
 {
-  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::SPILL_OVERFLOW
+  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::PAGE_SPILL
     && tfile_p->page_spill_handle != NULL;
 }
 
@@ -3413,7 +3413,7 @@ qmgr_tfile_has_fd_overflow (const QMGR_TEMP_FILE * tfile_p)
 UINT64
 qmgr_tfile_fd_overflow_segment_id (const QMGR_TEMP_FILE * tfile_p)
 {
-  if (tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::SPILL_OVERFLOW && tfile_p->page_spill_handle != NULL)
+  if (tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::PAGE_SPILL && tfile_p->page_spill_handle != NULL)
     {
       return tfile_p->page_spill_handle->segment_id ();
     }
@@ -3436,7 +3436,7 @@ qmgr_list_has_spill_segments (const QFILE_LIST_ID * list_id_p)
 bool
 qmgr_list_needs_pgbuf_materialize (const QFILE_LIST_ID * list_id_p)
 {
-  if (list_id_p != NULL && list_id_p->tuple_cnt > 0 && qfile_list_has_new_backing (list_id_p))
+  if (list_id_p != NULL && list_id_p->tuple_cnt > 0 && qfile_list_has_tapeset (list_id_p))
     {
       return true;
     }
@@ -3961,7 +3961,7 @@ static int
 qmgr_copy_new_result_to_query_area (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 {
   assert (list_id_p != NULL);
-  assert (qfile_list_has_new_backing (list_id_p));
+  assert (qfile_list_has_tapeset (list_id_p));
   assert (!qmgr_list_has_spill_segments (list_id_p));
 
   /* QFILE_FLAG_RESULT_FILE -> a permanent FILE_QUERY_AREA list (the cache is

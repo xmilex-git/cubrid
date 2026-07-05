@@ -1233,7 +1233,7 @@ namespace
     QFILE_CLEAR_LIST_ID (&lst);
 
     /* cleared: no backing committed -> not mixed */
-    if (qfile_list_has_old_backing (&lst) || qfile_list_has_new_backing (&lst)
+    if (qfile_list_has_pgbuf_backing (&lst) || qfile_list_has_tapeset (&lst)
 	|| qfile_list_is_mixed_backing (&lst) || QFILE_LIST_ID_BACKING_KIND (&lst) != QFILE_BACKING_NONE)
       {
 	return 1;
@@ -1242,8 +1242,8 @@ namespace
     /* clean OLD: real first-page VPID, no Tapeset */
     QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
     QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
-    QFILE_LIST_ID_BACKING_KIND (&lst) = QFILE_BACKING_OLD;
-    if (!qfile_list_has_old_backing (&lst) || qfile_list_has_new_backing (&lst) || qfile_list_is_mixed_backing (&lst))
+    QFILE_LIST_ID_BACKING_KIND (&lst) = QFILE_BACKING_PGBUF;
+    if (!qfile_list_has_pgbuf_backing (&lst) || qfile_list_has_tapeset (&lst) || qfile_list_is_mixed_backing (&lst))
       {
 	return 2;
       }
@@ -1252,8 +1252,8 @@ namespace
     qfile::tapeset ts_new;
     QFILE_CLEAR_LIST_ID (&lst);
     QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
-    QFILE_LIST_ID_BACKING_KIND (&lst) = QFILE_BACKING_NEW;
-    if (qfile_list_has_old_backing (&lst) || !qfile_list_has_new_backing (&lst) || qfile_list_is_mixed_backing (&lst))
+    QFILE_LIST_ID_BACKING_KIND (&lst) = QFILE_BACKING_TAPESET;
+    if (qfile_list_has_pgbuf_backing (&lst) || !qfile_list_has_tapeset (&lst) || qfile_list_is_mixed_backing (&lst))
       {
 	return 3;
       }
@@ -1277,7 +1277,7 @@ namespace
 
     /* drop the Tapeset -> clean OLD again (not mixed) */
     QFILE_LIST_ID_TAPESET (&lst) = NULL;
-    if (qfile_list_is_mixed_backing (&lst) || !qfile_list_has_old_backing (&lst))
+    if (qfile_list_is_mixed_backing (&lst) || !qfile_list_has_pgbuf_backing (&lst))
       {
 	return 6;
       }
@@ -1353,11 +1353,11 @@ namespace
     /* clean OLD: OK into an OLD mechanism, REJECTED by a NEW mechanism. */
     QFILE_LIST_ID_FIRST_VPID (&lst).pageid = 42;
     QFILE_LIST_ID_FIRST_VPID (&lst).volid = 0;
-    if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_OLD))
+    if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_PGBUF))
       {
 	return 1;
       }
-    if (!qfile_backing_mechanism_violation (&lst, QFILE_BACKING_NEW))
+    if (!qfile_backing_mechanism_violation (&lst, QFILE_BACKING_TAPESET))
       {
 	return 2;
       }
@@ -1365,36 +1365,36 @@ namespace
     /* clean NEW: OK into a NEW mechanism, REJECTED by an OLD mechanism. */
     QFILE_CLEAR_LIST_ID (&lst);
     QFILE_LIST_ID_TAPESET (&lst) = &ts_new;
-    if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_NEW))
+    if (qfile_backing_mechanism_violation (&lst, QFILE_BACKING_TAPESET))
       {
 	return 3;
       }
-    if (!qfile_backing_mechanism_violation (&lst, QFILE_BACKING_OLD))
+    if (!qfile_backing_mechanism_violation (&lst, QFILE_BACKING_PGBUF))
       {
 	return 4;
       }
 
     /* NULL list is never a violation. */
-    if (qfile_backing_mechanism_violation (NULL, QFILE_BACKING_OLD)
-	|| qfile_backing_mechanism_violation (NULL, QFILE_BACKING_NEW))
+    if (qfile_backing_mechanism_violation (NULL, QFILE_BACKING_PGBUF)
+	|| qfile_backing_mechanism_violation (NULL, QFILE_BACKING_TAPESET))
       {
 	return 5;
       }
 
     /* A~E counter: starts/returns to 0, increments. */
-    qfile_ae_reset_old_touch_count ();
-    if (qfile_ae_old_touch_count () != 0)
+    qfile_ae_reset_pgbuf_touch_count ();
+    if (qfile_ae_pgbuf_touch_count () != 0)
       {
 	return 6;
       }
-    qfile_ae_record_old_touch ();
-    qfile_ae_record_old_touch ();
-    if (qfile_ae_old_touch_count () != 2)
+    qfile_ae_record_pgbuf_touch ();
+    qfile_ae_record_pgbuf_touch ();
+    if (qfile_ae_pgbuf_touch_count () != 2)
       {
 	return 7;
       }
-    qfile_ae_reset_old_touch_count ();
-    if (qfile_ae_old_touch_count () != 0)
+    qfile_ae_reset_pgbuf_touch_count ();
+    if (qfile_ae_pgbuf_touch_count () != 0)
       {
 	return 8;
       }
@@ -1792,7 +1792,7 @@ namespace
 
   /* G21: qfile_tapeset_import (issue #90/#78 R10) -- normal per-tape
    * move-and-null transfer appends src's Tapes after dest's existing ones,
-   * accumulates tuple_cnt/page_cnt and propagates new_contains_overflow_, and
+   * accumulates tuple_cnt/page_cnt and propagates tapeset_contains_overflow_, and
    * leaves src's Tapeset structurally empty: the "do not reuse src as a Tape
    * source" contract this fix establishes (previously src kept unowned
    * dangling Tape pointers after import).  Also covers the dest==src
@@ -1828,7 +1828,7 @@ namespace
     dest.page_cnt = 1;
     src.tuple_cnt = 3;
     src.page_cnt = 2;
-    QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (&src) = true;
+    QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW (&src) = true;
 
     if (qfile_tapeset_import (NULL, &dest, &src) != NO_ERROR)
       {
@@ -1838,7 +1838,7 @@ namespace
       }
 
     /* counts accumulate, overflow flag propagates */
-    if (dest.tuple_cnt != 5 || dest.page_cnt != 3 || !QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (&dest))
+    if (dest.tuple_cnt != 5 || dest.page_cnt != 3 || !QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW (&dest))
       {
 	tapeset_teardown (&dest);
 	tapeset_teardown (&src);

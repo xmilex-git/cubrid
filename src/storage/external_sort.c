@@ -4910,7 +4910,7 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
   for (i = 1; i < parallel_num; i++)
     {
       sort_info_p = (SORT_INFO *) px_sort_param[i].put_arg;
-      if (qfile_list_has_new_backing (origin_list_id))
+      if (qfile_list_has_tapeset (origin_list_id))
 	{
 	  /* 2A-1b (#78): NEW (Tapeset) fan-in -- import this worker's frozen
 	   * Tape(s) into the origin Tapeset in worker order (= globally sorted,
@@ -4919,7 +4919,7 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
 	    {
 	      continue;
 	    }
-	  if (qfile_list_has_old_backing (sort_info_p->output_file))
+	  if (qfile_list_has_pgbuf_backing (sort_info_p->output_file))
 	    {
 	      /* worker stayed OLD (conversion OOM) feeding a NEW origin: a
 	       * mixed-backing error, never a silent data loss. */
@@ -4968,7 +4968,7 @@ sort_merge_run_for_parallel (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param
     }
   /* reopen final output file (OLD append mode only; a NEW origin is a frozen
    * Tapeset that is never reopened for append). */
-  if (!qfile_list_has_new_backing (origin_list_id))
+  if (!qfile_list_has_tapeset (origin_list_id))
     {
       error = qfile_reopen_list_as_append_mode (thread_p, origin_list_id);
       if (error != NO_ERROR)
@@ -5180,7 +5180,7 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
        * (chunk_distributor + per-worker tapeset_reader).  Any OLD-backed input
        * -- including raw-fd overflow spill, which the deleted sector scan could
        * not enumerate anyway (#99) -- is demoted to a correct serial sort. */
-      if (!qfile_list_has_new_backing (sort_info_p->input_file))
+      if (!qfile_list_has_tapeset (sort_info_p->input_file))
 	{
 	  er_log_debug (ARG_FILE_LINE, "sort: OLD-backed ORDER_BY input -> serial (#130 fallback)\n");
 	  return 1;
@@ -5278,7 +5278,7 @@ sort_check_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
       QFILE_LIST_ID *input_list = px->input_list;
       /* #130 fallback: OLD-backed input -> serial (the OLD sector-scan reader is
        * deleted; see the ORDER_BY branch above). */
-      if (input_list == NULL || !qfile_list_has_new_backing (input_list))
+      if (input_list == NULL || !qfile_list_has_tapeset (input_list))
 	{
 	  er_log_debug (ARG_FILE_LINE, "sort: OLD-backed %s input -> serial (#130 fallback)\n",
 			(sort_param->px_type == SORT_ANALYTIC) ? "ANALYTIC" : "GROUP_BY");
@@ -5367,7 +5367,7 @@ sort_put_result_for_parallel (cubthread::entry & thread_ref, SORT_PARAM * sort_p
 			     ori_sort_info_p->input_file->query_id, ori_sort_info_p->flag, NULL);
 	  if (sort_info_p->output_file != NULL && sort_param->ori_sort_param->px_output_is_new)
 	    {
-	      (void) qfile_list_make_new_backed (thread_p, sort_info_p->output_file, sort_param->tde_encrypted);
+	      (void) qfile_list_make_tapeset_backed (thread_p, sort_info_p->output_file, sort_param->tde_encrypted);
 	    }
 	}
     }
@@ -5448,7 +5448,7 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
 
       /* #130: sort_check_parallelism demotes OLD-backed input to serial, so a
        * parallel sort input is always NEW (Tapeset)-backed here. */
-      assert (qfile_list_has_new_backing (input_file));
+      assert (qfile_list_has_tapeset (input_file));
       {
 	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_file);
 	sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);
@@ -5609,7 +5609,7 @@ sort_start_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SOR
        * Mirrors the ORDER_BY branch (#122).  sort_check_parallelism has already
        * ensured the key builds as an A_sort_key (use_original == 0) and demoted
        * OLD-backed input to serial (#130). */
-      assert (qfile_list_has_new_backing (input_list));
+      assert (qfile_list_has_tapeset (input_list));
       {
 	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (input_list);
 	sort_param->px_chunk_dist = new qfile::chunk_distributor (ts, parallel_num);

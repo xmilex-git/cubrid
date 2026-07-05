@@ -29,7 +29,7 @@
 #include "object_representation.h"
 #include "page_buffer.h"
 #include "perf_monitor.h"
-#include "qfile_page_spill.hpp"	/* (c′) SPILL_OVERFLOW backing (#132) */
+#include "qfile_page_spill.hpp"	/* (c′) PAGE_SPILL backing (#132) */
 #include "qfile_spill_file.hpp"	/* qfile::spill_file::set_os_error (shared substrate, #132) */
 #include "query_manager.h"
 #include "system_parameter.h"
@@ -340,10 +340,10 @@ namespace
 
 namespace temp_page_store
 {
-  /* (c′) SPILL_OVERFLOW consumer shims (#132): an unknown page (e.g. a membuf
+  /* (c′) PAGE_SPILL consumer shims (#132): an unknown page (e.g. a membuf
    * page routed through the same qmgr call path) is a silent NO_ERROR. */
   int
-  spill_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept
+  page_spill_flush_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, PAGE_PTR page_p, int free_page) noexcept
   {
     if (tfile_p == NULL || tfile_p->page_spill_handle == NULL
 	|| !tfile_p->page_spill_handle->mark_dirty (page_p))
@@ -482,7 +482,7 @@ namespace temp_page_store
 	  return ER_FAILED;
 	}
 
-      src.backing = qmgr_temp_backing::SPILL_OVERFLOW;
+      src.backing = qmgr_temp_backing::PAGE_SPILL;
       src.page_spill_handle = spill_p;
       src.spill_query_id = static_cast<QUERY_ID> (-11);
       src.spill_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
@@ -492,7 +492,7 @@ namespace temp_page_store
 
       if (src.page_spill_handle != NULL || src.backing != qmgr_temp_backing::MEMBUF || src.spill_next_pageid != 0
 	  || src.spill_query_id != NULL_QUERY_ID || dst.page_spill_handle != spill_p
-	  || dst.backing != qmgr_temp_backing::SPILL_OVERFLOW || dst.spill_next_pageid != 3
+	  || dst.backing != qmgr_temp_backing::PAGE_SPILL || dst.spill_next_pageid != 3
 	  || dst.spill_query_id != static_cast<QUERY_ID> (-11))
 	{
 	  delete spill_p;
@@ -540,7 +540,7 @@ namespace temp_page_store
 
           /* (c′) page-spill backing (#132; the sole membuf-overflow backing
            * since 커밋 B #137).  The choice is made ONCE at the tfile's first
-           * spill; the SPILL_OVERFLOW tag pins it thereafter. */
+           * spill; the PAGE_SPILL tag pins it thereafter. */
           int os_error = 0;
           if (tfile_p->page_spill_handle == NULL)
             {
@@ -560,7 +560,7 @@ namespace temp_page_store
             }
           vpid_p->volid = NULL_VOLID;
           vpid_p->pageid = tfile_p->spill_next_pageid++;
-          tfile_p->backing = qmgr_temp_backing::SPILL_OVERFLOW;
+          tfile_p->backing = qmgr_temp_backing::PAGE_SPILL;
           PAGE_PTR spill_page_p = tfile_p->page_spill_handle->alloc_new_page (thread_p, vpid_p->pageid);
           if (spill_page_p == NULL)
             {
@@ -577,7 +577,7 @@ namespace temp_page_store
       case qmgr_temp_backing::PRIVATE_SPILL_FALLBACK:
         return alloc_private_spill_page (thread_p, tfile_p, vpid_p);
 
-      case qmgr_temp_backing::SPILL_OVERFLOW:
+      case qmgr_temp_backing::PAGE_SPILL:
         if (tfile_p->page_spill_handle == NULL)
           {
             er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_TEMP_FILE, 1, LOG_FIND_THREAD_TRAN_INDEX (thread_p));
@@ -634,7 +634,7 @@ namespace temp_page_store
           }
         return fix_private_spill_page (thread_p, vpid_p);
 
-      case qmgr_temp_backing::SPILL_OVERFLOW:
+      case qmgr_temp_backing::PAGE_SPILL:
         if (vpid_p->volid == NULL_VOLID && vpid_p->pageid >= 0 && vpid_p->pageid <= tfile_p->membuf_last)
           {
             return fix_membuf_page (thread_p, tfile_p, vpid_p);

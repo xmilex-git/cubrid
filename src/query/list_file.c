@@ -1403,7 +1403,7 @@ qfile_close_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 	    {
 	      QFILE_LIST_ID_TAPESET (list_id_p) = ts;
 	      QFILE_LIST_ID_OWNS_TAPESET (list_id_p) = true;
-	      QFILE_LIST_ID_BACKING_KIND (list_id_p) = QFILE_BACKING_NEW;
+	      QFILE_LIST_ID_BACKING_KIND (list_id_p) = QFILE_BACKING_TAPESET;
 	    }
 	  else
 	    {
@@ -1448,7 +1448,7 @@ qfile_list_demote_new_to_old (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p
 {
   QFILE_LIST_ID *old_list_p;
 
-  if (list_id_p == NULL || !qfile_list_has_new_backing (list_id_p))
+  if (list_id_p == NULL || !qfile_list_has_tapeset (list_id_p))
     {
       return NO_ERROR;
     }
@@ -1500,7 +1500,7 @@ qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_
   QFILE_LIST_ID *new_list_p;
   bool tde_encrypted;
 
-  if (list_id_p == NULL || qfile_list_has_new_backing (list_id_p)
+  if (list_id_p == NULL || qfile_list_has_tapeset (list_id_p)
       || QFILE_LIST_ID_TFILE_VFID (list_id_p) == NULL)
     {
       return NO_ERROR;
@@ -1515,7 +1515,7 @@ qfile_list_promote_old_to_new (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_
       return ER_FAILED;
     }
 
-  if (qfile_list_make_new_backed (thread_p, new_list_p, tde_encrypted) != NO_ERROR
+  if (qfile_list_make_tapeset_backed (thread_p, new_list_p, tde_encrypted) != NO_ERROR
       || qfile_copy_tuple (thread_p, new_list_p, list_id_p) != NO_ERROR)
     {
       qfile_close_and_free_list_file (thread_p, new_list_p);
@@ -1548,7 +1548,7 @@ qfile_reopen_list_as_append_mode (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_
    * immutable, no temp-file VFID).  Demote it to an OLD backing first so the
    * append path below works -- covers UNION ALL (qfile_union_list) and the
    * recursive-CTE common-list optimisation.  (#78 C-3/C-6) */
-  if (qfile_list_has_new_backing (list_id_p))
+  if (qfile_list_has_tapeset (list_id_p))
     {
       if (qfile_list_demote_new_to_old (thread_p, list_id_p) != NO_ERROR)
 	{
@@ -1852,7 +1852,7 @@ qfile_producer_add_overflow_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list
   int run_pages, start_off, run_end, copied, i;
 
   assert (QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) != NULL);
-  QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (list_id_p) = true;
+  QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW (list_id_p) = true;
 
   run_pages = qfile_overflow_run_pages (tuple_length);
   if (run_pages <= 0)
@@ -2981,7 +2981,7 @@ xqfile_get_list_file_page (THREAD_ENTRY * thread_p, QUERY_ID query_id, VOLID vol
        * synthetic first_vpid/next_vpid seeded at the sink.  ADR0006 overflow
        * runs are translated to the legacy VPID overflow chain inside the serve
        * (#120b D2). */
-      if (qfile_list_has_new_backing (query_entry_p->list_id))
+      if (qfile_list_has_tapeset (query_entry_p->list_id))
 	{
 	  return qfile_serve_tapeset_fetch_pages (thread_p, query_entry_p->list_id, page_id, page_buf_p, page_size_p);
 	}
@@ -3595,7 +3595,7 @@ error:
 /* Backing-kind ENTRY guard + A~E counter (SSOT #75 round-3 (d)/(e))  */
 /* ------------------------------------------------------------------ */
 
-static std::atomic<long> qfile_Ae_old_touch (0);
+static std::atomic<long> qfile_Ae_pgbuf_touch (0);
 static std::atomic<long> qfile_New_backed_create (0);
 
 /* #120 client-fetch routing census: how many client fetch requests were served
@@ -3621,44 +3621,44 @@ qfile_client_fetch_record_materialize (void)
 }
 
 void
-qfile_ae_record_old_touch (void)
+qfile_ae_record_pgbuf_touch (void)
 {
-  long count = qfile_Ae_old_touch.fetch_add (1, std::memory_order_relaxed) + 1;
+  long count = qfile_Ae_pgbuf_touch.fetch_add (1, std::memory_order_relaxed) + 1;
   perfmon_set_stat_to_global (PSTAT_QF_OLD_TOUCH_ON_NEW, (int) count);
 }
 
 long
-qfile_ae_old_touch_count (void)
+qfile_ae_pgbuf_touch_count (void)
 {
-  return qfile_Ae_old_touch.load (std::memory_order_relaxed);
+  return qfile_Ae_pgbuf_touch.load (std::memory_order_relaxed);
 }
 
 void
-qfile_ae_reset_old_touch_count (void)
+qfile_ae_reset_pgbuf_touch_count (void)
 {
-  qfile_Ae_old_touch.store (0, std::memory_order_relaxed);
+  qfile_Ae_pgbuf_touch.store (0, std::memory_order_relaxed);
   perfmon_set_stat_to_global (PSTAT_QF_OLD_TOUCH_ON_NEW, 0);
 }
 
 /* NEW(Tapeset)-backed list creation count (redesign #78/#92): the sibling
  * "did the NEW path actually run" half of the A~E backing-kind census —
- * qfile_ae_old_touch_count() alone can only prove OLD *violated* a NEW list,
+ * qfile_ae_pgbuf_touch_count() alone can only prove OLD *violated* a NEW list,
  * not that a NEW list ever existed (a rejected gate still reads old_touch==0). */
 void
-qfile_new_backed_record_create (void)
+qfile_tapeset_backed_record_create (void)
 {
   long count = qfile_New_backed_create.fetch_add (1, std::memory_order_relaxed) + 1;
   perfmon_set_stat_to_global (PSTAT_QF_NEW_BACKED_CREATE, (int) count);
 }
 
 long
-qfile_new_backed_create_count (void)
+qfile_tapeset_backed_create_count (void)
 {
   return qfile_New_backed_create.load (std::memory_order_relaxed);
 }
 
 void
-qfile_new_backed_reset_create_count (void)
+qfile_tapeset_backed_reset_create_count (void)
 {
   qfile_New_backed_create.store (0, std::memory_order_relaxed);
   perfmon_set_stat_to_global (PSTAT_QF_NEW_BACKED_CREATE, 0);
@@ -3673,9 +3673,9 @@ qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIND mechanism
     }
   /* An OLD mechanism reaching a NEW (Tapeset) list is exactly an "A~E NEW-backed
    * list touched by an OLD scan-bypass path" event; record it (SSOT #75 §6). */
-  if (mechanism == QFILE_BACKING_OLD)
+  if (mechanism == QFILE_BACKING_PGBUF)
     {
-      qfile_ae_record_old_touch ();
+      qfile_ae_record_pgbuf_touch ();
     }
   er_set (ER_ERROR_SEVERITY, file, line, ER_QPROC_INVALID_XASLNODE, 0);
   return ER_QPROC_INVALID_XASLNODE;
@@ -3712,10 +3712,10 @@ qfile_append_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * base_list_id, QFILE_
   /* backing-kind entry guard (production-hard): an OLD combine never takes a NEW
    * (Tapeset) operand (SSOT #75 round-3 (d)/(e)). */
   {
-    int guard_rc = QFILE_GUARD_OLD_MECHANISM (base_list_id);
+    int guard_rc = QFILE_GUARD_PGBUF_MECHANISM (base_list_id);
     if (guard_rc == NO_ERROR)
       {
-	guard_rc = QFILE_GUARD_OLD_MECHANISM (append_list_id);
+	guard_rc = QFILE_GUARD_PGBUF_MECHANISM (append_list_id);
       }
     if (guard_rc != NO_ERROR)
       {
@@ -5234,7 +5234,7 @@ qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * key_info_p, QFILE_TUPLE_V
   return NO_ERROR;
 }
 
-/* qfile_list_is_spill_overflowed () - true when an OLD-backed list has overflowed
+/* qfile_list_is_page_spilled () - true when an OLD-backed list has overflowed
  *   its membuf into a spill temp file (#107).
  *
  *   For such a list a P_sort_key (use_original) sort re-fixes the original
@@ -5246,11 +5246,11 @@ qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * key_info_p, QFILE_TUPLE_V
  *   profitable.
  */
 bool
-qfile_list_is_spill_overflowed (const QFILE_LIST_ID * list_id_p)
+qfile_list_is_page_spilled (const QFILE_LIST_ID * list_id_p)
 {
   QMGR_TEMP_FILE *tfile_p = (list_id_p != NULL) ? QFILE_LIST_ID_TFILE_VFID (list_id_p) : NULL;
 
-  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::SPILL_OVERFLOW;
+  return tfile_p != NULL && tfile_p->backing == qmgr_temp_backing::PAGE_SPILL;
 }
 
 /* qfile_initialize_sort_info () -
@@ -5284,7 +5284,7 @@ qfile_initialize_sort_info (SORT_INFO * sort_info_p, QFILE_LIST_ID * list_id_p, 
    * the re-fetch entirely.  Here a bail-out is harmless: the VPID back-references stay
    * valid, so the sort falls back to the (slow but correct) re-fetch path. */
   if (sort_info_p->key_info.use_original == 1
-      && (qfile_list_has_new_backing (list_id_p) || qfile_list_is_spill_overflowed (list_id_p)))
+      && (qfile_list_has_tapeset (list_id_p) || qfile_list_is_page_spilled (list_id_p)))
     {
       bool all_columns_carried = false;
 
@@ -5331,7 +5331,7 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
 }
 
 /*
- * qfile_list_make_new_backed () - convert a freshly-opened (empty) OLD list
+ * qfile_list_make_tapeset_backed () - convert a freshly-opened (empty) OLD list
  *   into a NEW Tapeset-backed producer list (redesign #78, 2A-1b).  Drop the
  *   empty temp file so the list carries no OLD backing (tfile_vfid/first_vpid
  *   stay NULL), then attach a tape_writer (membuf prefix = work_mem; TDE per
@@ -5341,7 +5341,7 @@ qfile_clear_sort_info (SORT_INFO * sort_info_p)
  *   return: int (NO_ERROR or ER_FAILED)
  */
 int
-qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted)
+qfile_list_make_tapeset_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, bool tde_encrypted)
 {
   char *scratch;
   void *writer;
@@ -5370,7 +5370,7 @@ qfile_list_make_new_backed (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, 
   VFID_SET_NULL (&list_id_p->temp_vfid);
   QFILE_LIST_ID_PRODUCER_WRITER (list_id_p) = writer;
   QFILE_LIST_ID_PRODUCER_PAGE (list_id_p) = scratch;
-  qfile_new_backed_record_create ();
+  qfile_tapeset_backed_record_create ();
   er_log_debug (ARG_FILE_LINE, "WM_SORT_NEW: query_id=%lld SORT output -> NEW Tapeset producer (tde=%d)\n",
 		(long long) list_id_p->query_id, (int) tde_encrypted);
   return NO_ERROR;
@@ -5396,7 +5396,7 @@ QFILE_LIST_ID *
 qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, SORT_LIST * sort_list_p,
 			   QUERY_OPTIONS option, int flag, SORT_GET_FUNC * get_func, SORT_PUT_FUNC * put_func,
 			   SORT_CMP_FUNC * cmp_func, void *extra_arg, int limit, bool do_close, int parallelism,
-			   ORDERBY_STATS * orderby_stats, bool suppress_new_backing)
+			   ORDERBY_STATS * orderby_stats, bool suppress_tapeset_backing)
 {
   QFILE_LIST_ID *srlist_id;
   QFILE_LIST_SCAN_ID t_scan_id;
@@ -5449,13 +5449,13 @@ qfile_sort_list_with_func (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, S
    * file (the producer's BufFile re-applies TDE); the parallel path is forced
    * serial while the output is NEW (see sort_listfile) until per-worker import
    * is wired.  do_close gating keeps an open producer from being MOVE'd.
-   * suppress_new_backing (#105): CONNECT BY's sort output feeds the parent-pos
+   * suppress_tapeset_backing (#105): CONNECT BY's sort output feeds the parent-pos
    * recalc, which serialises tuple positions into QFILE_TUPLE_POSITION_DB (a
    * VPID-only format with no TAPE variant); a NEW(Tapeset) list has only TAPE
    * coordinates, so such lists MUST stay OLD-backed. */
   bool srlist_tde = (QFILE_LIST_ID_TFILE_VFID (srlist_id)->tde_encrypted);
-  if (do_close && !suppress_new_backing
-      && qfile_list_make_new_backed (thread_p, srlist_id, srlist_tde) != NO_ERROR)
+  if (do_close && !suppress_tapeset_backing
+      && qfile_list_make_tapeset_backed (thread_p, srlist_id, srlist_tde) != NO_ERROR)
     {
       qfile_close_and_free_list_file (thread_p, srlist_id);
       return NULL;

@@ -106,7 +106,7 @@ struct qmgr_temp_file
   int spill_owner_tran_index;
   unsigned int spill_worker_id;
   int spill_next_pageid;	/* dense overflow pageid issuer for the (c′) page-spill backing */
-  qfile::page_spill_file *page_spill_handle;	/* (c′) SPILL_OVERFLOW backing; containment-owned (D2, #132) */
+  qfile::page_spill_file *page_spill_handle;	/* (c′) PAGE_SPILL backing; containment-owned (D2, #132) */
   bool preserved;		/* if temp file is preserved */
   bool tde_encrypted;		/* whether the file of temp_vfid has to be encrypted when flushing (TDE) */
 };

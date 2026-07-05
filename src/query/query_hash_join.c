@@ -275,7 +275,7 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
        * output list.  A nested hash join ((t1 JOIN t2) JOIN t3) whose upper join
        * consumes this list can only run its parallel split when the input is
        * NEW-backed -- the split guards (hjoin_try_parallel* + #113 px_scan
-       * fallback) require qfile_list_has_new_backing on both inputs -- so an OLD
+       * fallback) require qfile_list_has_tapeset on both inputs -- so an OLD
        * lower-HJ output forced the upper split permanently serial (#112).
        * Promote the finished list to NEW:
        * same consumed-not-reopened NEW-promote direction as UNION ALL C-3
@@ -1988,7 +1988,7 @@ hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
    * exhaustion forced a serial OLD-backed scan upstream), force serial
    * partitioning (HASHJOIN_STATUS_PARTITION) --
    * this is now the permanent serial fallback for OLD-backed input. */
-  if (!qfile_list_has_new_backing (outer_list_id) || !qfile_list_has_new_backing (inner_list_id))
+  if (!qfile_list_has_tapeset (outer_list_id) || !qfile_list_has_tapeset (inner_list_id))
     {
       manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);
@@ -2127,7 +2127,7 @@ hjoin_try_parallel_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, H
    * input to lose its NEW backing and fall back to OLD.  Without this guard the
    * hash join would use the row-losing sector reader, producing wrong results
    * (e.g. count=407 instead of 200360). */
-  if (!qfile_list_has_new_backing (single_context->probe->list_id))
+  if (!qfile_list_has_tapeset (single_context->probe->list_id))
     {
       manager->num_parallel_threads = 0;
       assert (manager->px_worker_manager == NULL);

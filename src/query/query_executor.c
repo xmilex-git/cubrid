@@ -5480,7 +5480,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 
     {
       bool out_tde = (QFILE_LIST_ID_TFILE_VFID (output_list_id)->tde_encrypted);
-      if (qfile_list_make_new_backed (thread_p, output_list_id, out_tde) != NO_ERROR)
+      if (qfile_list_make_tapeset_backed (thread_p, output_list_id, out_tde) != NO_ERROR)
 	{
 	  qfile_close_list (thread_p, output_list_id);
 	  QFILE_FREE_AND_INIT_LIST_ID (output_list_id);
@@ -5500,7 +5500,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 	  qfile_destroy_list (thread_p, list_id);
 	  qfile_close_list (thread_p, gbstate.output_file);
 	  qfile_copy_list_id (list_id, gbstate.output_file, true,
-			      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
+			      qfile_list_has_tapeset (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
 			      QFILE_PROHIBIT_DEPENDENT);
 	  qexec_clear_groupby_state (thread_p, &gbstate);
 
@@ -5548,7 +5548,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 	  qfile_destroy_list (thread_p, list_id);
 	  qfile_close_list (thread_p, gbstate.output_file);
 	  qfile_copy_list_id (list_id, gbstate.output_file, true,
-			      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
+			      qfile_list_has_tapeset (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
 			      QFILE_PROHIBIT_DEPENDENT);
 
 	  goto wrapup;
@@ -5685,7 +5685,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
    * pread past membuf_last, amplified per-row by the sorted-order access pattern; a
    * bail-out here is harmless (VPID back-references stay valid — slow but correct). */
   if (gbstate.key_info.use_original == 1
-      && (qfile_list_has_new_backing (list_id) || qfile_list_is_spill_overflowed (list_id)))
+      && (qfile_list_has_tapeset (list_id) || qfile_list_is_page_spilled (list_id)))
     {
       bool all_columns_carried = false;
 
@@ -5757,7 +5757,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 #endif
   qfile_destroy_list (thread_p, list_id);
   qfile_copy_list_id (list_id, gbstate.output_file, true,
-		      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT : QFILE_PROHIBIT_DEPENDENT);
+		      qfile_list_has_tapeset (gbstate.output_file) ? QFILE_MOVE_DEPENDENT : QFILE_PROHIBIT_DEPENDENT);
   /* qexec_clear_groupby_state() will free gbstate.output_file */
 
 wrapup:
@@ -18829,7 +18829,7 @@ qexec_listfile_orderby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QFILE_LIST_ID
 	  ordby_info.ordbynum_val = NULL;
 	  ordby_info.ordbynum_flag = 0;
 
-	  /* suppress_new_backing=true (#105): qexec_listfile_orderby is CONNECT BY-only;
+	  /* suppress_tapeset_backing=true (#105): qexec_listfile_orderby is CONNECT BY-only;
 	   * its sorted output (incl. the BF->DF result that feeds
 	   * qexec_recalc_tuples_parent_pos_in_list) must stay OLD-backed so parent-pos
 	   * tuple positions can be serialised into QFILE_TUPLE_POSITION_DB (VPID-only). */
@@ -21095,7 +21095,7 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
 
     {
       bool out_tde = (QFILE_LIST_ID_TFILE_VFID (output_list_id)->tde_encrypted);
-      if (qfile_list_make_new_backed (thread_p, output_list_id, out_tde) != NO_ERROR)
+      if (qfile_list_make_tapeset_backed (thread_p, output_list_id, out_tde) != NO_ERROR)
 	{
 	  qfile_close_list (thread_p, output_list_id);
 	  QFILE_FREE_AND_INIT_LIST_ID (output_list_id);
@@ -21111,7 +21111,7 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
       qfile_destroy_list (thread_p, list_id);
       qfile_close_list (thread_p, gbstate.output_file);
       qfile_copy_list_id (list_id, gbstate.output_file, true,
-			  qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
+			  qfile_list_has_tapeset (gbstate.output_file) ? QFILE_MOVE_DEPENDENT :
 			  QFILE_PROHIBIT_DEPENDENT);
       qexec_clear_groupby_state (thread_p, &gbstate);	/* will free gbstate.output_file */
 
@@ -21251,7 +21251,7 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
     }
   qfile_destroy_list (thread_p, list_id);
   qfile_copy_list_id (list_id, gbstate.output_file, true,
-		      qfile_list_has_new_backing (gbstate.output_file) ? QFILE_MOVE_DEPENDENT : QFILE_PROHIBIT_DEPENDENT);
+		      qfile_list_has_tapeset (gbstate.output_file) ? QFILE_MOVE_DEPENDENT : QFILE_PROHIBIT_DEPENDENT);
 
   if (XASL_IS_FLAGED (xasl, XASL_IS_MERGE_QUERY) && list_id->tuple_cnt != tuple_cnt)
     {
@@ -21702,7 +21702,7 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
    * records instead of just dropping use_original — a plain A_sort_key materializes only the sort
    * key columns and qexec_analytic_put_next would then read past a truncated tuple (#100 class
    * bug; #103). */
-  if (analytic_state.key_info.use_original == 1 && qfile_list_has_new_backing (list_id))
+  if (analytic_state.key_info.use_original == 1 && qfile_list_has_tapeset (list_id))
     {
       bool all_columns_carried = false;
 

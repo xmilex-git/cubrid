@@ -57,7 +57,7 @@ namespace parallel_scan
       val_descr *m_vd;
       SCAN_STATS *m_scan_stats;
       bool m_on_trace;
-      bool m_new_tuple_source;
+      bool m_tapeset_source;
   };
 }
 

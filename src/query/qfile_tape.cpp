@@ -1358,7 +1358,7 @@ qfile_tapeset_scan_open (QFILE_LIST_SCAN_ID *scan_id_p)
   /* backing-kind entry guard (production-hard): a NEW (Tapeset) scan never runs
    * over a list that also carries OLD backing (SSOT #75 round-3 (d)/(e)). */
   {
-    int guard_rc = QFILE_GUARD_NEW_MECHANISM (&scan_id_p->list_id);
+    int guard_rc = QFILE_GUARD_TAPESET_MECHANISM (&scan_id_p->list_id);
     if (guard_rc != NO_ERROR)
       {
 	return guard_rc;
@@ -1939,9 +1939,9 @@ qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID
   if (sts != NULL)
     {
       dts->transfer_tapes_from (sts);	/* per-tape move-and-null; src left empty */
-      if (QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (src))
+      if (QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW (src))
 	{
-	  QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW (dest) = true;
+	  QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW (dest) = true;
 	}
     }
   dest->tuple_cnt += src->tuple_cnt;
@@ -2047,8 +2047,8 @@ qfile_producer_overflow_roundtrip (THREAD_ENTRY *thread_p, TDE_ALGORITHM algo)
   if (rc == NO_ERROR)
     {
       qfile_close_list (thread_p, &ov);	/* NEW branch: freeze -> tapeset, frees scratch */
-      if (QFILE_LIST_ID_TAPESET (&ov) == NULL || QFILE_LIST_ID_BACKING_KIND (&ov) != QFILE_BACKING_NEW
-	  || qfile_list_is_mixed_backing (&ov) || qfile_list_has_old_backing (&ov))
+      if (QFILE_LIST_ID_TAPESET (&ov) == NULL || QFILE_LIST_ID_BACKING_KIND (&ov) != QFILE_BACKING_TAPESET
+	  || qfile_list_is_mixed_backing (&ov) || qfile_list_has_pgbuf_backing (&ov))
 	{
 	  rc = ER_FAILED;
 	}
@@ -2170,9 +2170,9 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
   if (rc == NO_ERROR)
     {
       qfile_close_list (thread_p, &lst);	/* NEW branch: freeze -> tapeset_, backing_kind=NEW */
-      if (QFILE_LIST_ID_TAPESET (&lst) == NULL || QFILE_LIST_ID_BACKING_KIND (&lst) != QFILE_BACKING_NEW
-	  || qfile_list_is_mixed_backing (&lst) || !qfile_list_has_new_backing (&lst)
-	  || qfile_list_has_old_backing (&lst))
+      if (QFILE_LIST_ID_TAPESET (&lst) == NULL || QFILE_LIST_ID_BACKING_KIND (&lst) != QFILE_BACKING_TAPESET
+	  || qfile_list_is_mixed_backing (&lst) || !qfile_list_has_tapeset (&lst)
+	  || qfile_list_has_pgbuf_backing (&lst))
 	{
 	  rc = ER_FAILED;
 	}

@@ -53,7 +53,7 @@ namespace parallel_scan
 	return NO_ERROR;
       }
 
-    if (qfile_list_has_new_backing (list_id))
+    if (qfile_list_has_tapeset (list_id))
       {
 	qfile::tapeset *ts = (qfile::tapeset *) QFILE_LIST_ID_TAPESET (list_id);
 	if (ts == nullptr)

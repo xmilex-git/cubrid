@@ -443,8 +443,8 @@ typedef struct qfile_list_id QFILE_LIST_ID;
 enum qfile_backing_kind
 {
   QFILE_BACKING_NONE = 0,
-  QFILE_BACKING_OLD = 1,	/* membuf / page-spill / pgbuf temp */
-  QFILE_BACKING_NEW = 2		/* Tapeset / per-worker private file / offset */
+  QFILE_BACKING_PGBUF = 1,	/* membuf / page-spill / pgbuf temp */
+  QFILE_BACKING_TAPESET = 2		/* Tapeset / per-worker private file / offset */
 };
 typedef enum qfile_backing_kind QFILE_BACKING_KIND;
 struct qfile_list_id
@@ -472,7 +472,7 @@ struct qfile_list_id
    * macro below.  Not serialized (transient runtime structure). */
   void *tapeset_;		/* (access via QFILE_LIST_ID_TAPESET) */
   bool owns_tapeset_;		/* this list_id owns/free the tapeset (access via QFILE_LIST_ID_OWNS_TAPESET) */
-  bool new_contains_overflow_;	/* NEW Tapeset has ADR0006 overflow tuple pages; page-parallel list scan must avoid it. */
+  bool tapeset_contains_overflow_;	/* NEW Tapeset has ADR0006 overflow tuple pages; page-parallel list scan must avoid it. */
   /* Migration backing-kind tag (redesign G008, issue #73).  QFILE_BACKING_NONE
    * on a cleared list; set OLD/NEW when a producer commits a backing.  Access
    * via QFILE_LIST_ID_BACKING_KIND.  Not serialized (transient runtime tag). */
@@ -527,7 +527,7 @@ struct qfile_list_id
       (list_id)->tapeset_ = NULL; \
       (list_id)->owns_tapeset_ = false; \
       (list_id)->backing_kind_ = QFILE_BACKING_NONE; \
-      (list_id)->new_contains_overflow_ = false; \
+      (list_id)->tapeset_contains_overflow_ = false; \
       (list_id)->producer_writer_ = NULL; \
       (list_id)->producer_page_ = NULL; \
       (list_id)->producer_failed_ = false; \
@@ -558,7 +558,7 @@ struct qfile_list_id
 #define QFILE_LIST_ID_PRODUCER_WRITER(list_id) ((list_id)->producer_writer_)
 #define QFILE_LIST_ID_PRODUCER_PAGE(list_id)   ((list_id)->producer_page_)
 #define QFILE_LIST_ID_PRODUCER_FAILED(list_id) ((list_id)->producer_failed_)
-#define QFILE_LIST_ID_NEW_CONTAINS_OVERFLOW(list_id) ((list_id)->new_contains_overflow_)
+#define QFILE_LIST_ID_TAPESET_CONTAINS_OVERFLOW(list_id) ((list_id)->tapeset_contains_overflow_)
 
 /* Synthetic marker volid for a NEW (Tapeset)-backed top-level result served
  * directly to the client without pgbuf materialization (#120a).  The client
@@ -582,14 +582,14 @@ struct qfile_list_id
  * qfile_check_no_mixed_backing (debug-only).
  */
 static inline bool
-qfile_list_has_old_backing (const QFILE_LIST_ID * list_id)
+qfile_list_has_pgbuf_backing (const QFILE_LIST_ID * list_id)
 {
   return list_id != NULL
 	 && (!VPID_ISNULL (&QFILE_LIST_ID_FIRST_VPID (list_id)) || QFILE_LIST_ID_TFILE_VFID (list_id) != NULL);
 }
 
 static inline bool
-qfile_list_has_new_backing (const QFILE_LIST_ID * list_id)
+qfile_list_has_tapeset (const QFILE_LIST_ID * list_id)
 {
   return list_id != NULL && QFILE_LIST_ID_TAPESET (list_id) != NULL;
 }
@@ -597,7 +597,7 @@ qfile_list_has_new_backing (const QFILE_LIST_ID * list_id)
 static inline bool
 qfile_list_is_mixed_backing (const QFILE_LIST_ID * list_id)
 {
-  return qfile_list_has_old_backing (list_id) && qfile_list_has_new_backing (list_id);
+  return qfile_list_has_pgbuf_backing (list_id) && qfile_list_has_tapeset (list_id);
 }
 
 static inline void
@@ -636,13 +636,13 @@ qfile_backing_mechanism_violation (const QFILE_LIST_ID * list_id, QFILE_BACKING_
     {
       return false;
     }
-  if (mechanism == QFILE_BACKING_OLD)
+  if (mechanism == QFILE_BACKING_PGBUF)
     {
-      return qfile_list_has_new_backing (list_id);
+      return qfile_list_has_tapeset (list_id);
     }
-  if (mechanism == QFILE_BACKING_NEW)
+  if (mechanism == QFILE_BACKING_TAPESET)
     {
-      return qfile_list_has_old_backing (list_id);
+      return qfile_list_has_pgbuf_backing (list_id);
     }
   return false;
 }
@@ -659,17 +659,17 @@ extern int qfile_backing_guard (const QFILE_LIST_ID * list_id, QFILE_BACKING_KIN
 /* A~E runtime counter: "a NEW-backed list was touched by an OLD scan-bypass
  * path" (evidence §H-3 inventory A~E).  MUST read 0 on a migrated NEW operator
  * (SSOT #75 §6).  Process-wide; reset is for tests. */
-extern void qfile_ae_record_old_touch (void);
-extern long qfile_ae_old_touch_count (void);
-extern void qfile_ae_reset_old_touch_count (void);
+extern void qfile_ae_record_pgbuf_touch (void);
+extern long qfile_ae_pgbuf_touch_count (void);
+extern void qfile_ae_reset_pgbuf_touch_count (void);
 
 /* Sibling counter: a list was actually converted to NEW(Tapeset) backing
- * (qfile_list_make_new_backed()).  Process-wide; reset is for tests. Both
+ * (qfile_list_make_tapeset_backed()).  Process-wide; reset is for tests. Both
  * counters are also exposed via `cubrid statdump` (PSTAT_QF_NEW_BACKED_CREATE /
  * PSTAT_QF_OLD_TOUCH_ON_NEW, redesign #78/#92). */
-extern void qfile_new_backed_record_create (void);
-extern long qfile_new_backed_create_count (void);
-extern void qfile_new_backed_reset_create_count (void);
+extern void qfile_tapeset_backed_record_create (void);
+extern long qfile_tapeset_backed_create_count (void);
+extern void qfile_tapeset_backed_reset_create_count (void);
 
 /* #120 client-fetch routing census (statdump PSTAT_QF_CLIENT_FETCH_SERVE /
  * PSTAT_QF_CLIENT_FETCH_MATERIALIZE): Tapeset direct serves of client fetch
@@ -689,8 +689,8 @@ extern void qfile_tuple_position_report_tape_misuse (void);
 #endif
 
 /* Call-site macros carrying ARG_FILE_LINE (error_manager.h must be in scope). */
-#define QFILE_GUARD_OLD_MECHANISM(list_id) qfile_backing_guard ((list_id), QFILE_BACKING_OLD, ARG_FILE_LINE)
-#define QFILE_GUARD_NEW_MECHANISM(list_id) qfile_backing_guard ((list_id), QFILE_BACKING_NEW, ARG_FILE_LINE)
+#define QFILE_GUARD_PGBUF_MECHANISM(list_id) qfile_backing_guard ((list_id), QFILE_BACKING_PGBUF, ARG_FILE_LINE)
+#define QFILE_GUARD_TAPESET_MECHANISM(list_id) qfile_backing_guard ((list_id), QFILE_BACKING_TAPESET, ARG_FILE_LINE)
 
 /* Tuple position coordinate type */
 enum qfile_tuple_position_coordinate_type

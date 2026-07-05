@@ -46,7 +46,7 @@ namespace parallel_scan
       m_vd (nullptr),
       m_scan_stats (nullptr),
       m_on_trace (false),
-      m_new_tuple_source (false)
+      m_tapeset_source (false)
   {
     m_scan_pred = { nullptr, nullptr, nullptr };
     m_tplrec.size = 0;
@@ -74,7 +74,7 @@ namespace parallel_scan
     m_curr_tpl = nullptr;
     m_curr_tplno = 0;
     m_tuple_count = 0;
-    m_new_tuple_source = false;
+    m_tapeset_source = false;
     return NO_ERROR;
   }
 
@@ -94,7 +94,7 @@ namespace parallel_scan
 	db_private_free_and_init (thread_p, m_tplrec.tpl);
 	m_tplrec.size = 0;
       }
-    m_new_tuple_source = false;
+    m_tapeset_source = false;
     return NO_ERROR;
   }
 
@@ -113,8 +113,8 @@ namespace parallel_scan
 	m_curr_pgptr = nullptr;
       }
 
-    m_new_tuple_source = qfile_list_has_new_backing (m_list_id);
-    if (m_new_tuple_source)
+    m_tapeset_source = qfile_list_has_tapeset (m_list_id);
+    if (m_tapeset_source)
       {
 	m_curr_pgptr = nullptr;
 	m_curr_tfile = nullptr;
@@ -141,7 +141,7 @@ namespace parallel_scan
       {
 	QFILE_TUPLE tpl;
 
-	if (m_new_tuple_source)
+	if (m_tapeset_source)
 	  {
 	    qfile::tapeset_reader *reader = input_handler_list::get_thread_new_reader ();
 	    if (reader == nullptr)

@@ -28,7 +28,7 @@
 #include "query_manager.h"		/* QMGR_TEMP_FILE (qmgr_temp_file) */
 #include "memory_alloc.h"		/* db_private_alloc, db_private_free_and_init */
 #include "storage_common.h"		/* OID_INITIALIZER, S_CLOSED, VPID_SET_NULL, ... */
-#include "query_list.h"			/* QFILE_LIST_ID_TAPESET, qfile_list_has_new_backing */
+#include "query_list.h"			/* QFILE_LIST_ID_TAPESET, qfile_list_has_tapeset */
 #include "qfile_tape.hpp"		/* qfile::tapeset */
 #include "qfile_chunk.hpp"		/* qfile::chunk_distributor */
 
@@ -83,7 +83,7 @@ namespace parallel_query
       {
 	QFILE_LIST_ID *outer_list_id = outer->fetch_info->list_id;
 
-	if (qfile_list_has_new_backing (outer_list_id))
+	if (qfile_list_has_tapeset (outer_list_id))
 	  {
 	    /* #84: reached only when both split inputs are NEW-backed AND the
 	     * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
@@ -226,7 +226,7 @@ namespace parallel_query
       {
 	QFILE_LIST_ID *inner_list_id = inner->fetch_info->list_id;
 
-	if (qfile_list_has_new_backing (inner_list_id))
+	if (qfile_list_has_tapeset (inner_list_id))
 	  {
 	    /* #84: reached only when both split inputs are NEW-backed AND the
 	     * HASHJOIN_NEW gate is on (hjoin_try_parallel forces serial
@@ -731,7 +731,7 @@ error_exit:
       {
 	QFILE_LIST_ID *probe_list_id = manager->single_context.probe->list_id;
 
-	if (qfile_list_has_new_backing (probe_list_id))
+	if (qfile_list_has_tapeset (probe_list_id))
 	  {
 	    /* redesign #78 2A-3: NEW (Tapeset) probe input -> shared chunk_distributor
 	     * + per-worker tapeset_reader (ADR 0003/0005/0006).  The OLD sector

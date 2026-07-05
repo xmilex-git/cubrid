@@ -2,7 +2,7 @@
 -- reliably trigger BOTH real parallel-worker engagement (parity.sh's
 -- passthrough-tautology guard needs >=2 actual workers on the heap scan --
 -- empirically ~300K rows is too small on this build/optimizer, 5.12M works)
--- and NEW(Tapeset) backing conversion (qfile_list_make_new_backed() converts
+-- and NEW(Tapeset) backing conversion (qfile_list_make_tapeset_backed() converts
 -- any closed SORT/DISTINCT output regardless of size when its gate is on, so
 -- row count is not required for that half -- it just needs to be nonzero).
 --
