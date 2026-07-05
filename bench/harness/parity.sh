@@ -74,10 +74,10 @@ check_wm_engagement()
   local after=$3
   local new_before new_after old_before old_after new_delta old_delta
 
-  new_before=$(extract_stat "${before}" "Num_qfile_new_backed_create")
-  new_after=$(extract_stat "${after}" "Num_qfile_new_backed_create")
-  old_before=$(extract_stat "${before}" "Num_qfile_old_touch_on_new")
-  old_after=$(extract_stat "${after}" "Num_qfile_old_touch_on_new")
+  new_before=$(extract_stat "${before}" "Num_qfile_tapeset_create")
+  new_after=$(extract_stat "${after}" "Num_qfile_tapeset_create")
+  old_before=$(extract_stat "${before}" "Num_qfile_pgbuf_touch_on_tapeset")
+  old_after=$(extract_stat "${after}" "Num_qfile_pgbuf_touch_on_tapeset")
   new_delta=$(( ${new_after:-0} - ${new_before:-0} ))
   old_delta=$(( ${old_after:-0} - ${old_before:-0} ))
   echo "${label}: new_backed_create_delta=${new_delta} old_touch_on_new_delta=${old_delta}" | tee -a "${proof}"

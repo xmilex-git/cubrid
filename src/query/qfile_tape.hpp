@@ -605,18 +605,18 @@ void qfile_producer_destroy (void *writer);
  * orphan-zero -- the private file is unlinked AND the RAM prefix is freed
  * (ADR 0001).  Exercises a real on-disk file (and the TDE-encrypted backing
  * when a cipher is loaded), which the bootless unit test cannot.  Gated by env
- * CUBRID_HELDTAPE_SELFTEST.  Returns 0 on PASS.
+ * CUBRID_WM_HELDTAPE_SELFTEST.  Returns 0 on PASS.
  */
 int qfile_heldtape_selftest (THREAD_ENTRY *thread_p);
 
 /* In-server self-test of N-reader concurrent read over a frozen (TDE) Tape
- * (ADR 0005, #78 2A-0).  Gated by env CUBRID_TAPEREAD_SELFTEST (debug). */
+ * (ADR 0005, #78 2A-0).  Gated by env CUBRID_WM_TAPEREAD_SELFTEST (debug). */
 int qfile_taperead_selftest (THREAD_ENTRY *thread_p);
 
 /* In-server self-test of the 2A-1 NEW-backing producer hook (redesign #78):
  * produce a list via qfile_add_tuple_to_list onto a producer_writer_-attached
  * QFILE_LIST_ID, close (freeze into a Tapeset), then scan via tapeset_scan and
- * assert robust parity.  Gated by env CUBRID_PRODUCER_SELFTEST (debug). */
+ * assert robust parity.  Gated by env CUBRID_WM_PRODUCER_SELFTEST (debug). */
 int qfile_producer_selftest (THREAD_ENTRY *thread_p);
 
 #if !defined (NDEBUG)

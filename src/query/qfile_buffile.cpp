@@ -457,7 +457,7 @@ namespace qfile
 
 /* ------------------------------------------------------------------ */
 /* In-server self-test (TDE round-trip; bootless unit test cannot load */
-/* a cipher).  Gated by env CUBRID_BUFFILE_SELFTEST.                   */
+/* a cipher).  Gated by env CUBRID_WM_BUFFILE_SELFTEST.                   */
 /* ------------------------------------------------------------------ */
 
 int

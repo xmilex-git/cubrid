@@ -1520,7 +1520,7 @@ qfile_tapeset_read_global_page (THREAD_ENTRY *thread_p, const QFILE_LIST_ID *lis
 
 /* ------------------------------------------------------------------ */
 /* In-server self-test: holdable reparent lifecycle (Phase1 1C, #72). */
-/* Gated by env CUBRID_HELDTAPE_SELFTEST (debug-only invocation).      */
+/* Gated by env CUBRID_WM_HELDTAPE_SELFTEST (debug-only invocation).      */
 /* ------------------------------------------------------------------ */
 
 namespace
@@ -1744,7 +1744,7 @@ qfile_heldtape_selftest (THREAD_ENTRY *thread_p)
 
 /* ------------------------------------------------------------------ */
 /* In-server self-test: N-reader CONCURRENT read of a frozen TDE Tape  */
-/* (ADR 0005, #78 2A-0).  Gated by env CUBRID_TAPEREAD_SELFTEST.        */
+/* (ADR 0005, #78 2A-0).  Gated by env CUBRID_WM_TAPEREAD_SELFTEST.        */
 /* A non-re-entrant decrypt (shared member scratch) would corrupt pages */
 /* under concurrent readers -> wrong tuples; this proves per-reader     */
 /* scratch + shared fd + pread is safe on an ENCRYPTED backing.         */
@@ -2117,7 +2117,7 @@ qfile_producer_overflow_roundtrip (THREAD_ENTRY *thread_p, TDE_ALGORITHM algo)
 
 /* ------------------------------------------------------------------ */
 /* In-server self-test: 2A-1 NEW-backing producer hook (redesign #78)  */
-/* Gated by env CUBRID_PRODUCER_SELFTEST (debug-only invocation).       */
+/* Gated by env CUBRID_WM_PRODUCER_SELFTEST (debug-only invocation).       */
 /* ------------------------------------------------------------------ */
 
 int

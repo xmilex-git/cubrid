@@ -14,10 +14,10 @@ below) and re-wired them; this checklist is the record of what changed and how t
 | `buffile_metrics.pgbuf_fixes` | `qfile_buffile.hpp` | producer-side pgbuf-bypass gate: MUST be 0 across `append_page`/`flush` |
 | `tapeset_scan_metrics.{page_reads,tuple_reads,tape_advances,jumps,copies,peeks}` | `qfile_tape.hpp` | scan-side operation counters (never tautological) |
 | `tapeset_scan_metrics.pgbuf_fixes` | `qfile_tape.hpp` | scan-side pgbuf-bypass gate: MUST be 0 across a `tapeset_scan`/`tapeset_reader`'s page touches |
-| `CUBRID_BUFFILE_SELFTEST` | `qfile_buffile_selftest` (`qfile_buffile.cpp`), gated in `qmgr_initialize` | in-server BufFile write/flush/read round-trip incl. TDE |
-| `CUBRID_HELDTAPE_SELFTEST` | `qfile_heldtape_selftest` (`qfile_tape.cpp`) | held/frozen Tape round-trip |
-| `CUBRID_TAPEREAD_SELFTEST` | `qfile_taperead_selftest` (`qfile_tape.cpp`) | N-reader concurrent `tapeset_reader` read (ADR 0005) |
-| `CUBRID_PRODUCER_SELFTEST` | `qfile_producer_selftest` (`qfile_tape.cpp`) | producer freeze path |
+| `CUBRID_WM_BUFFILE_SELFTEST` | `qfile_buffile_selftest` (`qfile_buffile.cpp`), gated in `qmgr_initialize` | in-server BufFile write/flush/read round-trip incl. TDE |
+| `CUBRID_WM_HELDTAPE_SELFTEST` | `qfile_heldtape_selftest` (`qfile_tape.cpp`) | held/frozen Tape round-trip |
+| `CUBRID_WM_TAPEREAD_SELFTEST` | `qfile_taperead_selftest` (`qfile_tape.cpp`) | N-reader concurrent `tapeset_reader` read (ADR 0005) |
+| `CUBRID_WM_PRODUCER_SELFTEST` | `qfile_producer_selftest` (`qfile_tape.cpp`) | producer freeze path |
 
 ## Fixed by #93 (previously tautological or silent)
 

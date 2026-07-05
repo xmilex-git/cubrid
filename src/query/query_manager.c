@@ -1191,7 +1191,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  assert (spill_coherence_rc == NO_ERROR);
 	}
     }
-  if (getenv ("CUBRID_BUFFILE_SELFTEST") != NULL)
+  if (getenv ("CUBRID_WM_BUFFILE_SELFTEST") != NULL)
     {
       int buffile_selftest_rc = qfile_buffile_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "BUFFILE_SELFTEST result=%d (0=PASS)\n", buffile_selftest_rc);
@@ -1205,7 +1205,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  assert (buffile_selftest_rc == NO_ERROR);
 	}
     }
-  if (getenv ("CUBRID_HELDTAPE_SELFTEST") != NULL)
+  if (getenv ("CUBRID_WM_HELDTAPE_SELFTEST") != NULL)
     {
       int heldtape_selftest_rc = qfile_heldtape_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "HELDTAPE_SELFTEST result=%d (0=PASS)\n", heldtape_selftest_rc);
@@ -1217,7 +1217,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  assert (heldtape_selftest_rc == NO_ERROR);
 	}
     }
-  if (getenv ("CUBRID_TAPEREAD_SELFTEST") != NULL)
+  if (getenv ("CUBRID_WM_TAPEREAD_SELFTEST") != NULL)
     {
       int taperead_selftest_rc = qfile_taperead_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "TAPEREAD_SELFTEST result=%d (0=PASS)\n", taperead_selftest_rc);
@@ -1229,7 +1229,7 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  assert (taperead_selftest_rc == NO_ERROR);
 	}
     }
-  if (getenv ("CUBRID_PRODUCER_SELFTEST") != NULL)
+  if (getenv ("CUBRID_WM_PRODUCER_SELFTEST") != NULL)
     {
       int producer_selftest_rc = qfile_producer_selftest (thread_p);
       er_log_debug (ARG_FILE_LINE, "PRODUCER_SELFTEST result=%d (0=PASS)\n", producer_selftest_rc);

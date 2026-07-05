@@ -51,11 +51,11 @@ latest_er_log()
 
 echo "gate_tapeset_scan: restarting ${DB_NAME} with BUFFILE/HELDTAPE/TAPEREAD/PRODUCER selftests enabled..."
 for t in "${SELFTESTS[@]}"; do
-  export "CUBRID_${t}_SELFTEST=1"
+  export "CUBRID_WM_${t}_SELFTEST=1"
 done
 restart_server
 for t in "${SELFTESTS[@]}"; do
-  unset "CUBRID_${t}_SELFTEST"
+  unset "CUBRID_WM_${t}_SELFTEST"
 done
 
 LOG=$(latest_er_log)

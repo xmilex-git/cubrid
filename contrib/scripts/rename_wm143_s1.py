@@ -81,10 +81,18 @@ S1B_PAIRS = [
 S1B_FILES = [
     "src/base/perf_monitor.c",
     "src/query/query_manager.c",
+    "src/query/qfile_tape.hpp",
+    "src/query/qfile_tape.cpp",
+    "src/query/qfile_buffile.cpp",
+    "src/query/qfile_buffile.hpp",
     "bench/harness/parity.sh",
-    "bench/harness/gate_tapeset_scan.sh",
-    "bench/harness/preflight.sh",
+    "bench/harness/checklists/issue68_hooks.md",
 ]
+# Not literal-token substitutions (dynamic `CUBRID_${t}_SELFTEST` construction);
+# apply this script first, then manually insert WM_ into the SELFTESTS loop in
+# bench/harness/gate_tapeset_scan.sh (see issue #143 S1b commit for the exact
+# diff). preflight.sh does not reference these env names (verified via grep at
+# S1b authoring time) and needs no change.
 
 
 def apply(pairs, files, repo_root):

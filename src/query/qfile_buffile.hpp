@@ -229,7 +229,7 @@ namespace qfile
  * In-server self-test of the BufFile write/flush/read round-trip, including the
  * TDE encrypt -> pwrite -> pread -> decrypt path which cannot run in the
  * bootless unit test (no loaded cipher).  Mirrors the raw-fd self-test; gated
- * by env CUBRID_BUFFILE_SELFTEST in qmgr_initialize (debug-only).  Returns 0 on
+ * by env CUBRID_WM_BUFFILE_SELFTEST in qmgr_initialize (debug-only).  Returns 0 on
  * PASS.
  */
 int qfile_buffile_selftest (THREAD_ENTRY *thread_p);
