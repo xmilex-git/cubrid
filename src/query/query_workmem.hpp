@@ -60,16 +60,9 @@ namespace temp_page_store
   void release_held (std::size_t bytes, int shard_index) noexcept;
 
   std::size_t reservation_bytes_for_pages (std::size_t pages) noexcept;
-  std::size_t reservation_bytes_for_degree (UINT32 degree, std::size_t pages_per_worker = 0) noexcept;
   void record_degrade () noexcept;
 
   std::size_t cap_bytes () noexcept;
   std::size_t reserved_bytes () noexcept;
-  std::size_t headroom_bytes () noexcept;
-  std::size_t shard_count () noexcept;
-  std::size_t refill_quantum_bytes () noexcept;
-  std::size_t worst_case_slack_bytes () noexcept;
-  std::size_t overshoot_limit_bytes () noexcept;
-  std::size_t position_budget_bytes () noexcept;
 }
 #endif /* _QUERY_WORKMEM_HPP_ */

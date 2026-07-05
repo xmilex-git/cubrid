@@ -27,6 +27,7 @@
 #include "object_primitive.h"
 #include "query_opfunc.h"
 #include "list_file.h"
+#include "qfile_tape.hpp"	/* qfile_tapeset_import (decl moved from list_file.h, #143 S2/M3) */
 #include "query_manager.h"
 #include "dbtype_def.h"
 #include "object_representation.h"

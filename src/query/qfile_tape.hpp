@@ -592,6 +592,8 @@ void *qfile_producer_create (int prefix_budget_pages, TDE_ALGORITHM tde_algo, un
  * BufFile sequence.  Returns an opaque writer (NULL on failure), consumed by
  * qfile_producer_freeze_tapeset / qfile_producer_destroy. */
 void *qfile_producer_create_for_list (THREAD_ENTRY *thread_p, bool tde_encrypted);
+/* redesign #78 2A-1b: import src's Tapeset backing into dest (SORT output migration). */
+int qfile_tapeset_import (THREAD_ENTRY *thread_p, QFILE_LIST_ID *dest, QFILE_LIST_ID *src);
 int qfile_producer_append (THREAD_ENTRY *thread_p, void *writer, const PAGE_PTR full_page);
 void *qfile_producer_freeze_tapeset (THREAD_ENTRY *thread_p, void *writer);
 void qfile_producer_destroy (void *writer);

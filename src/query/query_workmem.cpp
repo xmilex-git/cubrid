@@ -152,6 +152,16 @@ namespace
 
 namespace temp_page_store
 {
+  /* Internal accounting helpers (issue #143 S2/M4): consumed only within this TU,
+   * so they are declared static here instead of in query_workmem.hpp -- the public
+   * accountant surface stays limited to cap_bytes / reserved_bytes. */
+  static std::size_t headroom_bytes () noexcept;
+  static std::size_t shard_count () noexcept;
+  static std::size_t refill_quantum_bytes () noexcept;
+  static std::size_t worst_case_slack_bytes () noexcept;
+  static std::size_t overshoot_limit_bytes () noexcept;
+  static std::size_t position_budget_bytes () noexcept;
+
   budget_result
   reserve_membuf_budget (int requested_pages, std::size_t *reserved_bytes_out, int *reserved_shard_out) noexcept
   {
@@ -278,22 +288,6 @@ namespace temp_page_store
   reservation_bytes_for_pages (std::size_t pages) noexcept
   {
     return checked_add_bytes (checked_pages_to_bytes (pages), position_budget_bytes ());
-  }
-
-  std::size_t
-  reservation_bytes_for_degree (UINT32 degree, std::size_t pages_per_worker) noexcept
-  {
-    const std::size_t tier_pages = (pages_per_worker == 0)
-      ? static_cast<std::size_t> (std::max<UINT64> (prm_get_bigint_value (PRM_ID_WORK_MEM) / DB_PAGESIZE, 1))
-      : pages_per_worker;
-    const std::size_t per_worker_bytes = reservation_bytes_for_pages (tier_pages);
-
-    if (degree != 0 && per_worker_bytes > std::numeric_limits<std::size_t>::max () / degree)
-      {
-        return std::numeric_limits<std::size_t>::max ();
-      }
-
-    return per_worker_bytes * degree;
   }
 
   void
