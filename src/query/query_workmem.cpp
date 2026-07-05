@@ -107,13 +107,29 @@ namespace
   void
   init_accountant () noexcept
   {
-    /* The cap is intentionally internal: use a conservative fraction of the data buffer so work_mem cannot grow
-     * with concurrency to the size of the whole buffer pool; keep a fixed ceiling for large installations and a small
-     * floor for default test databases.  This is not a GUC and is surfaced only through perf peek statistics. */
+    /* #144 P3 D1 (escape hatch ②): the cap RESPECTS PRM_ID_WORK_MEM but stays
+     * bounded to a system-proportional ceiling so it cannot blow up with
+     * concurrency.  The cap is a GLOBAL budget shared across concurrent consumers
+     * (headroom = cap - total_reserved), so bounding it at data_buffer/2 caps the
+     * aggregate reservation regardless of how large work_mem is:
+     *   cap = clamp( min( max(work_mem, data_buffer/8), data_buffer/2 ), 64MiB, 4GiB )
+     * data_buffer/8 keeps the prior floor for small work_mem; data_buffer/2 is the
+     * concurrency-safety ceiling (escape hatch ① = raise to work_mem with only a
+     * 4GiB ceiling was rejected: it allows N×work_mem aggregate blowup).  A build
+     * that still exceeds the cap degrades to spill exactly as before (graceful
+     * fallback).  This promotes MID-SIZE in-mem-eligible builds (footprint in
+     * (data_buffer/8, data_buffer/2]) that the old fixed data_buffer/8 cap spilled;
+     * builds ≳ data_buffer/2 (e.g. a 5.12M-row self-join over a 512MiB pool) remain
+     * spilled by design -- that residual is attributed to the #65 w5 structural
+     * track (accounted budget vs develop's whole-pool free cache), not a regression.
+     * Surfaced only via perf peek. */
     const int page_buffer_pages = std::max (prm_get_integer_value (PRM_ID_PAGE_BUFFER_SIZE), 0);
     const std::size_t data_buffer_bytes = checked_pages_to_bytes (static_cast<std::size_t> (page_buffer_pages));
-    const std::size_t fraction = (data_buffer_bytes > 0) ? data_buffer_bytes / 8 : WORKMEM_MIN_CAP_BYTES;
-    const std::size_t capped = std::min (std::max (fraction, WORKMEM_MIN_CAP_BYTES), WORKMEM_MAX_CAP_BYTES);
+    const std::size_t db_eighth = (data_buffer_bytes > 0) ? data_buffer_bytes / 8 : WORKMEM_MIN_CAP_BYTES;
+    const std::size_t db_half = (data_buffer_bytes > 0) ? data_buffer_bytes / 2 : WORKMEM_MIN_CAP_BYTES;
+    const std::size_t work_mem_bytes = static_cast<std::size_t> (prm_get_bigint_value (PRM_ID_WORK_MEM));
+    const std::size_t desired = std::min (std::max (work_mem_bytes, db_eighth), db_half);
+    const std::size_t capped = std::min (std::max (desired, WORKMEM_MIN_CAP_BYTES), WORKMEM_MAX_CAP_BYTES);
 
     g_accountant.cap.store (clamp_to_accounting_bytes (capped), std::memory_order_release);
   }
