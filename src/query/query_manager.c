@@ -43,6 +43,7 @@
 #include "qfile_buffile.hpp"
 #include "qfile_page_spill.hpp"
 #include "qfile_tape.hpp"
+#include "qfile_tape_selftest.hpp"
 #include "stream_to_xasl.h"
 #include "session.h"
 #include "filter_pred_cache.h"
