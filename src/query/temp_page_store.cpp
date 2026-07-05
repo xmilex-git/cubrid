@@ -482,10 +482,6 @@ namespace temp_page_store
           put_page_header (spill_page_p, &page_header);
           return spill_page_p;
         }
-
-      case qmgr_temp_backing::PGBUF_PINNED:
-      case qmgr_temp_backing::SHARED_SPILL:
-        return unreachable_backing_page (thread_p);
       }
 
     return unreachable_backing_page (thread_p);
@@ -531,10 +527,6 @@ namespace temp_page_store
             return unreachable_backing_page (thread_p);
           }
         return tfile_p->page_spill_handle->fix_page (thread_p, vpid_p->pageid);
-
-      case qmgr_temp_backing::PGBUF_PINNED:
-      case qmgr_temp_backing::SHARED_SPILL:
-        return unreachable_backing_page (thread_p);
       }
 
     return unreachable_backing_page (thread_p);

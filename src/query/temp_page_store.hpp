@@ -37,9 +37,7 @@ typedef struct qmgr_temp_file QMGR_TEMP_FILE;
 enum class qmgr_temp_backing : int
 {
   MEMBUF = 0,
-  PGBUF_PINNED,
   PRIVATE_SPILL_FALLBACK,
-  SHARED_SPILL,
   PAGE_SPILL		/* (c′) per-tfile page-spill cache, #132; the sole OLD-tier
 				 * membuf-overflow backing since 커밋 B deleted raw-fd (#74 §5, #137) */
 };
