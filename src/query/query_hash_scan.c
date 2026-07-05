@@ -52,7 +52,7 @@
 #include "oid.h"
 #include "qfile_tape.hpp"
 #include "qfile_buffile.hpp"
-#include "temp_page_store.hpp"	/* work_mem accountant: reserve_held / release_held (#91/#123) */
+#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held (#91/#123) */
 
 #include <algorithm>
 #include <atomic>

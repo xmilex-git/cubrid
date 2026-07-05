@@ -290,6 +290,7 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/show_scan.c
   ${QUERY_DIR}/subquery_cache.c
   ${QUERY_DIR}/temp_page_store.cpp
+  ${QUERY_DIR}/query_workmem.cpp
   ${QUERY_DIR}/qfile_tape.cpp
   ${QUERY_DIR}/qfile_tape_selftest.cpp
   ${QUERY_DIR}/qfile_spill_file.cpp
@@ -314,6 +315,7 @@ set(QUERY_HEADERS
   ${QUERY_DIR}/query_reevaluation.hpp
   ${QUERY_DIR}/scan_json_table.hpp
   ${QUERY_DIR}/temp_page_store.hpp
+  ${QUERY_DIR}/query_workmem.hpp
   ${QUERY_DIR}/memoize.hpp
   ${QUERY_DIR}/qfile_tape.hpp
   ${QUERY_DIR}/qfile_tape_selftest.hpp

@@ -40,6 +40,7 @@
 #include "query_executor.h"
 #include "query_hash_scan.h"
 #include "temp_page_store.hpp"
+#include "query_workmem.hpp"
 #include "qfile_buffile.hpp"
 #include "qfile_page_spill.hpp"
 #include "qfile_tape.hpp"

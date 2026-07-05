@@ -31,7 +31,7 @@
 #include "page_buffer.h"	/* pgbuf_get_fix_debug_count (issue #93) */
 #include "system_parameter.h"	/* prm_get_integer_value / PRM_ID_TDE_DEFAULT_ALGORITHM */
 #include "file_io.h"		/* PEEK */
-#include "temp_page_store.hpp"	/* work_mem accountant: reserve_held / release_held (#91) */
+#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / release_held (#91) */
 
 #include <cassert>
 #include <cerrno>		/* ENOSPC/EDQUOT (ensure_buffile os_error mapping) */

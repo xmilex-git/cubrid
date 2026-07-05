@@ -98,7 +98,7 @@
 #include "network_interface_cl.h"
 #endif /* !defined (SERVER_MODE) */
 #if defined (SERVER_MODE) || defined (SA_MODE)
-#include "temp_page_store.hpp"
+#include "query_workmem.hpp"
 #endif /* defined (SERVER_MODE) || defined (SA_MODE) */
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
