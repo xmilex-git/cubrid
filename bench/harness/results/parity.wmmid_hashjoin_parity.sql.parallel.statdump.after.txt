@@ -1,5 +1,5 @@
 
-	Mon July 06 18:44:19 KST 2026
+	Tue July 07 06:21:49 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          1
@@ -19,7 +19,7 @@ Num_data_page_dirties         =      10387
 Num_data_page_ioreads         =       7455
 Num_data_page_iowrites        =          3
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      16910
+Num_data_page_private_quota   =      16900
 Num_data_page_private_count   =          6
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          7
@@ -106,19 +106,22 @@ Num_query_hashjoins_partitioned =          0
 Num_query_hashjoins_parallel  =          2
 Num_query_objfetches          =          0
 Num_query_holdable_cursors    =          0
-Num_workmem_degrades          =       3490
 Num_workmem_reserved_bytes    =          0
 Num_workmem_cap_bytes         =   67108864
 Num_workmem_op_limit_spills_sort =          0
 Num_workmem_op_limit_spills_hash =          0
-Num_workmem_cap_pressure_spills =          0
-Num_workmem_reserved_peak     =          0
+Num_workmem_cap_pressure_spills =       2879
+Num_workmem_reserved_peak     =   83681280
+Num_workmem_soft_reserved_peak =    3662448
+Num_workmem_spill_read_bytes  = 1553644296
+Num_workmem_spill_write_bytes = 1553644296
+Num_workmem_mro_gate_rejects  =          0
 Num_sort_io_pages             =          0
 Num_sort_data_pages           =         13
 Num_network_requests          =         55
 Num_adaptive_flush_pages      =          0
 Num_adaptive_flush_log_pages  =          0
-Num_adaptive_flush_max_pages  =      12288
+Num_adaptive_flush_max_pages  =      12672
 Num_prior_lsa_list_size       =          0
 Num_prior_lsa_list_maxed      =          0
 Num_prior_lsa_list_removed    =          0
@@ -390,7 +393,7 @@ Total_time_bt_vacuum_insid_traverse =          0
 Max_time_bt_vacuum_insid_traverse =          0
 Avg_time_bt_vacuum_insid_traverse =          0
 The timer values for vacuum_master are:
-Num_vacuum_master             =        472
+Num_vacuum_master             =        492
 Total_time_vacuum_master      =       2000
 Max_time_vacuum_master        =       1000
 Avg_time_vacuum_master        =          4
@@ -413,7 +416,7 @@ Time_get_snapshot_acquire_time =          0
 Count_get_snapshot_retry      =          0
 Time_tran_complete_time       =          0
 The timer values for compute_oldest_visible are:
-Num_compute_oldest_visible    =        472
+Num_compute_oldest_visible    =        492
 Total_time_compute_oldest_visible =          0
 Max_time_compute_oldest_visible =          0
 Avg_time_compute_oldest_visible =          0
@@ -425,7 +428,7 @@ Vacuum_page_efficiency_ratio  =       0.00
 Vacuum_page_fetch_ratio       =       0.00
 Data_page_fix_lock_acquire_time_msec =       0.00
 Data_page_fix_hold_acquire_time_msec =       0.00
-Data_page_fix_acquire_time_msec =     124.00
+Data_page_fix_acquire_time_msec =     131.00
 Data_page_allocate_time_ratio =     100.00
 Data_page_total_promote_success =       0.00
 Data_page_total_promote_fail  =       0.00
@@ -465,8 +468,8 @@ Total_time_flush_flush        =          0
 Max_time_flush_flush          =          0
 Avg_time_flush_flush          =          0
 The timer values for flush_sleep are:
-Num_flush_sleep               =          3
-Total_time_flush_sleep        =    3000000
+Num_flush_sleep               =          4
+Total_time_flush_sleep        =    4000000
 Max_time_flush_sleep          =    1000000
 Avg_time_flush_sleep          =    1000000
 The timer values for flush_collect_per_page are:
@@ -571,10 +574,10 @@ Total_time_DWB_file_sync_helper =          0
 Max_time_DWB_file_sync_helper =          0
 Avg_time_DWB_file_sync_helper =          0
 The timer values for DWB_flush_block_cond_wait are:
-Num_DWB_flush_block_cond_wait =       4511
-Total_time_DWB_flush_block_cond_wait =    4745000
+Num_DWB_flush_block_cond_wait =       4708
+Total_time_DWB_flush_block_cond_wait =    4960000
 Max_time_DWB_flush_block_cond_wait =       2000
-Avg_time_DWB_flush_block_cond_wait =       1051
+Avg_time_DWB_flush_block_cond_wait =       1053
 The timer values for DWB_flush_block_sort are:
 Num_DWB_flush_block_sort      =          0
 Total_time_DWB_flush_block_sort =          0
@@ -676,10 +679,8 @@ WORKER,PAGE_BTREE_R  ,BUF_NON_DIRTY,HOLDER_NON_DIRTY,READ  =         11
 Time_data_page_lock_acquire_time:
 Time_data_page_hold_acquire_time:
 Time_data_page_fix_acquire_time:
-WORKER,PAGE_UNKNOWN  ,NEW_NO_WAIT       ,WRITE,UNCOND      =             1000
-WORKER,PAGE_HEAP     ,OLD_NO_WAIT       ,READ ,COND        =           107000
-WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,COND        =            15000
-WORKER,PAGE_CATALOG  ,OLD_NO_WAIT       ,READ ,UNCOND      =             1000
+WORKER,PAGE_HEAP     ,OLD_NO_WAIT       ,READ ,COND        =           115000
+WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,COND        =            16000
 Num_mvcc_snapshot_ext:
 Time_obj_lock_acquire_time:
 Thread_stats_counters_timers:

@@ -1,5 +1,5 @@
 
-	Mon July 06 18:49:36 KST 2026
+	Tue July 07 08:16:01 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          0
@@ -19,14 +19,14 @@ Num_data_page_dirties         =          0
 Num_data_page_ioreads         =          0
 Num_data_page_iowrites        =          0
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      31016
+Num_data_page_private_quota   =      31000
 Num_data_page_private_count   =          0
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          0
-Num_data_page_lru1            =         24
+Num_data_page_lru1            =         26
 Num_data_page_lru2            =         24
-Num_data_page_lru3            =         46
-Num_data_page_victim_candidate =         46
+Num_data_page_lru3            =         45
+Num_data_page_victim_candidate =         45
 Num_log_page_fetches          =          0
 Num_log_page_ioreads          =          0
 Num_log_page_iowrites         =          0
@@ -106,13 +106,16 @@ Num_query_hashjoins_partitioned =          0
 Num_query_hashjoins_parallel  =          0
 Num_query_objfetches          =          0
 Num_query_holdable_cursors    =          0
-Num_workmem_degrades          =          0
 Num_workmem_reserved_bytes    =          0
 Num_workmem_cap_bytes         =  267780096
 Num_workmem_op_limit_spills_sort =          0
 Num_workmem_op_limit_spills_hash =          0
 Num_workmem_cap_pressure_spills =          0
 Num_workmem_reserved_peak     =          0
+Num_workmem_soft_reserved_peak =          0
+Num_workmem_spill_read_bytes  =          0
+Num_workmem_spill_write_bytes =          0
+Num_workmem_mro_gate_rejects  =          0
 Num_sort_io_pages             =          0
 Num_sort_data_pages           =          0
 Num_network_requests          =          2
@@ -571,10 +574,10 @@ Total_time_DWB_file_sync_helper =          0
 Max_time_DWB_file_sync_helper =          0
 Avg_time_DWB_file_sync_helper =          0
 The timer values for DWB_flush_block_cond_wait are:
-Num_DWB_flush_block_cond_wait =          0
-Total_time_DWB_flush_block_cond_wait =          0
-Max_time_DWB_flush_block_cond_wait =          0
-Avg_time_DWB_flush_block_cond_wait =          0
+Num_DWB_flush_block_cond_wait =          1
+Total_time_DWB_flush_block_cond_wait =       1000
+Max_time_DWB_flush_block_cond_wait =       1000
+Avg_time_DWB_flush_block_cond_wait =       1000
 The timer values for DWB_flush_block_sort are:
 Num_DWB_flush_block_sort      =          0
 Total_time_DWB_flush_block_sort =          0

@@ -1,5 +1,5 @@
 ===== serial =====
-cubrid_rel=CUBRID 11.5.0 (11.5.0.2509-056ac6c) (64bit release build for Linux) (Jul  6 2026 18:26:55)
+cubrid_rel=CUBRID 11.5.0 (11.5.0.2522-f2c9014) (64bit release build for Linux) (Jul  7 2026 06:08:27)
 data_buffer_size=512.0M (512.0M)
 parallelism=1 (4)
 max_parallel_workers=1 (100)
@@ -8,7 +8,7 @@ CUBRID_WM_SORT_NEW=<unset>
 CUBRID_WM_HASHJOIN_NEW=<unset>
 serial: new_backed_create_delta=2 old_touch_on_new_delta=0
 ===== parallel =====
-cubrid_rel=CUBRID 11.5.0 (11.5.0.2509-056ac6c) (64bit release build for Linux) (Jul  6 2026 18:26:55)
+cubrid_rel=CUBRID 11.5.0 (11.5.0.2522-f2c9014) (64bit release build for Linux) (Jul  7 2026 06:08:27)
 data_buffer_size=512.0M (512.0M)
 parallelism=8 (4)
 max_parallel_workers=8 (100)
