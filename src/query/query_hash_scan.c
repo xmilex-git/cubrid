@@ -727,6 +727,46 @@ hscan_value_arena_destroy (HSCAN_VALUE_ARENA * arena)
   free (arena);
 }
 
+/*
+ * hscan_value_arena_reset () - issue #147 T1 S2 (V4): rewind the arena for
+ *   batch-boundary reuse without a destroy+recreate malloc/free storm (PG
+ *   batchCxt-reset equivalent). Keeps the single largest block (used = 0,
+ *   the common case -- most batches never grow past one block) and frees any
+ *   extra blocks a larger-than-usual batch grew.
+ */
+void
+hscan_value_arena_reset (HSCAN_VALUE_ARENA * arena)
+{
+  if (arena == NULL || arena->head == NULL)
+    {
+      return;
+    }
+
+  struct hscan_value_arena_block *best = arena->head;
+  for (struct hscan_value_arena_block * b = arena->head; b != NULL; b = b->next)
+    {
+      if (b->size > best->size)
+	{
+	  best = b;
+	}
+    }
+
+  struct hscan_value_arena_block *b = arena->head;
+  while (b != NULL)
+    {
+      struct hscan_value_arena_block *next = b->next;
+      if (b != best)
+	{
+	  free (b);
+	}
+      b = next;
+    }
+
+  best->used = 0;
+  best->next = NULL;
+  arena->head = best;
+}
+
 static char *
 hscan_value_arena_bump (HSCAN_VALUE_ARENA * arena, size_t n)
 {

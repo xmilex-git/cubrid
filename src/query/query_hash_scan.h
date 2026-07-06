@@ -228,6 +228,9 @@ HASH_SCAN_VALUE *qdata_alloc_hscan_value_OID (THREAD_ENTRY * thread_p, QFILE_LIS
  * callback used when the table's values are arena-owned. */
 HSCAN_VALUE_ARENA *hscan_value_arena_create (void);
 void hscan_value_arena_destroy (HSCAN_VALUE_ARENA * arena);
+/* #147 T1 S2 (V4): rewind for batch-boundary reuse (block(s) preserved where
+ * possible, used = 0) -- no destroy+recreate churn between Grace batches. */
+void hscan_value_arena_reset (HSCAN_VALUE_ARENA * arena);
 HASH_SCAN_VALUE *qdata_alloc_hscan_value_arena (HSCAN_VALUE_ARENA * arena, QFILE_TUPLE tpl);
 int qdata_noop_free_hscan_entry (const void *key, void *data, void *args);
 
