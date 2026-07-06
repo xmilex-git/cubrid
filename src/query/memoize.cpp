@@ -18,6 +18,7 @@
 
 #include "memoize.hpp"
 
+#include "dbtype.h"		/* db_make_int / db_get_int (#146 T3 S3b selftest) */
 #include "error_code.h"
 #include "memory_alloc.h"
 #include "memory_hash.h"
@@ -1355,6 +1356,177 @@ extern "C"
 	  }
 	return ER_FAILED;
 	break;
+      }
+
+    return NO_ERROR;
+  }
+
+  /*
+   * memoize_storage_selftest () - #146 T3 S3b: in-server self-test of
+   *   memoize::storage's LRU eviction (D2/§5), exercised directly against
+   *   the storage class (bypassing new_storage()'s XASL-plan eligibility
+   *   checker, which needs a real query plan) with a one-INT-column
+   *   key/value fixture. Gated by env CUBRID_WM_MEMOIZE_SELFTEST.
+   *   Checks:
+   *     (a) a tiny budget actually evicts -- not all inserted keys stay resident
+   *     (b) an evicted key's next get() is a miss, and after recomputing +
+   *         put()ing again, get() hits with the newly recomputed value
+   *     (c) a single entry whose own footprint exceeds the whole budget is
+   *         bypassed (never retained), but the storage stays enabled
+   *     (d) the work_mem accountant nets back to the pre-test reading once
+   *         the storage is destroyed (no charge leak)
+   *   Returns 0 on PASS.
+   */
+  int
+  memoize_storage_selftest (THREAD_ENTRY *thread_p)
+  {
+    using namespace memoize;
+
+    DB_VALUE key_dbval;
+    DB_VALUE val_dbval;
+    db_make_int (&key_dbval, 0);
+    db_make_int (&val_dbval, 0);
+
+    qproc_db_value_list val_node;
+    val_node.next = NULL;
+    val_node.val = &val_dbval;
+    val_node.dom = NULL;
+
+    VAL_LIST val_list;
+    val_list.valp = &val_node;
+    val_list.val_cnt = 1;
+
+    std::vector<DB_VALUE *> key_ptr_src;
+    key_ptr_src.push_back (&key_dbval);
+
+    const std::size_t reserved_before = temp_page_store::reserved_bytes ();
+
+    /* (a) + (b): tiny budget (fits only ~1-2 entries), insert 20 distinct keys */
+    {
+      /* must clear sizeof(storage) itself (several std:: containers as direct
+       * members) plus room for a handful of entries, or every put() bounces
+       * back out immediately regardless of insertion order and this test
+       * degenerates into testing (c)'s bypass case instead of (a)/(b). */
+      const size_t tiny_budget = sizeof (storage) + 600;
+      storage *s = new storage (thread_p, tiny_budget, 1, 1, &val_list);
+      s->init (key_ptr_src);
+
+      const int n_keys = 20;
+      for (int i = 0; i < n_keys; i++)
+	{
+	  db_make_int (&key_dbval, i);
+	  s->set_key_changed ();
+	  if (s->get () != result_code::NOT_FOUND)
+	    {
+	      delete s;
+	      return ER_FAILED;
+	    }
+	  db_make_int (&val_dbval, i * 10);
+	  if (s->put () != result_code::SUCCESS)
+	    {
+	      delete s;
+	      return ER_FAILED;
+	    }
+	  if (s->put_nullptr () != result_code::SUCCESS)
+	    {
+	      delete s;
+	      return ER_FAILED;
+	    }
+	}
+
+      if (s->is_disabled ())
+	{
+	  /* eviction must never fall back to the old permanent hard stop */
+	  delete s;
+	  return ER_FAILED;
+	}
+
+      /* (a) the oldest key must have been evicted (LRU) -- not everything fits */
+      db_make_int (&key_dbval, 0);
+      s->set_key_changed ();
+      if (s->get () != result_code::NOT_FOUND)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+
+      /* (b) recompute + put again, then get() must hit with the NEW value */
+      db_make_int (&val_dbval, 999);
+      if (s->put () != result_code::SUCCESS)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+      if (s->put_nullptr () != result_code::SUCCESS)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+
+      db_make_int (&key_dbval, 0);
+      s->set_key_changed ();
+      if (s->get () != result_code::SUCCESS)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+      if (db_get_int (&val_dbval) != 999)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+
+      delete s;
+    }
+
+    /* (c): a single entry whose own footprint exceeds the whole budget must be
+     * bypassed (inserted then immediately evicted back out), not retained,
+     * and must not disable the storage. */
+    {
+      const size_t impossibly_tiny_budget = 8;
+      storage *s = new storage (thread_p, impossibly_tiny_budget, 1, 1, &val_list);
+      s->init (key_ptr_src);
+
+      db_make_int (&key_dbval, 0);
+      s->set_key_changed ();
+      if (s->get () != result_code::NOT_FOUND)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+      db_make_int (&val_dbval, 42);
+      if (s->put () != result_code::SUCCESS)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+      if (s->put_nullptr () != result_code::SUCCESS)
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+      if (s->is_disabled ())
+	{
+	  delete s;
+	  return ER_FAILED;
+	}
+
+      db_make_int (&key_dbval, 0);
+      s->set_key_changed ();
+      if (s->get () != result_code::NOT_FOUND)
+	{
+	  /* must have been bypassed, not retained */
+	  delete s;
+	  return ER_FAILED;
+	}
+
+      delete s;
+    }
+
+    /* (d): no charge leak once every storage above has been destroyed */
+    if (temp_page_store::reserved_bytes () != reserved_before)
+      {
+	return ER_FAILED;
       }
 
     return NO_ERROR;

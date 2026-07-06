@@ -169,6 +169,10 @@ extern "C"
   int memoize_get (THREAD_ENTRY *thread_p, xasl_node *xasl, bool *success, bool *is_ended);
   int memoize_put (THREAD_ENTRY *thread_p, xasl_node *xasl, bool *success);
   int memoize_put_nullptr (THREAD_ENTRY *thread_p, xasl_node *xasl, bool *success);
+
+  /* #146 T3 S3b: in-server self-test of memoize::storage's LRU eviction
+   * (D2/§5) -- gated by env CUBRID_WM_MEMOIZE_SELFTEST. Returns 0 on PASS. */
+  int memoize_storage_selftest (THREAD_ENTRY *thread_p);
 }
 
 #endif /* _MEMOIZE_HPP_ */

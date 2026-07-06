@@ -27,7 +27,7 @@
 #include <string.h>
 
 #include "xasl.h"
-#include "dbtype.h"
+#include "dbtype.h"		/* db_make_int / db_get_int (#146 T3 S3b selftest) */
 #include "query_executor.h"
 #include "xasl_predicate.hpp"
 #include "regu_var.hpp"
@@ -510,7 +510,9 @@ sq_get (THREAD_ENTRY * thread_p, SQ_KEY * key, XASL_NODE * xasl, REGU_VARIABLE *
          adapting to the effectiveness of the cache. */
       if ((double) SQ_CACHE_SIZE (xasl) > (double) SQ_CACHE_SIZE_MAX (xasl) * 0.6)
 	{
-	  if (SQ_CACHE_HIT (xasl) / SQ_CACHE_MISS (xasl) < SQ_CACHE_MIN_HIT_RATIO)
+	  /* #146 T3 S3b: guard against div-by-zero -- with no miss recorded
+	   * yet, there is no ratio to evaluate; do not disable. */
+	  if (SQ_CACHE_MISS (xasl) > 0 && SQ_CACHE_HIT (xasl) / SQ_CACHE_MISS (xasl) < SQ_CACHE_MIN_HIT_RATIO)
 	    {
 	      SQ_CACHE_ENABLED (xasl) = false;
 	      return false;
@@ -577,4 +579,249 @@ sq_cache_destroy (THREAD_ENTRY * thread_p, SQ_CACHE * sq_cache)
       sq_cache->wm_charged_bytes = 0;
       sq_cache->wm_charged_shard = -1;
     }
+}
+
+/*
+ * sq_cache_selftest () - #146 T3 S3b: in-server self-test of sq_cache's LRU
+ *   eviction (D2/§5), exercised directly against sq_put()/sq_get() with a
+ *   minimal one-INT-key/one-INT-value XASL_NODE/SQ_CACHE fixture (bypassing
+ *   the parser-level pt_prepare_corr_subquery_hash_result_cache eligibility
+ *   check, which needs a real query plan). Gated by env
+ *   CUBRID_WM_SQCACHE_SELFTEST. Checks:
+ *     (a) a tiny budget actually evicts -- not all inserted keys stay resident
+ *     (b) an evicted key's next sq_get() is a miss, and after recomputing +
+ *         sq_put()ing again, sq_get() hits with the newly recomputed value
+ *     (c) a single entry whose own footprint exceeds the whole budget is
+ *         bypassed (never retained), but the cache stays enabled
+ *     (d) the work_mem accountant nets back to the pre-test reading once
+ *         the cache is destroyed (no charge leak)
+ *   Returns 0 on PASS.
+ */
+int
+sq_cache_selftest (THREAD_ENTRY * thread_p)
+{
+  UINT64 saved_work_mem = (UINT64) prm_get_bigint_value (PRM_ID_WORK_MEM);
+  float saved_multiplier = prm_get_float_value (PRM_ID_HASH_MEM_MULTIPLIER);
+  const std::size_t reserved_before = temp_page_store::reserved_bytes ();
+  DB_VALUE key_dbval;
+  SQ_KEY sq_key_struct;
+  DB_VALUE *sq_key_dbv_array[1];
+  SQ_CACHE sq_cache_obj;
+  XASL_NODE xasl;
+  int rc = NO_ERROR;
+
+  db_make_int (&key_dbval, 0);
+  sq_key_dbv_array[0] = &key_dbval;
+  sq_key_struct.dbv_array = sq_key_dbv_array;
+  sq_key_struct.n_elements = 1;
+
+  memset (&sq_cache_obj, 0, sizeof (sq_cache_obj));
+  sq_cache_obj.sq_key_struct = &sq_key_struct;
+  sq_cache_obj.wm_charged_shard = -1;
+
+  memset (&xasl, 0, sizeof (xasl));
+  xasl.sq_cache = &sq_cache_obj;
+
+  /* (a) + (b): tiny budget (fits only a handful of entries), 20 distinct keys */
+  prm_set_bigint_value (PRM_ID_WORK_MEM, 2048);
+  prm_set_float_value (PRM_ID_HASH_MEM_MULTIPLIER, 1.0f);
+  {
+    const int n_keys = 20;
+    int i;
+
+    for (i = 0; i < n_keys && rc == NO_ERROR; i++)
+      {
+	DB_VALUE v;
+	REGU_VARIABLE regu;
+	SQ_KEY *key;
+
+	db_make_int (&key_dbval, i);
+	key = sq_make_key (thread_p, &xasl);
+	if (key == NULL)
+	  {
+	    rc = ER_FAILED;
+	    break;
+	  }
+
+	memset (&regu, 0, sizeof (regu));
+	db_make_int (&v, i * 10);
+	regu.type = TYPE_CONSTANT;
+	regu.value.dbvalptr = &v;
+
+	if (sq_put (thread_p, key, &xasl, &regu) != NO_ERROR)
+	  {
+	    sq_free_key (thread_p, key);
+	    rc = ER_FAILED;
+	  }
+      }
+
+    if (rc == NO_ERROR && !SQ_CACHE_ENABLED (&xasl))
+      {
+	/* eviction must never fall back to the old permanent hard stop */
+	rc = ER_FAILED;
+      }
+
+    if (rc == NO_ERROR)
+      {
+	/* (a) the oldest key must have been evicted (LRU) -- not everything fits */
+	DB_VALUE v0;
+	REGU_VARIABLE regu0;
+	SQ_KEY *key0;
+
+	db_make_int (&key_dbval, 0);
+	key0 = sq_make_key (thread_p, &xasl);
+	memset (&regu0, 0, sizeof (regu0));
+	regu0.type = TYPE_CONSTANT;
+	regu0.value.dbvalptr = &v0;
+
+	if (key0 == NULL || sq_get (thread_p, key0, &xasl, &regu0))
+	  {
+	    rc = ER_FAILED;
+	  }
+	if (key0 != NULL)
+	  {
+	    sq_free_key (thread_p, key0);
+	  }
+	/* the miss just recorded above is what (a) is testing; reset the
+	 * hit/miss counters so it doesn't also trip the pre-existing,
+	 * orthogonal "disable on poor hit ratio" breaker (sq_get's 60%-full
+	 * check) before (b) gets to test recompute-after-eviction
+	 * correctness. */
+	SQ_CACHE_HIT (&xasl) = 0;
+	SQ_CACHE_MISS (&xasl) = 0;
+      }
+
+    if (rc == NO_ERROR)
+      {
+	/* (b) recompute + put again, then get() must hit with the NEW value */
+	DB_VALUE v;
+	REGU_VARIABLE regu;
+	SQ_KEY *key;
+
+	db_make_int (&key_dbval, 0);
+	key = sq_make_key (thread_p, &xasl);
+	memset (&regu, 0, sizeof (regu));
+	db_make_int (&v, 999);
+	regu.type = TYPE_CONSTANT;
+	regu.value.dbvalptr = &v;
+
+	if (key == NULL || sq_put (thread_p, key, &xasl, &regu) != NO_ERROR)
+	  {
+	    if (key != NULL)
+	      {
+		sq_free_key (thread_p, key);
+	      }
+	    rc = ER_FAILED;
+	  }
+
+	if (rc == NO_ERROR)
+	  {
+	    DB_VALUE v2;
+	    REGU_VARIABLE regu2;
+	    SQ_KEY *key2;
+
+	    db_make_int (&key_dbval, 0);
+	    key2 = sq_make_key (thread_p, &xasl);
+	    memset (&regu2, 0, sizeof (regu2));
+	    regu2.type = TYPE_CONSTANT;
+	    regu2.value.dbvalptr = &v2;
+
+	    if (key2 == NULL || !sq_get (thread_p, key2, &xasl, &regu2) || db_get_int (&v2) != 999)
+	      {
+		rc = ER_FAILED;
+	      }
+	    if (key2 != NULL)
+	      {
+		sq_free_key (thread_p, key2);
+	      }
+	  }
+      }
+  }
+  sq_cache_destroy (thread_p, &sq_cache_obj);
+
+  /* (c): a single entry whose own footprint exceeds the whole budget must be
+   * bypassed (skipped, not retained), and must not disable the cache. */
+  if (rc == NO_ERROR)
+    {
+      DB_VALUE v;
+      REGU_VARIABLE regu;
+      SQ_KEY *key;
+
+      memset (&sq_cache_obj, 0, sizeof (sq_cache_obj));
+      sq_cache_obj.sq_key_struct = &sq_key_struct;
+      sq_cache_obj.wm_charged_shard = -1;
+      xasl.sq_cache = &sq_cache_obj;
+
+      prm_set_bigint_value (PRM_ID_WORK_MEM, 1);
+      prm_set_float_value (PRM_ID_HASH_MEM_MULTIPLIER, 1.0f);
+
+      db_make_int (&key_dbval, 0);
+      key = sq_make_key (thread_p, &xasl);
+      memset (&regu, 0, sizeof (regu));
+      db_make_int (&v, 42);
+      regu.type = TYPE_CONSTANT;
+      regu.value.dbvalptr = &v;
+
+      if (key == NULL)
+	{
+	  rc = ER_FAILED;
+	}
+      else
+	{
+	  /* #146 T3 S3b: sq_put()'s documented bypass contract is to return
+	   * ER_FAILED here (see the "doesn't fit" branch in sq_put) -- that is
+	   * the outcome under test, not a selftest failure. Per that same
+	   * contract, sq_put() only frees val internally; key remains owned
+	   * by the caller either way. */
+	  int put_rc = sq_put (thread_p, key, &xasl, &regu);
+
+	  sq_free_key (thread_p, key);
+
+	  if (put_rc == NO_ERROR)
+	    {
+	      /* a 1-byte budget should never actually retain this entry */
+	      rc = ER_FAILED;
+	    }
+	  else if (!SQ_CACHE_ENABLED (&xasl))
+	    {
+	      /* bypass of one oversized entry must not disable the cache */
+	      rc = ER_FAILED;
+	    }
+	  else
+	    {
+	      DB_VALUE v2;
+	      REGU_VARIABLE regu2;
+	      SQ_KEY *key2;
+
+	      db_make_int (&key_dbval, 0);
+	      key2 = sq_make_key (thread_p, &xasl);
+	      memset (&regu2, 0, sizeof (regu2));
+	      regu2.type = TYPE_CONSTANT;
+	      regu2.value.dbvalptr = &v2;
+
+	      if (key2 == NULL || sq_get (thread_p, key2, &xasl, &regu2))
+		{
+		  /* must have been bypassed, not retained */
+		  rc = ER_FAILED;
+		}
+	      if (key2 != NULL)
+		{
+		  sq_free_key (thread_p, key2);
+		}
+	    }
+	}
+
+      sq_cache_destroy (thread_p, &sq_cache_obj);
+    }
+
+  prm_set_bigint_value (PRM_ID_WORK_MEM, saved_work_mem);
+  prm_set_float_value (PRM_ID_HASH_MEM_MULTIPLIER, saved_multiplier);
+
+  /* (d): no charge leak once every sq_cache above has been destroyed */
+  if (rc == NO_ERROR && temp_page_store::reserved_bytes () != reserved_before)
+    {
+      rc = ER_FAILED;
+    }
+
+  return rc;
 }

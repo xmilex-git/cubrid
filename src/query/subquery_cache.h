@@ -37,6 +37,10 @@ extern void sq_cache_destroy (THREAD_ENTRY * thread_p, SQ_CACHE * sq_cache);
 extern SQ_KEY *sq_make_key (THREAD_ENTRY * thread_p, xasl_node * xasl);
 extern void sq_free_key (THREAD_ENTRY * thread_p, SQ_KEY * key);
 
+/* #146 T3 S3b: in-server self-test of sq_cache's LRU eviction (D2/§5) --
+ * gated by env CUBRID_WM_SQCACHE_SELFTEST. Returns 0 on PASS. */
+extern int sq_cache_selftest (THREAD_ENTRY * thread_p);
+
 #define SQ_CACHE_MIN_HIT_RATIO 9	/* it means 90% */
 #define SQ_CACHE_EXPECTED_ENTRY_SIZE 512
 

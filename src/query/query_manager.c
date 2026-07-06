@@ -45,6 +45,8 @@
 #include "qfile_page_spill.hpp"
 #include "qfile_tape.hpp"
 #include "qfile_tape_selftest.hpp"
+#include "memoize.hpp"		/* memoize_storage_selftest (#146 T3 S3b) */
+#include "subquery_cache.h"	/* sq_cache_selftest (#146 T3 S3b) */
 #include "stream_to_xasl.h"
 #include "session.h"
 #include "filter_pred_cache.h"
@@ -1297,6 +1299,32 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  er_log_debug (ARG_FILE_LINE, "WORKMEM_OPLIMIT_SELFTEST FAIL result=%d\n", oplimit_selftest_rc);
 	  fprintf (stderr, "WORKMEM_OPLIMIT_SELFTEST FAIL result=%d\n", oplimit_selftest_rc);
 	  assert (oplimit_selftest_rc == NO_ERROR);
+	}
+    }
+  if (getenv ("CUBRID_WM_MEMOIZE_SELFTEST") != NULL)
+    {
+      /* #146 T3 S3b: memoize::storage LRU eviction (D2/§5). */
+      int memoize_selftest_rc = memoize_storage_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "MEMOIZE_SELFTEST result=%d (0=PASS)\n", memoize_selftest_rc);
+      fprintf (stderr, "MEMOIZE_SELFTEST result=%d (0=PASS)\n", memoize_selftest_rc);
+      if (memoize_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "MEMOIZE_SELFTEST FAIL result=%d\n", memoize_selftest_rc);
+	  fprintf (stderr, "MEMOIZE_SELFTEST FAIL result=%d\n", memoize_selftest_rc);
+	  assert (memoize_selftest_rc == NO_ERROR);
+	}
+    }
+  if (getenv ("CUBRID_WM_SQCACHE_SELFTEST") != NULL)
+    {
+      /* #146 T3 S3b: sq_cache LRU eviction (D2/§5). */
+      int sqcache_selftest_rc = sq_cache_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "SQCACHE_SELFTEST result=%d (0=PASS)\n", sqcache_selftest_rc);
+      fprintf (stderr, "SQCACHE_SELFTEST result=%d (0=PASS)\n", sqcache_selftest_rc);
+      if (sqcache_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "SQCACHE_SELFTEST FAIL result=%d\n", sqcache_selftest_rc);
+	  fprintf (stderr, "SQCACHE_SELFTEST FAIL result=%d\n", sqcache_selftest_rc);
+	  assert (sqcache_selftest_rc == NO_ERROR);
 	}
     }
 
