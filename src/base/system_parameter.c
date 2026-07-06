@@ -135,6 +135,8 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_WORK_MEM "work_mem"
 
+#define PRM_NAME_HASH_MEM_MULTIPLIER "hash_mem_multiplier"
+
 #define PRM_NAME_PB_NBUFFERS "data_buffer_pages"
 
 #define PRM_NAME_PAGE_BUFFER_SIZE "data_buffer_size"
@@ -1133,6 +1135,18 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.bi = 4LL * 1024 * 1024 /* 4 MB */ }},
    {false, {.bi = 4LL * 1024 * 1024 * 1024 /* 4 GB */ }},
    {false, {.bi = 64LL * 1024 /* 64 KB */ }},
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_HASH_MEM_MULTIPLIER,
+   PRM_NAME_HASH_MEM_MULTIPLIER,
+   (PRM_FOR_SESSION | PRM_FOR_QRY_STRING | PRM_USER_CHANGE | PRM_FOR_SERVER | PRM_FOR_CLIENT),
+   PRM_FLOAT,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.f = 2.0f}},
+   {false, {.f = 2.0f}},
+   {false, {.f = 1000.0f}},
+   {false, {.f = 1.0f}},
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},

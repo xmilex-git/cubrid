@@ -1286,6 +1286,19 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	}
     }
 #endif /* !NDEBUG */
+  if (getenv ("CUBRID_WM_OPLIMIT_SELFTEST") != NULL)
+    {
+      /* #146 T3 S0: per-op work_mem limit accessor (row_store / hash * multiplier). */
+      int oplimit_selftest_rc = qfile_workmem_op_limit_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "WORKMEM_OPLIMIT_SELFTEST result=%d (0=PASS)\n", oplimit_selftest_rc);
+      fprintf (stderr, "WORKMEM_OPLIMIT_SELFTEST result=%d (0=PASS)\n", oplimit_selftest_rc);
+      if (oplimit_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "WORKMEM_OPLIMIT_SELFTEST FAIL result=%d\n", oplimit_selftest_rc);
+	  fprintf (stderr, "WORKMEM_OPLIMIT_SELFTEST FAIL result=%d\n", oplimit_selftest_rc);
+	  assert (oplimit_selftest_rc == NO_ERROR);
+	}
+    }
 
   return scan_initialize ();
 }

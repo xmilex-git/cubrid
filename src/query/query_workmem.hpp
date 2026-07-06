@@ -63,5 +63,19 @@ namespace temp_page_store
 
   std::size_t cap_bytes () noexcept;
   std::size_t reserved_bytes () noexcept;
+
+  /* #146 T3 S0 (contract only): per-operation layer-1 hard limit, PG two-tier
+   * model (D7/D8).  row_store = sort/tuplestore/list-membuf state, limit =
+   * session work_mem.  hash = hash build/agg-hash/memoize-like state, limit =
+   * session work_mem * session hash_mem_multiplier.  This slice adds the
+   * accessor only; existing call sites keep reading PRM_ID_WORK_MEM directly
+   * until a later slice switches them over. */
+  enum class op_workmem_kind
+  {
+    row_store,
+    hash
+  };
+
+  std::size_t op_limit_bytes (op_workmem_kind kind) noexcept;
 }
 #endif /* _QUERY_WORKMEM_HPP_ */

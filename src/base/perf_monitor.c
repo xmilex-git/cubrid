@@ -304,6 +304,11 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_NUM_DEGRADES, "Num_workmem_degrades"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_RESERVED_BYTES, "Num_workmem_reserved_bytes"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_CAP_BYTES, "Num_workmem_cap_bytes"),
+  /* #146 T3 S0: skeleton only -- no increment/peek site wired yet. */
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_OP_LIMIT_SPILLS_SORT, "Num_workmem_op_limit_spills_sort"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_OP_LIMIT_SPILLS_HASH, "Num_workmem_op_limit_spills_hash"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_CAP_PRESSURE_SPILLS, "Num_workmem_cap_pressure_spills"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_RESERVED_PEAK, "Num_workmem_reserved_peak"),
 
   /* Execution statistics for external sort */
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_SORT_NUM_IO_PAGES, "Num_sort_io_pages"),

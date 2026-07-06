@@ -360,6 +360,27 @@ namespace temp_page_store
   }
 
   std::size_t
+  op_limit_bytes (op_workmem_kind kind) noexcept
+  {
+    const std::size_t work_mem_bytes = static_cast<std::size_t> (prm_get_bigint_value (PRM_ID_WORK_MEM));
+    if (kind != op_workmem_kind::hash)
+      {
+        return work_mem_bytes;
+      }
+
+    /* PRM_ID_HASH_MEM_MULTIPLIER is clamped to [1.0, 1000.0] at SET time
+     * (system_parameter.c), so this is never a narrowing below work_mem. */
+    const float multiplier = std::max (prm_get_float_value (PRM_ID_HASH_MEM_MULTIPLIER), 1.0f);
+    const double scaled = static_cast<double> (work_mem_bytes) * static_cast<double> (multiplier);
+    if (scaled >= static_cast<double> (std::numeric_limits<std::size_t>::max ()))
+      {
+        return std::numeric_limits<std::size_t>::max ();
+      }
+
+    return static_cast<std::size_t> (scaled);
+  }
+
+  std::size_t
   position_budget_bytes () noexcept
   {
     /* Fixed-size segment-aware tuple positions.  Charge the held reservation for widened saved-scan,

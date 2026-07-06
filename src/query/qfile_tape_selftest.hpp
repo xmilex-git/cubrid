@@ -74,4 +74,11 @@ int qfile_freeze_oom_selftest (THREAD_ENTRY *thread_p);
 int qfile_emfile_fault_selftest (THREAD_ENTRY *thread_p);
 #endif /* !NDEBUG */
 
+/* In-server self-test of #146 T3 S0's per-operation work_mem limit accessor
+ * (temp_page_store::op_limit_bytes): asserts row_store == session work_mem,
+ * hash == session work_mem * session hash_mem_multiplier, and that a session
+ * hash_mem_multiplier change is reflected without a server restart.  Gated by
+ * env CUBRID_WM_OPLIMIT_SELFTEST (debug).  Returns 0 on PASS. */
+int qfile_workmem_op_limit_selftest (THREAD_ENTRY *thread_p);
+
 #endif /* _QFILE_TAPE_SELFTEST_HPP_ */

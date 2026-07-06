@@ -650,6 +650,55 @@ qfile_producer_selftest (THREAD_ENTRY *thread_p)
   return rc;
 }
 
+/* ------------------------------------------------------------------ */
+/* In-server self-test: #146 T3 S0 per-op work_mem limit accessor      */
+/* Gated by env CUBRID_WM_OPLIMIT_SELFTEST (debug-only invocation).    */
+/* ------------------------------------------------------------------ */
+
+int
+qfile_workmem_op_limit_selftest (THREAD_ENTRY *thread_p)
+{
+  (void) thread_p;
+  int rc = NO_ERROR;
+
+  const UINT64 saved_work_mem = prm_get_bigint_value (PRM_ID_WORK_MEM);
+  const float saved_multiplier = prm_get_float_value (PRM_ID_HASH_MEM_MULTIPLIER);
+
+  const UINT64 test_work_mem = 8ULL * 1024 * 1024;
+  prm_set_bigint_value (PRM_ID_WORK_MEM, test_work_mem);
+  prm_set_float_value (PRM_ID_HASH_MEM_MULTIPLIER, 2.0f);
+
+  /* row-store-shaped state (sort/tuplestore/list membuf) reads pure work_mem. */
+  if (temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::row_store) != test_work_mem)
+    {
+      rc = ER_FAILED;
+    }
+
+  /* hash-shaped state (hash build/agg hash/memoize-like) reads work_mem * multiplier. */
+  if (rc == NO_ERROR
+      && temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash) != test_work_mem * 2)
+    {
+      rc = ER_FAILED;
+    }
+
+  /* a session hash_mem_multiplier change must be reflected without a restart. */
+  if (rc == NO_ERROR)
+    {
+      prm_set_float_value (PRM_ID_HASH_MEM_MULTIPLIER, 4.0f);
+      if (temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash) != test_work_mem * 4)
+	{
+	  rc = ER_FAILED;
+	}
+    }
+
+  prm_set_bigint_value (PRM_ID_WORK_MEM, saved_work_mem);
+  prm_set_float_value (PRM_ID_HASH_MEM_MULTIPLIER, saved_multiplier);
+
+  er_log_debug (ARG_FILE_LINE, "WORKMEM_OPLIMIT_SELFTEST result=%d (0=PASS)\n", rc);
+  fprintf (stderr, "WORKMEM_OPLIMIT_SELFTEST result=%d (0=PASS)\n", rc);
+  return rc;
+}
+
 #if !defined (NDEBUG)
 /* ------------------------------------------------------------------ */
 /* In-server self-test: close/freeze ENOSPC failure propagation      */

@@ -377,6 +377,14 @@ typedef enum
   PSTAT_WORKMEM_NUM_DEGRADES,
   PSTAT_WORKMEM_RESERVED_BYTES,
   PSTAT_WORKMEM_CAP_BYTES,
+  /* #146 T3 S0 (contract only): counter skeleton -- registered here, not yet
+   * wired to any increment/peek site.  Layer-1 per-op limit spills split by
+   * consumer shape (S4 replaces PSTAT_WORKMEM_NUM_DEGRADES with these);
+   * layer-2 cap-pressure spills; reserved high-water peak. */
+  PSTAT_WORKMEM_OP_LIMIT_SPILLS_SORT,
+  PSTAT_WORKMEM_OP_LIMIT_SPILLS_HASH,
+  PSTAT_WORKMEM_CAP_PRESSURE_SPILLS,
+  PSTAT_WORKMEM_RESERVED_PEAK,
 
   /* Execution statistics for external sort */
   PSTAT_SORT_NUM_IO_PAGES,
