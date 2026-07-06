@@ -14823,9 +14823,17 @@ ptqo_to_merge_list_proc (PARSER_CONTEXT * parser, XASL_NODE * left, XASL_NODE * 
  *   parser(in): Parser context.
  *   outer_xasl(in): XASL node for outer input of the hash join.
  *   inner_xasl(in): XASL node for inner input of the hash join.
+ *   outer_streamed(in): issue #149 P2 -- true iff the caller (make_hashjoin_proc)
+ *     already confirmed this plan is a JOIN_LEFT/JOIN_RIGHT that is not a
+ *     PARALLEL candidate (plan->parallel_opt_use != PLAN_PARALLEL_OPT_USE).
+ *     When true, outer_xasl is excluded from aptr_list (never aptr-materialized)
+ *     and flagged XASL_HASHJOIN_OUTER_STREAMED so hjoin_execute_grace knows to
+ *     pull/self-materialize it instead. JOIN_INNER always passes false: its
+ *     build/probe side is picked by a runtime size comparison that needs both
+ *     sides' list_id already materialized.
  */
 XASL_NODE *
-pt_to_hashjoin_proc (PARSER_CONTEXT * parser, XASL_NODE * outer_xasl, XASL_NODE * inner_xasl)
+pt_to_hashjoin_proc (PARSER_CONTEXT * parser, XASL_NODE * outer_xasl, XASL_NODE * inner_xasl, bool outer_streamed)
 {
   XASL_NODE *xasl;
   HASHJOIN_PROC_NODE *proc;
@@ -14841,10 +14849,19 @@ pt_to_hashjoin_proc (PARSER_CONTEXT * parser, XASL_NODE * outer_xasl, XASL_NODE 
       return NULL;
     }
 
-  outer_xasl->next = inner_xasl;
-  inner_xasl->next = NULL;
-
-  xasl->aptr_list = outer_xasl;
+  if (outer_streamed)
+    {
+      outer_xasl->next = NULL;
+      inner_xasl->next = NULL;
+      xasl->aptr_list = inner_xasl;
+      XASL_SET_FLAG (outer_xasl, XASL_HASHJOIN_OUTER_STREAMED);
+    }
+  else
+    {
+      outer_xasl->next = inner_xasl;
+      inner_xasl->next = NULL;
+      xasl->aptr_list = outer_xasl;
+    }
 
   proc = &xasl->proc.hashjoin;
   proc->outer.xasl = outer_xasl;

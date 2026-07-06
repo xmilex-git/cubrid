@@ -521,6 +521,13 @@ struct cte_proc_node
 #define XASL_ANALYTIC_SKIP_SORT (0x1 << 21)	/* analytic skip sort optimization */
 #define XASL_DBLINK_CURSOR_REWIND	(0x1 << 22)	/* correlated DBLink subquery: rewind CCI cursor instead of re-issuing cci_execute per outer row */
 #define XASL_CORR_DBLINK		(0x1 << 23)	/* correlated push-down (per-row bind); mutually exclusive with XASL_DBLINK_CURSOR_REWIND */
+#define XASL_HASHJOIN_OUTER_STREAMED	(0x1 << 24)	/* issue #149 P2: set on a HASHJOIN_PROC's outer_xasl at plan
+							 * generation time when it was excluded from aptr_list
+							 * (JOIN_LEFT/JOIN_RIGHT, not a PARALLEL candidate) --
+							 * this node's list_id is NOT pre-materialized by the
+							 * aptr loop; hjoin_execute_grace must pull or
+							 * self-materialize it. Rides through the generic
+							 * xasl->flag (de)serialization, no new stream wiring. */
 
 #define XASL_IS_FLAGED(x, f)        (((x)->flag & (int) (f)) != 0)
 #define IS_DBLINK_CURSOR_REWIND_XASL(x)     XASL_IS_FLAGED ((x), XASL_DBLINK_CURSOR_REWIND)

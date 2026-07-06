@@ -588,7 +588,18 @@ make_hashjoin_proc (QO_ENV * env, QO_PLAN * plan, XASL_NODE * outer_xasl, XASL_N
       goto error_exit;
     }
 
-  xasl = pt_to_hashjoin_proc (parser, outer_xasl, inner_xasl);
+  {
+    /* issue #149 P2: stream outer (exclude it from aptr_list) only for
+     * JOIN_LEFT/JOIN_RIGHT (fixed build/probe assignment, no size compare
+     * needed -- see hjoin_grace_select_build_probe) plans that are not a
+     * PARALLEL candidate (px's hjoin_prepare_partition still needs outer's
+     * list_id fully materialized to hash-partition it -- P5 scope). */
+    JOIN_TYPE plan_join_type = plan->plan_un.join.join_type;
+    bool outer_streamed = (plan_join_type == JOIN_LEFT || plan_join_type == JOIN_RIGHT)
+      && plan->parallel_opt_use != PLAN_PARALLEL_OPT_USE;
+
+    xasl = pt_to_hashjoin_proc (parser, outer_xasl, inner_xasl, outer_streamed);
+  }
   if (xasl == NULL)
     {
       goto error_exit;
@@ -1878,18 +1889,36 @@ check_hashjoin_xasl (QO_ENV * env, XASL_NODE * xasl)
 	}
     }
 
-  if (hashjoin_xasl == NULL || hashjoin_xasl->type != HASHJOIN_PROC || hashjoin_xasl->aptr_list == NULL	/* outer */
-      || hashjoin_xasl->aptr_list->next == NULL /* inner */ )
+  if (hashjoin_xasl == NULL || hashjoin_xasl->type != HASHJOIN_PROC || hashjoin_xasl->aptr_list == NULL)
     {
       goto error_exit;
     }
-  assert (hashjoin_xasl->aptr_list->next->next == NULL);
 
   proc = &hashjoin_xasl->proc.hashjoin;
 
   if (proc->outer.xasl == NULL || proc->inner.xasl == NULL)
     {
       goto error_exit;
+    }
+
+  /* issue #149 P2: aptr_list holds outer+inner (2 entries) normally, but
+   * only inner (1 entry, outer_xasl->next left NULL) when
+   * pt_to_hashjoin_proc excluded a streamed outer -- see
+   * XASL_HASHJOIN_OUTER_STREAMED. */
+  if (XASL_IS_FLAGED (proc->outer.xasl, XASL_HASHJOIN_OUTER_STREAMED))
+    {
+      if (hashjoin_xasl->aptr_list != proc->inner.xasl || hashjoin_xasl->aptr_list->next != NULL)
+	{
+	  goto error_exit;
+	}
+    }
+  else
+    {
+      if (hashjoin_xasl->aptr_list->next == NULL /* inner */ )
+	{
+	  goto error_exit;
+	}
+      assert (hashjoin_xasl->aptr_list->next->next == NULL);
     }
 
   merge_info = &proc->merge_info;
