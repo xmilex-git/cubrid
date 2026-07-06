@@ -23,6 +23,7 @@
 #include "memory_hash.h"
 #include "object_primitive.h"
 #include "query_evaluator.h"
+#include "query_workmem.hpp"	/* work_mem accountant: op_limit_bytes / reserve_held_soft_at_shard / release_held / record_op_limit_spill_hash */
 #include "regu_var.hpp"
 #include "system.h"
 #include "system_parameter.h"
@@ -751,6 +752,10 @@ namespace memoize
     , m_keyptr_src ()
     , m_key_value_map ()
     , m_current_value_list ()
+    , m_lru_order ()
+    , m_lru_pos ()
+    , m_wm_charged_bytes (0)
+    , m_wm_charged_shard (-1)
     , disabled (false)
     , has_range (false)
     , key_changed (false)
@@ -785,7 +790,17 @@ namespace memoize
 
     m_keyptr_src.clear();
     m_key_value_map.clear();
+    m_lru_pos.clear();
+    m_lru_order.clear();
     db_change_private_heap (thread_get_thread_entry_info(), heap_id);
+
+    /* #146 T3 S3: release whatever sync_wm_charge() accumulated. */
+    if (m_wm_charged_bytes > 0)
+      {
+	temp_page_store::release_held (m_wm_charged_bytes, m_wm_charged_shard);
+      }
+    m_wm_charged_bytes = 0;
+    m_wm_charged_shard = -1;
   }
 
   void storage::start_timer()
@@ -818,9 +833,14 @@ namespace memoize
       db_change_private_heap (thread_get_thread_entry_info(), heap_id);
     });
     value *v;
-    if (disabled || get_current_size() >= m_max_storage_size)
+    /* #146 T3 S3: the old get_current_size() >= m_max_storage_size branch
+     * here (permanently disabling on a read) is gone -- put()/put_nullptr()
+     * now evict LRU entries to stay under budget on every insert, so a get()
+     * is no longer expected to observe an over-budget storage in normal
+     * operation.  `disabled` is left solely to the (unrelated) low-hit-ratio
+     * degrade in put(). */
+    if (disabled)
       {
-	disabled = true;
 	return result_code::FULL;
       }
 
@@ -844,6 +864,9 @@ namespace memoize
 	    miss++;
 	    return result_code::NOT_FOUND;
 	  }
+
+	/* #146 T3 S3: a real hit -- mark most-recently-used. */
+	touch_lru (m_last_key);
 
 	for (auto it = range.first; it != range.second; it++)
 	  {
@@ -900,9 +923,12 @@ namespace memoize
 
     try
       {
-	if (disabled || get_current_size() >= m_max_storage_size)
+	/* #146 T3 S3: the size-limit branch that used to live here is gone --
+	 * insert first, then evict_lru_to_fit() below brings it back under
+	 * budget (LRU eviction replaces the old permanent hard stop). The
+	 * low-hit-ratio degrade is unrelated to memory and is unchanged. */
+	if (disabled)
 	  {
-	    disabled = true;
 	    return result_code::FULL;
 	  }
 	if (hit+miss > MEMOIZE_FREE_ITERATION_LIMIT)
@@ -925,6 +951,9 @@ namespace memoize
 	m_value_sz += v->get_size();
 
 	m_key_value_map.insert ({k, v});
+	touch_lru (k);
+	evict_lru_to_fit ();
+	sync_wm_charge ();
 
 	return result_code::SUCCESS;
       }
@@ -946,9 +975,9 @@ namespace memoize
       {
 	if (!current_key_joined)
 	  {
-	    if (disabled || get_current_size() >= m_max_storage_size)
+	    /* #146 T3 S3: same insert-then-evict change as put() above. */
+	    if (disabled)
 	      {
-		disabled = true;
 		return result_code::FULL;
 	      }
 
@@ -968,6 +997,9 @@ namespace memoize
 	    m_hash_sz += hash_entry_sz;
 
 	    m_key_value_map.insert ({k, nullptr});
+	    touch_lru (k);
+	    evict_lru_to_fit ();
+	    sync_wm_charge ();
 	  }
 
 	return result_code::SUCCESS;
@@ -1037,6 +1069,100 @@ namespace memoize
   {
     return m_key_sz + m_value_sz + m_hash_sz + m_key_value_map.bucket_count() * sizeof (void *) + sizeof (storage);
   }
+
+  /*
+   * storage::touch_lru () - mark a logical key as most-recently-used.  k must
+   *   already be present in m_key_value_map (called right after insert()).
+   *   Looked up by key::hash/key::equal (value-based), so a fresh key* that
+   *   is logically equal to an already-tracked one correctly finds and moves
+   *   the existing LRU node rather than creating a duplicate.
+   */
+  void storage::touch_lru (key *k)
+  {
+    auto it = m_lru_pos.find (k);
+    if (it != m_lru_pos.end())
+      {
+	m_lru_order.splice (m_lru_order.end(), m_lru_order, it->second);
+	return;
+      }
+    m_lru_order.push_back (k);
+    m_lru_pos.emplace (k, std::prev (m_lru_order.end()));
+  }
+
+  /*
+   * storage::evict_lru_to_fit () - #146 T3 S3 (D2/§5): evict least-recently-used
+   *   logical keys (and every key/value pair sharing that logical key --
+   *   put()/put_nullptr() can insert several fresh key* allocations for the
+   *   same logical key across repeated calls) until under budget or nothing
+   *   is left to evict.  Replaces the old permanent "disabled = true" hard
+   *   stop: an evicted key simply becomes a future cache miss, which is
+   *   already a correct, tested path (re-executes the real computation and
+   *   put()s again) -- so eviction order has no correctness impact, only a
+   *   performance one.
+   */
+  void storage::evict_lru_to_fit ()
+  {
+    while (get_current_size() >= m_max_storage_size && !m_lru_order.empty())
+      {
+	key *victim = m_lru_order.front();
+
+	m_lru_pos.erase (victim);
+	m_lru_order.pop_front();
+
+	auto range = m_key_value_map.equal_range (victim);
+	auto vit = range.first;
+	while (vit != range.second)
+	  {
+	    key *entry_key = vit->first;
+	    value *entry_value = vit->second;
+
+	    if (entry_value != nullptr)
+	      {
+		m_value_sz -= entry_value->get_size();
+		entry_value->~value();
+		free (entry_value);
+	      }
+	    m_key_sz -= entry_key->get_size();
+	    m_hash_sz -= hash_entry_sz;
+
+	    entry_key->~key();
+	    m_key_fixed_allocator.deallocate (entry_key);
+
+	    vit = m_key_value_map.erase (vit);
+	  }
+
+	temp_page_store::record_op_limit_spill_hash ();
+      }
+  }
+
+  /*
+   * storage::sync_wm_charge () - #146 T3 S3 (D2/§5): reconcile the work_mem
+   *   accountant charge with get_current_size(), batched at 256KB (same
+   *   convention as the agg-hash and membuf/sort growth charges) so this
+   *   isn't a per-put() atomic. Soft (reserve_held_soft_at_shard): the memory
+   *   is already real by the time an entry is in the map, so rejecting the
+   *   charge would only make the accountant under-report it.
+   */
+  void storage::sync_wm_charge ()
+  {
+    constexpr size_t quantum_bytes = 256 * 1024;
+    const size_t current = get_current_size();
+
+    if (current > m_wm_charged_bytes && current - m_wm_charged_bytes >= quantum_bytes)
+      {
+	const size_t delta = current - m_wm_charged_bytes;
+
+	temp_page_store::reserve_held_soft_at_shard (delta, &m_wm_charged_shard);
+	m_wm_charged_bytes += delta;
+      }
+    else if (current < m_wm_charged_bytes && m_wm_charged_bytes - current >= quantum_bytes)
+      {
+	const size_t delta = m_wm_charged_bytes - current;
+
+	temp_page_store::release_held (delta, m_wm_charged_shard);
+	m_wm_charged_bytes -= delta;
+      }
+  }
 }
 
 extern "C"
@@ -1044,12 +1170,17 @@ extern "C"
   using namespace memoize;
   int new_memoize_storage (THREAD_ENTRY *thread_p, xasl_node *xasl)
   {
-    UINT64 storage_size = prm_get_bigint_value (PRM_ID_MEMOIZE_MEMORY_LIMIT);
-
-    if (storage_size == 0)
+    /* #146 T3 S3: memoize_memory_limit is deprecated as a byte-budget knob
+     * (the budget itself is now op_limit_bytes(hash), D6/D7/D8) but its 0
+     * value is kept as the on/off switch for the whole feature -- there is
+     * no other lever to disable memoize, and losing that admin escape hatch
+     * was not part of this slice's scope. */
+    if (prm_get_bigint_value (PRM_ID_MEMOIZE_MEMORY_LIMIT) == 0)
       {
 	return NO_ERROR;
       }
+
+    UINT64 storage_size = temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash);
 
     if (xasl->memoize_storage != nullptr)
       {

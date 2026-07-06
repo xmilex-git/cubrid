@@ -60,6 +60,16 @@ namespace temp_page_store
    * backing) without losing any reservation already held. */
   bool reserve_held_at_shard (std::size_t bytes, int *shard_inout) noexcept;
 
+  /* #146 T3 S3: sticky-shard variant of reserve_held_soft -- unconditional
+   * (never rejects) charge for a holder whose byte usage can grow AND shrink
+   * mid-query (e.g. agg-hash: LRU eviction actually frees memory, so the
+   * charge should track it back down, unlike D3 membuf's destroy-only
+   * release). Same *shard_inout contract as reserve_held_at_shard. Soft
+   * because the memory is already real/committed by the time this is called
+   * (the entry exists in the hash table already) -- rejecting the charge
+   * would just make the accountant under-report real usage, not prevent it. */
+  void reserve_held_soft_at_shard (std::size_t bytes, int *shard_inout) noexcept;
+
   std::size_t reservation_bytes_for_pages (std::size_t pages) noexcept;
   void record_degrade () noexcept;
   /* #146 T3 S1 (D7-2): cap reached -> charge rejected -> the caller spills
@@ -70,6 +80,10 @@ namespace temp_page_store
    * to temp files/disk -- an operator-facing "raise work_mem" signal, distinct
    * from cap_pressure_spill (layer-2, cross-query contention). */
   void record_op_limit_spill_sort () noexcept;
+  /* #146 T3 S3 (§6): same as record_op_limit_spill_sort but for hash-shaped
+   * (op_workmem_kind::hash) consumers -- agg-hash eviction, memoize
+   * eviction/bypass, sq_cache eviction. */
+  void record_op_limit_spill_hash () noexcept;
 
   std::size_t cap_bytes () noexcept;
   std::size_t reserved_bytes () noexcept;

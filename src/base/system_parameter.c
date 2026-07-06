@@ -3455,6 +3455,12 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
+  /* #146 T3 S3: deprecated -- no longer consumed. agg-hash's byte limit is
+   * now op_limit_bytes(hash) = work_mem * session hash_mem_multiplier
+   * (query_executor.c qexec_hash_gby_agg_tuple). Registration kept only for
+   * backward compatibility (existing conf files / SET SYSTEM PARAMETERS
+   * calls referencing this name must not fail); any value set here is
+   * silently ignored. */
   {PRM_ID_MAX_AGG_HASH_SIZE,
    PRM_NAME_MAX_AGG_HASH_SIZE,
    (PRM_FOR_SERVER | PRM_TEST_CHANGE | PRM_SIZE_UNIT),
@@ -4967,6 +4973,10 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
+  /* #146 T3 S3: deprecated -- no longer consumed. sq_cache's byte limit is
+   * now op_limit_bytes(hash) = work_mem * session hash_mem_multiplier
+   * (subquery_cache.c sq_cache_initialize). Registration kept only for
+   * backward compatibility; any value set here is silently ignored. */
   {PRM_ID_MAX_SUBQUERY_CACHE_SIZE,
    PRM_NAME_MAX_SUBQUERY_CACHE_SIZE,
    (PRM_FOR_SERVER | PRM_USER_CHANGE | PRM_SIZE_UNIT),
@@ -5289,6 +5299,11 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
+  /* #146 T3 S3: deprecated as a byte-budget knob -- the budget is now
+   * op_limit_bytes(hash) = work_mem * session hash_mem_multiplier
+   * (memoize.cpp new_memoize_storage). Only 0 is still meaningful (disables
+   * memoize entirely -- the sole remaining lever to turn the feature off);
+   * every other value set here is silently ignored. */
   {PRM_ID_MEMOIZE_MEMORY_LIMIT,
    PRM_NAME_MEMOIZE_MEMORY_LIMIT,
    (PRM_USER_CHANGE | PRM_FOR_CLIENT | PRM_FOR_SERVER | PRM_FOR_SESSION | PRM_FOR_QRY_STRING | PRM_SIZE_UNIT),

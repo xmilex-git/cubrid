@@ -61,6 +61,10 @@ struct sq_cache
     int hit;
     int miss;
   } stats;
+  /* #146 T3 S3: work_mem accountant charge tracking size, batched (see
+   * sq_cache_sync_wm_charge in subquery_cache.c). */
+  size_t wm_charged_bytes;
+  int wm_charged_shard;
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
 };
 

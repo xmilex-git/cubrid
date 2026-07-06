@@ -291,6 +291,18 @@ namespace temp_page_store
   }
 
   void
+  reserve_held_soft_at_shard (std::size_t bytes, int *shard_inout) noexcept
+  {
+    ensure_init ();
+
+    const int shard = (*shard_inout >= 0) ? *shard_inout : choose_shard ();
+    g_accountant.shards[shard].reserved.fetch_add (clamp_to_accounting_bytes (bytes), std::memory_order_acq_rel);
+    /* #146 T3 S1b/S3: same floor-tier reasoning as reserve_held_soft -- no
+     * peak update (see there); this is the uncapped tier by design. */
+    *shard_inout = shard;
+  }
+
+  void
   release_held (std::size_t bytes, int shard_index) noexcept
   {
     if (bytes == 0 || shard_index < 0 || shard_index >= static_cast<int> (WORKMEM_SHARD_COUNT))
@@ -323,6 +335,12 @@ namespace temp_page_store
   record_op_limit_spill_sort () noexcept
   {
     perfmon_inc_stat_to_global (PSTAT_WORKMEM_OP_LIMIT_SPILLS_SORT);
+  }
+
+  void
+  record_op_limit_spill_hash () noexcept
+  {
+    perfmon_inc_stat_to_global (PSTAT_WORKMEM_OP_LIMIT_SPILLS_HASH);
   }
 
   std::size_t

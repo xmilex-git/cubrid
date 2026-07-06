@@ -24,6 +24,7 @@
 #include "xasl.h"
 #include "xasl_predicate.hpp"
 #include "tsc_timer.h"
+#include <list>
 #include <unordered_map>
 #include "fixed_size_allocator.hpp"
 
@@ -125,6 +126,16 @@ namespace memoize
       value *get_value();
       result_code set_value (value *value);
 
+      /* #146 T3 S3 (§5): LRU bookkeeping (D2 memory-limit degrade: eviction
+       * instead of the old permanent hard stop) and work_mem accountant sync.
+       * m_lru_order holds one representative key* per logical (value-equal)
+       * key, front = least-recently-used; m_lru_pos maps that logical key to
+       * its position for O(1) touch-on-put. Neither container owns the
+       * pointee -- m_key_value_map remains the sole owner, same as before. */
+      void touch_lru (key *k);
+      void evict_lru_to_fit ();
+      void sync_wm_charge ();
+
       const size_t m_max_storage_size;
       const int m_key_cnt;
       const int m_value_cnt;
@@ -139,6 +150,10 @@ namespace memoize
       std::vector<DB_VALUE *> m_keyptr_src;
       std::unordered_multimap<key *, value *, key::hash, key::equal> m_key_value_map;
       std::vector<value *> m_current_value_list;
+      std::list<key *> m_lru_order;
+      std::unordered_map<key *, std::list<key *>::iterator, key::hash, key::equal> m_lru_pos;
+      size_t m_wm_charged_bytes;
+      int m_wm_charged_shard;
       bool disabled;
       bool has_range;
       bool key_changed;

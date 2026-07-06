@@ -33,6 +33,7 @@
 #include "db_function.hpp"  // FUNC_CODE
 #include "heap_file.h"
 
+#include <cstddef>
 #include <vector>
 
 // forward definitions
@@ -80,8 +81,13 @@ namespace cubquery
 
     /* runtime statistics stuff */
     int hash_size;		/* hash table size */
-    int group_count;		/* groups processed in hash table */
+    int group_count;		/* groups processed in hash table (cumulative, never decremented) */
     int tuple_count;		/* tuples processed in hash table */
+
+    /* #146 T3 S3 (D2/§5): work_mem accountant charge tracking hash_size,
+     * batched to avoid a per-tuple atomic (see qexec_agg_hash_sync_charge) */
+    size_t wm_charged_bytes;
+    int wm_charged_shard;
 
     /* partial list file stuff */
     SCAN_CODE part_scan_code;	/* scan status of partial list file */

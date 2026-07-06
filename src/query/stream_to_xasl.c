@@ -2525,6 +2525,10 @@ stx_build_sq_cache (THREAD_ENTRY * thread_p, char *ptr, SQ_CACHE ** sq_cache_p)
 	  return NULL;
 	}
       memset (new_sq_cache, 0, sizeof (SQ_CACHE));
+      /* #146 T3 S3: memset zeroed wm_charged_shard to 0, a valid shard index
+       * -- explicit -1 so the first charge picks a fresh shard instead of
+       * treating 0 as "already sticky-assigned". */
+      new_sq_cache->wm_charged_shard = -1;
 
       new_sq_cache->sq_key_struct = (SQ_KEY *) stx_alloc_struct (thread_p, sizeof (SQ_KEY));
       new_sq_cache->sq_key_struct->dbv_array =

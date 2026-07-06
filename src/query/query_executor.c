@@ -50,6 +50,8 @@
 #include "xasl_cache.h"
 #include "stream_to_xasl.h"
 #include "query_manager.h"
+#include "query_workmem.hpp"	/* work_mem accountant: op_limit_bytes / reserve_held_soft_at_shard / release_held */
+#include "memory_hash.h"	/* mht_table::nentries -- live agg-hash group count (#146 T3 S3 dual limit) */
 #include "query_reevaluation.hpp"
 #include "extendible_hash.h"
 #include "replication.h"
@@ -463,6 +465,8 @@ static int qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, 
 				     BUILDLIST_PROC_NODE * proc, QFILE_TUPLE_RECORD * tplrec,
 				     QFILE_TUPLE_DESCRIPTOR * tpldesc, QFILE_LIST_ID * groupby_list,
 				     bool * output_tuple);
+static void qexec_agg_hash_sync_charge (AGGREGATE_HASH_CONTEXT * context);
+static void qexec_agg_hash_release_charge (AGGREGATE_HASH_CONTEXT * context);
 static void qexec_gby_start_group_dim (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, const RECDES * recdes);
 static void qexec_gby_start_group (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, const RECDES * recdes, int N);
 static void qexec_gby_finalize_group_val_list (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, int N);
@@ -4646,6 +4650,59 @@ qexec_hash_gby_agg_tuple_public (THREAD_ENTRY * thread_p, xasl_node * xasl, XASL
 				   output_tuple);
 }
 
+/* #146 T3 S3 (D2/§5): batch quantum for agg-hash accountant charging -- same
+ * convention as the membuf/sort growth charges, so hash_size's near-per-tuple
+ * churn doesn't become a per-tuple atomic op. */
+#define AGG_HASH_CHARGE_QUANTUM_BYTES ((size_t) (256 * 1024))
+
+/*
+ * qexec_agg_hash_sync_charge () - reconcile the work_mem accountant charge
+ *   with context->hash_size, batched at AGG_HASH_CHARGE_QUANTUM_BYTES so a
+ *   charge/release only happens every ~256KB of net change (grow or shrink --
+ *   unlike D3 membuf, LRU eviction here actually frees memory, so the charge
+ *   must be able to shrink back down mid-query). Soft (reserve_held_soft_at_shard):
+ *   the memory is already real by the time an entry lands in the hash table,
+ *   so rejecting the charge would only make the accountant under-report it.
+ */
+static void
+qexec_agg_hash_sync_charge (AGGREGATE_HASH_CONTEXT * context)
+{
+  const size_t current = (context->hash_size > 0) ? (size_t) context->hash_size : 0;
+
+  if (current > context->wm_charged_bytes && current - context->wm_charged_bytes >= AGG_HASH_CHARGE_QUANTUM_BYTES)
+    {
+      const size_t delta = current - context->wm_charged_bytes;
+
+      temp_page_store::reserve_held_soft_at_shard (delta, &context->wm_charged_shard);
+      context->wm_charged_bytes += delta;
+    }
+  else if (current < context->wm_charged_bytes
+	   && context->wm_charged_bytes - current >= AGG_HASH_CHARGE_QUANTUM_BYTES)
+    {
+      const size_t delta = context->wm_charged_bytes - current;
+
+      temp_page_store::release_held (delta, context->wm_charged_shard);
+      context->wm_charged_bytes -= delta;
+    }
+}
+
+/*
+ * qexec_agg_hash_release_charge () - release whatever qexec_agg_hash_sync_charge
+ *   has accumulated (the residual under the quantum, plus everything above
+ *   it). Called once at context teardown; a no-op if nothing was charged.
+ */
+static void
+qexec_agg_hash_release_charge (AGGREGATE_HASH_CONTEXT * context)
+{
+  if (context->wm_charged_bytes > 0)
+    {
+      temp_page_store::release_held (context->wm_charged_bytes, context->wm_charged_shard);
+    }
+
+  context->wm_charged_bytes = 0;
+  context->wm_charged_shard = -1;
+}
+
 /*
  * qexec_hash_gby_agg_tuple () - aggregate tuple using hash table
  *   return: error code or NO_ERROR
@@ -4666,7 +4723,26 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
   AGGREGATE_HASH_KEY *key = context->temp_key;
   AGGREGATE_HASH_VALUE *value;
   HENTRY_PTR hentry;
-  static UINT64 mem_limit = prm_get_bigint_value (PRM_ID_MAX_AGG_HASH_SIZE);
+  /* #146 T3 S3 (D6/D7/D8): hash-shaped per-op limit (work_mem * session
+   * hash_mem_multiplier), not the deprecated PRM_ID_MAX_AGG_HASH_SIZE, and
+   * read fresh every call (the old "static" here meant a session SET of the
+   * old knob was never picked up after the first tuple of the server's
+   * lifetime -- must not repeat that for the new session-scoped multiplier). */
+  const UINT64 mem_limit = temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash);
+  /* #146 T3 S3 (§5): dual limit (bytes+ngroups). ngroups is a safety net
+   * against hash-table/bucket overhead (HENTRY nodes, bucket array) that
+   * qdata_get_agg_h{key,value}_size do not account for -- only the DB_VALUE
+   * payloads and the key/value struct sizes are counted -- so a degenerate
+   * many-tiny-groups case can't silently balloon real RSS while hash_size
+   * stays innocently under budget. Derived from the same byte budget with a
+   * conservative floor estimate of per-entry overhead; not a separately
+   * tunable knob.
+   * NOTE: 128 bytes/entry is an ESTIMATE, not a measured figure -- the design
+   * doc specifies a dual limit but not a concrete per-entry overhead number.
+   * Lead-reviewed and accepted (#146 S3) as a reasonable floor; flagged for
+   * re-evaluation once real HENTRY/bucket overhead is measured under load. */
+  const UINT64 agg_hash_min_entry_overhead_bytes = 128;
+  const UINT64 max_groups = MAX (1, mem_limit / agg_hash_min_entry_overhead_bytes);
   int rc = NO_ERROR;
   TSC_TICKS start_tick, end_tick;
   TSCTIMEVAL tv_diff;
@@ -4820,8 +4896,16 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 	}
     }
 
-  /* keep hash table within memory limit */
-  while (context->hash_size > (int) mem_limit)
+  /* keep hash table within the dual limit (bytes+ngroups, #146 T3 S3 §5).
+   * #146 T3 S3 bug fix: comparing via "(int) mem_limit" (matching the
+   * pre-existing style for the old, always-small max_agg_hash_size) is UB
+   * once mem_limit = work_mem * hash_mem_multiplier reaches 2^31 -- a
+   * completely ordinary setting (e.g. work_mem=1G, multiplier=2.0) that the
+   * old knob could never reach. The narrowing wrapped mem_limit to a huge
+   * negative int, made this branch of the condition permanently true, and
+   * thrashed the hash table empty on every tuple. Widen hash_size instead. */
+  while ((context->hash_size > 0 && (UINT64) context->hash_size > mem_limit)
+	 || context->hash_table->nentries > max_groups)
     {
       /* get least recently used entry */
       hentry = context->hash_table->lru_head;
@@ -4859,7 +4943,14 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
       context->hash_size -= qdata_get_agg_hkey_size (key);
       context->hash_size -= qdata_get_agg_hvalue_size (value, false);
       mht_rem (context->hash_table, key, qdata_free_agg_hentry, NULL);
+      /* #146 T3 S3 (§6): per-op (hash) limit reached -> normal eviction to
+       * part_list, the "raise hash_mem/multiplier" signal. */
+      temp_page_store::record_op_limit_spill_hash ();
     }
+
+  /* #146 T3 S3 (D2/§5): reconcile the accountant charge with the settled
+   * hash_size (grows or shrinks after the eviction loop above). */
+  qexec_agg_hash_sync_charge (context);
 
   /* check very high selectivity case */
   if (context->tuple_count > HASH_AGGREGATE_VH_SELECTIVITY_TUPLE_THRESHOLD)
@@ -4873,6 +4964,14 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 	  /* dump hash table to list file, no need to keep it in memory */
 	  qdata_save_agg_htable_to_list (thread_p, context->hash_table, groupby_list, context->part_list_id,
 					 context->temp_dbval_array);
+	  /* #146 T3 S3: the table is now empty (qexec_free_agg_hash_context's
+	   * mht_clear tears it down for real at context teardown), but
+	   * context->hash_size was never reset for this pre-existing path --
+	   * harmless before this slice charged it, but now the charge must be
+	   * released too, since state == HS_REJECT_ALL means no further tuple
+	   * ever reaches qexec_agg_hash_sync_charge again for this context. */
+	  context->hash_size = 0;
+	  qexec_agg_hash_sync_charge (context);
 
 #if !defined(NDEBUG)
 	  er_log_debug (ARG_FILE_LINE, "hash aggregation abandoned: very high selectivity");
@@ -27567,6 +27666,11 @@ qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * pro
   proc->agg_hash_context->curr_part_value = NULL;
   proc->agg_hash_context->sort_key.key = NULL;
   proc->agg_hash_context->sort_key.nkeys = 0;
+  /* #146 T3 S3: init early (not with the other counters further below) --
+   * qexec_free_agg_hash_context() reads these on every error exit from this
+   * function too, including exits before the counters below are reached. */
+  proc->agg_hash_context->wm_charged_bytes = 0;
+  proc->agg_hash_context->wm_charged_shard = -1;
 
   /*
    * create temporary dbvalue array
@@ -27881,6 +27985,12 @@ qexec_free_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc
       proc->agg_hash_context->tuple_recdes.data = NULL;
       proc->agg_hash_context->tuple_recdes.area_size = 0;
     }
+
+  /* #146 T3 S3: release whatever qexec_agg_hash_sync_charge accumulated,
+   * before the counters below reset hash_size (the release reads
+   * wm_charged_bytes, not hash_size, but do it here for the same "torn down
+   * together" reasoning as the rest of this function). */
+  qexec_agg_hash_release_charge (proc->agg_hash_context);
 
   /* reinit counters */
   proc->agg_hash_context->hash_size = 0;

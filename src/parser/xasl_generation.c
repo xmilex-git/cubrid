@@ -28428,6 +28428,13 @@ pt_prepare_corr_subquery_hash_result_cache (PARSER_CONTEXT * parser, PT_NODE * n
 
   xasl->sq_cache = (SQ_CACHE *) pt_alloc_packing_buf (sizeof (SQ_CACHE));
   SQ_CACHE_KEY_STRUCT (xasl) = sq_key_struct;
+#if defined (SERVER_MODE) || defined (SA_MODE)
+  /* #146 T3 S3: this allocator does not guarantee zeroed memory -- explicit
+   * init so sq_cache_initialize()'s first charge picks a fresh shard rather
+   * than reading garbage as "already sticky-assigned". */
+  xasl->sq_cache->wm_charged_bytes = 0;
+  xasl->sq_cache->wm_charged_shard = -1;
+#endif /* SERVER_MODE || SA_MODE */
   return true;
 }
 

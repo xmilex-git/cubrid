@@ -37,6 +37,7 @@
 #include "list_file.h"
 
 #include "subquery_cache.h"
+#include "query_workmem.hpp"	/* work_mem accountant: op_limit_bytes / reserve_held_soft_at_shard / release_held / record_op_limit_spill_hash */
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -52,6 +53,11 @@ static void sq_unpack_val (SQ_VAL * val, REGU_VARIABLE * retp);
 static unsigned int sq_hash_func (const void *key, unsigned int ht_size);
 static int sq_cmp_func (const void *key1, const void *key2);
 static int sq_rem_func (const void *key, void *data, void *args);
+
+/* #146 T3 S3 (D2/§5) */
+static UINT64 sq_entry_size (SQ_KEY * key, SQ_VAL * val);
+static void sq_evict_lru_to_fit (THREAD_ENTRY * thread_p, XASL_NODE * xasl, UINT64 incoming_entry_size);
+static void sq_sync_wm_charge (XASL_NODE * xasl);
 
 /**************************************************************************************/
 
@@ -289,6 +295,102 @@ sq_rem_func (const void *key, void *data, void *args)
 }
 
 /*
+ * sq_entry_size () - #146 T3 S3: byte footprint of one (key, val) pair, the
+ *   same computation sq_put() used to do inline for the entry about to be
+ *   inserted; also needed at eviction time, to know how much to subtract for
+ *   an entry being removed, computed before it is destroyed.
+ */
+static UINT64
+sq_entry_size (SQ_KEY * key, SQ_VAL * val)
+{
+  UINT64 size = DB_SIZEOF (HENTRY);
+  int i;
+
+  for (i = 0; i < key->n_elements; i++)
+    {
+      size += (UINT64) or_db_value_size (key->dbv_array[i]);
+    }
+  size += sizeof (SQ_KEY);
+  size += DB_SIZEOF (DB_VALUE *) * key->n_elements;
+
+  switch (val->type)
+    {
+    case TYPE_CONSTANT:
+      size += (UINT64) or_db_value_size (val->val.dbvalptr) + sizeof (SQ_VAL);
+      break;
+
+    case TYPE_LIST_ID:
+      size += sizeof (SQ_VAL);
+      break;
+
+    default:
+      break;
+    }
+
+  return size;
+}
+
+/*
+ * sq_evict_lru_to_fit () - #146 T3 S3 (D2/§5): evict least-recently-used
+ *   entries (via the hash table's built-in LRU list, enabled in
+ *   sq_cache_initialize) until incoming_entry_size fits under the budget or
+ *   nothing is left to evict.  Replaces the old permanent "enabled = false"
+ *   hard stop -- an evicted entry simply becomes a future cache miss (an
+ *   already correct, tested path: sq_get() returns false, the caller
+ *   re-evaluates the subquery and sq_put()s again), so eviction order has no
+ *   correctness impact, only a performance one.
+ */
+static void
+sq_evict_lru_to_fit (THREAD_ENTRY * thread_p, XASL_NODE * xasl, UINT64 incoming_entry_size)
+{
+  MHT_TABLE *ht = SQ_CACHE_HT (xasl);
+
+  while (SQ_CACHE_SIZE (xasl) + incoming_entry_size > SQ_CACHE_SIZE_MAX (xasl) && ht->lru_head != NULL)
+    {
+      SQ_KEY *victim_key = (SQ_KEY *) ht->lru_head->key;
+      SQ_VAL *victim_val = (SQ_VAL *) ht->lru_head->data;
+      UINT64 victim_size = sq_entry_size (victim_key, victim_val);
+
+      mht_rem (ht, victim_key, sq_rem_func, (void *) thread_p);
+      SQ_CACHE_SIZE (xasl) -= MIN (victim_size, SQ_CACHE_SIZE (xasl));
+
+      temp_page_store::record_op_limit_spill_hash ();
+    }
+}
+
+/*
+ * sq_sync_wm_charge () - #146 T3 S3 (D2/§5): reconcile the work_mem accountant
+ *   charge with SQ_CACHE_SIZE(xasl), batched at 256KB (same convention as the
+ *   other T3 growth charges) so this isn't a per-put() atomic. Soft
+ *   (reserve_held_soft_at_shard): the memory is already real by the time an
+ *   entry is in the map, so rejecting the charge would only make the
+ *   accountant under-report it.
+ */
+static void
+sq_sync_wm_charge (XASL_NODE * xasl)
+{
+  const UINT64 quantum_bytes = 256 * 1024;
+  const UINT64 current = SQ_CACHE_SIZE (xasl);
+  size_t *charged_bytes = &xasl->sq_cache->wm_charged_bytes;
+  int *charged_shard = &xasl->sq_cache->wm_charged_shard;
+
+  if (current > *charged_bytes && current - *charged_bytes >= quantum_bytes)
+    {
+      const size_t delta = (size_t) (current - *charged_bytes);
+
+      temp_page_store::reserve_held_soft_at_shard (delta, charged_shard);
+      *charged_bytes += delta;
+    }
+  else if (current < *charged_bytes && *charged_bytes - current >= quantum_bytes)
+    {
+      const size_t delta = *charged_bytes - (size_t) current;
+
+      temp_page_store::release_held (delta, *charged_shard);
+      *charged_bytes -= delta;
+    }
+}
+
+/*
  * sq_cache_initialize () - Initializes the cache for a given XASL node.
  *   return: NO_ERROR if successful, ER_FAILED otherwise.
  *   xasl(in/out): The XASL node for which the cache is being initialized.
@@ -300,7 +402,10 @@ sq_rem_func (const void *key, void *data, void *args)
 int
 sq_cache_initialize (XASL_NODE * xasl)
 {
-  UINT64 max_subquery_cache_size = (UINT64) prm_get_bigint_value (PRM_ID_MAX_SUBQUERY_CACHE_SIZE);
+  /* #146 T3 S3 (D6/D7/D8): max_subquery_cache_size is deprecated as the byte
+   * budget -- replaced by the hash-shaped per-op limit (work_mem * session
+   * hash_mem_multiplier), same treatment as memoize. */
+  UINT64 max_subquery_cache_size = temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash);
   int sq_hm_entries = (int) max_subquery_cache_size / SQ_CACHE_EXPECTED_ENTRY_SIZE;	// default 4096 (4K)
   int actual_entries;
 
@@ -309,6 +414,9 @@ sq_cache_initialize (XASL_NODE * xasl)
     {
       return ER_FAILED;
     }
+  /* #146 T3 S3 (§5): build the LRU list so sq_evict_lru_to_fit() can use
+   * lru_head/mht_rem instead of the old permanent hard stop. */
+  SQ_CACHE_HT (xasl)->build_lru_list = true;
   SQ_CACHE_ENABLED (xasl) = true;
   SQ_CACHE_SIZE_MAX (xasl) = max_subquery_cache_size;
   SQ_CACHE_SIZE (xasl) += DB_SIZEOF (SQ_CACHE);
@@ -338,8 +446,7 @@ sq_put (THREAD_ENTRY * thread_p, SQ_KEY * key, XASL_NODE * xasl, REGU_VARIABLE *
 {
   SQ_VAL *val;
   const void *ret;
-  UINT64 new_entry_size = 0;
-  int i;
+  UINT64 new_entry_size;
 
   val = sq_make_val (thread_p, regu_var);
 
@@ -352,32 +459,17 @@ sq_put (THREAD_ENTRY * thread_p, SQ_KEY * key, XASL_NODE * xasl, REGU_VARIABLE *
 	}
     }
 
-  new_entry_size += DB_SIZEOF (HENTRY);
+  new_entry_size = sq_entry_size (key, val);
 
-  for (i = 0; i < key->n_elements; i++)
-    {
-      new_entry_size += (UINT64) or_db_value_size (key->dbv_array[i]);
-    }
-  new_entry_size += sizeof (SQ_KEY);
-  new_entry_size += DB_SIZEOF (DB_VALUE *) * key->n_elements;
-
-  switch (val->type)
-    {
-    case TYPE_CONSTANT:
-      new_entry_size += (UINT64) or_db_value_size (val->val.dbvalptr) + sizeof (SQ_VAL);
-      break;
-
-    case TYPE_LIST_ID:
-      new_entry_size += sizeof (SQ_VAL);
-      break;
-
-    default:
-      break;
-    }
+  /* #146 T3 S3 (D2/§5): evict LRU entries to make room instead of the old
+   * permanent "enabled = false" hard stop. */
+  sq_evict_lru_to_fit (thread_p, xasl, new_entry_size);
 
   if (SQ_CACHE_SIZE_MAX (xasl) < SQ_CACHE_SIZE (xasl) + new_entry_size)
     {
-      SQ_CACHE_ENABLED (xasl) = false;
+      /* Even fully evicted, this one entry alone doesn't fit -- bypass
+       * (skip caching just this entry); the cache stays enabled for
+       * entries that do fit. */
       sq_free_val (thread_p, val);
       return ER_FAILED;
     }
@@ -390,6 +482,7 @@ sq_put (THREAD_ENTRY * thread_p, SQ_KEY * key, XASL_NODE * xasl, REGU_VARIABLE *
       return ER_FAILED;
     }
   SQ_CACHE_SIZE (xasl) += new_entry_size;
+  sq_sync_wm_charge (xasl);
   return NO_ERROR;
 }
 
@@ -476,5 +569,12 @@ sq_cache_destroy (THREAD_ENTRY * thread_p, SQ_CACHE * sq_cache)
       sq_cache->enabled = false;
       sq_cache->stats.hit = 0;
       sq_cache->stats.miss = 0;
+      /* #146 T3 S3: release whatever sq_sync_wm_charge() accumulated. */
+      if (sq_cache->wm_charged_bytes > 0)
+	{
+	  temp_page_store::release_held (sq_cache->wm_charged_bytes, sq_cache->wm_charged_shard);
+	}
+      sq_cache->wm_charged_bytes = 0;
+      sq_cache->wm_charged_shard = -1;
     }
 }
