@@ -1361,6 +1361,96 @@ mht_clear_hls (MHT_HLS_TABLE * ht, int (*rem_func) (const void *key, void *data,
 }
 
 /*
+ * mht_rehash_out_hls - issue #147 T1 S4: split part of an HLS table out to a
+ *   caller-supplied sink, without clearing the rest.
+ *   return: error code
+ *   ht(in/out): hash table
+ *   route_func(in): called once per surviving entry as
+ *                   route_func(key, data, args, &evict); if *evict comes
+ *                   back true the entry is unlinked (route_func is expected
+ *                   to have already handed `data` off, e.g. spilled it to a
+ *                   batch file); a non-NO_ERROR return aborts the walk
+ *   args(in): opaque route_func argument
+ *   nevicted_out(out): count evicted before returning (whole-walk total on
+ *                      success, partial count on an aborting error), may be
+ *                      NULL
+ *
+ * Note: each bucket's head node is the only one whose `tail` field is kept
+ *       up to date (mht_put_hls_internal always appends via
+ *       table[hash]->tail, see that function) -- if the head itself is
+ *       evicted, or the surviving tail changes, this fixes `tail` on the new
+ *       head so future mht_put_hls calls into this bucket stay correct.
+ */
+int
+mht_rehash_out_hls (MHT_HLS_TABLE * ht, int (*route_func) (unsigned int key, void *data, void *args, bool * evict),
+		     void *args, unsigned int *nevicted_out)
+{
+  HENTRY_HLS_PTR *hvector;	/* Entries of hash table */
+  HENTRY_HLS_PTR hentry, prev, next_hentry;
+  unsigned int i, error_code;
+  unsigned int nevicted = 0;
+
+  assert (ht != NULL);
+  assert (route_func != NULL);
+
+  for (hvector = ht->table, i = 0; i < ht->size; hvector++, i++)
+    {
+      prev = NULL;
+
+      for (hentry = *hvector; hentry != NULL; hentry = next_hentry)
+	{
+	  bool evict = false;
+
+	  next_hentry = hentry->next;
+
+	  error_code = (*route_func) (hentry->key, hentry->data, args, &evict);
+	  if (error_code != NO_ERROR)
+	    {
+	      if (nevicted_out != NULL)
+		{
+		  *nevicted_out = nevicted;
+		}
+	      return error_code;
+	    }
+
+	  if (!evict)
+	    {
+	      prev = hentry;
+	      continue;
+	    }
+
+	  if (prev == NULL)
+	    {
+	      *hvector = next_hentry;
+	    }
+	  else
+	    {
+	      prev->next = next_hentry;
+	    }
+
+	  hentry->data = NULL;
+	  ht->nprealloc_entries++;
+	  hentry->next = ht->prealloc_entries;
+	  ht->prealloc_entries = hentry;
+
+	  ht->nentries--;
+	  nevicted++;
+	}
+
+      if (*hvector != NULL)
+	{
+	  (*hvector)->tail = prev;
+	}
+    }
+
+  if (nevicted_out != NULL)
+    {
+      *nevicted_out = nevicted;
+    }
+  return NO_ERROR;
+}
+
+/*
  * mht_dump - display all entries of hash table
  *   return: TRUE/FALSE
  *   out_fp(in): FILE stream where to dump; if NULL, stdout

@@ -170,6 +170,18 @@ extern MHT_HLS_TABLE *mht_create_hls (const char *name, int est_size,
 				      int (*cmp_func) (const void *key1, const void *key2));
 extern int mht_clear_hls (MHT_HLS_TABLE * ht, int (*rem_func) (const void *key, void *data, void *args),
 			  void *func_args);
+/* issue #147 T1 S4: split part of an HLS table out to a caller-supplied sink
+ * in a single walk, without clearing the rest. For every surviving entry,
+ * calls route_func(key, data, args, &evict); *evict == true unlinks the
+ * entry (recycled onto ht->prealloc_entries exactly like mht_clear_hls) and
+ * does not free it (route_func is expected to have already handed the data
+ * off, e.g. spilled it to a batch file, before returning). route_func
+ * returning a non-NO_ERROR code aborts the walk immediately and propagates
+ * that code; *nevicted_out (if non-NULL) receives the count evicted before
+ * the abort (or the total on success). */
+extern int mht_rehash_out_hls (MHT_HLS_TABLE * ht,
+				int (*route_func) (unsigned int key, void *data, void *args, bool *evict),
+				void *args, unsigned int *nevicted_out);
 extern void mht_destroy_hls (MHT_HLS_TABLE * ht);
 extern int mht_dump_hls (THREAD_ENTRY * thread_p, FILE * out_fp, const MHT_HLS_TABLE * ht, const int print_id_opt,
 			 int (*print_func) (THREAD_ENTRY * thread_p, FILE * fp, const void *data, const void *type_list,

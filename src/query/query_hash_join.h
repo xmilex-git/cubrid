@@ -493,6 +493,20 @@ int qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_i
  * hjoin_execute_grace) -- must stay 0 for such a run. */
 long hjoin_debug_random_probe_read_count (void);
 
+/* issue #147 T1 S4: process-wide count of mid-build/mid-reload nbatch
+ * doublings actually performed by hjoin_execute_grace (see
+ * hjoin_grace_maybe_grow). Zero for any run whose upfront nbatch estimate
+ * held; nonzero means the estimate under-shot (skew or per-tuple-size
+ * variance) and the real-memory-tracked overflow check kicked in. */
+long hjoin_debug_grace_nbatch_grow_count (void);
+
+/* issue #147 T1 S4: cumulative over-hash_mem bytes accepted once the
+ * give-up heuristic (hjoin_grace_maybe_grow) has latched grow_enabled=false
+ * for a join (repeated doubling attempts stopped helping -- e.g. one
+ * dominant key). Zero means growth either never triggered or, when it did,
+ * kept freeing memory each time. */
+long hjoin_debug_grace_skew_overflow_bytes (void);
+
 /* Hash Join Execution */
 int hjoin_execute (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
 /* issue #147 S6: per-partition PARALLEL entry point (join_task::execute) --

@@ -60,6 +60,24 @@ hjoin_debug_random_probe_read_count (void)
   return hjoin_debug_random_probe_reads.load (std::memory_order_relaxed);
 }
 
+/* issue #147 T1 S4: mid-build/mid-reload nbatch growth observability (same
+ * debug-counter pattern as hjoin_debug_random_probe_reads above -- no full
+ * HASHJOIN_STATS wiring, see the S2 stop-and-report's deferred gap). */
+static std::atomic<long> hjoin_debug_grace_nbatch_grows { 0 };
+static std::atomic<long> hjoin_debug_grace_skew_overflow { 0 };
+
+long
+hjoin_debug_grace_nbatch_grow_count (void)
+{
+  return hjoin_debug_grace_nbatch_grows.load (std::memory_order_relaxed);
+}
+
+long
+hjoin_debug_grace_skew_overflow_bytes (void)
+{
+  return hjoin_debug_grace_skew_overflow.load (std::memory_order_relaxed);
+}
+
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -1898,8 +1916,27 @@ namespace
     std::vector<qfile::batch_record_store *> inner;
     std::vector<qfile::batch_record_store *> outer;
 
-    explicit hjoin_grace_batch_files (int nbatch) : inner ((size_t) nbatch, nullptr), outer ((size_t) nbatch, nullptr)
+    explicit hjoin_grace_batch_files (int nbatch)
     {
+      /* issue #147 T1 S4: reserve the max upfront so grow()'s resize() below
+       * never reallocates -- hjoin_execute_grace's reload loop holds
+       * inner_store/outer_store as references into these vectors' elements
+       * across a mid-reload grow(), which would otherwise dangle. */
+      inner.reserve ((size_t) HJOIN_GRACE_MAX_NBATCH);
+      outer.reserve ((size_t) HJOIN_GRACE_MAX_NBATCH);
+      inner.resize ((size_t) nbatch, nullptr);
+      outer.resize ((size_t) nbatch, nullptr);
+    }
+
+    /* issue #147 T1 S4: widen for a mid-build/mid-reload nbatch doubling; new
+     * slots start unassigned (NULL). Never reallocates (see the reserve()
+     * calls above) -- existing element references stay valid. */
+    void
+    grow (int new_nbatch)
+    {
+      assert (new_nbatch <= HJOIN_GRACE_MAX_NBATCH);
+      inner.resize ((size_t) new_nbatch, nullptr);
+      outer.resize ((size_t) new_nbatch, nullptr);
     }
 
     ~hjoin_grace_batch_files ()
@@ -1941,6 +1978,230 @@ namespace
       }
     return NO_ERROR;
   }
+
+  /*
+   * hjoin_grace_arena_charge_estimate () - issue #147 T1 S4: bytes the arena
+   *   bump-allocates for one build tuple of `tuple_size` (mirrors
+   *   qdata_alloc_hscan_value_arena's own math -- 8-byte aligned
+   *   sizeof(HASH_SCAN_VALUE) + tuple_size). Used to track the CURRENTLY
+   *   in-memory batch's real footprint in real time, as an alternative to
+   *   hjoin_grace_choose_nbatch's one-shot upfront estimate (which averages
+   *   build_bytes/nbatch over the whole build set and can't see per-tuple
+   *   skew or a per-tuple size far from that average).
+   */
+  UINT64
+  hjoin_grace_arena_charge_estimate (int tuple_size)
+  {
+    UINT64 n = sizeof (HASH_SCAN_VALUE) + (UINT64) tuple_size;
+    return (n + 7) & ~((UINT64) 7);
+  }
+
+  /*
+   * issue #147 T1 S4 (D2 routing invariant this growth scheme depends on):
+   * hjoin_grace_route()'s batch bits are ror32(hash, nbatch_bits) & (nbatch-1)
+   * -- nbatch_bits is fixed once, from the INITIAL (pre-growth) nbatch, and
+   * never recomputed as nbatch itself grows (hjoin_execute_grace never
+   * reassigns its local `nbatch_bits` after the first hjoin_grace_choose_nbatch
+   * call). That is deliberate: with the rotate amount fixed and only the mask
+   * (nbatch-1) widening, doubling nbatch is a clean bit-trie bisection --
+   * every key currently routed to some batch X (X < old_nbatch) reroutes,
+   * under the wider mask, to EITHER X again or to X + old_nbatch, never to
+   * any other (in particular never to an already-finished, already-deleted
+   * lower batch). If nbatch_bits were instead recomputed from the grown
+   * nbatch (widening the rotate amount along with the mask), the *window* of
+   * hash bits sampled would shift too, and growth could silently reroute an
+   * in-memory or already-spilled record to an arbitrary unrelated batch --
+   * including one already probed and torn down. Do not "fix" nbatch_bits to
+   * track nbatch; that would both break this invariant and change existing
+   * (non-growth) golden output ordering for every fixture with nbatch > 1.
+   */
+
+  /* Context for hjoin_grace_grow_route_func (issue #147 T1 S4). */
+  struct hjoin_grace_grow_ctx
+  {
+    THREAD_ENTRY *thread_p;
+    hjoin_grace_batch_files *batches;
+    int old_nbatch;		/* mask width before this doubling -- also the eviction threshold */
+    int new_nbatch;
+    int nbatch_bits;		/* fixed rotate amount, see comment above -- never changes */
+    const std::string *dir;
+    TDE_ALGORITHM tde_algo;
+    UINT32 worker_id;
+    std::uint64_t *next_seq;
+    UINT64 freed_bytes;
+  };
+
+  /*
+   * hjoin_grace_grow_route_func () - mht_rehash_out_hls callback: re-route one
+   *   currently in-memory entry against the widened mask; entries that still
+   *   land under old_nbatch stay (evict=false), everything else is spilled to
+   *   its (guaranteed not-yet-visited, per the invariant above) new batch
+   *   file and evicted from the table. The evicted value's arena bytes are
+   *   NOT reclaimed here (the arena is bump-only, freed en masse at the next
+   *   hscan_value_arena_reset / hjoin_scan_clear) -- only its charge is
+   *   backed out of the caller's running in-mem byte count.
+   */
+  int
+  hjoin_grace_grow_route_func (unsigned int key, void *data, void *args, bool * evict)
+  {
+    hjoin_grace_grow_ctx *ctx = (hjoin_grace_grow_ctx *) args;
+    HASH_SCAN_VALUE *value = (HASH_SCAN_VALUE *) data;
+    QFILE_TUPLE tpl = value->tuple;
+    int batchno_new = hjoin_grace_route ((UINT32) key, ctx->new_nbatch, ctx->nbatch_bits);
+
+    if (batchno_new < ctx->old_nbatch)
+      {
+	*evict = false;
+	return NO_ERROR;
+      }
+
+    *evict = true;
+    int error = hjoin_grace_ensure_batch_file (ctx->thread_p, *ctx->dir, ctx->tde_algo, ctx->worker_id, ctx->next_seq,
+						&ctx->batches->inner[batchno_new]);
+    if (error == NO_ERROR)
+      {
+	error = ctx->batches->inner[batchno_new]->append (ctx->thread_p, key, tpl);
+      }
+    if (error == NO_ERROR)
+      {
+	ctx->freed_bytes += hjoin_grace_arena_charge_estimate (QFILE_GET_TUPLE_LENGTH (tpl));
+      }
+    return error;
+  }
+
+  static const int HJOIN_GRACE_EFFECTIVE_CAP_MULT = 8;	/* D3 trade-off guard's own escape hatch,
+							 * same order of magnitude as HJOIN_GRACE_MAX_NBATCH's halving bound */
+
+  /*
+   * hjoin_grace_maybe_grow () - issue #147 T1 S4 (D3/D4): mid-build/mid-reload
+   *   nbatch doubling. Call after every IN_MEM insert with the batch's
+   *   really-tracked footprint (`*in_mem_bytes_p` / `*in_mem_tuple_cnt_p`); if
+   *   it exceeds `*effective_hash_mem_p` and growth is still enabled, doubles
+   *   nbatch in one hash-table walk (hjoin_grace_grow_route_func): entries
+   *   that still route under the old mask stay, the rest spill to a fresh
+   *   batch file. Safe whether the currently-loaded chunk is the initial
+   *   build's batch 0 or a reload's batch X -- see the routing-invariant
+   *   comment above hjoin_grace_grow_ctx. The reload loop's own bound
+   *   (`batchno < nbatch`) picks up any newly-created higher batches
+   *   automatically once nbatch grows.
+   *
+   *   D3 trade-off guard: doubling nbatch can create up to `old_nbatch` new
+   *   batch-file write buffers (BUFFILE_BATCH_PAGES=8 pages each side, see
+   *   qfile_buffile.cpp) -- cheap at small nbatch, but as nbatch approaches
+   *   HJOIN_GRACE_MAX_NBATCH the aggregate buffer cost can exceed simply
+   *   letting this one batch run over its budget. When the estimated buffer
+   *   cost would exceed hash_mem itself, this raises `*effective_hash_mem_p`
+   *   (capped at HJOIN_GRACE_EFFECTIVE_CAP_MULT * hash_mem) instead of
+   *   splitting, and leaves nbatch/the table untouched this round.
+   *
+   *   Give-up heuristic: if a split happens but frees nothing (nfreed == 0,
+   *   e.g. one dominant key repeated ninmemory times -- no bit split can ever
+   *   separate identical hash keys) or frees everything (nfreed ==
+   *   ninmemory, e.g. this batch's whole content is uniform in the new bit --
+   *   no future doubling from here helps either), `*grow_enabled_p` latches
+   *   false: subsequent overflow is accepted over-budget (soft-charged to
+   *   hjoin_debug_grace_skew_overflow_bytes) rather than retried.
+   *
+   *   MCV (most-common-value) skew handling -- detecting a single dominant
+   *   key ahead of time and routing it to a dedicated structure instead of
+   *   relying on this give-up fallback -- is out of scope for this slice
+   *   (issue #147 S4 slice plan); the give-up branch below is the hook point
+   *   where that logic would plug in.
+   */
+  int
+  hjoin_grace_maybe_grow (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, hjoin_grace_batch_files & batches,
+			  int *nbatch_p, int nbatch_bits, const std::string & dir, TDE_ALGORITHM tde_algo,
+			  UINT32 worker_id, std::uint64_t * next_seq, UINT64 hash_mem, UINT64 * effective_hash_mem_p,
+			  UINT64 * in_mem_bytes_p, INT64 * in_mem_tuple_cnt_p, bool * grow_enabled_p,
+			  UINT64 last_insert_charge)
+  {
+    const UINT64 charge = *in_mem_bytes_p + hjoin_grace_bucket_bytes_estimate (*in_mem_tuple_cnt_p);
+    if (charge <= *effective_hash_mem_p)
+      {
+	return NO_ERROR;
+      }
+
+    /* Once over budget, charge just the tuple that was last inserted (not the
+     * running total) -- `charge - *effective_hash_mem_p` would double-count
+     * everything already over budget on every subsequent insert, making the
+     * counter's magnitude meaningless past the first give-up. */
+    if (!*grow_enabled_p)
+      {
+	hjoin_debug_grace_skew_overflow.fetch_add ((long) last_insert_charge, std::memory_order_relaxed);
+	return NO_ERROR;
+      }
+
+    const int old_nbatch = *nbatch_p;
+    const int new_nbatch = old_nbatch * 2;
+    if (new_nbatch > HJOIN_GRACE_MAX_NBATCH)
+      {
+	*grow_enabled_p = false;
+	hjoin_debug_grace_skew_overflow.fetch_add ((long) last_insert_charge, std::memory_order_relaxed);
+	return NO_ERROR;
+      }
+
+    const UINT64 buffer_cost_estimate = (UINT64) old_nbatch * 8 /* BUFFILE_BATCH_PAGES */  * DB_PAGESIZE * 2;
+    if (buffer_cost_estimate > hash_mem && *effective_hash_mem_p < (UINT64) HJOIN_GRACE_EFFECTIVE_CAP_MULT * hash_mem)
+      {
+	*effective_hash_mem_p *= 2;
+	return NO_ERROR;
+      }
+
+    batches.grow (new_nbatch);
+
+    hjoin_grace_grow_ctx ctx = { thread_p, &batches, old_nbatch, new_nbatch, nbatch_bits, &dir, tde_algo, worker_id,
+      next_seq, 0
+    };
+    unsigned int nevicted = 0;
+    int error = mht_rehash_out_hls (hash_scan->memory.hash_table, hjoin_grace_grow_route_func, &ctx, &nevicted);
+    if (error != NO_ERROR)
+      {
+	return error;
+      }
+
+    const INT64 ninmemory_before = *in_mem_tuple_cnt_p;
+    *nbatch_p = new_nbatch;
+    *in_mem_tuple_cnt_p = ninmemory_before - (INT64) nevicted;
+    *in_mem_bytes_p -= ctx.freed_bytes;
+    hjoin_debug_grace_nbatch_grows.fetch_add (1, std::memory_order_relaxed);
+
+    if (nevicted == 0 || (INT64) nevicted == ninmemory_before)
+      {
+	*grow_enabled_p = false;
+      }
+
+    return NO_ERROR;
+  }
+
+  /*
+   * hjoin_grace_build_insert_tracked () - hjoin_grace_build_insert wrapper
+   *   that also tracks the current in-mem batch's real bytes/tuple count and
+   *   invokes hjoin_grace_maybe_grow (issue #147 T1 S4). Used at every site
+   *   that inserts into the currently-loaded IN_MEM table (initial build's
+   *   batch 0 and the reload loop's inner-read sub-loop).
+   */
+  int
+  hjoin_grace_build_insert_tracked (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan,
+				    QFILE_LIST_SCAN_ID * scan_id_source, UINT32 hash_key, QFILE_TUPLE tuple,
+				    hjoin_grace_batch_files & batches, int *nbatch_p, int nbatch_bits,
+				    const std::string & dir, TDE_ALGORITHM tde_algo, UINT32 worker_id,
+				    std::uint64_t * next_seq, UINT64 hash_mem, UINT64 * effective_hash_mem_p,
+				    UINT64 * in_mem_bytes_p, INT64 * in_mem_tuple_cnt_p, bool * grow_enabled_p)
+  {
+    int error = hjoin_grace_build_insert (thread_p, hash_scan, scan_id_source, hash_key, tuple);
+    if (error != NO_ERROR)
+      {
+	return error;
+      }
+
+    const UINT64 this_tuple_charge = hjoin_grace_arena_charge_estimate (QFILE_GET_TUPLE_LENGTH (tuple));
+    *in_mem_tuple_cnt_p += 1;
+    *in_mem_bytes_p += this_tuple_charge;
+
+    return hjoin_grace_maybe_grow (thread_p, hash_scan, batches, nbatch_p, nbatch_bits, dir, tde_algo, worker_id,
+				   next_seq, hash_mem, effective_hash_mem_p, in_mem_bytes_p, in_mem_tuple_cnt_p,
+				   grow_enabled_p, this_tuple_charge);
+  }
 }				/* anonymous namespace */
 
 /*
@@ -1973,6 +2234,17 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
   std::string dir;
   TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
   std::uint64_t next_seq = 0;
+  /* issue #147 T1 S4: mid-build/mid-reload nbatch growth state. hash_mem is
+   * fetched once here (same accessor hjoin_grace_choose_nbatch used for the
+   * upfront estimate); effective_hash_mem is the D3 trade-off guard's own
+   * (possibly raised) threshold. in_mem_bytes/in_mem_tuple_cnt track
+   * whatever conceptual batch (0 during build, X during a reload) is
+   * currently resident; reset to 0 at each reload iteration's table clear. */
+  const UINT64 hash_mem = (UINT64) temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash);
+  UINT64 effective_hash_mem = hash_mem;
+  UINT64 in_mem_bytes = 0;
+  INT64 in_mem_tuple_cnt = 0;
+  bool grace_grow_enabled = true;
 
   assert (thread_p != NULL);
   assert (manager != NULL);
@@ -2005,17 +2277,17 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
   key = hash_scan->temp_key;
 
   hjoin_grace_batch_files batches (nbatch);
-  if (nbatch > 1)
+  /* issue #147 T1 S4: resolved unconditionally (not just nbatch > 1) -- a
+   * mid-build grow can create the first batch file even when the upfront
+   * estimate chose nbatch == 1. */
+  if (!qfile::buffile::default_scratch_dir (dir))
     {
-      if (!qfile::buffile::default_scratch_dir (dir))
-	{
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
-	  error = er_errid ();
-	  goto error_exit;
-	}
-      tde_algo = hjoin_grace_tde_algo (manager);
-      next_seq = ((std::uint64_t) manager->query_id << 20) ^ 1;
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+      error = er_errid ();
+      goto error_exit;
     }
+  tde_algo = hjoin_grace_tde_algo (manager);
+  next_seq = ((std::uint64_t) manager->query_id << 20) ^ 1;
 
   result_list_id = qfile_open_list (thread_p, &manager->type_list, NULL, manager->query_id, manager->qlist_flag, NULL);
   if (result_list_id == NULL)
@@ -2051,8 +2323,10 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
 
       if (batchno == 0)
 	{
-	  error = hjoin_grace_build_insert (thread_p, hash_scan, &build->list_scan_id, hash_key,
-					   build->tuple_record.tpl);
+	  error = hjoin_grace_build_insert_tracked (thread_p, hash_scan, &build->list_scan_id, hash_key,
+						    build->tuple_record.tpl, batches, &nbatch, nbatch_bits, dir,
+						    tde_algo, worker_id, &next_seq, hash_mem, &effective_hash_mem,
+						    &in_mem_bytes, &in_mem_tuple_cnt, &grace_grow_enabled);
 	}
       else
 	{
@@ -2162,6 +2436,9 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
 	{
 	  hscan_value_arena_reset (hash_scan->memory.value_arena);
 	}
+      /* issue #147 T1 S4: this reload iteration's own in-mem footprint starts fresh. */
+      in_mem_bytes = 0;
+      in_mem_tuple_cnt = 0;
 
       if (inner_store != NULL)
 	{
@@ -2180,7 +2457,35 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
 		{
 		  break;
 		}
-	      error = hjoin_grace_build_insert (thread_p, hash_scan, &build->list_scan_id, rd_hash, rd_tuple);
+
+	      /* issue #147 T1 S4: a growth triggered while reloading an earlier
+	       * batch (nbatch only ever grows) may have moved this record's true
+	       * home past `batchno` since it was written -- recheck and
+	       * forward-spill instead of inserting if so; guaranteed to land on
+	       * a not-yet-visited batch (see the routing-invariant comment above
+	       * hjoin_grace_grow_ctx). */
+	      {
+		const int rd_batchno = hjoin_grace_route (rd_hash, nbatch, nbatch_bits);
+		if (rd_batchno != batchno)
+		  {
+		    error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, worker_id, &next_seq,
+							   &batches.inner[rd_batchno]);
+		    if (error == NO_ERROR)
+		      {
+			error = batches.inner[rd_batchno]->append (thread_p, rd_hash, rd_tuple);
+		      }
+		    if (error != NO_ERROR)
+		      {
+			goto error_exit;
+		      }
+		    continue;
+		  }
+	      }
+
+	      error = hjoin_grace_build_insert_tracked (thread_p, hash_scan, &build->list_scan_id, rd_hash, rd_tuple,
+							batches, &nbatch, nbatch_bits, dir, tde_algo, worker_id,
+							&next_seq, hash_mem, &effective_hash_mem, &in_mem_bytes,
+							&in_mem_tuple_cnt, &grace_grow_enabled);
 	      if (error != NO_ERROR)
 		{
 		  goto error_exit;
@@ -2207,6 +2512,30 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
 	      {
 		break;
 	      }
+
+	    /* issue #147 T1 S4: same staleness concern as the inner-read loop
+	     * above -- a growth since this outer record was written (whether
+	     * during this same batch's own inner reload just above, or an
+	     * earlier batch's) may have moved its true home past `batchno`;
+	     * recheck and forward-spill instead of probing now if so. */
+	    {
+	      const int rd_batchno = hjoin_grace_route (rd_hash, nbatch, nbatch_bits);
+	      if (rd_batchno != batchno)
+		{
+		  error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, worker_id, &next_seq,
+							 &batches.outer[rd_batchno]);
+		  if (error == NO_ERROR)
+		    {
+		      error = batches.outer[rd_batchno]->append (thread_p, rd_hash, rd_tuple);
+		    }
+		  if (error != NO_ERROR)
+		    {
+		      goto error_exit;
+		    }
+		  continue;
+		}
+	    }
+
 	    probe->tuple_record.tpl = rd_tuple;
 	    probe->tuple_record.size = QFILE_GET_TUPLE_LENGTH (rd_tuple);
 
