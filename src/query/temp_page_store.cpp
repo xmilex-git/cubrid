@@ -456,6 +456,16 @@ namespace temp_page_store
                * degrade to disk-spill backing early instead of erroring. */
               temp_page_store::record_cap_pressure_spill ();
             }
+          else if (tfile_p->membuf_type == TEMP_FILE_MEMBUF_NORMAL)
+            {
+              /* #146 T3 S2: the row_store per-op limit (membuf_npages, sized
+               * from op_limit_bytes(row_store)) was reached with no cap
+               * pressure involved -- the normal "raise work_mem" signal.
+               * TEMP_FILE_MEMBUF_KEY_BUFFER is excluded: its capacity comes
+               * from the unrelated, out-of-scope index_scan_key_buffer_pages
+               * knob (design doc §5), not work_mem. */
+              temp_page_store::record_op_limit_spill_sort ();
+            }
 
           /* page-spill backing: the choice is made ONCE at the tfile's first
            * spill; the PAGE_SPILL tag pins it thereafter. */

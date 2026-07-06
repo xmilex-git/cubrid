@@ -4070,7 +4070,10 @@ qmgr_allocate_tempfile_with_buffer (int num_buffer_pages)
 static int
 qmgr_work_mem_buffer_pages (void)
 {
-  UINT64 work_mem_pages = prm_get_bigint_value (PRM_ID_WORK_MEM) / DB_PAGESIZE;
+  /* #146 T3 S2 (D6): list-file membuf target is the row_store per-op limit,
+   * not PRM_ID_WORK_MEM directly -- same value today (no multiplier for
+   * row_store), but makes the limit's identity explicit. */
+  UINT64 work_mem_pages = temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::row_store) / DB_PAGESIZE;
 
   return (int) MAX (work_mem_pages, 1);
 }

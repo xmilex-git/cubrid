@@ -54,6 +54,7 @@
 #include "qfile_chunk.hpp"
 #include "qfile_tape.hpp"
 #include "query_manager.h"
+#include "query_workmem.hpp"	/* work_mem accountant: reserve_held / reserve_held_soft / release_held */
 #include "object_representation.h"
 #include "px_worker_manager.hpp"
 #include "px_callable_task.hpp"
@@ -145,6 +146,8 @@ struct sort_param
   VOL_LIST vol_list;		/* Temporary volume information list */
   char *internal_memory;	/* Internal_memory used for internal sorting phase and as input/output buffers for temp
 				 * files during merging phase */
+  size_t wm_charged_bytes;	/* #146 T3 S2: work_mem accountant charge for internal_memory (D2/§5); 0 = uncharged */
+  int wm_charged_shard;		/* shard wm_charged_bytes landed on; -1 = none */
   int tot_runs;			/* Total number of runs */
   int tot_buffers;		/* Size of internal memory used in terms of number of buffers it occupies */
   int tot_tempfiles;		/* Total number of temporary files */
@@ -262,6 +265,8 @@ static int sort_exphase_merge_elim_dup (THREAD_ENTRY * thread_p, SORT_PARAM * so
 static int sort_exphase_merge (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param);
 static int sort_get_avg_numpages_of_nonempty_tmpfile (SORT_PARAM * sort_param);
 static void sort_return_used_resources (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, PARALLEL_TYPE parallel_type);
+static void sort_charge_internal_memory_wm (size_t bytes, size_t * charged_bytes_out, int *charged_shard_out);
+static void sort_release_internal_memory_wm (size_t * charged_bytes_inout, int *charged_shard_inout);
 static int sort_add_new_file (THREAD_ENTRY * thread_p, VFID * vfid, int file_pg_cnt_est, bool force_alloc,
 			      bool tde_encrypted);
 
@@ -1415,6 +1420,8 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
       sort_param->file_contents[i].num_pages = NULL;
     }
   sort_param->internal_memory = NULL;
+  sort_param->wm_charged_bytes = 0;
+  sort_param->wm_charged_shard = -1;
 
   /* initialize temp. overflow file. Real value will be assigned in sort_inphase_sort function, if long size sorting
    * records are encountered. */
@@ -1428,7 +1435,11 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->vol_list.vol_cnt = 0;
   sort_param->vol_list.vol_info = NULL;
 
-  work_mem_pages = (INT32) MAX (prm_get_bigint_value (PRM_ID_WORK_MEM) / DB_PAGESIZE, 4);
+  /* #146 T3 S2 (D6): row-store-shaped per-op limit, not PRM_ID_WORK_MEM directly
+   * -- same value today (no multiplier for row_store), but makes the limit's
+   * identity explicit and picks up any future row_store-tier change. */
+  work_mem_pages =
+    (INT32) MAX (temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::row_store) / DB_PAGESIZE, 4);
   if (est_inp_pg_cnt > 0)
     {
       /* 10% of overhead and fragmentation */
@@ -1456,6 +1467,10 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
 	  goto cleanup;
 	}
     }
+  /* #146 T3 S2 (D2/§5): charge the buffer actually allocated (whichever
+   * fallback size above), not the originally requested size. */
+  sort_charge_internal_memory_wm ((size_t) sort_param->tot_buffers * (size_t) DB_PAGESIZE,
+				  &sort_param->wm_charged_bytes, &sort_param->wm_charged_shard);
 
   sort_param->half_files = sort_get_num_half_tmpfiles (sort_param->tot_buffers, input_pages);
   sort_param->tot_tempfiles = sort_param->half_files << 1;
@@ -1814,6 +1829,10 @@ sort_listfile_internal (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
   if (sort_param->tot_runs > 1)
     {
       assert (sort_param->tot_runs > 0);
+      /* #146 T3 S2 (§6): the in-memory run (sized to op_limit_bytes(row_store))
+       * didn't hold everything -- external merge to temp files follows, the
+       * per-op "raise work_mem" signal for row-store-shaped consumers. */
+      temp_page_store::record_op_limit_spill_sort ();
       /* Create output temporary files make file and temporary volume page count estimates */
       file_pg_cnt_est = sort_get_avg_numpages_of_nonempty_tmpfile (sort_param);
       file_pg_cnt_est = MAX (1, file_pg_cnt_est);
@@ -4205,6 +4224,49 @@ sort_get_avg_numpages_of_nonempty_tmpfile (SORT_PARAM * sort_param)
 }
 
 /*
+ * sort_charge_internal_memory_wm () - #146 T3 S2 (D2/§5): charge internal_memory
+ *   to the work_mem accountant.  Hard reserve_held first; on cap rejection,
+ *   fall back to the unconditional reserve_held_soft (recording a degrade) --
+ *   internal_memory is a single fixed buffer the sort algorithm needs to
+ *   exist, so (unlike D7-2 membuf growth) there is no "spill instead" option
+ *   here; this mirrors the existing hard-then-soft convention used by
+ *   hls_spill_create/tape_writer::wm_reserve_batch. Always "succeeds" from the
+ *   caller's perspective (behavior never changes), matching bytes/shard are
+ *   written out for a matching sort_release_internal_memory_wm() later.
+ */
+static void
+sort_charge_internal_memory_wm (size_t bytes, size_t * charged_bytes_out, int *charged_shard_out)
+{
+  int shard = -1;
+
+  if (!temp_page_store::reserve_held (bytes, &shard))
+    {
+      temp_page_store::record_degrade ();
+      temp_page_store::reserve_held_soft (bytes, &shard);
+    }
+
+  *charged_bytes_out = bytes;
+  *charged_shard_out = shard;
+}
+
+/*
+ * sort_release_internal_memory_wm () - undo sort_charge_internal_memory_wm ();
+ *   a no-op if nothing was charged. Resets both out-params so a repeat call
+ *   (e.g. an error path followed by the normal cleanup path) is harmless.
+ */
+static void
+sort_release_internal_memory_wm (size_t * charged_bytes_inout, int *charged_shard_inout)
+{
+  if (*charged_bytes_inout > 0)
+    {
+      temp_page_store::release_held (*charged_bytes_inout, *charged_shard_inout);
+    }
+
+  *charged_bytes_inout = 0;
+  *charged_shard_inout = -1;
+}
+
+/*
  * sort_return_used_resources () - Return system resource used for sorting
  *   return: void
  *   sort_param(in): Sort paramater
@@ -4229,6 +4291,7 @@ sort_return_used_resources (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, PA
     {
       free_and_init (sort_param->internal_memory);
     }
+  sort_release_internal_memory_wm (&sort_param->wm_charged_bytes, &sort_param->wm_charged_shard);
 
   if (parallel_type == PX_SINGLE || parallel_type == PX_MAIN_IN_PARALLEL)
     {
@@ -4433,6 +4496,13 @@ sort_copy_sort_param (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
   for (i = 0; i < parallel_num; i++)
     {
       px_sort_param[i].internal_memory = NULL;
+      /* #146 T3 S2: the memcpy also duplicated the LEADER's wm_charged_bytes/
+       * shard into every worker slot -- without this reset, a worker whose
+       * own charge below never runs (error path) would still look "charged"
+       * with the leader's values and sort_return_used_resources() would
+       * release bytes this worker never actually held. */
+      px_sort_param[i].wm_charged_bytes = 0;
+      px_sort_param[i].wm_charged_shard = -1;
       /* The memcpy above shallow-copies main's caller-owned pointers into
        * every worker slot. If a later alloc in this function fails, cleanup
        * runs sort_return_used_resources(PX_THREAD_IN_PARALLEL) which would
@@ -4465,6 +4535,13 @@ sort_copy_sort_param (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
 	  goto clear;
 	}
       sort_param->internal_memory = new_internal_memory;
+      /* #146 T3 S2: buffer grew to 8 pages -- release the leader's old charge
+       * and recharge for the new size. Simpler and safer than tracking a
+       * delta against the sticky shard; this path is cold (only hit when
+       * going parallel with a sub-8-page leader buffer). */
+      sort_release_internal_memory_wm (&sort_param->wm_charged_bytes, &sort_param->wm_charged_shard);
+      sort_charge_internal_memory_wm ((size_t) sort_param->tot_buffers * (size_t) DB_PAGESIZE,
+				      &sort_param->wm_charged_bytes, &sort_param->wm_charged_shard);
     }
 
   /* alloc new memory */
@@ -4477,6 +4554,10 @@ sort_copy_sort_param (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, error, 1, (size_t) (sort_param->tot_buffers * DB_PAGESIZE));
 	  goto clear;
 	}
+      /* #146 T3 S2 (D2/§5): per-worker charge (PG-style: parallel workers each
+       * charge their own internal_memory). */
+      sort_charge_internal_memory_wm ((size_t) sort_param->tot_buffers * (size_t) DB_PAGESIZE,
+				      &px_sort_param[i].wm_charged_bytes, &px_sort_param[i].wm_charged_shard);
       px_sort_param[i].tot_buffers = sort_param->tot_buffers;	/* match allocated size (may be 8 for parallel) */
       for (j = 0; j < SORT_MAX_TOT_FILES; j++)
 	{
@@ -4516,6 +4597,7 @@ clear:
 	    {
 	      free_and_init (px_sort_param[i].internal_memory);
 	    }
+	  sort_release_internal_memory_wm (&px_sort_param[i].wm_charged_bytes, &px_sort_param[i].wm_charged_shard);
 	  for (j = 0; j < SORT_MAX_TOT_FILES; j++)
 	    {
 	      if (px_sort_param[i].file_contents[j].num_pages != NULL)

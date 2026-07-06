@@ -319,6 +319,12 @@ namespace temp_page_store
     perfmon_inc_stat_to_global (PSTAT_WORKMEM_CAP_PRESSURE_SPILLS);
   }
 
+  void
+  record_op_limit_spill_sort () noexcept
+  {
+    perfmon_inc_stat_to_global (PSTAT_WORKMEM_OP_LIMIT_SPILLS_SORT);
+  }
+
   std::size_t
   cap_bytes () noexcept
   {

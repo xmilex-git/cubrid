@@ -66,6 +66,10 @@ namespace temp_page_store
    * early instead of erroring.  Distinct from record_degrade() (existing
    * per-op soft-degrade counter, left as-is). */
   void record_cap_pressure_spill () noexcept;
+  /* #146 T3 S2 (§6): layer-1 per-op (row_store) limit reached -> normal spill
+   * to temp files/disk -- an operator-facing "raise work_mem" signal, distinct
+   * from cap_pressure_spill (layer-2, cross-query contention). */
+  void record_op_limit_spill_sort () noexcept;
 
   std::size_t cap_bytes () noexcept;
   std::size_t reserved_bytes () noexcept;
