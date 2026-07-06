@@ -1348,6 +1348,118 @@ error_exit:
   goto cleanup;
 }
 
+/* Bounded halving, mirrors HLS_SPILL_MAX_NBATCH's role for the batch-spill
+ * hash (query_hash_scan.c) -- an escape hatch against a pathological
+ * build_bytes/hash_mem ratio spinning nbatch up without bound. */
+static const int HJOIN_GRACE_MAX_NBATCH = 512;
+
+/*
+ * hjoin_grace_bucket_bytes_estimate () - rough per-entry bucket-array
+ *   overhead for an in-memory hash table sized to hold `tuple_cnt` entries
+ *   (mht_create_hls's bucket vector, one pointer-ish slot per bucket at
+ *   ~0.7 load factor -- see memory_hash.c). An approximation: the halving
+ *   loop below is the same tolerance mechanism PG's own estimate-then-halve
+ *   sizing relies on, so a rough constant-per-tuple estimate is sufficient.
+ *   (File-scope, not the anonymous namespace with the rest of the Grace
+ *   helpers, so hjoin_check_partition -- defined earlier in the file -- can
+ *   call it; see D-S2-1.)
+ */
+static UINT64
+hjoin_grace_bucket_bytes_estimate (INT64 tuple_cnt)
+{
+  if (tuple_cnt <= 0)
+    {
+      return 0;
+    }
+  return (UINT64) tuple_cnt * sizeof (void *);
+}
+
+/*
+ * hjoin_grace_choose_nbatch () - issue #147 D4: precompute nbatch (power of
+ *   two) so each batch's build footprint fits hash_mem (session work_mem *
+ *   hash_mem_multiplier, #146 S0 accessor -- op_limit_bytes(hash) is first
+ *   consumed here). Uses the build side's REAL materialized size
+ *   (page_cnt/tuple_cnt), not an estimate; halving loop bounded by
+ *   HJOIN_GRACE_MAX_NBATCH (PG ExecChooseHashTableSize equivalent).
+ */
+static int
+hjoin_grace_choose_nbatch (INT64 build_tuple_cnt, INT64 build_page_cnt)
+{
+  if (build_tuple_cnt <= 0 || build_page_cnt <= 0)
+    {
+      return 1;
+    }
+
+  const UINT64 hash_mem = (UINT64) temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash);
+  const UINT64 build_bytes = (UINT64) build_page_cnt * DB_PAGESIZE;
+
+  int nbatch = 1;
+  while (nbatch < HJOIN_GRACE_MAX_NBATCH)
+    {
+      const UINT64 per_batch_tuples = (UINT64) build_tuple_cnt / (UINT64) nbatch;
+      const UINT64 per_batch_bytes = build_bytes / (UINT64) nbatch;
+      const UINT64 bucket_bytes = hjoin_grace_bucket_bytes_estimate ((INT64) per_batch_tuples);
+
+      if (per_batch_bytes + bucket_bytes <= hash_mem)
+	{
+	  break;
+	}
+      nbatch <<= 1;
+    }
+  return nbatch;
+}
+
+/*
+ * hjoin_grace_build_side_size () - read-only lookup of which side
+ *   hjoin_check_partition's Grace-nbatch gate (D-S2-1) should size against:
+ *   mirrors hjoin_init_context/hjoin_grace_select_build_probe's build-side
+ *   pick (JOIN_INNER: smaller side; JOIN_LEFT: inner; JOIN_RIGHT: outer)
+ *   without mutating context (build/probe assignment proper happens later,
+ *   once execution actually starts down the SINGLE or Grace path).
+ */
+static void
+hjoin_grace_build_side_size (const HASHJOIN_MANAGER * manager, const HASHJOIN_CONTEXT * single_context,
+			     INT64 * tuple_cnt_out, INT64 * page_cnt_out)
+{
+  const QFILE_LIST_ID *outer_list_id = single_context->outer.list_id;
+  const QFILE_LIST_ID *inner_list_id = single_context->inner.list_id;
+
+  switch (manager->join_type)
+    {
+    case JOIN_INNER:
+      if (outer_list_id->tuple_cnt < inner_list_id->tuple_cnt
+	  || (outer_list_id->tuple_cnt == inner_list_id->tuple_cnt
+	      && outer_list_id->page_cnt < inner_list_id->page_cnt))
+	{
+	  *tuple_cnt_out = outer_list_id->tuple_cnt;
+	  *page_cnt_out = outer_list_id->page_cnt;
+	}
+      else
+	{
+	  *tuple_cnt_out = inner_list_id->tuple_cnt;
+	  *page_cnt_out = inner_list_id->page_cnt;
+	}
+      break;
+
+    case JOIN_LEFT:
+      *tuple_cnt_out = inner_list_id->tuple_cnt;
+      *page_cnt_out = inner_list_id->page_cnt;
+      break;
+
+    case JOIN_RIGHT:
+      *tuple_cnt_out = outer_list_id->tuple_cnt;
+      *page_cnt_out = outer_list_id->page_cnt;
+      break;
+
+    default:
+      /* impossible case */
+      assert_release_error (false);
+      *tuple_cnt_out = 0;
+      *page_cnt_out = 0;
+      break;
+    }
+}
+
 /*
  * hjoin_check_partition() -
  *   return: One of the following HASHJOIN_STATUS values:
@@ -1356,6 +1468,21 @@ error_exit:
  *   thread_p(in): Thread entry.
  *   manager(in): Hash join manager containing shared state.
  *   single_context(in): Hash join context for single-threaded execution.
+ *
+ * issue #147 T1 S2 D-S2-1 correction: the #123 entry-metadata formula below
+ * stays (px's hjoin_prepare_partition/hjoin_split_qlist NULL-partition scheme
+ * still consumes its part_cnt as ITS OWN partition-count parameter), but it
+ * no longer gates SINGLE vs PARTITION alone. That formula sizes off
+ * fixed-width index entries (HENTRY_HLS + SIMPLE_POS), so a small-entry-count/
+ * wide-tuple build set could slip through as SINGLE while its actual bytes
+ * exceed work_mem -- hjoin_scan_init would then pick HYBRID/HASH_FILE for the
+ * plain SINGLE path, and the probe-random-read pathology Grace exists to
+ * eliminate would reappear. The gate is now `part_cnt > 1 || grace_nbatch > 1`
+ * (either formula can trigger PARTITION); part_cnt is clamped up to at least
+ * grace_nbatch so px, if it does engage, still gets a fine-enough partition
+ * count. The residual mismatch direction (#123 says PARTITION, Grace says
+ * nbatch == 1) is safe: hjoin_execute_grace recomputes its own nbatch
+ * independently and simply degenerates to a single in-memory batch.
  */
 static HASHJOIN_STATUS
 hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * single_context)
@@ -1365,6 +1492,8 @@ hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASH
   UINT64 mem_limit;
   INT64 min_tuple_cnt;
   UINT32 part_cnt;
+  INT64 build_tuple_cnt, build_page_cnt;
+  int grace_nbatch;
 
   assert (thread_p != NULL);
   assert (manager != NULL);
@@ -1386,12 +1515,22 @@ hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASH
   part_cnt =
     CEIL_PTVDIV ((sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) * min_tuple_cnt,
 		 mem_limit * PARTITION_FILL_FACTOR);
-  if (part_cnt > 1)
+
+  hjoin_grace_build_side_size (manager, single_context, &build_tuple_cnt, &build_page_cnt);
+  grace_nbatch = hjoin_grace_choose_nbatch (build_tuple_cnt, build_page_cnt);
+  if (part_cnt < (UINT32) grace_nbatch)
+    {
+      part_cnt = (UINT32) grace_nbatch;
+    }
+
+  if (part_cnt > 1 || grace_nbatch > 1)
     {
       if (IS_OUTER_JOIN_TYPE (manager->join_type))
 	{
 	  /* In outer joins, tuples with NULL in any join column are placed in the last partition.
-	   * HASHJOIN_STATUS_FILL_NULL_VALUES is triggered for all tuples in this partition. */
+	   * HASHJOIN_STATUS_FILL_NULL_VALUES is triggered for all tuples in this partition.
+	   * (px-only scheme -- Grace's own NULL handling is need_skip_next-based, no
+	   * dedicated partition; see hjoin_execute_grace.) */
 	  part_cnt += 1;
 	}
 
@@ -1442,64 +1581,6 @@ hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASH
 
 namespace
 {
-  /* Bounded halving, mirrors HLS_SPILL_MAX_NBATCH's role for the batch-spill
-   * hash (query_hash_scan.c) -- an escape hatch against a pathological
-   * build_bytes/hash_mem ratio spinning nbatch up without bound. */
-  const int HJOIN_GRACE_MAX_NBATCH = 512;
-
-  /*
-   * hjoin_grace_bucket_bytes_estimate () - rough per-entry bucket-array
-   *   overhead for an in-memory hash table sized to hold `tuple_cnt` entries
-   *   (mht_create_hls's bucket vector, one pointer-ish slot per bucket at
-   *   ~0.7 load factor -- see memory_hash.c). An approximation: the halving
-   *   loop below is the same tolerance mechanism PG's own estimate-then-halve
-   *   sizing relies on, so a rough constant-per-tuple estimate is sufficient.
-   */
-  UINT64
-  hjoin_grace_bucket_bytes_estimate (INT64 tuple_cnt)
-  {
-    if (tuple_cnt <= 0)
-      {
-	return 0;
-      }
-    return (UINT64) tuple_cnt * sizeof (void *);
-  }
-
-  /*
-   * hjoin_grace_choose_nbatch () - issue #147 D4: precompute nbatch (power of
-   *   two) so each batch's build footprint fits hash_mem (session work_mem *
-   *   hash_mem_multiplier, #146 S0 accessor -- op_limit_bytes(hash) is first
-   *   consumed here). Uses the build side's REAL materialized size
-   *   (page_cnt/tuple_cnt), not an estimate; halving loop bounded by
-   *   HJOIN_GRACE_MAX_NBATCH (PG ExecChooseHashTableSize equivalent).
-   */
-  int
-  hjoin_grace_choose_nbatch (INT64 build_tuple_cnt, INT64 build_page_cnt)
-  {
-    if (build_tuple_cnt <= 0 || build_page_cnt <= 0)
-      {
-	return 1;
-      }
-
-    const UINT64 hash_mem = (UINT64) temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash);
-    const UINT64 build_bytes = (UINT64) build_page_cnt * DB_PAGESIZE;
-
-    int nbatch = 1;
-    while (nbatch < HJOIN_GRACE_MAX_NBATCH)
-      {
-	const UINT64 per_batch_tuples = (UINT64) build_tuple_cnt / (UINT64) nbatch;
-	const UINT64 per_batch_bytes = build_bytes / (UINT64) nbatch;
-	const UINT64 bucket_bytes = hjoin_grace_bucket_bytes_estimate ((INT64) per_batch_tuples);
-
-	if (per_batch_bytes + bucket_bytes <= hash_mem)
-	  {
-	    break;
-	  }
-	nbatch <<= 1;
-      }
-    return nbatch;
-  }
-
   /* number of bits nbatch (a power of two) occupies, e.g. 8 -> 3 */
   int
   hjoin_grace_nbatch_bits (int nbatch)
