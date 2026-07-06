@@ -4092,7 +4092,17 @@ qdump_print_hashjoin_stats_text (FILE * fp, xasl_node * xasl_p, int indent)
   part_cnt = stats_group->context_cnt;
 
   const bool is_partition_parallel = (status == HASHJOIN_STATUS_PARTITION || status == HASHJOIN_STATUS_PARALLEL);
-  assert (part_stats == NULL || is_partition_parallel || status == HASHJOIN_STATUS_PARALLEL_PROBE);
+  /* issue #147 T1: HASHJOIN_STATUS_GRACE_DONE (serial Grace, S2) is accepted
+   * here too -- hjoin_prepare_partition allocates context_stats/part_stats
+   * whenever thread_is_on_trace even though Grace's own hjoin_try_partition
+   * dispatch never uses manager->contexts[], so part_stats can be non-NULL
+   * for this status. Falls into the !is_partition_parallel single-context
+   * path below (reads stats, never part_stats) -- Grace's own build/probe
+   * trace population into `stats` is a known, separately-tracked gap (some
+   * trace fields may print empty/zero for this status); this only fixes
+   * the crash, not that gap. */
+  assert (part_stats == NULL || is_partition_parallel || status == HASHJOIN_STATUS_PARALLEL_PROBE
+	  || status == HASHJOIN_STATUS_GRACE_DONE);
 
   outer_xasl = proc->outer.xasl;
   inner_xasl = proc->inner.xasl;
@@ -4409,7 +4419,17 @@ qdump_print_hashjoin_stats_json (xasl_node * xasl_p, json_t * parent)
   part_cnt = stats_group->context_cnt;
 
   const bool is_partition_parallel = (status == HASHJOIN_STATUS_PARTITION || status == HASHJOIN_STATUS_PARALLEL);
-  assert (part_stats == NULL || is_partition_parallel || status == HASHJOIN_STATUS_PARALLEL_PROBE);
+  /* issue #147 T1: HASHJOIN_STATUS_GRACE_DONE (serial Grace, S2) is accepted
+   * here too -- hjoin_prepare_partition allocates context_stats/part_stats
+   * whenever thread_is_on_trace even though Grace's own hjoin_try_partition
+   * dispatch never uses manager->contexts[], so part_stats can be non-NULL
+   * for this status. Falls into the !is_partition_parallel single-context
+   * path below (reads stats, never part_stats) -- Grace's own build/probe
+   * trace population into `stats` is a known, separately-tracked gap (some
+   * trace fields may print empty/zero for this status); this only fixes
+   * the crash, not that gap. */
+  assert (part_stats == NULL || is_partition_parallel || status == HASHJOIN_STATUS_PARALLEL_PROBE
+	  || status == HASHJOIN_STATUS_GRACE_DONE);
 
   outer_xasl = proc->outer.xasl;
   inner_xasl = proc->inner.xasl;
