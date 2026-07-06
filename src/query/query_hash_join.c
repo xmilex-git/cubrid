@@ -78,6 +78,22 @@ hjoin_debug_grace_skew_overflow_bytes (void)
   return hjoin_debug_grace_skew_overflow.load (std::memory_order_relaxed);
 }
 
+/* issue #149 P2: outer-streaming coverage observability (same pattern). */
+static std::atomic<long> hjoin_debug_outer_streamed { 0 };
+static std::atomic<long> hjoin_debug_outer_fallback_materialize { 0 };
+
+long
+hjoin_debug_outer_streamed_count (void)
+{
+  return hjoin_debug_outer_streamed.load (std::memory_order_relaxed);
+}
+
+long
+hjoin_debug_outer_fallback_materialize_count (void)
+{
+  return hjoin_debug_outer_fallback_materialize.load (std::memory_order_relaxed);
+}
+
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -812,6 +828,24 @@ hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NO
   manager->inner = &proc->inner;
   assert (manager->outer->xasl != NULL);
   assert (manager->inner->xasl != NULL);
+
+  /* issue #149 P2: a streamed outer (XASL_HASHJOIN_OUTER_STREAMED) was
+   * excluded from aptr_list at plan time (see pt_to_hashjoin_proc), but
+   * qexec_execute_mainblock_internal's aptr-loop area now runs it manually
+   * in the exact spot/context the old aptr loop always ran it in (see the
+   * HASHJOIN_PROC branch right before the `for (xptr2 = xptr->aptr_list...)`
+   * loop) -- calling qexec_execute_mainblock from *here* instead left a
+   * resource-tracker entry unreleased (issue #149 P2 stop-and-report:
+   * SIGABRT via cubbase::restrack_assert, net_server_request's end-of-request
+   * pop_resource_tracks). By the time hjoin_init_manager runs, outer's
+   * list_id is therefore already materialized like any other consumer
+   * (hjoin_check_empty_inputs, hjoin_execute_grace,
+   * hjoin_grace_select_build_probe, ...) expects -- nothing further to do
+   * here. */
+  if (XASL_IS_FLAGED (manager->outer->xasl, XASL_HASHJOIN_OUTER_STREAMED))
+    {
+      hjoin_debug_outer_fallback_materialize.fetch_add (1, std::memory_order_relaxed);
+    }
 
   outer_list_id = manager->outer->xasl->list_id;
   inner_list_id = manager->inner->xasl->list_id;

@@ -507,6 +507,19 @@ long hjoin_debug_grace_nbatch_grow_count (void);
  * kept freeing memory each time. */
 long hjoin_debug_grace_skew_overflow_bytes (void);
 
+/* issue #149 P2: process-wide count of hjoin_execute_grace invocations that
+ * confirmed probe=outer (XASL_HASHJOIN_OUTER_STREAMED, JOIN_LEFT) and
+ * actually pulled outer row-by-row instead of self-materializing it. */
+long hjoin_debug_outer_streamed_count (void);
+
+/* issue #149 P2: process-wide count of hjoin_execute_grace invocations where
+ * outer was flagged XASL_HASHJOIN_OUTER_STREAMED but had to be
+ * self-materialized anyway -- either because it was confirmed build side
+ * (JOIN_RIGHT) or its XASL shape didn't qualify for the narrow streaming
+ * path (CTE/aggregate/scan_ptr chain). Zero regression either way (same
+ * result as the pre-P2 fully-materialized path), just no W1 benefit. */
+long hjoin_debug_outer_fallback_materialize_count (void);
+
 /* Hash Join Execution */
 int hjoin_execute (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
 /* issue #147 S6: per-partition PARALLEL entry point (join_task::execute) --

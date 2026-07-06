@@ -2408,6 +2408,20 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
       XASL_SET_FLAG (xasl_p, decache_clone_flag);
       pg_cnt += qexec_clear_xasl (thread_p, xasl_p, is_final, false);
     }
+  /* issue #149 P2: a streamed HASHJOIN_PROC keeps its outer_xasl OUT of
+   * aptr_list (XASL_HASHJOIN_OUTER_STREAMED, see pt_to_hashjoin_proc), so
+   * the aptr loop above never reaches it -- clear it explicitly here or its
+   * scan resources survive the request (observed: heap_attrinfo private
+   * allocation from heap_file.c tracked by the VM resource tracker fired
+   * restrack_assert at end-of-request pop_resource_tracks). The flag is
+   * never set on PARALLEL-candidate plans, so the for_parallel_aptr clear
+   * variant needs no counterpart. */
+  if (xasl->type == HASHJOIN_PROC && xasl->proc.hashjoin.outer.xasl != NULL
+      && XASL_IS_FLAGED (xasl->proc.hashjoin.outer.xasl, XASL_HASHJOIN_OUTER_STREAMED))
+    {
+      XASL_SET_FLAG (xasl->proc.hashjoin.outer.xasl, decache_clone_flag);
+      pg_cnt += qexec_clear_xasl (thread_p, xasl->proc.hashjoin.outer.xasl, is_final, false);
+    }
   for (xasl_p = xasl->bptr_list; xasl_p; xasl_p = xasl_p->next)
     {
       XASL_SET_FLAG (xasl_p, decache_clone_flag);
@@ -15939,6 +15953,24 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 
 	      outer_xasl = xptr->proc.hashjoin.outer.xasl;
 	      inner_xasl = xptr->proc.hashjoin.inner.xasl;
+
+	      /* issue #149 P2: outer_xasl was excluded from aptr_list at plan
+	       * time (see pt_to_hashjoin_proc) -- run it here, in the exact
+	       * spot/context the aptr loop below always ran it in before P2
+	       * (first, ahead of inner_xasl and any of this hashjoin's own
+	       * aptr entries), instead of from hjoin_init_manager's own
+	       * unrelated call context (which left a tracked resource
+	       * unreleased -- see issue #149 P2 stop-and-report). The
+	       * empty-side skip-check just below (which reads outer_xasl's
+	       * tuple_cnt) depends on this running first. */
+	      if (XASL_IS_FLAGED (outer_xasl, XASL_HASHJOIN_OUTER_STREAMED) && IS_XASL_INITIAL_STATUS (outer_xasl->status))
+		{
+		  if (qexec_execute_mainblock (thread_p, outer_xasl, xasl_state, NULL) != NO_ERROR)
+		    {
+		      qexec_failure_line (__LINE__, xasl_state);
+		      GOTO_EXIT_ON_ERROR;
+		    }
+		}
 	    }
 	  else
 	    {
@@ -16669,6 +16701,16 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
       if (xptr->aptr_list)
 	{
 	  qexec_clear_head_lists (thread_p, xptr->aptr_list);
+	}
+      /* issue #149 P2: a streamed HASHJOIN_PROC's outer_xasl was excluded
+       * from aptr_list at plan time (see pt_to_hashjoin_proc), so the loop
+       * above never resets it -- do it explicitly here so a rescan of this
+       * mainblock (e.g. this hashjoin nested in a correlated construct)
+       * re-materializes outer instead of reusing a stale list_id from the
+       * prior invocation. */
+      if (xptr->type == HASHJOIN_PROC && XASL_IS_FLAGED (xptr->proc.hashjoin.outer.xasl, XASL_HASHJOIN_OUTER_STREAMED))
+	{
+	  qexec_clear_xasl_head (thread_p, xptr->proc.hashjoin.outer.xasl);
 	}
     }
   if (tplrec.tpl)
