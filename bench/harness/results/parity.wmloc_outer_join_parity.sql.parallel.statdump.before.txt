@@ -1,5 +1,5 @@
 
-	Mon July 06 18:48:38 KST 2026
+	Mon July 06 18:49:36 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          0
@@ -19,12 +19,12 @@ Num_data_page_dirties         =          0
 Num_data_page_ioreads         =          0
 Num_data_page_iowrites        =          0
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      31012
+Num_data_page_private_quota   =      31016
 Num_data_page_private_count   =          0
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          0
-Num_data_page_lru1            =         35
-Num_data_page_lru2            =         14
+Num_data_page_lru1            =         24
+Num_data_page_lru2            =         24
 Num_data_page_lru3            =         46
 Num_data_page_victim_candidate =         46
 Num_log_page_fetches          =          0
@@ -615,7 +615,7 @@ Num_alloc_bcb_wait_threads_low_priority =          0
 Num_flushed_bcbs_wait_for_direct_victim =          0
 Num_lfcq_big_private_lists    =          0
 Num_lfcq_private_lists        =          0
-Num_lfcq_shared_lists         =         32
+Num_lfcq_shared_lists         =         30
 Num_data_page_avoid_dealloc   =          0
 Num_data_page_avoid_victim    =          0
 The timer values for Log_redo_async are:

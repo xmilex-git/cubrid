@@ -1,5 +1,5 @@
 
-	Mon July 06 18:48:38 KST 2026
+	Mon July 06 18:44:14 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          0
@@ -19,12 +19,12 @@ Num_data_page_dirties         =          0
 Num_data_page_ioreads         =          0
 Num_data_page_iowrites        =          0
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      31012
+Num_data_page_private_quota   =      28015
 Num_data_page_private_count   =          0
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          0
-Num_data_page_lru1            =         35
-Num_data_page_lru2            =         14
+Num_data_page_lru1            =         24
+Num_data_page_lru2            =         24
 Num_data_page_lru3            =         46
 Num_data_page_victim_candidate =         46
 Num_log_page_fetches          =          0
@@ -108,7 +108,7 @@ Num_query_objfetches          =          0
 Num_query_holdable_cursors    =          0
 Num_workmem_degrades          =          0
 Num_workmem_reserved_bytes    =          0
-Num_workmem_cap_bytes         =  267780096
+Num_workmem_cap_bytes         =   67108864
 Num_workmem_op_limit_spills_sort =          0
 Num_workmem_op_limit_spills_hash =          0
 Num_workmem_cap_pressure_spills =          0
@@ -118,7 +118,7 @@ Num_sort_data_pages           =          0
 Num_network_requests          =          2
 Num_adaptive_flush_pages      =          0
 Num_adaptive_flush_log_pages  =          0
-Num_adaptive_flush_max_pages  =          0
+Num_adaptive_flush_max_pages  =        128
 Num_prior_lsa_list_size       =          0
 Num_prior_lsa_list_maxed      =          0
 Num_prior_lsa_list_removed    =          0
@@ -615,7 +615,7 @@ Num_alloc_bcb_wait_threads_low_priority =          0
 Num_flushed_bcbs_wait_for_direct_victim =          0
 Num_lfcq_big_private_lists    =          0
 Num_lfcq_private_lists        =          0
-Num_lfcq_shared_lists         =         32
+Num_lfcq_shared_lists         =         30
 Num_data_page_avoid_dealloc   =          0
 Num_data_page_avoid_victim    =          0
 The timer values for Log_redo_async are:

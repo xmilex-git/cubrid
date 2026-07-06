@@ -15,7 +15,7 @@ max_parallel_workers=8 (100)
 CUBRID_WM_SCAN_NEW=<unset>
 CUBRID_WM_SORT_NEW=<unset>
 CUBRID_WM_HASHJOIN_NEW=<unset>
-parallel_engaged=parallel workers: 4,parallel workers: 7
-parallel: new_backed_create_delta=15 old_touch_on_new_delta=0
-serial_md5=0108e87bf517545d048d50bae2bfca0e
-parallel_md5=0108e87bf517545d048d50bae2bfca0e
+parallel_engaged=parallel workers: 2,parallel workers: 7
+parallel: new_backed_create_delta=18 old_touch_on_new_delta=0
+serial_md5=a21863c89751195c0f76dffca8c0a6b4
+parallel_md5=a21863c89751195c0f76dffca8c0a6b4

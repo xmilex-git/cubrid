@@ -1,11 +1,9 @@
 ;plan detail
-select /*+ PARALLEL(8) */
-       o_orderpriority,
-       o_orderstatus,
-       count(*) as cnt,
-       sum(o_totalprice) as revenue
-from orders
-where o_orderdate >= date '1994-01-01'
-  and o_orderdate < date '1994-07-01'
-group by o_orderpriority, o_orderstatus
-order by revenue desc, o_orderpriority, o_orderstatus;
+;trace on
+SELECT /*+ USE_HASH(a,b) PARALLEL(8) */ MOD(a.id,997) g, COUNT(*) c, SUM(CAST(a.id AS NUMERIC(38,0))) s, MIN(a.id) mn, MAX(a.id) mx
+FROM wmloc_t a LEFT OUTER JOIN wmloc_t b ON a.id = b.id + 1
+GROUP BY MOD(a.id,997);
+
+SELECT /*+ USE_HASH(a,b) PARALLEL(8) */ MOD(a.id,997) g, COUNT(*) c, SUM(CAST(a.id AS NUMERIC(38,0))) s, MIN(a.id) mn, MAX(a.id) mx
+FROM wmloc_t a RIGHT OUTER JOIN wmloc_t b ON a.id = b.id + 1
+GROUP BY MOD(a.id,997);
