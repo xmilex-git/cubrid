@@ -495,6 +495,11 @@ long hjoin_debug_random_probe_read_count (void);
 
 /* Hash Join Execution */
 int hjoin_execute (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
+/* issue #147 S6: per-partition PARALLEL entry point (join_task::execute) --
+ * forces the Grace IN_MEM reload instead of hjoin_execute's old auto-tier
+ * select for one claimed partition context. See query_hash_join.c. */
+int hjoin_execute_grace_px (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+			    UINT32 worker_id);
 int hjoin_merge_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
 
 /* Hash Join Shared Split Info */

@@ -563,7 +563,15 @@ namespace parallel_query
 	      break;		/* error_exit */
 	    }
 
-	  error = hjoin_execute (&thread_ref, m_manager, context);
+	  /* issue #147 S6/D-S6-1: force the Grace IN_MEM reload for this partition
+	   * (D-S2-1's nbatch clamp guarantees it fits hash_mem) instead of
+	   * hjoin_execute's old auto-tier-select, which could still pick
+	   * HYBRID/HASH_FILE (probe random reads) for a large partition -- this
+	   * was the diagnosed cause of the PARALLEL benchmark cell not moving.
+	   * m_index (this worker's stable task slot, unique among concurrently
+	   * running join_task instances for this join) disambiguates concurrent
+	   * workers' batch record store filenames. */
+	  error = hjoin_execute_grace_px (&thread_ref, m_manager, context, (UINT32) m_index);
 
 	  if (thread_is_on_trace (&thread_ref))
 	    {

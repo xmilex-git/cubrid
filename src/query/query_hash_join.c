@@ -116,12 +116,27 @@ static int hjoin_split_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manage
 			      HASHJOIN_INPUT_SPLIT_INFO * split_info, QFILE_LIST_ID ** temp_part_list_id,
 			      HASH_SCAN_KEY * temp_key);
 
-/* Hash Join Grace (issue #147 T1 S2): serial-only lazy forward-spill batch
- * state machine, replacing hjoin_build_partitions for the non-px fallback of
- * hjoin_try_partition's HASHJOIN_STATUS_PARTITION branch. px (PARALLEL /
- * PARALLEL_PROBE) is untouched -- see the call site in hjoin_try_partition. */
-static int hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
-				HASHJOIN_CONTEXT * single_context);
+/* Hash Join Grace (issue #147 T1 S2/S6): lazy forward-spill batch state
+ * machine. Originally serial-only (replacing hjoin_build_partitions for the
+ * non-px fallback of hjoin_try_partition's HASHJOIN_STATUS_PARTITION branch);
+ * issue #147 S6 reuses it verbatim per-partition for PARALLEL mode too (see
+ * hjoin_execute_grace_px / join_task::execute) -- D-S2-1's nbatch clamp
+ * guarantees every px-bound partition already fits hash_mem, so forcing
+ * IN_MEM per partition is always safe there. `worker_id` disambiguates
+ * concurrently-running callers' batch record store filenames (buffile's
+ * naming folds in worker_id + pid; multiple px workers share one pid) --
+ * every simultaneous caller MUST pass a distinct worker_id (the serial call
+ * site always passes 0, since it never runs concurrently with anything). */
+static int hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+				UINT32 worker_id);
+
+/* issue #147 S6: per-partition PARALLEL entry point -- mirrors hjoin_execute()'s
+ * empty-input dispatch (FILL_NULL_VALUES / TRY / END, including the px-only
+ * last-partition-is-the-NULL-partition rule) but calls hjoin_execute_grace()
+ * instead of hjoin_execute_internal() for the TRY case. hjoin_execute() itself
+ * stays untouched (still used by the plain SINGLE path). */
+int hjoin_execute_grace_px (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+			    UINT32 worker_id);
 
 /* Hash Join Parallel */
 static HASHJOIN_STATUS hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
@@ -1245,7 +1260,7 @@ hjoin_try_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
        * needed by px's build_partitions) is unused here -- Grace computes its
        * own nbatch/routing independently (D4, hash_mem-based) rather than
        * reusing the #123-formula-derived partition count. */
-      error = hjoin_execute_grace (thread_p, manager, single_context);
+      error = hjoin_execute_grace (thread_p, manager, single_context, 0 /* worker_id: serial, never concurrent */ );
       if (error == NO_ERROR)
 	{
 	  status = HASHJOIN_STATUS_GRACE_DONE;
@@ -1889,18 +1904,20 @@ namespace
    * hjoin_grace_ensure_batch_file () - lazily create the batch file for
    *   (is_outer, batchno) on first spill. `next_seq` is a per-call counter
    *   the caller bumps for every file created (uniqueness within this join's
-   *   files; the underlying buffile also folds in worker_id/pid).
+   *   files); `worker_id` is issue #147 S6's addition -- distinguishes
+   *   concurrently-running px workers' batch files (folded into the
+   *   underlying buffile's name alongside pid, which px workers share).
    */
   int
   hjoin_grace_ensure_batch_file (THREAD_ENTRY * thread_p, const std::string & dir, TDE_ALGORITHM tde_algo,
-				 std::uint64_t * next_seq, qfile::batch_record_store ** slot)
+				 UINT32 worker_id, std::uint64_t * next_seq, qfile::batch_record_store ** slot)
   {
     if (*slot != NULL)
       {
 	return NO_ERROR;
       }
     int os_error = 0;
-    *slot = qfile::batch_record_store::create (thread_p, dir.c_str (), (*next_seq)++, 0, tde_algo, &os_error);
+    *slot = qfile::batch_record_store::create (thread_p, dir.c_str (), (*next_seq)++, worker_id, tde_algo, &os_error);
     if (*slot == NULL)
       {
 	qfile::spill_file::set_os_error (os_error);
@@ -1912,16 +1929,20 @@ namespace
 }				/* anonymous namespace */
 
 /*
- * hjoin_execute_grace () - issue #147 T1 S2: serial Grace hash join.
- *   Precomputes nbatch (D4); build 1-pass (batch 0 direct-insert, other
- *   batches forward-spilled) then probe 1-pass (batch 0 immediate match,
- *   other batches forward-spilled); then reloads batches 1..nbatch-1 one at
- *   a time into the same IN_MEM table (mht_clear_hls + arena reset, no
- *   destroy/recreate churn) and probes each against its outer batch file.
- *   nbatch == 1 degenerates to the existing single-batch path unchanged.
+ * hjoin_execute_grace () - issue #147 T1 S2/S6: Grace hash join, serial or
+ *   per-px-partition. Precomputes nbatch (D4); build 1-pass (batch 0
+ *   direct-insert, other batches forward-spilled) then probe 1-pass (batch 0
+ *   immediate match, other batches forward-spilled); then reloads batches
+ *   1..nbatch-1 one at a time into the same IN_MEM table (mht_clear_hls +
+ *   arena reset, no destroy/recreate churn) and probes each against its
+ *   outer batch file. nbatch == 1 degenerates to the existing single-batch
+ *   path unchanged. `worker_id` must be unique among any callers that may
+ *   run concurrently (distinct px workers each processing their own claimed
+ *   partition); the serial call site passes 0 (never concurrent).
  */
 static int
-hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context)
+hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+		     UINT32 worker_id)
 {
   HASHJOIN_FETCH_INFO *build, *probe;
   HASH_LIST_SCAN *hash_scan;
@@ -1941,7 +1962,9 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
   assert (thread_p != NULL);
   assert (manager != NULL);
   assert (context != NULL);
-  assert (context == &manager->single_context);
+  assert (context == &manager->single_context
+	  || (manager->contexts != NULL && context >= manager->contexts
+	      && context < manager->contexts + manager->context_cnt));
   assert (context->list_id == NULL);
 
   error = hjoin_grace_select_build_probe (manager, context);
@@ -2018,7 +2041,7 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
 	}
       else
 	{
-	  error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, &next_seq, &batches.inner[batchno]);
+	  error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, worker_id, &next_seq, &batches.inner[batchno]);
 	  if (error == NO_ERROR)
 	    {
 	      error = batches.inner[batchno]->append (thread_p, hash_key, build->tuple_record.tpl);
@@ -2077,7 +2100,7 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
 	}
       else
 	{
-	  error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, &next_seq, &batches.outer[batchno]);
+	  error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, worker_id, &next_seq, &batches.outer[batchno]);
 	  if (error == NO_ERROR)
 	    {
 	      error = batches.outer[batchno]->append (thread_p, hash_scan->curr_hash_key, probe->tuple_record.tpl);
@@ -2259,6 +2282,86 @@ error_exit:
       assert_release_error (er_errid () != NO_ERROR);
       error = er_errid ();
     }
+  return error;
+}
+
+/*
+ * hjoin_execute_grace_px () - issue #147 S6: per-partition PARALLEL entry
+ *   point (join_task::execute). Mirrors hjoin_execute()'s empty-input
+ *   dispatch (FILL_NULL_VALUES / TRY / END, including the px-only
+ *   last-partition-is-the-NULL-partition rule) but calls hjoin_execute_grace()
+ *   instead of hjoin_execute_internal() for the TRY case, forcing the Grace
+ *   IN_MEM reload (D-S2-1's nbatch clamp guarantees it fits hash_mem) so this
+ *   partition never falls into hjoin_scan_init's old auto-tier-select, which
+ *   could otherwise still pick HYBRID/HASH_FILE (probe random reads) for a
+ *   large partition -- exactly the pathology D-S6-1 identified as the reason
+ *   PARALLEL benchmark cells weren't moving. `worker_id` (this worker's
+ *   stable task slot index, see join_task::execute) must be unique among
+ *   concurrently-running callers -- distinct px workers never share one.
+ */
+int
+hjoin_execute_grace_px (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+			UINT32 worker_id)
+{
+  HASHJOIN_STATUS status;
+  int error = NO_ERROR;
+#if !defined (NDEBUG)
+  long random_reads_before;
+#endif /* !NDEBUG */
+
+  assert (thread_p != NULL);
+  assert (manager != NULL);
+  assert (context != NULL);
+
+  status = hjoin_check_empty_inputs (manager, context);
+
+  if (IS_OUTER_JOIN_TYPE (manager->join_type) && context == &manager->contexts[manager->context_cnt - 1])
+    {
+      status = (status == HASHJOIN_STATUS_TRY) ? HASHJOIN_STATUS_FILL_NULL_VALUES : status;
+    }
+
+  context->status = status;
+
+  switch (status)
+    {
+    case HASHJOIN_STATUS_FILL_NULL_VALUES:
+      assert (context != &manager->single_context);
+      error = hjoin_outer_fill_null_values (thread_p, manager, context);
+      break;
+
+    case HASHJOIN_STATUS_TRY:
+#if !defined (NDEBUG)
+      /* issue #147 S6 D-S6-1 item 4: defensive check -- the Grace path this
+       * call forces must never take a random-read (HYBRID/HASH_FILE) probe
+       * branch. Structurally guaranteed today (hjoin_execute_grace only ever
+       * selects HASH_METH_IN_MEM), but this catches a future regression at
+       * runtime instead of silently reintroducing the exact pathology S6
+       * exists to remove. Reuses the existing process-wide counter (gate ①)
+       * rather than adding a new one. */
+      random_reads_before = hjoin_debug_random_probe_read_count ();
+#endif /* !NDEBUG */
+
+      error = hjoin_execute_grace (thread_p, manager, context, worker_id);
+
+#if !defined (NDEBUG)
+      assert (hjoin_debug_random_probe_read_count () == random_reads_before);
+#endif /* !NDEBUG */
+      break;
+
+    case HASHJOIN_STATUS_END:
+      /* Nothing to do */
+      break;
+
+    case HASHJOIN_STATUS_ERROR:
+    default:
+      assert_release_error (er_errid () != NO_ERROR);
+      error = er_errid ();
+      break;
+    }
+
+  /* Check if qfile_close_list was called */
+  assert (context->list_id == NULL || context->list_id->last_pgptr == NULL);
+
   return error;
 }
 
