@@ -46,11 +46,6 @@ namespace
   constexpr std::size_t WORKMEM_REFILL_QUANTUM_BYTES = 256ULL * 1024ULL;
   constexpr std::size_t WORKMEM_MIN_CAP_BYTES = 64ULL * 1024ULL * 1024ULL;
   constexpr std::size_t WORKMEM_MAX_CAP_BYTES = 4ULL * 1024ULL * 1024ULL * 1024ULL;
-  constexpr std::size_t WORKMEM_MIN_TEMP_FILE_BYTES = 4ULL * 1024ULL * 1024ULL;
-  constexpr std::size_t WORKMEM_MAX_TEMP_FILE_BYTES = 256ULL * 1024ULL * 1024ULL;
-  constexpr std::size_t WORKMEM_POSITION_SAVED_SCAN_BUDGET = 64;
-  constexpr std::size_t WORKMEM_POSITION_HASH_ENTRY_BUDGET = 4096;
-  constexpr std::size_t WORKMEM_CONNECT_BY_PARENT_BUDGET = 1024;
 
   struct alignas (64) workmem_shard
   {
@@ -65,6 +60,10 @@ namespace
   };
 
   workmem_accountant g_accountant;
+  /* #146 T3 S1 (§6): historical high-water of the accountant's total reserved
+   * bytes, updated at every successful charge (see try_charge_shard). */
+  std::atomic<int64_t> g_reserved_peak_bytes { 0 };
+
   int64_t
   clamp_to_accounting_bytes (std::size_t bytes) noexcept
   {
@@ -74,6 +73,18 @@ namespace
       }
 
     return static_cast<int64_t> (bytes);
+  }
+
+  void
+  update_reserved_peak (std::size_t observed_bytes) noexcept
+  {
+    int64_t observed = clamp_to_accounting_bytes (observed_bytes);
+    int64_t prev = g_reserved_peak_bytes.load (std::memory_order_relaxed);
+    while (observed > prev
+           && !g_reserved_peak_bytes.compare_exchange_weak (prev, observed, std::memory_order_relaxed))
+      {
+        /* prev refreshed by compare_exchange_weak on failure; retry. */
+      }
   }
 
   std::size_t
@@ -96,12 +107,6 @@ namespace
       }
 
     return pages * DB_PAGESIZE;
-  }
-
-  std::size_t
-  checked_bytes_to_pages (std::size_t bytes) noexcept
-  {
-    return (bytes + DB_PAGESIZE - 1) / DB_PAGESIZE;
   }
 
   void
@@ -176,54 +181,35 @@ namespace temp_page_store
   static std::size_t refill_quantum_bytes () noexcept;
   static std::size_t worst_case_slack_bytes () noexcept;
   static std::size_t overshoot_limit_bytes () noexcept;
-  static std::size_t position_budget_bytes () noexcept;
+  /* Charges bytes onto a caller-chosen shard (already committed to
+   * g_accountant.shards[shard] by the caller via fetch_add) and rolls the
+   * charge back if it pushes the accountant past cap (+ overshoot slack).
+   * Shared by reserve_held (fresh shard) and reserve_held_at_shard (sticky
+   * shard) so the cap-check logic lives in one place. */
+  static bool try_charge_shard (int shard, std::size_t bytes) noexcept;
 
-  budget_result
-  reserve_membuf_budget (int requested_pages, std::size_t *reserved_bytes_out, int *reserved_shard_out) noexcept
+  static bool
+  try_charge_shard (int shard, std::size_t bytes) noexcept
   {
-    const std::size_t cap = cap_bytes ();
-    const std::size_t headroom = headroom_bytes ();
-    const std::size_t requested_page_count = static_cast<std::size_t> (std::max (requested_pages, 0));
-    const std::size_t per_file_target_bytes = std::min (std::max (cap / 8, WORKMEM_MIN_TEMP_FILE_BYTES),
-							WORKMEM_MAX_TEMP_FILE_BYTES);
-    const std::size_t target_pages = checked_bytes_to_pages (per_file_target_bytes);
-    const std::size_t requested = std::max (requested_page_count, target_pages);
-    std::size_t pages = requested;
+    const int64_t accounting_bytes = clamp_to_accounting_bytes (bytes);
+    g_accountant.shards[shard].reserved.fetch_add (accounting_bytes, std::memory_order_acq_rel);
 
-    if (cap > 0 && reservation_bytes_for_pages (requested) > headroom)
+    const std::size_t observed = exact_reserved_bytes ();
+    if (observed <= overshoot_limit_bytes ())
       {
-        const std::size_t requested_bytes = reservation_bytes_for_pages (requested);
-
-        if (headroom == 0 || requested_bytes == 0)
-          {
-            pages = requested > 0 ? 1 : 0;
-          }
-        else
-          {
-            pages = std::max (static_cast<std::size_t> (1), requested * headroom / requested_bytes);
-          }
+        update_reserved_peak (observed);
+        return true;
       }
 
-    const std::size_t bytes = reservation_bytes_for_pages (pages);
-    int shard = -1;
-    reserve_held_soft (bytes, &shard);
-    if (shard >= 0)
+    const std::size_t reconciled = exact_reserved_bytes ();
+    if (reconciled <= cap_bytes ())
       {
-        const bool over_cap = pages != requested;
-        if (over_cap)
-          {
-            record_degrade ();
-          }
-        *reserved_bytes_out = bytes;
-        *reserved_shard_out = shard;
-        return budget_result { static_cast<int> (std::min<std::size_t> (pages,
-									 static_cast<std::size_t> (std::numeric_limits<int>::max ()))),
-			       over_cap, false };
+        update_reserved_peak (reconciled);
+        return true;
       }
 
-    *reserved_bytes_out = 0;
-    *reserved_shard_out = -1;
-    return budget_result { 0, true, true };
+    g_accountant.shards[shard].reserved.fetch_sub (accounting_bytes, std::memory_order_acq_rel);
+    return false;
   }
 
   void
@@ -257,25 +243,28 @@ namespace temp_page_store
     ensure_init ();
 
     const int shard = choose_shard ();
-    const int64_t accounting_bytes = clamp_to_accounting_bytes (bytes);
-    g_accountant.shards[shard].reserved.fetch_add (accounting_bytes, std::memory_order_acq_rel);
-
-    const std::size_t observed = exact_reserved_bytes ();
-    if (observed <= overshoot_limit_bytes ())
+    if (try_charge_shard (shard, bytes))
       {
         *shard_out = shard;
         return true;
       }
 
-    const std::size_t reconciled = exact_reserved_bytes ();
-    if (reconciled <= cap_bytes ())
-      {
-        *shard_out = shard;
-        return true;
-      }
-
-    g_accountant.shards[shard].reserved.fetch_sub (accounting_bytes, std::memory_order_acq_rel);
     *shard_out = -1;
+    return false;
+  }
+
+  bool
+  reserve_held_at_shard (std::size_t bytes, int *shard_inout) noexcept
+  {
+    ensure_init ();
+
+    const int shard = (*shard_inout >= 0) ? *shard_inout : choose_shard ();
+    if (try_charge_shard (shard, bytes))
+      {
+        *shard_inout = shard;
+        return true;
+      }
+
     return false;
   }
 
@@ -286,6 +275,7 @@ namespace temp_page_store
 
     const int shard = choose_shard ();
     g_accountant.shards[shard].reserved.fetch_add (clamp_to_accounting_bytes (bytes), std::memory_order_acq_rel);
+    update_reserved_peak (exact_reserved_bytes ());
     *shard_out = shard;
   }
 
@@ -303,13 +293,19 @@ namespace temp_page_store
   std::size_t
   reservation_bytes_for_pages (std::size_t pages) noexcept
   {
-    return checked_add_bytes (checked_pages_to_bytes (pages), position_budget_bytes ());
+    return checked_pages_to_bytes (pages);
   }
 
   void
   record_degrade () noexcept
   {
     perfmon_inc_stat_to_global (PSTAT_WORKMEM_NUM_DEGRADES);
+  }
+
+  void
+  record_cap_pressure_spill () noexcept
+  {
+    perfmon_inc_stat_to_global (PSTAT_WORKMEM_CAP_PRESSURE_SPILLS);
   }
 
   std::size_t
@@ -324,6 +320,12 @@ namespace temp_page_store
   reserved_bytes () noexcept
   {
     return exact_reserved_bytes ();
+  }
+
+  std::size_t
+  reserved_peak_bytes () noexcept
+  {
+    return static_cast<std::size_t> (g_reserved_peak_bytes.load (std::memory_order_relaxed));
   }
 
   std::size_t
@@ -378,16 +380,5 @@ namespace temp_page_store
       }
 
     return static_cast<std::size_t> (scaled);
-  }
-
-  std::size_t
-  position_budget_bytes () noexcept
-  {
-    /* Fixed-size segment-aware tuple positions.  Charge the held reservation for widened saved-scan,
-     * hash-list and connect-by parent-position bytes.  reserve_held still enforces
-     * reserved <= cap + worst_case_slack, with worst_case_slack = shard_count * refill_quantum. */
-    return WORKMEM_POSITION_SAVED_SCAN_BUDGET * projected_tuple_position_bytes
-      + WORKMEM_POSITION_HASH_ENTRY_BUDGET * projected_tuple_simple_pos_bytes
-      + WORKMEM_CONNECT_BY_PARENT_BUDGET * projected_tuple_position_db_bytes;
   }
 }

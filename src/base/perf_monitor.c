@@ -4045,6 +4045,7 @@ perfmon_get_peek_stats (UINT64 * stats)
   stats[pstat_Metadata[PSTAT_QM_NUM_HOLDABLE_CURSORS].start_offset] = session_get_number_of_holdable_cursors ();
   stats[pstat_Metadata[PSTAT_WORKMEM_RESERVED_BYTES].start_offset] = temp_page_store::reserved_bytes ();
   stats[pstat_Metadata[PSTAT_WORKMEM_CAP_BYTES].start_offset] = temp_page_store::cap_bytes ();
+  stats[pstat_Metadata[PSTAT_WORKMEM_RESERVED_PEAK].start_offset] = temp_page_store::reserved_peak_bytes ();
 #endif /* defined (SERVER_MODE) || defined (SA_MODE) */
 }
 

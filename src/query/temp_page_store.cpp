@@ -73,6 +73,48 @@ namespace
     return NO_ERROR;
   }
 
+  /* #146 T3 S1 (D2/D5): growth-time high-water charge for MEMBUF pages, batched
+   * at MEMBUF_GROWTH_BATCH_PAGES so the accountant sees one atomic charge per
+   * batch rather than one per page (mirrors tape_writer::wm_reserve_batch's
+   * refill-quantum pattern in qfile_tape.cpp).  tfile_p->wm_reserved_bytes is
+   * the high-water charged-so-far amount, not a prepaid budget;
+   * wm_reserved_shard is the sticky shard every increment lands on so
+   * release_held_reservation can undo the whole thing in one release_held
+   * call.  Returns false (nothing charged) if the cap rejects the next batch --
+   * the caller degrades to disk-spill backing instead of erroring (D7-2). */
+  constexpr int MEMBUF_GROWTH_BATCH_PAGES = 64;
+
+  bool
+  charge_membuf_page (QMGR_TEMP_FILE * tfile_p, int next_page_index)
+  {
+    const std::size_t charged_pages = tfile_p->wm_reserved_bytes / DB_PAGESIZE;
+    const std::size_t needed_pages = static_cast<std::size_t> (next_page_index) + 1;
+
+    if (charged_pages >= needed_pages)
+      {
+        return true;
+      }
+
+    std::size_t target_pages = charged_pages + MEMBUF_GROWTH_BATCH_PAGES;
+    if (target_pages < needed_pages)
+      {
+        target_pages = needed_pages;
+      }
+    if (target_pages > static_cast<std::size_t> (tfile_p->membuf_npages))
+      {
+        target_pages = static_cast<std::size_t> (tfile_p->membuf_npages);
+      }
+
+    const std::size_t delta_bytes = (target_pages - charged_pages) * DB_PAGESIZE;
+    if (!temp_page_store::reserve_held_at_shard (delta_bytes, &tfile_p->wm_reserved_shard))
+      {
+        return false;
+      }
+
+    tfile_p->wm_reserved_bytes += delta_bytes;
+    return true;
+  }
+
   PAGE_PTR
   alloc_private_spill_page (THREAD_ENTRY * thread_p, QMGR_TEMP_FILE * tfile_p, VPID * vpid_p)
   {
@@ -397,7 +439,8 @@ namespace temp_page_store
       {
       case qmgr_temp_backing::MEMBUF:
         {
-          if (tfile_p->membuf != NULL && tfile_p->membuf_last < tfile_p->membuf_npages - 1)
+          const bool membuf_has_capacity = (tfile_p->membuf != NULL && tfile_p->membuf_last < tfile_p->membuf_npages - 1);
+          if (membuf_has_capacity && charge_membuf_page (tfile_p, tfile_p->membuf_last + 1))
             {
 	      QFILE_PAGE_HEADER page_header = QFILE_PAGE_HEADER_INITIALIZER;
 
@@ -405,6 +448,13 @@ namespace temp_page_store
               vpid_p->pageid = ++(tfile_p->membuf_last);
 	      put_page_header (tfile_p->membuf[tfile_p->membuf_last], &page_header);
               return tfile_p->membuf[tfile_p->membuf_last];
+            }
+          if (membuf_has_capacity)
+            {
+              /* Capacity remained but the growth charge was rejected: this is
+               * cap pressure, not per-op exhaustion (#146 T3 S1 D7-2) --
+               * degrade to disk-spill backing early instead of erroring. */
+              temp_page_store::record_cap_pressure_spill ();
             }
 
           /* page-spill backing: the choice is made ONCE at the tfile's first

@@ -43,26 +43,35 @@ namespace temp_page_store
   constexpr std::size_t projected_tuple_position_db_bytes = 40;
   constexpr std::size_t projected_tuple_simple_pos_bytes = 32;
 
-  struct budget_result
-  {
-    int pages_granted;
-    bool over_cap;
-    bool hard_oom;
-  };
-
-  budget_result reserve_membuf_budget (int requested_pages, std::size_t *reserved_bytes_out,
-                                        int *reserved_shard_out) noexcept;
   void release_held_reservation (QMGR_TEMP_FILE * tfile_p) noexcept;
 
   bool reserve_held (std::size_t bytes, int *shard_out) noexcept;
   void reserve_held_soft (std::size_t bytes, int *shard_out) noexcept;
   void release_held (std::size_t bytes, int shard_index) noexcept;
 
+  /* #146 T3 S1 (D2/D5): growth-time charge for a charge holder that
+   * accumulates its reservation incrementally (currently: MEMBUF high-water
+   * page charging in temp_page_store::alloc_page).  *shard_inout == -1 means
+   * "pick a shard now"; on success it is set to the shard the bytes landed on
+   * and every subsequent call for the same holder must pass that same value
+   * back in, so the whole reservation lands on one shard and release_held can
+   * undo it exactly.  On failure (cap reached) nothing is charged and
+   * *shard_inout is left unchanged -- the caller degrades (e.g. to disk-spill
+   * backing) without losing any reservation already held. */
+  bool reserve_held_at_shard (std::size_t bytes, int *shard_inout) noexcept;
+
   std::size_t reservation_bytes_for_pages (std::size_t pages) noexcept;
   void record_degrade () noexcept;
+  /* #146 T3 S1 (D7-2): cap reached -> charge rejected -> the caller spills
+   * early instead of erroring.  Distinct from record_degrade() (existing
+   * per-op soft-degrade counter, left as-is). */
+  void record_cap_pressure_spill () noexcept;
 
   std::size_t cap_bytes () noexcept;
   std::size_t reserved_bytes () noexcept;
+  /* #146 T3 S1 (§6): historical high-water of reserved_bytes(), observed at
+   * every successful charge. */
+  std::size_t reserved_peak_bytes () noexcept;
 
   /* #146 T3 S0 (contract only): per-operation layer-1 hard limit, PG two-tier
    * model (D7/D8).  row_store = sort/tuplestore/list-membuf state, limit =

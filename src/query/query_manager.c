@@ -4086,9 +4086,7 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
 {
   QMGR_QUERY_ENTRY *query_p;
   QMGR_TRAN_ENTRY *tran_entry_p;
-  int tran_index, i, num_buffer_pages, requested_buffer_pages, reserved_shard;
-  size_t reserved_bytes;
-  temp_page_store::budget_result budget;
+  int tran_index, i, num_buffer_pages, requested_buffer_pages;
   QMGR_TEMP_FILE *tfile_vfid_p, *temp;
   PAGE_PTR page_p;
   static int index_scan_key_buffer_pages = prm_get_integer_value (PRM_ID_INDEX_SCAN_KEY_BUFFER_PAGES);
@@ -4100,16 +4098,13 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
       return NULL;
     }
 
+  /* #146 T3 S1 (D2): membuf capacity is sized to the per-operation layer-1
+   * target only; the global cap (layer-2) no longer shrinks it here. Pages are
+   * charged to the accountant as they are actually used (high-water), in
+   * temp_page_store::alloc_page -- not prepaid in full at creation. */
   requested_buffer_pages =
     ((membuf_type == TEMP_FILE_MEMBUF_NORMAL) ? qmgr_work_mem_buffer_pages () : index_scan_key_buffer_pages);
-  budget = temp_page_store::reserve_membuf_budget (requested_buffer_pages, &reserved_bytes, &reserved_shard);
-  if (budget.hard_oom)
-    {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-	      temp_page_store::reservation_bytes_for_pages (0));
-      return NULL;
-    }
-  num_buffer_pages = budget.pages_granted;
+  num_buffer_pages = requested_buffer_pages;
 
   tfile_vfid_p = qmgr_get_temp_file_from_list (&qmgr_Query_table.temp_file_list[membuf_type]);
   if (tfile_vfid_p != NULL && tfile_vfid_p->membuf_capacity_pages < num_buffer_pages)
@@ -4124,7 +4119,6 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
 
   if (tfile_vfid_p == NULL)
     {
-      temp_page_store::release_held (reserved_bytes, reserved_shard);
       return NULL;
     }
 
@@ -4136,12 +4130,16 @@ qmgr_create_new_temp_file (THREAD_ENTRY * thread_p, QUERY_ID query_id, QMGR_TEMP
   tfile_vfid_p->membuf_npages = num_buffer_pages;
   tfile_vfid_p->membuf_type = membuf_type;
   tfile_vfid_p->backing = qmgr_temp_backing::MEMBUF;
-  tfile_vfid_p->wm_reserved_bytes = reserved_bytes;
-  tfile_vfid_p->wm_reserved_shard = reserved_shard;
+  tfile_vfid_p->wm_reserved_bytes = 0;
+  tfile_vfid_p->wm_reserved_shard = -1;
   tfile_vfid_p->spill_query_id = query_id;
   tfile_vfid_p->spill_owner_tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
   tfile_vfid_p->spill_worker_id = 0;
-  tfile_vfid_p->spill_next_pageid = num_buffer_pages;
+  /* #146 T3 S1 (D7-2): spill can now start before the membuf fills (a
+   * rejected growth charge spills early), so the membuf-full page count is
+   * no longer a valid initial value here -- the first real spill in
+   * temp_page_store::alloc_page sets this to the actual membuf_last + 1. */
+  tfile_vfid_p->spill_next_pageid = 0;
   tfile_vfid_p->page_spill_handle = NULL;
   tfile_vfid_p->preserved = false;
   tfile_vfid_p->tde_encrypted = false;

@@ -100,8 +100,8 @@ struct qmgr_temp_file
   QMGR_TEMP_FILE_MEMBUF_TYPE membuf_type;
   int membuf_capacity_pages;
   qmgr_temp_backing backing;
-  size_t wm_reserved_bytes;
-  int wm_reserved_shard;
+  size_t wm_reserved_bytes;	/* #146 T3 S1: high-water bytes actually charged so far (grows as MEMBUF pages are used, not a prepaid budget) */
+  int wm_reserved_shard;	/* sticky shard all of wm_reserved_bytes landed on (temp_page_store::reserve_held_at_shard) */
   QUERY_ID spill_query_id;
   int spill_owner_tran_index;
   unsigned int spill_worker_id;
