@@ -4241,7 +4241,7 @@ sort_charge_internal_memory_wm (size_t bytes, size_t * charged_bytes_out, int *c
 
   if (!temp_page_store::reserve_held (bytes, &shard))
     {
-      temp_page_store::record_degrade ();
+      temp_page_store::record_cap_pressure_spill ();
       temp_page_store::reserve_held_soft (bytes, &shard);
     }
 

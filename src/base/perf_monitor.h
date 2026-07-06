@@ -374,17 +374,29 @@ typedef enum
 
   PSTAT_QM_NUM_OBJFETCHES,
   PSTAT_QM_NUM_HOLDABLE_CURSORS,
-  PSTAT_WORKMEM_NUM_DEGRADES,
   PSTAT_WORKMEM_RESERVED_BYTES,
   PSTAT_WORKMEM_CAP_BYTES,
-  /* #146 T3 S0 (contract only): counter skeleton -- registered here, not yet
-   * wired to any increment/peek site.  Layer-1 per-op limit spills split by
-   * consumer shape (S4 replaces PSTAT_WORKMEM_NUM_DEGRADES with these);
-   * layer-2 cap-pressure spills; reserved high-water peak. */
+  /* #146 T3 S4: layer-1 per-op limit spills split by consumer shape
+   * (replaces the retired PSTAT_WORKMEM_NUM_DEGRADES); layer-2 cap-pressure
+   * spills; reserved high-water peak. */
   PSTAT_WORKMEM_OP_LIMIT_SPILLS_SORT,
   PSTAT_WORKMEM_OP_LIMIT_SPILLS_HASH,
   PSTAT_WORKMEM_CAP_PRESSURE_SPILLS,
   PSTAT_WORKMEM_RESERVED_PEAK,
+  /* #146 T3 S4 (§6): soft-tier-only reserved high-water (D-SOFT) --
+   * reserve_held_soft's charges are deliberately excluded from
+   * PSTAT_WORKMEM_RESERVED_PEAK (S1b), so this is the only visibility into
+   * how far the uncapped floor tier actually grows. */
+  PSTAT_WORKMEM_SOFT_RESERVED_PEAK,
+  /* #146 T3 S4 (§6, #141 VTune): spill file I/O byte counters -- the raw-fd
+   * path (qfile_page_spill/buffile) bypasses page-buffer accounting, so
+   * without these, spill I/O volume is a statdump blind spot. */
+  PSTAT_WORKMEM_SPILL_READ_BYTES,
+  PSTAT_WORKMEM_SPILL_WRITE_BYTES,
+  /* #146 T3 S4 (§6): Multi-Range-Opt approval-gate rejections -- LIMIT x
+   * entry-size-estimate exceeded the row-store per-op limit, so the plan
+   * fell back to the normal (already-accounted) scan path instead of MRO. */
+  PSTAT_WORKMEM_MRO_GATE_REJECTS,
 
   /* Execution statistics for external sort */
   PSTAT_SORT_NUM_IO_PAGES,

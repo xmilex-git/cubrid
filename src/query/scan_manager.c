@@ -51,6 +51,7 @@
 #include "xasl_predicate.hpp"
 #include "xasl.h"
 #include "query_hash_scan.h"
+#include "query_workmem.hpp"	/* op_limit_bytes / record_mro_gate_reject (#146 T3 S4) */
 #include "statistics.h"
 #include "px_scan.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -3726,6 +3727,29 @@ scan_open_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
     bool use_multi_range_opt = (isidp->bt_num_attrs > 1 && isidp->indx_info->key_info.key_limit_reset == true
 				&& isidp->key_limit_upper > 0 && isidp->key_limit_upper < DB_INT32_MAX
 				&& isidp->key_limit_lower == -1) ? true : false;
+
+    if (use_multi_range_opt)
+      {
+	/* #146 T3 S4 (D-MRO/§5): approval gate -- top_n_items/buffer were
+	 * previously LIMIT-proportional with no memory bound at all (OOM was
+	 * the only defense). Estimate the per-entry footprint conservatively
+	 * from this index's own max key length (root_header->node.max_key_len,
+	 * already read for the coverage buffer above) and only allow MRO
+	 * when the whole array fits under the row-store per-op limit;
+	 * otherwise fall back to the normal scan path, whose own list-file
+	 * membuf is already work_mem accounted -- only the access strategy
+	 * changes, the fallback answer must stay identical. */
+	const UINT64 mro_entry_size_estimate = (UINT64) sizeof (RANGE_OPT_ITEM)
+	  + (UINT64) (2 * sizeof (RANGE_OPT_ITEM *)) + (UINT64) root_header->node.max_key_len;
+	const UINT64 mro_total_estimate = (UINT64) isidp->key_limit_upper * mro_entry_size_estimate;
+	const UINT64 mro_limit = temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::row_store);
+
+	if (mro_total_estimate > mro_limit)
+	  {
+	    use_multi_range_opt = false;
+	    temp_page_store::record_mro_gate_reject ();
+	  }
+      }
 
     if (scan_init_multi_range_optimization (thread_p, &(isidp->multi_range_opt), use_multi_range_opt,
 					    (int) isidp->key_limit_upper) != NO_ERROR)

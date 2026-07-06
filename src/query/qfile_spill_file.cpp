@@ -26,6 +26,7 @@
 #include "boot_sr.h"		/* boot_db_full_name */
 #include "error_manager.h"
 #include "file_io.h"		/* FILEIO_PAGE / fileio_initialize_res / fileio_get_directory_path */
+#include "query_workmem.hpp"	/* record_spill_read_bytes / record_spill_write_bytes (#146 T3 S4) */
 #include "tde.h"
 
 #include <cassert>
@@ -312,6 +313,7 @@ namespace qfile
   bool
   full_pwrite (int fd, const void *buf, std::size_t len, off_t offset) noexcept
   {
+    const std::size_t total_len = len;
     const char *ptr = static_cast<const char *> (buf);
     while (len > 0)
       {
@@ -333,12 +335,16 @@ namespace qfile
 	len -= static_cast<std::size_t> (written);
 	offset += written;
       }
+    /* #146 T3 S4 (§6, #141 VTune): this raw fd bypasses the page buffer, so
+     * without this counter its I/O volume is invisible to statdump. */
+    temp_page_store::record_spill_write_bytes (total_len);
     return true;
   }
 
   bool
   full_pread (int fd, void *buf, std::size_t len, off_t offset) noexcept
   {
+    const std::size_t total_len = len;
     char *ptr = static_cast<char *> (buf);
     while (len > 0)
       {
@@ -360,6 +366,7 @@ namespace qfile
 	len -= static_cast<std::size_t> (nread);
 	offset += nread;
       }
+    temp_page_store::record_spill_read_bytes (total_len);
     return true;
   }
 

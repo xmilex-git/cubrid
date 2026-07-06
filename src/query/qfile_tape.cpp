@@ -295,7 +295,9 @@ namespace qfile
 	/* cap reached: shrink the budget to what is reserved so the writer
 	 * spills from here on (degrade once, no per-page retry). */
 	m_prefix_budget = (int) m_prefix.size ();
-	temp_page_store::record_degrade ();
+	/* #146 T3 S4: record_degrade() retired -- this is a layer-2 cap
+	 * rejection (reserve_held failed), i.e. cap pressure. */
+	temp_page_store::record_cap_pressure_spill ();
 	return false;
       }
     m_wm_charges.emplace_back (bytes, shard);

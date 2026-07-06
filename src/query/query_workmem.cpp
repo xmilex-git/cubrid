@@ -63,6 +63,12 @@ namespace
   /* #146 T3 S1 (§6): historical high-water of the accountant's total reserved
    * bytes, updated at every successful charge (see try_charge_shard). */
   std::atomic<int64_t> g_reserved_peak_bytes { 0 };
+  /* #146 T3 S4 (§6, D-SOFT): historical high-water observed specifically at
+   * soft-tier charges (reserve_held_soft/reserve_held_soft_at_shard) -- the
+   * one moment S1b deliberately excluded from g_reserved_peak_bytes. Gives
+   * visibility into how far the uncapped floor tier actually pushes the
+   * accountant past cap, without polluting the cap-governed tier's peak. */
+  std::atomic<int64_t> g_soft_reserved_peak_bytes { 0 };
 
   int64_t
   clamp_to_accounting_bytes (std::size_t bytes) noexcept
@@ -82,6 +88,18 @@ namespace
     int64_t prev = g_reserved_peak_bytes.load (std::memory_order_relaxed);
     while (observed > prev
            && !g_reserved_peak_bytes.compare_exchange_weak (prev, observed, std::memory_order_relaxed))
+      {
+        /* prev refreshed by compare_exchange_weak on failure; retry. */
+      }
+  }
+
+  void
+  update_soft_reserved_peak (std::size_t observed_bytes) noexcept
+  {
+    int64_t observed = clamp_to_accounting_bytes (observed_bytes);
+    int64_t prev = g_soft_reserved_peak_bytes.load (std::memory_order_relaxed);
+    while (observed > prev
+           && !g_soft_reserved_peak_bytes.compare_exchange_weak (prev, observed, std::memory_order_relaxed))
       {
         /* prev refreshed by compare_exchange_weak on failure; retry. */
       }
@@ -275,7 +293,9 @@ namespace temp_page_store
 
     const int shard = choose_shard ();
     g_accountant.shards[shard].reserved.fetch_add (clamp_to_accounting_bytes (bytes), std::memory_order_acq_rel);
-    /* #146 T3 S1b: no peak update here.  reserve_held_soft is the pre-existing,
+    update_soft_reserved_peak (exact_reserved_bytes ());
+    /* #146 T3 S1b: no g_reserved_peak_bytes update here (soft peak tracked
+     * separately above, S4).  reserve_held_soft is the pre-existing,
      * intentionally uncapped "must succeed" floor tier (hls_spill_create /
      * hls_spill_finalize_file in query_hash_scan.c call it only after a hard
      * reserve_held already failed) -- it can legitimately push the accountant
@@ -297,8 +317,9 @@ namespace temp_page_store
 
     const int shard = (*shard_inout >= 0) ? *shard_inout : choose_shard ();
     g_accountant.shards[shard].reserved.fetch_add (clamp_to_accounting_bytes (bytes), std::memory_order_acq_rel);
+    update_soft_reserved_peak (exact_reserved_bytes ());
     /* #146 T3 S1b/S3: same floor-tier reasoning as reserve_held_soft -- no
-     * peak update (see there); this is the uncapped tier by design. */
+     * g_reserved_peak_bytes update (see there); soft peak tracked above (S4). */
     *shard_inout = shard;
   }
 
@@ -320,12 +341,6 @@ namespace temp_page_store
   }
 
   void
-  record_degrade () noexcept
-  {
-    perfmon_inc_stat_to_global (PSTAT_WORKMEM_NUM_DEGRADES);
-  }
-
-  void
   record_cap_pressure_spill () noexcept
   {
     perfmon_inc_stat_to_global (PSTAT_WORKMEM_CAP_PRESSURE_SPILLS);
@@ -341,6 +356,24 @@ namespace temp_page_store
   record_op_limit_spill_hash () noexcept
   {
     perfmon_inc_stat_to_global (PSTAT_WORKMEM_OP_LIMIT_SPILLS_HASH);
+  }
+
+  void
+  record_mro_gate_reject () noexcept
+  {
+    perfmon_inc_stat_to_global (PSTAT_WORKMEM_MRO_GATE_REJECTS);
+  }
+
+  void
+  record_spill_read_bytes (std::size_t bytes) noexcept
+  {
+    perfmon_add_stat_to_global (PSTAT_WORKMEM_SPILL_READ_BYTES, (UINT64) bytes);
+  }
+
+  void
+  record_spill_write_bytes (std::size_t bytes) noexcept
+  {
+    perfmon_add_stat_to_global (PSTAT_WORKMEM_SPILL_WRITE_BYTES, (UINT64) bytes);
   }
 
   std::size_t
@@ -361,6 +394,12 @@ namespace temp_page_store
   reserved_peak_bytes () noexcept
   {
     return static_cast<std::size_t> (g_reserved_peak_bytes.load (std::memory_order_relaxed));
+  }
+
+  std::size_t
+  soft_reserved_peak_bytes () noexcept
+  {
+    return static_cast<std::size_t> (g_soft_reserved_peak_bytes.load (std::memory_order_relaxed));
   }
 
   std::size_t

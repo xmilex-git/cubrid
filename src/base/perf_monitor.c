@@ -301,14 +301,16 @@ PSTAT_METADATA pstat_Metadata[] = {
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_QM_NUM_HASHJOINS_PARALLEL, "Num_query_hashjoins_parallel"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_QM_NUM_OBJFETCHES, "Num_query_objfetches"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_QM_NUM_HOLDABLE_CURSORS, "Num_query_holdable_cursors"),
-  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_NUM_DEGRADES, "Num_workmem_degrades"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_RESERVED_BYTES, "Num_workmem_reserved_bytes"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_CAP_BYTES, "Num_workmem_cap_bytes"),
-  /* #146 T3 S0: skeleton only -- no increment/peek site wired yet. */
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_OP_LIMIT_SPILLS_SORT, "Num_workmem_op_limit_spills_sort"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_OP_LIMIT_SPILLS_HASH, "Num_workmem_op_limit_spills_hash"),
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_CAP_PRESSURE_SPILLS, "Num_workmem_cap_pressure_spills"),
   PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_RESERVED_PEAK, "Num_workmem_reserved_peak"),
+  PSTAT_METADATA_INIT_SINGLE_PEEK (PSTAT_WORKMEM_SOFT_RESERVED_PEAK, "Num_workmem_soft_reserved_peak"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_SPILL_READ_BYTES, "Num_workmem_spill_read_bytes"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_SPILL_WRITE_BYTES, "Num_workmem_spill_write_bytes"),
+  PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_WORKMEM_MRO_GATE_REJECTS, "Num_workmem_mro_gate_rejects"),
 
   /* Execution statistics for external sort */
   PSTAT_METADATA_INIT_SINGLE_ACC (PSTAT_SORT_NUM_IO_PAGES, "Num_sort_io_pages"),
@@ -4046,6 +4048,8 @@ perfmon_get_peek_stats (UINT64 * stats)
   stats[pstat_Metadata[PSTAT_WORKMEM_RESERVED_BYTES].start_offset] = temp_page_store::reserved_bytes ();
   stats[pstat_Metadata[PSTAT_WORKMEM_CAP_BYTES].start_offset] = temp_page_store::cap_bytes ();
   stats[pstat_Metadata[PSTAT_WORKMEM_RESERVED_PEAK].start_offset] = temp_page_store::reserved_peak_bytes ();
+  /* #146 T3 S4 (D-SOFT): soft-tier-only reserved high-water. */
+  stats[pstat_Metadata[PSTAT_WORKMEM_SOFT_RESERVED_PEAK].start_offset] = temp_page_store::soft_reserved_peak_bytes ();
 #endif /* defined (SERVER_MODE) || defined (SA_MODE) */
 }
 

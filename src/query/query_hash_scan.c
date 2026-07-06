@@ -988,7 +988,7 @@ hls_spill_create (THREAD_ENTRY * thread_p, INT64 tuple_cnt)
        * cliff, and an unset-error NULL trips ASSERT_ERROR upstream).  The
        * staging footprint is small and bounded (<= MAX_NBATCH + 1 pages), so
        * overshoot soft-accounted. */
-      temp_page_store::record_degrade ();
+      temp_page_store::record_cap_pressure_spill ();
       temp_page_store::reserve_held_soft (stage_bytes, &shard);
     }
 
@@ -1189,7 +1189,7 @@ hls_spill_finalize_file (THREAD_ENTRY * thread_p, HLS_SPILL * spill, hls_spill_b
       /* range-bisect: split by hash midpoint into two raw files, recurse.
        * The split key is the sort key's range, so child runs stay disjoint
        * and ordered (lo-run entirely below hi-run). */
-      temp_page_store::record_degrade ();
+      temp_page_store::record_cap_pressure_spill ();
       UINT32 mid = lo + (hi - lo) / 2;	/* lo..mid -> low file, mid+1..hi -> high file */
       qfile::buffile *lo_bf = NULL, *hi_bf = NULL;
       INT64 lo_cnt = 0, hi_cnt = 0;
@@ -1309,7 +1309,7 @@ overshoot:
     {
       /* bisection unavailable (depth cap / degenerate range): overshoot,
        * soft-accounted -- mirrors PG's growEnabled=false. */
-      temp_page_store::record_degrade ();
+      temp_page_store::record_cap_pressure_spill ();
       temp_page_store::reserve_held_soft (load_bytes, &shard);
     }
 
@@ -1581,7 +1581,7 @@ qdata_hscan_wm_reserve (HASH_LIST_SCAN * hlsid, size_t bytes)
   assert (hlsid->wm_bytes == 0);
   if (!temp_page_store::reserve_held (bytes, &shard))
     {
-      temp_page_store::record_degrade ();	/* caller falls to the next tier */
+      temp_page_store::record_cap_pressure_spill ();	/* caller falls to the next tier */
       return false;
     }
   hlsid->wm_bytes = bytes;

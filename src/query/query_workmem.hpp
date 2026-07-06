@@ -71,10 +71,8 @@ namespace temp_page_store
   void reserve_held_soft_at_shard (std::size_t bytes, int *shard_inout) noexcept;
 
   std::size_t reservation_bytes_for_pages (std::size_t pages) noexcept;
-  void record_degrade () noexcept;
   /* #146 T3 S1 (D7-2): cap reached -> charge rejected -> the caller spills
-   * early instead of erroring.  Distinct from record_degrade() (existing
-   * per-op soft-degrade counter, left as-is). */
+   * early instead of erroring (layer-2 pressure, cross-query contention). */
   void record_cap_pressure_spill () noexcept;
   /* #146 T3 S2 (§6): layer-1 per-op (row_store) limit reached -> normal spill
    * to temp files/disk -- an operator-facing "raise work_mem" signal, distinct
@@ -84,12 +82,24 @@ namespace temp_page_store
    * (op_workmem_kind::hash) consumers -- agg-hash eviction, memoize
    * eviction/bypass, sq_cache eviction. */
   void record_op_limit_spill_hash () noexcept;
+  /* #146 T3 S4 (§6): MRO approval-gate rejection -- LIMIT x entry-size
+   * estimate exceeded the row-store per-op limit, plan fell back to the
+   * normal scan path. */
+  void record_mro_gate_reject () noexcept;
+  /* #146 T3 S4 (§6, #141 VTune): spill file raw-fd I/O byte counters. */
+  void record_spill_read_bytes (std::size_t bytes) noexcept;
+  void record_spill_write_bytes (std::size_t bytes) noexcept;
 
   std::size_t cap_bytes () noexcept;
   std::size_t reserved_bytes () noexcept;
   /* #146 T3 S1 (§6): historical high-water of reserved_bytes(), observed at
    * every successful charge. */
   std::size_t reserved_peak_bytes () noexcept;
+  /* #146 T3 S4 (§6, D-SOFT): historical high-water of the soft/uncapped
+   * floor tier's charges (reserve_held_soft*), tracked separately from
+   * reserved_peak_bytes() since S1b deliberately excluded soft charges from
+   * that peak. */
+  std::size_t soft_reserved_peak_bytes () noexcept;
 
   /* #146 T3 S0 (contract only): per-operation layer-1 hard limit, PG two-tier
    * model (D7/D8).  row_store = sort/tuplestore/list-membuf state, limit =
