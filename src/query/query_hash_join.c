@@ -32,12 +32,33 @@
 #include "px_hash_join.hpp"	/* parallel_query::hash_join::... */
 #include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
 #include "px_worker_manager.hpp"	/* parallel_query::worker_manager */
+#include "qfile_batch_record_store.hpp"	/* issue #147 T1 S2: raw batch record store (Grace batch files) */
 #include "query_list.h"		/* JOIN_TYPE */
 #include "query_manager.h"	/* QMGR_TEMP_FILE */
+#include "query_workmem.hpp"	/* temp_page_store::op_limit_bytes (hash_mem accessor, #146 S0) */
 #include "system_parameter.h"	/* prm_get_bigint_value, PRM_ID_... */
 #include <stdlib.h>
 #include "thread_entry.hpp"	/* THREAD_ENTRY */
-#include "xasl.h"		/* XASL_NODE, HASHJOIN_PROC_NODE */
+#include "xasl.h"		/* XASL_NODE, HASHJOIN_PROC_NODE, XASL_INCLUDES_TDE_CLASS */
+
+#include <atomic>
+#include <vector>
+
+/* issue #147 T1 S2 gate 1 (structure goal): process-wide count of
+ * hjoin_probe_key's random-read branches (HYBRID / HASH_FILE ->
+ * qfile_jump_scan_tuple_position). The Grace path (hjoin_execute_grace)
+ * forces every batch through HASH_METH_IN_MEM (never HYBRID/HASH_FILE), so
+ * this must stay 0 across a Grace-executed join; the SINGLE/old-PARTITION/
+ * PARALLEL paths may still legitimately use HYBRID/HASH_FILE for their own
+ * (unrelated, unchanged) tiering, so this counter's value is only meaningful
+ * scoped to a query run known to have taken the Grace path. */
+static std::atomic<long> hjoin_debug_random_probe_reads { 0 };
+
+long
+hjoin_debug_random_probe_read_count (void)
+{
+  return hjoin_debug_random_probe_reads.load (std::memory_order_relaxed);
+}
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -95,6 +116,13 @@ static int hjoin_split_qlist (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manage
 			      HASHJOIN_INPUT_SPLIT_INFO * split_info, QFILE_LIST_ID ** temp_part_list_id,
 			      HASH_SCAN_KEY * temp_key);
 
+/* Hash Join Grace (issue #147 T1 S2): serial-only lazy forward-spill batch
+ * state machine, replacing hjoin_build_partitions for the non-px fallback of
+ * hjoin_try_partition's HASHJOIN_STATUS_PARTITION branch. px (PARALLEL /
+ * PARALLEL_PROBE) is untouched -- see the call site in hjoin_try_partition. */
+static int hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
+				HASHJOIN_CONTEXT * single_context);
+
 /* Hash Join Parallel */
 static HASHJOIN_STATUS hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
 					   HASHJOIN_CONTEXT * single_context);
@@ -126,6 +154,9 @@ static int hjoin_inner_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manage
 			      QFILE_LIST_ID * list_id);
 static int hjoin_outer_probe (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
 			      QFILE_LIST_ID * list_id);
+static int hjoin_outer_probe_fill_empty (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
+					 HASHJOIN_CONTEXT * context, QFILE_LIST_ID * list_id,
+					 QFILE_TUPLE_RECORD * overflow_record);
 
 /* Merge QFILE_LIST_ID */
 static int hjoin_merge_tuple (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * outer_record,
@@ -204,6 +235,13 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 	  perfmon_inc_stat (thread_p, PSTAT_QM_NUM_HASHJOINS_PARTITIONED);
 
 	  error = hjoin_execute_partitions (thread_p, &manager);
+	  break;
+
+	case HASHJOIN_STATUS_GRACE_DONE:
+	  /* issue #147 T1 S2: hjoin_try_partition already ran the Grace batch
+	   * state machine to completion -- single_context->list_id is the
+	   * final result. Nothing left to execute here (unlike PARTITION). */
+	  perfmon_inc_stat (thread_p, PSTAT_QM_NUM_HASHJOINS_PARTITIONED);
 	  break;
 
 #if defined (SERVER_MODE)
@@ -1197,7 +1235,21 @@ hjoin_try_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
 	  assert (single_context->stats->num_parallel_threads == 0);
 	}
 
-      error = hjoin_build_partitions (thread_p, manager, &split_info);
+      /* issue #147 T1 S2: serial (non-px) fallback -- Grace batch state
+       * machine replaces the old hjoin_build_partitions + hjoin_execute_partitions
+       * pair. Grace runs build+probe to completion itself (single_context->list_id
+       * is the final result), so the status is switched to GRACE_DONE below
+       * instead of staying PARTITION (which would otherwise make qexec_hash_join
+       * call hjoin_execute_partitions again over the never-populated
+       * manager->contexts[]). split_info (from hjoin_prepare_partition above,
+       * needed by px's build_partitions) is unused here -- Grace computes its
+       * own nbatch/routing independently (D4, hash_mem-based) rather than
+       * reusing the #123-formula-derived partition count. */
+      error = hjoin_execute_grace (thread_p, manager, single_context);
+      if (error == NO_ERROR)
+	{
+	  status = HASHJOIN_STATUS_GRACE_DONE;
+	}
       break;
 
 #if defined (SERVER_MODE)
@@ -1232,7 +1284,7 @@ hjoin_try_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
    * since HASHJOIN_STATUS_SINGLE may retry on error*/
   hjoin_destroy_qlist (thread_p, single_context);
 
-  assert (status == HASHJOIN_STATUS_PARTITION || status == HASHJOIN_STATUS_PARALLEL);
+  assert (status == HASHJOIN_STATUS_GRACE_DONE || status == HASHJOIN_STATUS_PARALLEL);
 
   ASSERT_NO_ERROR_OR_INTERRUPTED ();
 
@@ -1353,6 +1405,780 @@ hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASH
 
       return HASHJOIN_STATUS_SINGLE;
     }
+}
+
+/* ==================================================================== */
+/* Hash Join Grace (issue #147 T1 S2 -- PG-serial-equivalent Grace       */
+/* rebuild). Serial-only: px (PARALLEL / PARALLEL_PROBE) is untouched    */
+/* and keeps using hjoin_check_partition / hjoin_prepare_partition /     */
+/* hjoin_split_qlist / hjoin_build_partitions exactly as before -- those */
+/* functions are NOT modified by this slice.  This block replaces only  */
+/* the non-px serial fallback (hjoin_try_partition's HASHJOIN_STATUS_    */
+/* PARTITION branch, see the call site below).                          */
+/*                                                                       */
+/* Design (see issue #147 D2/D4/D5, S2 slice-plan comment):              */
+/*   - nbatch is precomputed once from the REAL materialized build size */
+/*     (page_cnt/tuple_cnt), sized so every batch's build set fits      */
+/*     hash_mem (#146 accessor) -- so every batch always selects the    */
+/*     existing HASH_METH_IN_MEM tier (mht + #144 P3 D2 arena), and      */
+/*     HYBRID/HASH_FILE (qfile_jump_scan_tuple_position's random reads) */
+/*     are simply never reached from this path.  No new "avoid random   */
+/*     read" code is needed -- IN_MEM already has none.                 */
+/*   - Routing is bit-split: bucket bits (low) stay whatever mht's own   */
+/*     internal hashing already uses; batch bits are the hash's high    */
+/*     bits, taken via rotate_right so they don't correlate with the    */
+/*     bucket bits.  batch 0 is always in memory and never touches a    */
+/*     file (build 1-pass + probe 1-pass, forward-only: only nbatch-1   */
+/*     files, not nbatch, ever get created).                            */
+/*   - NULL-keyed tuples: no dedicated NULL batch/side-store (that's    */
+/*     S3). The existing hjoin_fetch_key "need_skip_next" signal already*/
+/*     gives the exact minimal contract asked for here: a NULL build key*/
+/*     is simply never inserted (no batching decision needed -- it can  */
+/*     never equal anything), a NULL probe key is skipped for INNER, or */
+/*     immediately emitted as an outer unmatched row for LEFT/RIGHT     */
+/*     (hjoin_outer_probe_fill_empty) -- exactly like the existing      */
+/*     single-batch code, reused verbatim.                              */
+/* ==================================================================== */
+
+namespace
+{
+  /* Bounded halving, mirrors HLS_SPILL_MAX_NBATCH's role for the batch-spill
+   * hash (query_hash_scan.c) -- an escape hatch against a pathological
+   * build_bytes/hash_mem ratio spinning nbatch up without bound. */
+  const int HJOIN_GRACE_MAX_NBATCH = 512;
+
+  /*
+   * hjoin_grace_bucket_bytes_estimate () - rough per-entry bucket-array
+   *   overhead for an in-memory hash table sized to hold `tuple_cnt` entries
+   *   (mht_create_hls's bucket vector, one pointer-ish slot per bucket at
+   *   ~0.7 load factor -- see memory_hash.c). An approximation: the halving
+   *   loop below is the same tolerance mechanism PG's own estimate-then-halve
+   *   sizing relies on, so a rough constant-per-tuple estimate is sufficient.
+   */
+  UINT64
+  hjoin_grace_bucket_bytes_estimate (INT64 tuple_cnt)
+  {
+    if (tuple_cnt <= 0)
+      {
+	return 0;
+      }
+    return (UINT64) tuple_cnt * sizeof (void *);
+  }
+
+  /*
+   * hjoin_grace_choose_nbatch () - issue #147 D4: precompute nbatch (power of
+   *   two) so each batch's build footprint fits hash_mem (session work_mem *
+   *   hash_mem_multiplier, #146 S0 accessor -- op_limit_bytes(hash) is first
+   *   consumed here). Uses the build side's REAL materialized size
+   *   (page_cnt/tuple_cnt), not an estimate; halving loop bounded by
+   *   HJOIN_GRACE_MAX_NBATCH (PG ExecChooseHashTableSize equivalent).
+   */
+  int
+  hjoin_grace_choose_nbatch (INT64 build_tuple_cnt, INT64 build_page_cnt)
+  {
+    if (build_tuple_cnt <= 0 || build_page_cnt <= 0)
+      {
+	return 1;
+      }
+
+    const UINT64 hash_mem = (UINT64) temp_page_store::op_limit_bytes (temp_page_store::op_workmem_kind::hash);
+    const UINT64 build_bytes = (UINT64) build_page_cnt * DB_PAGESIZE;
+
+    int nbatch = 1;
+    while (nbatch < HJOIN_GRACE_MAX_NBATCH)
+      {
+	const UINT64 per_batch_tuples = (UINT64) build_tuple_cnt / (UINT64) nbatch;
+	const UINT64 per_batch_bytes = build_bytes / (UINT64) nbatch;
+	const UINT64 bucket_bytes = hjoin_grace_bucket_bytes_estimate ((INT64) per_batch_tuples);
+
+	if (per_batch_bytes + bucket_bytes <= hash_mem)
+	  {
+	    break;
+	  }
+	nbatch <<= 1;
+      }
+    return nbatch;
+  }
+
+  /* number of bits nbatch (a power of two) occupies, e.g. 8 -> 3 */
+  int
+  hjoin_grace_nbatch_bits (int nbatch)
+  {
+    int nbits = 0;
+    for (int n = nbatch; n > 1; n >>= 1)
+      {
+	nbits++;
+      }
+    return nbits;
+  }
+
+  UINT32
+  hjoin_grace_ror32 (UINT32 v, unsigned int shift)
+  {
+    shift &= 31;
+    return (shift == 0) ? v : (UINT32) ((v >> shift) | (v << (32 - shift)));
+  }
+
+  /*
+   * hjoin_grace_route () - issue #147 D2: bit-split routing.  batch = the
+   *   hash's high bits, brought down via rotate_right so they don't overlap
+   *   the low bits mht's own internal bucket hashing already consumes.
+   *   nbatch == 1 always routes to batch 0 (no rotation needed).
+   */
+  int
+  hjoin_grace_route (UINT32 hash_key, int nbatch, int nbatch_bits)
+  {
+    if (nbatch <= 1)
+      {
+	return 0;
+      }
+    return (int) (hjoin_grace_ror32 (hash_key, (unsigned int) nbatch_bits) & (UINT32) (nbatch - 1));
+  }
+
+  /*
+   * hjoin_grace_tde_algo () - resolve the TDE algorithm for Grace batch files
+   *   from the join's own real flag (issue #147 fixed confirmation: unlike
+   *   hls_spill_new_file's TDE_ALGORITHM_NONE hardcode -- "no user data" is
+   *   not true here, batch files carry full tuples), matching the existing
+   *   qfile_producer_create_for_list convention.
+   */
+  TDE_ALGORITHM
+  hjoin_grace_tde_algo (const HASHJOIN_MANAGER * manager)
+  {
+    const bool tde_encrypted =
+      XASL_IS_FLAGED (manager->outer->xasl, XASL_INCLUDES_TDE_CLASS)
+      || XASL_IS_FLAGED (manager->inner->xasl, XASL_INCLUDES_TDE_CLASS);
+    if (!tde_encrypted)
+      {
+	return TDE_ALGORITHM_NONE;
+      }
+    return (TDE_ALGORITHM) prm_get_integer_value (PRM_ID_TDE_DEFAULT_ALGORITHM);
+  }
+
+  /*
+   * hjoin_grace_scan_init_in_mem () - forced HASH_METH_IN_MEM setup for a
+   *   Grace batch, sized for `tuple_cnt_hint` entries.  Deliberately separate
+   *   from hjoin_scan_init's list_id-driven tier auto-select: a Grace batch's
+   *   source is not (always) a QFILE_LIST_ID (reload batches read from a
+   *   qfile::batch_record_store), and by construction (nbatch sizing, D4)
+   *   every batch must select IN_MEM -- HYBRID/HASH_FILE never apply here.
+   */
+  int
+  hjoin_grace_scan_init_in_mem (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cnt,
+				INT64 tuple_cnt_hint)
+  {
+    hash_scan->wm_bytes = 0;
+    hash_scan->wm_shard = -1;
+
+    hash_scan->temp_key = qdata_alloc_hscan_key (thread_p, key_cnt, true);
+    if (hash_scan->temp_key == NULL)
+      {
+	goto error_exit;
+      }
+
+    hash_scan->temp_new_key = qdata_alloc_hscan_key (thread_p, key_cnt, true);
+    if (hash_scan->temp_new_key == NULL)
+      {
+	goto error_exit;
+      }
+
+    hash_scan->hash_list_scan_type = HASH_METH_IN_MEM;
+    hash_scan->memory.hash_table =
+      mht_create_hls ("Hash Join (Grace batch)", (int) MAX (tuple_cnt_hint, 2), NULL, NULL);
+    if (hash_scan->memory.hash_table == NULL)
+      {
+	goto error_exit;
+      }
+    hash_scan->memory.curr_hash_entry = NULL;
+    /* #144 P3 D2 arena; NULL (OOM) falls back to per-entry alloc, same as
+     * hjoin_scan_init's IN_MEM branch. */
+    hash_scan->memory.value_arena = hscan_value_arena_create ();
+
+    hash_scan->curr_hash_key = 0;
+    hash_scan->need_coerce_type = false;
+
+    ASSERT_NO_ERROR_OR_INTERRUPTED ();
+    return NO_ERROR;
+
+  error_exit:
+    hjoin_scan_clear (thread_p, hash_scan);
+
+    if (er_errid () == NO_ERROR)
+      {
+	assert_release_error (er_errid () != NO_ERROR);
+      }
+    return er_errid ();
+  }
+
+  /*
+   * hjoin_grace_select_build_probe () - mirrors hjoin_init_context's
+   *   build/probe assignment (JOIN_INNER smaller-side pick; JOIN_LEFT/RIGHT
+   *   fixed, preserved side = probe). Duplicated rather than reused because
+   *   hjoin_init_context also unconditionally calls hjoin_scan_init against
+   *   the FULL (unsplit) build list_id -- exactly the oversized tier check
+   *   Grace exists to avoid.
+   */
+  int
+  hjoin_grace_select_build_probe (HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context)
+  {
+    HASHJOIN_FETCH_INFO *outer = &context->outer;
+    HASHJOIN_FETCH_INFO *inner = &context->inner;
+
+    switch (manager->join_type)
+      {
+      case JOIN_INNER:
+	if (outer->list_id->tuple_cnt < inner->list_id->tuple_cnt
+	    || (outer->list_id->tuple_cnt == inner->list_id->tuple_cnt
+		&& outer->list_id->page_cnt < inner->list_id->page_cnt))
+	  {
+	    context->build = outer;
+	    context->probe = inner;
+	  }
+	else
+	  {
+	    context->build = inner;
+	    context->probe = outer;
+	  }
+	break;
+
+      case JOIN_LEFT:
+	outer->fill_record = &outer->tuple_record;
+	inner->fill_record = NULL;
+	context->build = inner;
+	context->probe = outer;
+	break;
+
+      case JOIN_RIGHT:
+	outer->fill_record = NULL;
+	inner->fill_record = &inner->tuple_record;
+	context->build = outer;
+	context->probe = inner;
+	break;
+
+      default:
+	/* impossible case */
+	assert_release_error (false);
+	return er_errid ();
+      }
+
+    return NO_ERROR;
+  }
+
+  /*
+   * hjoin_grace_build_insert () - insert one build tuple (already routed to
+   *   the current batch) into the IN_MEM table. `scan_id_source` is any
+   *   already-constructed QFILE_LIST_SCAN_ID (never dereferenced -- the
+   *   IN_MEM branch of hjoin_build_key ignores it; it exists only to satisfy
+   *   that function's non-NULL assert).
+   */
+  int
+  hjoin_grace_build_insert (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST_SCAN_ID * scan_id_source,
+			    UINT32 hash_key, QFILE_TUPLE tuple)
+  {
+    QFILE_TUPLE_RECORD rec;
+    rec.tpl = tuple;
+    rec.size = QFILE_GET_TUPLE_LENGTH (tuple);
+    hash_scan->curr_hash_key = hash_key;
+    return hjoin_build_key (thread_p, hash_scan, scan_id_source, &rec);
+  }
+
+  /*
+   * hjoin_grace_probe_match () - probe one already-fetched, already-hashed
+   *   probe tuple against the current batch's IN_MEM table: search every
+   *   matching hash entry (hjoin_probe_key / hjoin_fetch_key-compare, same as
+   *   hjoin_inner_probe/hjoin_outer_probe's do-while), evaluate during-join
+   *   predicate if present, merge each qualifying pair into result_list_id,
+   *   and -- for outer joins -- emit exactly one unmatched row via the
+   *   existing hjoin_outer_probe_fill_empty if nothing matched. Caller has
+   *   already: fetched the probe key into hash_scan->temp_key, confirmed it
+   *   is non-NULL, computed hash_scan->curr_hash_key, and set
+   *   context->probe->tuple_record to the probe tuple.
+   */
+  int
+  hjoin_grace_probe_match (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+			   QFILE_LIST_ID * result_list_id, QFILE_TUPLE_RECORD * overflow_record)
+  {
+    HASHJOIN_FETCH_INFO *outer = &context->outer;
+    HASHJOIN_FETCH_INFO *inner = &context->inner;
+    HASHJOIN_FETCH_INFO *build = context->build;
+    HASHJOIN_FETCH_INFO *probe = context->probe;
+    HASH_LIST_SCAN *hash_scan = &context->hash_scan;
+    HASH_SCAN_KEY *key = hash_scan->temp_key;
+    HASH_SCAN_KEY *found_key = hash_scan->temp_new_key;
+    bool need_skip_next = false;
+    bool any_record_added = false;
+    int error = NO_ERROR;
+
+    build->tuple_record.tpl = NULL;
+    build->tuple_record.size = 0;
+
+    do
+      {
+	error = hjoin_probe_key (thread_p, hash_scan, &build->list_scan_id, &build->tuple_record);
+	if (error != NO_ERROR)
+	  {
+	    return error;
+	  }
+	if (build->tuple_record.tpl == NULL)
+	  {
+	    break;		/* not found */
+	  }
+
+	error = hjoin_fetch_key (thread_p, build, &build->tuple_record, found_key, key /* compare_key */ ,
+				 &need_skip_next);
+	if (error != NO_ERROR)
+	  {
+	    return error;
+	  }
+	else if (need_skip_next)
+	  {
+	    need_skip_next = false;
+	    continue;
+	  }
+
+	if (context->during_join_pred != NULL)
+	  {
+	    DB_LOGICAL ev_res;
+
+	    error = fetch_val_list (thread_p, probe->regu_list_pred, context->val_descr, NULL, NULL,
+				    probe->tuple_record.tpl, PEEK);
+	    if (error != NO_ERROR)
+	      {
+		return error;
+	      }
+	    error = fetch_val_list (thread_p, build->regu_list_pred, context->val_descr, NULL, NULL,
+				    build->tuple_record.tpl, PEEK);
+	    if (error != NO_ERROR)
+	      {
+		return error;
+	      }
+	    ev_res = eval_pred (thread_p, context->during_join_pred, context->val_descr, NULL);
+	    if (ev_res == V_ERROR)
+	      {
+		return ER_FAILED;
+	      }
+	    if (ev_res != V_TRUE)
+	      {
+		continue;
+	      }
+	  }
+
+	error = hjoin_merge_tuple_to_list_id (thread_p, result_list_id, &outer->tuple_record, &inner->tuple_record,
+					      manager->merge_info, overflow_record);
+	if (error != NO_ERROR)
+	  {
+	    return error;
+	  }
+	any_record_added = true;
+      }
+    while (true);
+
+    if (!any_record_added && IS_OUTER_JOIN_TYPE (manager->join_type))
+      {
+	return hjoin_outer_probe_fill_empty (thread_p, manager, context, result_list_id, overflow_record);
+      }
+    return NO_ERROR;
+  }
+
+  /* One Grace batch's forward-spill files (index 0 is always structurally
+   * absent -- batch 0 never touches a file, per D2/S2). */
+  struct hjoin_grace_batch_files
+  {
+    std::vector<qfile::batch_record_store *> inner;
+    std::vector<qfile::batch_record_store *> outer;
+
+    explicit hjoin_grace_batch_files (int nbatch) : inner ((size_t) nbatch, nullptr), outer ((size_t) nbatch, nullptr)
+    {
+    }
+
+    ~hjoin_grace_batch_files ()
+    {
+      for (qfile::batch_record_store * store : inner)
+	{
+	  delete store;
+	}
+      for (qfile::batch_record_store * store : outer)
+	{
+	  delete store;
+	}
+    }
+  };
+
+  /*
+   * hjoin_grace_ensure_batch_file () - lazily create the batch file for
+   *   (is_outer, batchno) on first spill. `next_seq` is a per-call counter
+   *   the caller bumps for every file created (uniqueness within this join's
+   *   files; the underlying buffile also folds in worker_id/pid).
+   */
+  int
+  hjoin_grace_ensure_batch_file (THREAD_ENTRY * thread_p, const std::string & dir, TDE_ALGORITHM tde_algo,
+				 std::uint64_t * next_seq, qfile::batch_record_store ** slot)
+  {
+    if (*slot != NULL)
+      {
+	return NO_ERROR;
+      }
+    int os_error = 0;
+    *slot = qfile::batch_record_store::create (thread_p, dir.c_str (), (*next_seq)++, 0, tde_algo, &os_error);
+    if (*slot == NULL)
+      {
+	qfile::spill_file::set_os_error (os_error);
+	assert_release_error (er_errid () != NO_ERROR);
+	return er_errid ();
+      }
+    return NO_ERROR;
+  }
+}				/* anonymous namespace */
+
+/*
+ * hjoin_execute_grace () - issue #147 T1 S2: serial Grace hash join.
+ *   Precomputes nbatch (D4); build 1-pass (batch 0 direct-insert, other
+ *   batches forward-spilled) then probe 1-pass (batch 0 immediate match,
+ *   other batches forward-spilled); then reloads batches 1..nbatch-1 one at
+ *   a time into the same IN_MEM table (mht_clear_hls + arena reset, no
+ *   destroy/recreate churn) and probes each against its outer batch file.
+ *   nbatch == 1 degenerates to the existing single-batch path unchanged.
+ */
+static int
+hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context)
+{
+  HASHJOIN_FETCH_INFO *build, *probe;
+  HASH_LIST_SCAN *hash_scan;
+  QFILE_LIST_ID *result_list_id = NULL;
+  QFILE_TUPLE_RECORD overflow_record = { NULL, 0 };
+  SCAN_CODE scan_code;
+  HASH_SCAN_KEY *key;
+  bool need_skip_next = false;
+  bool build_scan_open = false, probe_scan_open = false;
+  int nbatch, nbatch_bits;
+  int batchno;
+  int error = NO_ERROR;
+  std::string dir;
+  TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
+  std::uint64_t next_seq = 0;
+
+  assert (thread_p != NULL);
+  assert (manager != NULL);
+  assert (context != NULL);
+  assert (context == &manager->single_context);
+  assert (context->list_id == NULL);
+
+  error = hjoin_grace_select_build_probe (manager, context);
+  if (error != NO_ERROR)
+    {
+      return error;
+    }
+
+  build = context->build;
+  probe = context->probe;
+  hash_scan = &context->hash_scan;
+
+  nbatch = hjoin_grace_choose_nbatch (build->list_id->tuple_cnt, build->list_id->page_cnt);
+  nbatch_bits = hjoin_grace_nbatch_bits (nbatch);
+
+  error = hjoin_grace_scan_init_in_mem (thread_p, hash_scan, manager->key_cnt,
+				       build->list_id->tuple_cnt / MAX (nbatch, 1));
+  if (error != NO_ERROR)
+    {
+      return error;
+    }
+
+  key = hash_scan->temp_key;
+
+  hjoin_grace_batch_files batches (nbatch);
+  if (nbatch > 1)
+    {
+      if (!qfile::buffile::default_scratch_dir (dir))
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OUT_OF_TEMP_SPACE, 0);
+	  error = er_errid ();
+	  goto error_exit;
+	}
+      tde_algo = hjoin_grace_tde_algo (manager);
+      next_seq = ((std::uint64_t) manager->query_id << 20) ^ 1;
+    }
+
+  result_list_id = qfile_open_list (thread_p, &manager->type_list, NULL, manager->query_id, manager->qlist_flag, NULL);
+  if (result_list_id == NULL)
+    {
+      goto error_exit;
+    }
+
+  /* ---- build 1-pass: batch 0 direct-insert, other batches forward-spilled (D2) ---- */
+  error = qfile_open_list_scan (build->list_id, &build->list_scan_id);
+  if (error != NO_ERROR)
+    {
+      goto error_exit;
+    }
+  build_scan_open = true;
+
+  build->tuple_record = { NULL, 0 };
+  while ((scan_code = qfile_scan_list_next (thread_p, &build->list_scan_id, &build->tuple_record, PEEK)) == S_SUCCESS)
+    {
+      error = hjoin_fetch_key (thread_p, build, &build->tuple_record, key, NULL /* compare_key */ , &need_skip_next);
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+      if (need_skip_next)
+	{
+	  /* NULL build key: never inserted, never batched (D2/S2 minimal NULL contract). */
+	  need_skip_next = false;
+	  continue;
+	}
+
+      const UINT32 hash_key = qdata_hash_scan_key (key, UINT_MAX, HASH_METH_IN_MEM);
+      batchno = hjoin_grace_route (hash_key, nbatch, nbatch_bits);
+
+      if (batchno == 0)
+	{
+	  error = hjoin_grace_build_insert (thread_p, hash_scan, &build->list_scan_id, hash_key,
+					   build->tuple_record.tpl);
+	}
+      else
+	{
+	  error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, &next_seq, &batches.inner[batchno]);
+	  if (error == NO_ERROR)
+	    {
+	      error = batches.inner[batchno]->append (thread_p, hash_key, build->tuple_record.tpl);
+	    }
+	}
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+    }
+  if (scan_code == S_ERROR)
+    {
+      error = er_errid ();
+      goto error_exit;
+    }
+  qfile_close_scan (thread_p, &build->list_scan_id);
+  build_scan_open = false;
+
+  /* ---- probe 1-pass: batch 0 immediate match, other batches forward-spilled (D2) ---- */
+  error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id);
+  if (error != NO_ERROR)
+    {
+      goto error_exit;
+    }
+  probe_scan_open = true;
+
+  probe->tuple_record = { NULL, 0 };
+  while ((scan_code = qfile_scan_list_next (thread_p, &probe->list_scan_id, &probe->tuple_record, PEEK)) == S_SUCCESS)
+    {
+      error = hjoin_fetch_key (thread_p, probe, &probe->tuple_record, key, NULL /* compare_key */ , &need_skip_next);
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+      if (need_skip_next)
+	{
+	  need_skip_next = false;
+	  if (IS_OUTER_JOIN_TYPE (manager->join_type))
+	    {
+	      error = hjoin_outer_probe_fill_empty (thread_p, manager, context, result_list_id, &overflow_record);
+	      if (error != NO_ERROR)
+		{
+		  goto error_exit;
+		}
+	    }
+	  continue;
+	}
+
+      hash_scan->curr_hash_key = qdata_hash_scan_key (key, UINT_MAX, HASH_METH_IN_MEM);
+      batchno = hjoin_grace_route (hash_scan->curr_hash_key, nbatch, nbatch_bits);
+
+      if (batchno == 0)
+	{
+	  /* probe->tuple_record already set by qfile_scan_list_next above */
+	  error = hjoin_grace_probe_match (thread_p, manager, context, result_list_id, &overflow_record);
+	}
+      else
+	{
+	  error = hjoin_grace_ensure_batch_file (thread_p, dir, tde_algo, &next_seq, &batches.outer[batchno]);
+	  if (error == NO_ERROR)
+	    {
+	      error = batches.outer[batchno]->append (thread_p, hash_scan->curr_hash_key, probe->tuple_record.tpl);
+	    }
+	}
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+    }
+  if (scan_code == S_ERROR)
+    {
+      error = er_errid ();
+      goto error_exit;
+    }
+  qfile_close_scan (thread_p, &probe->list_scan_id);
+  probe_scan_open = false;
+
+  /* ---- reload loop: batches 1..nbatch-1 ---- */
+  for (batchno = 1; batchno < nbatch; batchno++)
+    {
+      qfile::batch_record_store *&inner_store = batches.inner[batchno];
+      qfile::batch_record_store *&outer_store = batches.outer[batchno];
+
+      if (inner_store == NULL && outer_store == NULL)
+	{
+	  continue;		/* empty-batch rule 1: neither side ever spilled here */
+	}
+      if (outer_store == NULL)
+	{
+	  /* empty-batch rule 3: nothing to probe -- reloading the inner
+	   * table would be wasted work (no consumer). */
+	  delete inner_store;
+	  inner_store = NULL;
+	  continue;
+	}
+
+      /* reload the inner batch (rule 2: if inner_store is NULL the table
+       * simply stays empty -- every probe below then naturally misses,
+       * which is exactly the desired outer-join fill-empty / inner-join
+       * zero-rows behavior, with no special-case code). */
+      mht_clear_hls (hash_scan->memory.hash_table, qdata_noop_free_hscan_entry, NULL);
+      if (hash_scan->memory.value_arena != NULL)
+	{
+	  hscan_value_arena_reset (hash_scan->memory.value_arena);
+	}
+
+      if (inner_store != NULL)
+	{
+	  UINT32 rd_hash;
+	  QFILE_TUPLE rd_tuple;
+	  bool rd_eof = false;
+
+	  while (true)
+	    {
+	      error = inner_store->read (thread_p, &rd_hash, &rd_tuple, &rd_eof);
+	      if (error != NO_ERROR)
+		{
+		  goto error_exit;
+		}
+	      if (rd_eof)
+		{
+		  break;
+		}
+	      error = hjoin_grace_build_insert (thread_p, hash_scan, &build->list_scan_id, rd_hash, rd_tuple);
+	      if (error != NO_ERROR)
+		{
+		  goto error_exit;
+		}
+	    }
+	  /* §4: inner batch file closes immediately once its reload completes. */
+	  delete inner_store;
+	  inner_store = NULL;
+	}
+
+      {
+	UINT32 rd_hash;
+	QFILE_TUPLE rd_tuple;
+	bool rd_eof = false;
+
+	while (true)
+	  {
+	    error = outer_store->read (thread_p, &rd_hash, &rd_tuple, &rd_eof);
+	    if (error != NO_ERROR)
+	      {
+		goto error_exit;
+	      }
+	    if (rd_eof)
+	      {
+		break;
+	      }
+	    probe->tuple_record.tpl = rd_tuple;
+	    probe->tuple_record.size = QFILE_GET_TUPLE_LENGTH (rd_tuple);
+
+	    /* The hash was already computed once (stored in the batch file,
+	     * S1) and is reused as-is, but `key`'s decoded DB_VALUEs are
+	     * stale from whatever tuple hjoin_fetch_key last ran on -- they
+	     * must be re-fetched from THIS tuple before hjoin_grace_probe_match
+	     * uses `key` as the compare_key for the build-side match. A NULL
+	     * key can't recur here (this tuple was only spilled after an
+	     * earlier NULL check passed), so need_skip_next is not expected. */
+	    error = hjoin_fetch_key (thread_p, probe, &probe->tuple_record, key, NULL /* compare_key */ ,
+				     &need_skip_next);
+	    if (error != NO_ERROR)
+	      {
+		goto error_exit;
+	      }
+	    assert (!need_skip_next);
+	    need_skip_next = false;
+
+	    hash_scan->curr_hash_key = rd_hash;
+	    error = hjoin_grace_probe_match (thread_p, manager, context, result_list_id, &overflow_record);
+	    if (error != NO_ERROR)
+	      {
+		goto error_exit;
+	      }
+	  }
+	/* §4: outer batch file closes once its probe pass completes. */
+	delete outer_store;
+	outer_store = NULL;
+      }
+    }
+
+  qfile_close_list (thread_p, result_list_id);
+  context->list_id = result_list_id;
+
+  hjoin_scan_clear (thread_p, hash_scan);
+
+  if (overflow_record.tpl != NULL)
+    {
+      db_private_free_and_init (thread_p, overflow_record.tpl);
+    }
+
+  ASSERT_NO_ERROR_OR_INTERRUPTED ();
+  return NO_ERROR;
+
+error_exit:
+  if (build_scan_open)
+    {
+      qfile_close_scan (thread_p, &build->list_scan_id);
+    }
+  if (probe_scan_open)
+    {
+      qfile_close_scan (thread_p, &probe->list_scan_id);
+    }
+  if (overflow_record.tpl != NULL)
+    {
+      db_private_free_and_init (thread_p, overflow_record.tpl);
+    }
+  if (result_list_id != NULL)
+    {
+      qfile_close_list (thread_p, result_list_id);
+      qfile_destroy_list (thread_p, result_list_id);
+      QFILE_FREE_AND_INIT_LIST_ID (result_list_id);
+    }
+  hjoin_scan_clear (thread_p, hash_scan);
+
+  /* Any batch file left over from a mid-write error never got its write
+   * phase finalized under a real thread_p; close it here (idempotent) so
+   * batches' destructor -- which runs with thread_p = NULL -- only does the
+   * already-closed no-op instead of finalizing under a NULL thread context. */
+  for (qfile::batch_record_store * store : batches.inner)
+    {
+      if (store != NULL)
+	{
+	  store->close (thread_p);
+	}
+    }
+  for (qfile::batch_record_store * store : batches.outer)
+    {
+      if (store != NULL)
+	{
+	  store->close (thread_p);
+	}
+    }
+
+  if (error == NO_ERROR || er_errid () == NO_ERROR)
+    {
+      assert_release_error (er_errid () != NO_ERROR);
+      error = er_errid ();
+    }
+  return error;
 }
 
 /*
@@ -4133,6 +4959,7 @@ hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
       if (hash_value != NULL)
 	{
 	  MAKE_TUPLE_POSTION (tuple_position, hash_value->pos, list_scan_id);
+	  hjoin_debug_random_probe_reads.fetch_add (1, std::memory_order_relaxed);
 	  scan_code = qfile_jump_scan_tuple_position (thread_p, list_scan_id, &tuple_position, tuple_record, PEEK);
 	  if (scan_code != S_SUCCESS)
 	    {
@@ -4166,6 +4993,7 @@ hjoin_probe_key (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, QFILE_LIST
       if (eh_search == EH_KEY_FOUND)
 	{
 	  MAKE_TUPLE_POSTION (tuple_position, &spill_pos, list_scan_id);
+	  hjoin_debug_random_probe_reads.fetch_add (1, std::memory_order_relaxed);
 	  scan_code = qfile_jump_scan_tuple_position (thread_p, list_scan_id, &tuple_position, tuple_record, PEEK);
 	  if (scan_code != S_SUCCESS)
 	    {

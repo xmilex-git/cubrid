@@ -78,6 +78,11 @@ typedef enum hashjoin_status
   HASHJOIN_STATUS_PARTITION,
   HASHJOIN_STATUS_PARALLEL,
   HASHJOIN_STATUS_PARALLEL_PROBE,
+  /* issue #147 T1 S2: hjoin_try_partition's serial (non-px) fallback ran the
+   * Grace batch state machine to completion (single_context->list_id is
+   * already the final joined result) -- qexec_hash_join must NOT call
+   * hjoin_execute_partitions again for this status, unlike PARTITION. */
+  HASHJOIN_STATUS_GRACE_DONE,
   HASHJOIN_STATUS_END,
   HASHJOIN_STATUS_ERROR
 } HASHJOIN_STATUS;
@@ -481,6 +486,12 @@ typedef struct hashjoin_manager
  */
 
 int qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, VAL_DESCR * val_descr);
+
+/* issue #147 T1 S2 gate 1: process-wide count of hjoin_probe_key's random-read
+ * branches (HYBRID/HASH_FILE -> qfile_jump_scan_tuple_position). Meaningful
+ * only when scoped to a query run known to have taken the Grace path (see
+ * hjoin_execute_grace) -- must stay 0 for such a run. */
+long hjoin_debug_random_probe_read_count (void);
 
 /* Hash Join Execution */
 int hjoin_execute (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
