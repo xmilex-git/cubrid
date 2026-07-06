@@ -134,9 +134,9 @@ static int hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * mana
  * empty-input dispatch (FILL_NULL_VALUES / TRY / END, including the px-only
  * last-partition-is-the-NULL-partition rule) but calls hjoin_execute_grace()
  * instead of hjoin_execute_internal() for the TRY case. hjoin_execute() itself
- * stays untouched (still used by the plain SINGLE path). */
-int hjoin_execute_grace_px (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
-			    UINT32 worker_id);
+ * stays untouched (still used by the plain SINGLE path). Declared in
+ * query_hash_join.h (public, used cross-TU by join_task::execute) -- no
+ * separate forward declaration needed here. */
 
 /* Hash Join Parallel */
 static HASHJOIN_STATUS hjoin_try_parallel (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager,
@@ -151,7 +151,8 @@ static void hjoin_clear_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * 
 				    HASHJOIN_SPLIT_INFO * split_info, bool clear_all);
 
 /* Hash Join Context */
-static int hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context);
+static int hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context,
+			       bool * use_grace);
 static void hjoin_clear_context (THREAD_ENTRY * thread_p, HASHJOIN_CONTEXT * context);
 static void hjoin_destroy_qlist (THREAD_ENTRY * thread_p, HASHJOIN_CONTEXT * context);
 
@@ -666,6 +667,7 @@ hjoin_execute_internal (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HAS
 {
   HASHJOIN_FETCH_INFO *outer, *inner;
   HASHJOIN_FETCH_INFO *build = NULL, *probe = NULL;
+  bool use_grace = false;
 
   int error = NO_ERROR;
 
@@ -681,10 +683,23 @@ hjoin_execute_internal (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HAS
   outer->list_scan_id.status = S_CLOSED;
   inner->list_scan_id.status = S_CLOSED;
 
-  error = hjoin_init_context (thread_p, manager, context);
+  error = hjoin_init_context (thread_p, manager, context, &use_grace);
   if (error != NO_ERROR)
     {
       goto error_exit;
+    }
+  if (use_grace)
+    {
+      /* issue #147 S5-lite: SINGLE path's IN_MEM reserve was rejected by the
+       * layer-2 accountant despite fitting the static byte estimate --
+       * hjoin_init_context/hjoin_scan_init already bailed out without
+       * touching build->list_scan_id, so it's safe to hand this context
+       * straight to Grace (nbatch recomputed from the REAL build size)
+       * instead of accepting the old HYBRID/HASH_FILE degrade. context is
+       * always &manager->single_context here (this is the only live caller
+       * of hjoin_execute_internal), matching hjoin_execute_grace's contract;
+       * worker_id 0 -- serial, never concurrent. */
+      return hjoin_execute_grace (thread_p, manager, context, 0);
     }
 
   build = context->build;
@@ -3464,9 +3479,14 @@ hjoin_clear_shared_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manag
  *   thread_p(in): Thread entry.
  *   manager(in): Hash join manager containing shared state.
  *   context(in/out): Hash join context to initialize.
+ *   use_grace(out): issue #147 S5-lite -- set true when hjoin_scan_init
+ *     signals that the SINGLE path's IN_MEM reserve was rejected and the
+ *     caller must re-route into Grace instead. When true, this function
+ *     returns NO_ERROR early without touching stats/parallel-probe dispatch
+ *     (context->build/probe are still valid; nothing else is).
  */
 static int
-hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context)
+hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_CONTEXT * context, bool * use_grace)
 {
   HASHJOIN_FETCH_INFO *outer, *inner;
   HASHJOIN_FETCH_INFO *build = NULL;
@@ -3528,10 +3548,17 @@ hjoin_init_context (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOI
   build = context->build;
   assert (build != NULL);
 
-  error = hjoin_scan_init (thread_p, &context->hash_scan, manager->key_cnt, build->list_id);
+  error = hjoin_scan_init (thread_p, &context->hash_scan, manager->key_cnt, build->list_id, use_grace);
   if (error != NO_ERROR)
     {
       goto error_exit;
+    }
+  if (use_grace != NULL && *use_grace)
+    {
+      /* issue #147 S5-lite: caller (hjoin_execute_internal) re-routes into
+       * Grace -- build/probe are already set above; nothing else here
+       * (stats, parallel-probe dispatch) applies to that path. */
+      return NO_ERROR;
     }
 
   if (thread_is_on_trace (thread_p))
@@ -3666,9 +3693,11 @@ hjoin_destroy_qlist (THREAD_ENTRY * thread_p, HASHJOIN_CONTEXT * context)
  *   list_id(in): List identifier to be used as build input.
  */
 int
-hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cnt, QFILE_LIST_ID * list_id)
+hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cnt, QFILE_LIST_ID * list_id,
+		 bool * use_grace)
 {
   UINT64 mem_limit;
+  bool fits_in_mem_size;
 
   int error = NO_ERROR;
 
@@ -3676,6 +3705,11 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
   assert (hash_scan != NULL);
   assert (list_id == NULL || list_id->tuple_cnt > 0);
   assert (key_cnt > 0);
+
+  if (use_grace != NULL)
+    {
+      *use_grace = false;
+    }
 
   mem_limit = prm_get_bigint_value (PRM_ID_WORK_MEM);
   assert (mem_limit > 0);
@@ -3703,8 +3737,8 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
       /* Same tier contract as check_hash_list_scan: an in-memory tier must both
        * fit work_mem AND secure its estimate from the work_mem accountant; on
        * refusal it degrades to the next tier. */
-      if ((UINT64) list_id->page_cnt * DB_PAGESIZE <= mem_limit
-	  && qdata_hscan_wm_reserve (hash_scan, (size_t) list_id->page_cnt * DB_PAGESIZE))
+      fits_in_mem_size = (UINT64) list_id->page_cnt * DB_PAGESIZE <= mem_limit;
+      if (fits_in_mem_size && qdata_hscan_wm_reserve (hash_scan, (size_t) list_id->page_cnt * DB_PAGESIZE))
 	{
 #if HASHJOIN_DUMP_BUILD
 	  fprintf (stdout, "\nHash Join Method: In Memory\n");
@@ -3723,6 +3757,22 @@ hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cn
 	  /* #144 P3 D2: arena for the value+tuple bump-alloc (NULL => per-entry
 	   * fallback; freed en masse in hjoin_scan_clear). */
 	  hash_scan->memory.value_arena = hscan_value_arena_create ();
+	}
+      else if (fits_in_mem_size && use_grace != NULL)
+	{
+	  /* issue #147 S5-lite: the static byte estimate said IN_MEM should fit,
+	   * but the layer-2 accountant's live reserve just rejected it (a
+	   * tighter real-time cap than the static per-op estimate above --
+	   * e.g. other concurrent work_mem consumers). Degrading to HYBRID/
+	   * HASH_FILE here would reintroduce the exact probe-random-read
+	   * pathology Grace exists to eliminate (qfile_jump_scan_tuple_position).
+	   * Signal the caller to re-route into Grace's own nbatch-based
+	   * batching (which resizes against the REAL build size) instead of
+	   * silently degrading tier. hash_scan is left cleared/unusable --
+	   * the caller must not use it further on this path. */
+	  *use_grace = true;
+	  hjoin_scan_clear (thread_p, hash_scan);
+	  return NO_ERROR;
 	}
       else if ((UINT64) list_id->tuple_cnt * (sizeof (HENTRY_HLS) + sizeof (QFILE_TUPLE_SIMPLE_POS)) <= mem_limit
 	       && qdata_hscan_wm_reserve (hash_scan,

@@ -743,7 +743,8 @@ namespace parallel_query
 
       /* probe input is consumed via the per-worker tapeset_reader — no list_scan_id needed */
 
-      error = hjoin_scan_init (&thread_ref, &m_context->hash_scan, m_manager->key_cnt, nullptr /* skip hash table */ );
+      error = hjoin_scan_init (&thread_ref, &m_context->hash_scan, m_manager->key_cnt, nullptr /* skip hash table */ ,
+			       nullptr /* use_grace: N/A, list_id == nullptr never takes that branch */ );
       if (error != NO_ERROR)
 	{
 	  m_task_manager.handle_error (thread_ref);

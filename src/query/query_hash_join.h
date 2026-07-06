@@ -509,7 +509,14 @@ void hjoin_clear_shared_split_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * 
 				    HASHJOIN_SHARED_SPLIT_INFO * shared_info);
 
 /* Hash List Scan */
-int hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cnt, QFILE_LIST_ID * list_id);
+/* issue #147 S5-lite: use_grace (NULL-able; NULL for the "skip hash table"
+ * list_id == NULL callers, e.g. px probe workers) is set true when the
+ * IN_MEM tier's byte estimate said it should fit but the layer-2 accountant's
+ * live reserve rejected it -- the caller must re-route into Grace instead of
+ * accepting the HYBRID/HASH_FILE degrade this function would otherwise pick
+ * (hash_scan is left cleared/unusable in that case). */
+int hjoin_scan_init (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan, int key_cnt, QFILE_LIST_ID * list_id,
+		     bool * use_grace);
 void hjoin_scan_clear (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hash_scan);
 
 /* Hash Join Partitioning */
