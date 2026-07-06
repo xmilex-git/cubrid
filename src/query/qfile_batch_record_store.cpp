@@ -80,7 +80,7 @@ namespace qfile
 	 * under pool saturation (D4 -- op-limit enforcement lives at the
 	 * build-memory layer, not here), so an overshoot is soft-charged
 	 * instead of refused. */
-	temp_page_store::record_degrade ();
+	temp_page_store::record_cap_pressure_spill ();
 	temp_page_store::reserve_held_soft (bytes, &shard);
       }
     m_wm_charges.emplace_back (bytes, shard);
