@@ -1617,14 +1617,40 @@ hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASH
 /*     bucket bits.  batch 0 is always in memory and never touches a    */
 /*     file (build 1-pass + probe 1-pass, forward-only: only nbatch-1   */
 /*     files, not nbatch, ever get created).                            */
-/*   - NULL-keyed tuples: no dedicated NULL batch/side-store (that's    */
-/*     S3). The existing hjoin_fetch_key "need_skip_next" signal already*/
-/*     gives the exact minimal contract asked for here: a NULL build key*/
-/*     is simply never inserted (no batching decision needed -- it can  */
-/*     never equal anything), a NULL probe key is skipped for INNER, or */
-/*     immediately emitted as an outer unmatched row for LEFT/RIGHT     */
-/*     (hjoin_outer_probe_fill_empty) -- exactly like the existing      */
-/*     single-batch code, reused verbatim.                              */
+/*   - NULL-keyed tuples: no dedicated NULL batch/side-store. The        */
+/*     existing hjoin_fetch_key "need_skip_next" signal already gives    */
+/*     the exact minimal contract needed here: a NULL build key is       */
+/*     simply never inserted (no batching decision needed -- it can     */
+/*     never equal anything), a NULL probe key is skipped for INNER, or  */
+/*     immediately emitted as an outer unmatched row for LEFT/RIGHT      */
+/*     (hjoin_outer_probe_fill_empty) -- exactly like the existing       */
+/*     single-batch code, reused verbatim.                               */
+/*                                                                        */
+/*     D-S3-1 (issue #147 T1 S3, investigated/not implemented): the      */
+/*     design record calls for a PG v19-style NULL side-store (isolate   */
+/*     NULL-keyed tuples into their own hash_mem/16-capped store on      */
+/*     first read, batch-routing never sees them, drained once right     */
+/*     after batch 0). Investigated and NOT built, because it would add  */
+/*     cost for no gain in this engine's shape: a NULL join key can      */
+/*     never equal anything under SQL NULL semantics, so its outer-join  */
+/*     disposition (INNER: contributes nothing; LEFT/RIGHT: contributes  */
+/*     exactly one fill-empty row) is knowable the instant it's fetched, */
+/*     independent of which batch is active or whether the build side   */
+/*     has even been loaded yet -- there is no future state a side-store */
+/*     could let the decision wait for. Immediate emission costs zero    */
+/*     extra memory; a side-store would cost up to hash_mem/16 for the   */
+/*     same outcome. The one property it could change is output row      */
+/*     ORDER (NULL-driven fill-empty rows land in scan order today,      */
+/*     would land in a separate post-batch-0 burst under a side-store),  */
+/*     and hash-join output order is not a documented guarantee. Cost:   */
+/*     an intentional deviation from the design record's PG parity, on   */
+/*     record here rather than re-litigated. Escape hatch: build S3      */
+/*     properly if a future requirement needs NULL-driven rows in a      */
+/*     specific batch-relative position (none identified so far); the    */
+/*     gate this slice ran (S2's ③, LEFT/INNER/RIGHT + both-null +       */
+/*     unmatched combinations, merge-join parity) already covers this    */
+/*     path's correctness exhaustively and needs no new gate for this    */
+/*     decision alone.                                                   */
 /* ==================================================================== */
 
 namespace
