@@ -92,12 +92,13 @@ namespace qfile
    * boot keeps the sweep off the query hot path. */
   void spill_scratch_boot_sweep ();
 
-  /* Resolve the per-server default scratch directory: $CUBRID_TMP, else the
+  /* Resolve the per-server default scratch directory: unconditionally the
    * database volume directory, then <base>/cubrid_buffile/<db>/<server_id>
    * (server_id persists across restarts in a per-db marker file, so boot
-   * sweeps only this server's own subtree).  No /tmp or $TMP fallback -- both
-   * can be tmpfs, which would defeat spilling.  Returns false if no disk-backed
-   * base can be formed. */
+   * sweeps only this server's own subtree).  No $CUBRID_TMP override, no
+   * /tmp or $TMP fallback (issue #147 D-SP1) -- all of those can point
+   * outside the DB volume or at tmpfs, which would defeat spilling.  Returns
+   * false if no disk-backed base can be formed. */
   bool spill_scratch_default_dir (std::string &out);
 
   /*

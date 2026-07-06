@@ -204,18 +204,14 @@ namespace
 
   buffile_dir_state g_buffile_dirs;
 
-  /* Resolve the disk-backed root (no /tmp or $TMP fallback: both can be
-   * tmpfs and a spill file on tmpfs defeats the point of spilling -- risks
-   * host OOM).  Priority: $CUBRID_TMP, else the database volume directory.
-   * Empty return means "no usable disk-backed base". */
+  /* Resolve the disk-backed root: unconditionally the database volume
+   * directory (no $CUBRID_TMP override, no /tmp or $TMP fallback -- all of
+   * those can point outside the DB volume or at tmpfs, defeating the point
+   * of spilling and risking host OOM; see issue #147 D-SP1).  Empty return
+   * means "no usable disk-backed base". */
   std::string
   buffile_root_base ()
   {
-    const char *cubrid_tmp = getenv ("CUBRID_TMP");
-    if (cubrid_tmp != NULL && cubrid_tmp[0] != '\0')
-      {
-	return cubrid_tmp;
-      }
     const char *db_full = boot_db_full_name ();
     if (db_full != NULL && db_full[0] != '\0')
       {
