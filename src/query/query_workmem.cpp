@@ -275,7 +275,18 @@ namespace temp_page_store
 
     const int shard = choose_shard ();
     g_accountant.shards[shard].reserved.fetch_add (clamp_to_accounting_bytes (bytes), std::memory_order_acq_rel);
-    update_reserved_peak (exact_reserved_bytes ());
+    /* #146 T3 S1b: no peak update here.  reserve_held_soft is the pre-existing,
+     * intentionally uncapped "must succeed" floor tier (hls_spill_create /
+     * hls_spill_finalize_file in query_hash_scan.c call it only after a hard
+     * reserve_held already failed) -- it can legitimately push the accountant
+     * arbitrarily far past cap, which is not a cap-enforcement defect but the
+     * documented degrade-to-floor design. Folding its contribution into
+     * reserved_peak would make that stat read as "cap enforcement is failing
+     * by Nx" when the hard-charge tier (try_charge_shard, used by reserve_held
+     * and reserve_held_at_shard/D5 membuf growth) is in fact bounded to
+     * cap + worst_case_slack at every accepted charge. reserved_peak tracks
+     * that cap-governed tier only, matching its purpose as a cap-pressure
+     * observability signal (design doc S6). */
     *shard_out = shard;
   }
 
