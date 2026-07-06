@@ -42,6 +42,7 @@
 #include "temp_page_store.hpp"
 #include "query_workmem.hpp"
 #include "qfile_buffile.hpp"
+#include "qfile_batch_record_store.hpp"
 #include "qfile_page_spill.hpp"
 #include "qfile_tape.hpp"
 #include "qfile_tape_selftest.hpp"
@@ -1207,6 +1208,20 @@ qmgr_initialize (THREAD_ENTRY * thread_p)
 	  er_log_debug (ARG_FILE_LINE, "BUFFILE_SELFTEST FAIL result=%d\n", buffile_selftest_rc);
 	  fprintf (stderr, "BUFFILE_SELFTEST FAIL result=%d\n", buffile_selftest_rc);
 	  assert (buffile_selftest_rc == NO_ERROR);
+	}
+    }
+  if (getenv ("CUBRID_WM_BATCHSTORE_SELFTEST") != NULL)
+    {
+      /* issue #147 T1 S1: raw batch record store round-trip + bulk/unlink +
+       * accountant charge/release + DB-volume path rule. */
+      int batchstore_selftest_rc = qfile_batch_record_store_selftest (thread_p);
+      er_log_debug (ARG_FILE_LINE, "BATCHSTORE_SELFTEST result=%d (0=PASS)\n", batchstore_selftest_rc);
+      fprintf (stderr, "BATCHSTORE_SELFTEST result=%d (0=PASS)\n", batchstore_selftest_rc);
+      if (batchstore_selftest_rc != NO_ERROR)
+	{
+	  er_log_debug (ARG_FILE_LINE, "BATCHSTORE_SELFTEST FAIL result=%d\n", batchstore_selftest_rc);
+	  fprintf (stderr, "BATCHSTORE_SELFTEST FAIL result=%d\n", batchstore_selftest_rc);
+	  assert (batchstore_selftest_rc == NO_ERROR);
 	}
     }
   if (getenv ("CUBRID_WM_HELDTAPE_SELFTEST") != NULL)

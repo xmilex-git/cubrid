@@ -309,6 +309,7 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/qfile_spill_file.cpp
   ${QUERY_DIR}/qfile_page_spill.cpp
   ${QUERY_DIR}/qfile_buffile.cpp
+  ${QUERY_DIR}/qfile_batch_record_store.cpp
   ${QUERY_DIR}/qfile_chunk.cpp
   ${QUERY_DIR}/memoize.cpp
   ${QUERY_DIR}/stream_to_xasl.c
@@ -336,6 +337,7 @@ set(QUERY_HEADERS
   ${QUERY_DIR}/qfile_spill_file.hpp
   ${QUERY_DIR}/qfile_page_spill.hpp
   ${QUERY_DIR}/qfile_buffile.hpp
+  ${QUERY_DIR}/qfile_batch_record_store.hpp
   ${QUERY_DIR}/qfile_chunk.hpp
   )
 
