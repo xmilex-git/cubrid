@@ -1740,6 +1740,59 @@ hjoin_check_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASH
       part_cnt = (UINT32) grace_nbatch;
     }
 
+#if defined (SERVER_MODE)
+  /* issue #149 (materialize-preserving concurrency recovery, part 2): a
+   * SINGLE verdict here means "try the in-memory build" -- but if the
+   * layer-2 accountant cap cannot possibly grant that build,
+   * hjoin_scan_init's reserve gets rejected at runtime and S5-lite degrades
+   * to *serial* Grace, serializing the whole join on a px-eligible plan
+   * (observed: wmmid @ db=256M/wm=256M, cap=128M < ~150M build -> 1.4x).
+   * Predict the rejection up front and partition instead, so the px pool
+   * stays engaged; partitions small enough to fit are joined IN_MEM by the
+   * workers exactly as before. */
+  if (part_cnt <= 1 && grace_nbatch <= 1 && manager->num_parallel_threads > 1)
+    {
+      UINT64 build_bytes = (UINT64) build_page_cnt * DB_PAGESIZE;
+      /* in-memory footprint expands ~1.8x over the raw list bytes (hash
+       * entries + value arena; measured on the campaign fixtures: 174M list
+       * -> ~320M footprint, 82M -> ~150M).  Predict a runtime cap rejection
+       * only when that footprint genuinely cannot fit -- an over-eager
+       * prediction here demotes joins whose in-memory build was optimal. */
+      UINT64 est_footprint = build_bytes + (build_bytes * 4) / 5;
+
+      /* threshold cap/2, not cap: (a) measured, the partitioned px build
+       * (parallel build + parallel probe) already beats the SINGLE path's
+       * serial build + parallel probe once the build is this size (wmmid
+       * 2.4M: 4.4s partitioned vs 6.9s single); (b) a near-cap in-memory
+       * build monopolizes the layer-2 budget every other operator in the
+       * query shares.  Genuinely small builds keep PARALLEL_PROBE. */
+      if (est_footprint > (UINT64) temp_page_store::cap_bytes () / 2)
+	{
+	  part_cnt = 2;		/* enter the PARTITION branch; the floor below widens it */
+	}
+    }
+
+  /* issue #149 (materialize-preserving concurrency recovery): the px execute
+   * phase reserves MIN(parallel hint, part_cnt) workers and each partition is
+   * then joined serially by one worker -- a large work_mem shrinks part_cnt
+   * to 2..3 and starves the pool (observed on the same data: work_mem
+   * 64M -> 256M drops HASHJOIN from 8 workers/2.5s to 3 workers/4.0s purely
+   * through this cap).  Floor the partition count at twice the parallel hint
+   * so every worker gets pull-work and stays balanced; the bytes routed are
+   * identical, only the partition-file granularity changes.  Serial Grace is
+   * unaffected (it ignores part_cnt and computes its own nbatch); tiny
+   * inputs are exempt (>= 1024 rows per floored partition required). */
+  if (part_cnt > 1 && manager->num_parallel_threads > 1)
+    {
+      UINT32 floor_cnt = (UINT32) (2 * manager->num_parallel_threads);
+
+      if (part_cnt < floor_cnt && min_tuple_cnt >= (INT64) floor_cnt * 1024)
+	{
+	  part_cnt = floor_cnt;
+	}
+    }
+#endif /* defined (SERVER_MODE) */
+
   if (part_cnt > 1 || grace_nbatch > 1)
     {
       if (IS_OUTER_JOIN_TYPE (manager->join_type))
