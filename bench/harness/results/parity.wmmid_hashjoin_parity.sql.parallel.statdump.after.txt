@@ -1,5 +1,5 @@
 
-	Tue July 07 11:59:44 KST 2026
+	Tue July 07 13:27:32 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          1
@@ -14,19 +14,19 @@ Max_time_file_iosync_all      =          0
 Avg_time_file_iosync_all      =          0
 Num_file_page_allocs          =          0
 Num_file_page_deallocs        =          0
-Num_data_page_fetches         =      34281
+Num_data_page_fetches         =      34284
 Num_data_page_dirties         =      10387
 Num_data_page_ioreads         =       7455
 Num_data_page_iowrites        =          3
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      15108
+Num_data_page_private_quota   =      15702
 Num_data_page_private_count   =          6
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          7
-Num_data_page_lru1            =       7478
+Num_data_page_lru1            =       7479
 Num_data_page_lru2            =         93
-Num_data_page_lru3            =         79
-Num_data_page_victim_candidate =         76
+Num_data_page_lru3            =         78
+Num_data_page_victim_candidate =         75
 Num_log_page_fetches          =          0
 Num_log_page_ioreads          =          0
 Num_log_page_iowrites         =          0
@@ -110,18 +110,18 @@ Num_workmem_reserved_bytes    =          0
 Num_workmem_cap_bytes         =  267780096
 Num_workmem_op_limit_spills_sort =          0
 Num_workmem_op_limit_spills_hash =          0
-Num_workmem_cap_pressure_spills =        404
+Num_workmem_cap_pressure_spills =        415
 Num_workmem_reserved_peak     =  283584744
-Num_workmem_soft_reserved_peak =   59346388
-Num_workmem_spill_read_bytes  =  684454032
-Num_workmem_spill_write_bytes =  684454032
+Num_workmem_soft_reserved_peak =   59346532
+Num_workmem_spill_read_bytes  =  707760576
+Num_workmem_spill_write_bytes =  707760576
 Num_workmem_mro_gate_rejects  =          0
 Num_sort_io_pages             =          0
 Num_sort_data_pages           =         13
 Num_network_requests          =         55
 Num_adaptive_flush_pages      =          0
 Num_adaptive_flush_log_pages  =          0
-Num_adaptive_flush_max_pages  =      15232
+Num_adaptive_flush_max_pages  =      14600
 Num_prior_lsa_list_size       =          0
 Num_prior_lsa_list_maxed      =          0
 Num_prior_lsa_list_removed    =          0
@@ -393,10 +393,10 @@ Total_time_bt_vacuum_insid_traverse =          0
 Max_time_bt_vacuum_insid_traverse =          0
 Avg_time_bt_vacuum_insid_traverse =          0
 The timer values for vacuum_master are:
-Num_vacuum_master             =        588
-Total_time_vacuum_master      =       6000
+Num_vacuum_master             =        570
+Total_time_vacuum_master      =       5000
 Max_time_vacuum_master        =       1000
-Avg_time_vacuum_master        =         10
+Avg_time_vacuum_master        =          8
 The timer values for vacuum_job are:
 Num_vacuum_job                =          0
 Total_time_vacuum_job         =          0
@@ -416,7 +416,7 @@ Time_get_snapshot_acquire_time =          0
 Count_get_snapshot_retry      =          0
 Time_tran_complete_time       =          0
 The timer values for compute_oldest_visible are:
-Num_compute_oldest_visible    =        588
+Num_compute_oldest_visible    =        570
 Total_time_compute_oldest_visible =       1000
 Max_time_compute_oldest_visible =       1000
 Avg_time_compute_oldest_visible =          1
@@ -428,7 +428,7 @@ Vacuum_page_efficiency_ratio  =       0.00
 Vacuum_page_fetch_ratio       =       0.00
 Data_page_fix_lock_acquire_time_msec =       0.00
 Data_page_fix_hold_acquire_time_msec =       0.00
-Data_page_fix_acquire_time_msec =    1397.00
+Data_page_fix_acquire_time_msec =    1013.00
 Data_page_allocate_time_ratio =     100.00
 Data_page_total_promote_success =       0.00
 Data_page_total_promote_fail  =       0.00
@@ -442,11 +442,11 @@ Num_unfix_lru3_private_to_shared_mid =          0
 Num_unfix_lru2_private_keep   =          0
 Num_unfix_lru2_shared_keep    =          0
 Num_unfix_lru2_private_to_top =          0
-Num_unfix_lru2_shared_to_top  =       1632
+Num_unfix_lru2_shared_to_top  =       1633
 Num_unfix_lru3_private_to_top =          5
-Num_unfix_lru3_shared_to_top  =       5821
+Num_unfix_lru3_shared_to_top  =       5820
 Num_unfix_lru1_private_keep   =         11
-Num_unfix_lru1_shared_keep    =      14934
+Num_unfix_lru1_shared_keep    =      14935
 Num_unfix_void_to_private_mid_vacuum =          0
 Num_unfix_lru1_any_keep_vacuum =          0
 Num_unfix_lru2_any_keep_vacuum =       4228
@@ -468,8 +468,8 @@ Total_time_flush_flush        =          0
 Max_time_flush_flush          =          0
 Avg_time_flush_flush          =          0
 The timer values for flush_sleep are:
-Num_flush_sleep               =          5
-Total_time_flush_sleep        =    5000000
+Num_flush_sleep               =          4
+Total_time_flush_sleep        =    4000000
 Max_time_flush_sleep          =    1000000
 Avg_time_flush_sleep          =    1000000
 The timer values for flush_collect_per_page are:
@@ -574,10 +574,10 @@ Total_time_DWB_file_sync_helper =          0
 Max_time_DWB_file_sync_helper =          0
 Avg_time_DWB_file_sync_helper =          0
 The timer values for DWB_flush_block_cond_wait are:
-Num_DWB_flush_block_cond_wait =       5533
-Total_time_DWB_flush_block_cond_wait =    5926000
-Max_time_DWB_flush_block_cond_wait =       7000
-Avg_time_DWB_flush_block_cond_wait =       1071
+Num_DWB_flush_block_cond_wait =       5332
+Total_time_DWB_flush_block_cond_wait =    5741000
+Max_time_DWB_flush_block_cond_wait =       8000
+Avg_time_DWB_flush_block_cond_wait =       1076
 The timer values for DWB_flush_block_sort are:
 Num_DWB_flush_block_sort      =          0
 Total_time_DWB_flush_block_sort =          0
@@ -647,12 +647,12 @@ Num_data_page_fix_ext:
 WORKER,PAGE_UNKNOWN  ,NEW_NO_WAIT       ,WRITE,UNCOND      =         97
 WORKER,PAGE_UNKNOWN  ,OLD_PAGE_IN_PB    ,WRITE,UNCOND      =         39
 WORKER,PAGE_FTAB     ,OLD_NO_WAIT       ,READ ,UNCOND      =          1
-WORKER,PAGE_FTAB     ,OLD_PAGE_IN_PB    ,READ ,UNCOND      =         20
+WORKER,PAGE_FTAB     ,OLD_PAGE_IN_PB    ,READ ,UNCOND      =         21
 WORKER,PAGE_FTAB     ,OLD_PAGE_IN_PB    ,WRITE,UNCOND      =        140
 WORKER,PAGE_HEAP     ,OLD_NO_WAIT       ,READ ,COND        =       7445
 WORKER,PAGE_HEAP     ,OLD_NO_WAIT       ,READ ,UNCOND      =          7
 WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,COND        =      22337
-WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,UNCOND      =         37
+WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,UNCOND      =         39
 WORKER,PAGE_VOLHEADER,OLD_PAGE_IN_PB    ,WRITE,UNCOND      =          7
 WORKER,PAGE_VOLBITMAP,OLD_PAGE_IN_PB    ,WRITE,UNCOND      =          8
 WORKER,PAGE_QRESULT  ,OLD_PAGE_IN_PB    ,WRITE,UNCOND      =       4118
@@ -662,11 +662,11 @@ WORKER,PAGE_BTREE_R  ,OLD_PAGE_IN_PB    ,READ ,UNCOND      =         11
 Num_data_page_promote_ext:
 Num_data_page_promote_time_ext:
 Num_data_page_unfix_ext:
-WORKER,PAGE_FTAB     ,BUF_NON_DIRTY,HOLDER_NON_DIRTY,READ  =          9
+WORKER,PAGE_FTAB     ,BUF_NON_DIRTY,HOLDER_NON_DIRTY,READ  =         10
 WORKER,PAGE_FTAB     ,BUF_NON_DIRTY,HOLDER_DIRTY    ,WRITE =          6
 WORKER,PAGE_FTAB     ,BUF_DIRTY    ,HOLDER_NON_DIRTY,READ  =         12
 WORKER,PAGE_FTAB     ,BUF_DIRTY    ,HOLDER_DIRTY    ,WRITE =        140
-WORKER,PAGE_HEAP     ,BUF_NON_DIRTY,HOLDER_NON_DIRTY,READ  =      29826
+WORKER,PAGE_HEAP     ,BUF_NON_DIRTY,HOLDER_NON_DIRTY,READ  =      29828
 WORKER,PAGE_VOLHEADER,BUF_NON_DIRTY,HOLDER_NON_DIRTY,WRITE =          6
 WORKER,PAGE_VOLHEADER,BUF_NON_DIRTY,HOLDER_DIRTY    ,WRITE =          2
 WORKER,PAGE_VOLBITMAP,BUF_NON_DIRTY,HOLDER_DIRTY    ,WRITE =          4
@@ -679,8 +679,8 @@ WORKER,PAGE_BTREE_R  ,BUF_NON_DIRTY,HOLDER_NON_DIRTY,READ  =         11
 Time_data_page_lock_acquire_time:
 Time_data_page_hold_acquire_time:
 Time_data_page_fix_acquire_time:
-WORKER,PAGE_HEAP     ,OLD_NO_WAIT       ,READ ,COND        =          1375000
-WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,COND        =            20000
+WORKER,PAGE_HEAP     ,OLD_NO_WAIT       ,READ ,COND        =           995000
+WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,COND        =            16000
 WORKER,PAGE_HEAP     ,OLD_PAGE_IN_PB    ,READ ,UNCOND      =             1000
 WORKER,PAGE_QRESULT  ,OLD_PAGE_IN_PB    ,WRITE,UNCOND      =             1000
 Num_mvcc_snapshot_ext:
