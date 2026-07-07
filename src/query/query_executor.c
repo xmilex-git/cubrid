@@ -1132,6 +1132,29 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
   int ret = NO_ERROR;
   bool output_tuple = true;
 
+  /* issue #149 P3: a streamed hashjoin outer's qualifying rows are pushed
+   * straight into the join probe instead of being materialized into
+   * xasl->list_id.  Only the sink owner's own rows are redirected -- any
+   * nested subplan of the outer still materializes normally.  The features
+   * asserted below are excluded by hjoin_outer_stream_push_eligible's narrow
+   * shape gate (see query_hash_join.c) before a sink is ever installed. */
+  if (xasl_state->stream_sink != NULL && xasl_state->stream_sink->owner == xasl)
+    {
+      HASHJOIN_STREAM_SINK *sink = xasl_state->stream_sink;
+
+      assert (xasl->type == BUILDLIST_PROC);
+      assert (xasl->topn_items == NULL);
+      assert (!(COMPOSITE_LOCK (xasl->scan_op_type) || QEXEC_IS_MULTI_TABLE_UPDATE_DELETE (xasl)));
+      assert (!(xasl->type == BUILDLIST_PROC && xasl->proc.buildlist.g_hash_eligible));
+
+      if (qdata_copy_valptr_list_to_tuple (thread_p, xasl->outptr_list, &xasl_state->vd, &sink->tplrec) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+
+      return sink->push_fn (thread_p, sink->ctx, &sink->tplrec);
+    }
+
   if ((COMPOSITE_LOCK (xasl->scan_op_type) || QEXEC_IS_MULTI_TABLE_UPDATE_DELETE (xasl))
       && !XASL_IS_FLAGED (xasl, XASL_MULTI_UPDATE_AGG))
     {
@@ -15226,7 +15249,7 @@ qexec_end_mainblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_
       break;
 
     case HASHJOIN_PROC:
-      if (qexec_hash_join (thread_p, xasl, xasl_state->query_id, &xasl_state->vd) != NO_ERROR)
+      if (qexec_hash_join (thread_p, xasl, xasl_state->query_id, &xasl_state->vd, xasl_state) != NO_ERROR)
 	{
 	  GOTO_EXIT_ON_ERROR;
 	}
@@ -15963,8 +15986,14 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 	       * unreleased -- see issue #149 P2 stop-and-report). The
 	       * empty-side skip-check just below (which reads outer_xasl's
 	       * tuple_cnt) depends on this running first. */
-	      if (XASL_IS_FLAGED (outer_xasl, XASL_HASHJOIN_OUTER_STREAMED) && IS_XASL_INITIAL_STATUS (outer_xasl->status))
+	      if (XASL_IS_FLAGED (outer_xasl, XASL_HASHJOIN_OUTER_STREAMED) && IS_XASL_INITIAL_STATUS (outer_xasl->status)
+		  && !hjoin_outer_stream_push_eligible (xptr))
 		{
+		  /* issue #149 P3: push-eligible outers (LEFT, narrow shape)
+		   * are deliberately NOT pre-materialized here -- the join's
+		   * probe phase drives them with a push sink installed (see
+		   * hjoin_execute_grace).  Everything else (RIGHT, non-narrow)
+		   * keeps this pre-P3 materializing fallback. */
 		  if (qexec_execute_mainblock (thread_p, outer_xasl, xasl_state, NULL) != NO_ERROR)
 		    {
 		      qexec_failure_line (__LINE__, xasl_state);
@@ -17013,6 +17042,9 @@ qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, c
 
   /* initialize error line */
   xasl_state.qp_xasl_line = 0;
+
+  /* issue #149 P3: no streamed hashjoin outer is being driven yet */
+  xasl_state.stream_sink = NULL;
 
   tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
   if (logtb_find_current_isolation (thread_p) >= TRAN_REP_READ)

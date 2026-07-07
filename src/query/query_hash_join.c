@@ -33,7 +33,9 @@
 #include "px_parallel.hpp"	/* parallel_query::compute_parallel_degree */
 #include "px_worker_manager.hpp"	/* parallel_query::worker_manager */
 #include "qfile_batch_record_store.hpp"	/* issue #147 T1 S2: raw batch record store (Grace batch files) */
+#include "query_executor.h"	/* issue #149 P3: HASHJOIN_STREAM_SINK, XASL_STATE, qexec_execute_mainblock */
 #include "query_list.h"		/* JOIN_TYPE */
+#include "query_opfunc.h"	/* issue #149 P3: qdata_get_valptr_type_list */
 #include "query_manager.h"	/* QMGR_TEMP_FILE */
 #include "query_workmem.hpp"	/* temp_page_store::op_limit_bytes (hash_mem accessor, #146 S0) */
 #include "system_parameter.h"	/* prm_get_bigint_value, PRM_ID_... */
@@ -130,7 +132,7 @@ static int hjoin_execute_internal (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * m
 
 /* Hash Join Manager */
 static int hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NODE * xasl,
-			       QUERY_ID query_id, VAL_DESCR * val_descr);
+			       QUERY_ID query_id, VAL_DESCR * val_descr, XASL_STATE * xasl_state);
 static void hjoin_clear_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager);
 
 /* Hash Join Domain Info */
@@ -235,7 +237,8 @@ static void hjoin_print_tuple (QFILE_LIST_ID * list_id, QFILE_TUPLE tuple, HASHJ
  *   val_descr(in): Value descriptor for positional values.
  */
 int
-qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, VAL_DESCR * val_descr)
+qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, VAL_DESCR * val_descr,
+		 XASL_STATE * xasl_state)
 {
   HASHJOIN_MANAGER manager;
   HASHJOIN_CONTEXT *single_context;
@@ -247,7 +250,7 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
   assert (xasl != NULL);
   assert (query_id != NULL_QUERY_ID);
 
-  error = hjoin_init_manager (thread_p, &manager, xasl, query_id, val_descr);
+  error = hjoin_init_manager (thread_p, &manager, xasl, query_id, val_descr, xasl_state);
   if (error != NO_ERROR)
     {
       goto error_exit;
@@ -255,7 +258,12 @@ qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, V
 
   single_context = &manager.single_context;
 
-  status = hjoin_check_empty_inputs (&manager, single_context);
+  /* issue #149 P3: in push-stream mode the outer's emptiness is unknowable
+   * until it runs (during the probe phase) and the inner-empty fast paths
+   * read the outer list too -- skip the shortcut entirely; the Grace state
+   * machine handles an empty build table (every probe misses -> fill-empty)
+   * and an empty outer (zero pushes -> zero rows) without special cases. */
+  status = manager.outer_stream_push ? HASHJOIN_STATUS_TRY : hjoin_check_empty_inputs (&manager, single_context);
   single_context->status = status;
   switch (status)
     {
@@ -796,9 +804,62 @@ error_exit:
  *   query_id(in): Query identifier.
  *   val_descr(in): Value descriptor for positional values.
  */
+/*
+ * hjoin_outer_stream_push_eligible () - issue #149 P3: can this join's
+ *   plan-time-detached outer actually be push-streamed at runtime?
+ *   (see the header for the full contract)
+ */
+bool
+hjoin_outer_stream_push_eligible (const XASL_NODE * hashjoin_xasl)
+{
+  const XASL_NODE *outer;
+  const BUILDLIST_PROC_NODE *bl;
+
+  if (hashjoin_xasl == NULL || hashjoin_xasl->type != HASHJOIN_PROC)
+    {
+      return false;
+    }
+
+  outer = hashjoin_xasl->proc.hashjoin.outer.xasl;
+  if (outer == NULL || !XASL_IS_FLAGED (outer, XASL_HASHJOIN_OUTER_STREAMED))
+    {
+      return false;
+    }
+
+  /* probe side must be the physical outer: LEFT only (RIGHT swaps the outer
+   * into the build side, which needs real materialized sizes; INNER picks
+   * sides by comparing real sizes -- both already excluded at plan time,
+   * re-checked defensively here). */
+  if (hashjoin_xasl->proc.hashjoin.merge_info.join_type != JOIN_LEFT)
+    {
+      return false;
+    }
+
+  /* narrow shape: a plain scan+filter+projection BUILDLIST.  Anything that
+   * gives the materialized list its own semantics (sort, group, aggregate,
+   * analytic, connect-by, top-n, click-counter update) must keep the
+   * materializing fallback path. */
+  if (outer->type != BUILDLIST_PROC)
+    {
+      return false;
+    }
+  if (outer->orderby_list != NULL || outer->topn_items != NULL || outer->connect_by_ptr != NULL
+      || outer->selected_upd_list != NULL || outer->option == Q_DISTINCT)
+    {
+      return false;
+    }
+  bl = &outer->proc.buildlist;
+  if (bl->groupby_list != NULL || bl->g_agg_list != NULL || bl->g_hash_eligible || bl->a_eval_list != NULL)
+    {
+      return false;
+    }
+
+  return true;
+}
+
 static int
 hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NODE * xasl, QUERY_ID query_id,
-		    VAL_DESCR * val_descr)
+		    VAL_DESCR * val_descr, XASL_STATE * xasl_state)
 {
   HASHJOIN_PROC_NODE *proc;
   QFILE_LIST_MERGE_INFO *merge_info;
@@ -842,7 +903,16 @@ hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NO
    * (hjoin_check_empty_inputs, hjoin_execute_grace,
    * hjoin_grace_select_build_probe, ...) expects -- nothing further to do
    * here. */
-  if (XASL_IS_FLAGED (manager->outer->xasl, XASL_HASHJOIN_OUTER_STREAMED))
+  manager->xasl_state = xasl_state;
+
+  /* issue #149 P3: if the detached outer is push-eligible the executor's
+   * aptr-area pre-run left it untouched (IS_XASL_INITIAL_STATUS) -- its rows
+   * will be pushed straight into the probe phase and its list file never
+   * receives a tuple.  Every other detached-outer case (RIGHT, non-narrow
+   * shape) was pre-materialized by the executor exactly as before P3. */
+  manager->outer_stream_push = (hjoin_outer_stream_push_eligible (xasl)
+				&& IS_XASL_INITIAL_STATUS (manager->outer->xasl->status));
+  if (XASL_IS_FLAGED (manager->outer->xasl, XASL_HASHJOIN_OUTER_STREAMED) && !manager->outer_stream_push)
     {
       hjoin_debug_outer_fallback_materialize.fetch_add (1, std::memory_order_relaxed);
     }
@@ -852,11 +922,46 @@ hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NO
   assert (outer_list_id != NULL);
   assert (inner_list_id != NULL);
 
+  /* issue #149 P3: the push-streamed outer never ran, so its list has no
+   * type list yet -- but the domain/fetch machinery below needs the outer's
+   * tuple types now.  Install them from the outer's own output column list
+   * (the same source qexec_start_mainblock_iterations' qfile_open_list uses;
+   * when the outer subplan actually runs during the probe phase its own
+   * list-open replaces this). */
+  if (manager->outer_stream_push && outer_list_id->type_list.type_cnt == 0)
+    {
+      QFILE_TUPLE_VALUE_TYPE_LIST tmp_type_list = { NULL, 0 };
+
+      if (qdata_get_valptr_type_list (thread_p, manager->outer->xasl->outptr_list, &tmp_type_list) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+      /* qdata_get_valptr_type_list allocates domp with db_private_alloc, but
+       * qfile_clear_list_id frees a list's domp with free() -- hand the list
+       * a malloc'd copy so its own cleanup discipline applies unchanged. */
+      if (tmp_type_list.type_cnt > 0)
+	{
+	  outer_list_id->type_list.domp = (TP_DOMAIN **) malloc (sizeof (TP_DOMAIN *) * tmp_type_list.type_cnt);
+	  if (outer_list_id->type_list.domp == NULL)
+	    {
+	      db_private_free_and_init (thread_p, tmp_type_list.domp);
+	      return ER_FAILED;
+	    }
+	  memcpy (outer_list_id->type_list.domp, tmp_type_list.domp, sizeof (TP_DOMAIN *) * tmp_type_list.type_cnt);
+	  outer_list_id->type_list.type_cnt = tmp_type_list.type_cnt;
+	}
+      if (tmp_type_list.domp != NULL)
+	{
+	  db_private_free_and_init (thread_p, tmp_type_list.domp);
+	}
+    }
+
   /* When aptr_list is executed in qexec_execute_mainblock_internal,
    * it checks the results from outer_xasl and inner_xasl in merge_info.
    * If either has no result, the other is skipped,
    * and the skipped node can have a type count of 0 in list_id.type_list. */
-  if (outer_list_id->type_list.type_cnt == 0 || inner_list_id->type_list.type_cnt == 0)
+  if ((!manager->outer_stream_push && outer_list_id->type_list.type_cnt == 0)
+      || inner_list_id->type_list.type_cnt == 0)
     {
       return NO_ERROR;
     }
@@ -961,6 +1066,20 @@ hjoin_init_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, XASL_NO
 #if defined (SERVER_MODE) && HASHJOIN_DUMP_HASH_TABLE
   pthread_mutex_init (&manager->dump_hash_table_mutex, NULL);
 #endif /* defined (SERVER_MODE) && HASHJOIN_DUMP_HASH_TABLE */
+
+  /* issue #149 P3: the temporary outer type list installed above has served
+   * every consumer in this function (domain_info and the merged result
+   * type_list both copy the interned TP_DOMAIN pointers, not the array).
+   * Revert the outer's list to its virgin never-opened state: anything that
+   * treats a non-zero type_cnt as "this list was opened" (aptr skip checks,
+   * the per-query qlist open/close balance assert, clear paths) must see the
+   * truth -- the outer only really runs during the probe phase. */
+  if (manager->outer_stream_push && outer_list_id->type_list.domp != NULL)
+    {
+      free (outer_list_id->type_list.domp);
+      outer_list_id->type_list.domp = NULL;
+      outer_list_id->type_list.type_cnt = 0;
+    }
 
   ASSERT_NO_ERROR_OR_INTERRUPTED ();
   return NO_ERROR;
@@ -1288,6 +1407,22 @@ hjoin_try_partition (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
   assert (manager != NULL);
   assert (single_context != NULL);
   assert (single_context == &manager->single_context);
+
+  /* issue #149 P3: push-stream mode always runs the Grace state machine on
+   * the single context -- the old #123 partition-count formula reads the
+   * outer's (not yet existing) tuple count, and the plain SINGLE path scans
+   * the outer's (never populated) list file.  Grace with nbatch computed
+   * from the materialized build (inner) side handles every case, nbatch==1
+   * included (batch 0 only, no batch files -- same work as SINGLE). */
+  if (manager->outer_stream_push)
+    {
+      error = hjoin_execute_grace (thread_p, manager, single_context, 0 /* worker_id: serial */ );
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+      return HASHJOIN_STATUS_GRACE_DONE;
+    }
 
   status = hjoin_check_partition (thread_p, manager, single_context);
   if (status == HASHJOIN_STATUS_SINGLE)
@@ -2129,6 +2264,72 @@ namespace
     return error;
   }
 
+  /* issue #149 P3: per-push context for a push-streamed outer.  The push
+   * callback below executes the exact same per-tuple body as
+   * hjoin_execute_grace's probe 1-pass list-scan loop -- KEEP THE TWO IN
+   * SYNC (the loop is the source of truth). */
+  struct hjoin_grace_push_ctx
+  {
+    HASHJOIN_MANAGER *manager;
+    HASHJOIN_CONTEXT *context;
+    HASHJOIN_FETCH_INFO *probe;
+    HASH_LIST_SCAN *hash_scan;
+    HASH_SCAN_KEY *key;
+    QFILE_LIST_ID *result_list_id;
+    QFILE_TUPLE_RECORD *overflow_record;
+    hjoin_grace_batch_files *batches;
+    const std::string *dir;
+    TDE_ALGORITHM tde_algo;
+    UINT32 worker_id;
+    std::uint64_t *next_seq;
+    int nbatch;
+    int nbatch_bits;
+  };
+
+  int
+  hjoin_grace_stream_push_fn (THREAD_ENTRY * thread_p, void *arg, QFILE_TUPLE_RECORD * tplrec)
+  {
+    hjoin_grace_push_ctx *c = (hjoin_grace_push_ctx *) arg;
+    bool need_skip_next = false;
+    int batchno;
+    int error;
+
+    c->probe->tuple_record = *tplrec;
+
+    error = hjoin_fetch_key (thread_p, c->probe, &c->probe->tuple_record, c->key, NULL /* compare_key */ ,
+			     &need_skip_next);
+    if (error != NO_ERROR)
+      {
+	return error;
+      }
+    if (need_skip_next)
+      {
+	if (IS_OUTER_JOIN_TYPE (c->manager->join_type))
+	  {
+	    return hjoin_outer_probe_fill_empty (thread_p, c->manager, c->context, c->result_list_id,
+						 c->overflow_record);
+	  }
+	return NO_ERROR;
+      }
+
+    c->hash_scan->curr_hash_key = qdata_hash_scan_key (c->key, UINT_MAX, HASH_METH_IN_MEM);
+    batchno = hjoin_grace_route (c->hash_scan->curr_hash_key, c->nbatch, c->nbatch_bits);
+
+    if (batchno == 0)
+      {
+	return hjoin_grace_probe_match (thread_p, c->manager, c->context, c->result_list_id, c->overflow_record);
+      }
+
+    error = hjoin_grace_ensure_batch_file (thread_p, *c->dir, c->tde_algo, c->worker_id, c->next_seq,
+					   &c->batches->outer[batchno]);
+    if (error == NO_ERROR)
+      {
+	error = c->batches->outer[batchno]->append (thread_p, c->hash_scan->curr_hash_key,
+						    c->probe->tuple_record.tpl);
+      }
+    return error;
+  }
+
   static const int HJOIN_GRACE_EFFECTIVE_CAP_MULT = 8;	/* D3 trade-off guard's own escape hatch,
 							 * same order of magnitude as HJOIN_GRACE_MAX_NBATCH's halving bound */
 
@@ -2410,6 +2611,60 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
   build_scan_open = false;
 
   /* ---- probe 1-pass: batch 0 immediate match, other batches forward-spilled (D2) ---- */
+
+  /* issue #149 P3: push-stream mode -- instead of scanning a materialized
+   * outer list, run the outer subplan to completion under its normal driver
+   * with a sink installed: qexec_end_one_iteration redirects every
+   * qualifying outer row into hjoin_grace_stream_push_fn (same per-tuple
+   * body as the loop below), so the outer's list file never receives a
+   * tuple.  Future-batch rows land in the outer batch stores exactly as in
+   * the list path; the reload loop below is shared unchanged. */
+  if (manager->outer_stream_push && context == &manager->single_context)
+    {
+      hjoin_grace_push_ctx pctx;
+      HASHJOIN_STREAM_SINK sink;
+      HASHJOIN_STREAM_SINK *saved_sink;
+
+      pctx.manager = manager;
+      pctx.context = context;
+      pctx.probe = probe;
+      pctx.hash_scan = hash_scan;
+      pctx.key = key;
+      pctx.result_list_id = result_list_id;
+      pctx.overflow_record = &overflow_record;
+      pctx.batches = &batches;
+      pctx.dir = &dir;
+      pctx.tde_algo = tde_algo;
+      pctx.worker_id = worker_id;
+      pctx.next_seq = &next_seq;
+      pctx.nbatch = nbatch;
+      pctx.nbatch_bits = nbatch_bits;
+
+      sink.owner = manager->outer->xasl;
+      sink.push_fn = hjoin_grace_stream_push_fn;
+      sink.ctx = &pctx;
+      sink.tplrec.tpl = NULL;
+      sink.tplrec.size = 0;
+
+      assert (manager->xasl_state != NULL);
+      saved_sink = manager->xasl_state->stream_sink;
+      manager->xasl_state->stream_sink = &sink;
+      hjoin_debug_outer_streamed.fetch_add (1, std::memory_order_relaxed);
+
+      error = qexec_execute_mainblock (thread_p, manager->outer->xasl, manager->xasl_state, NULL);
+
+      manager->xasl_state->stream_sink = saved_sink;
+      if (sink.tplrec.tpl != NULL)
+	{
+	  db_private_free_and_init (thread_p, sink.tplrec.tpl);
+	}
+      if (error != NO_ERROR)
+	{
+	  goto error_exit;
+	}
+      goto probe_pass_done;
+    }
+
   error = qfile_open_list_scan (probe->list_id, &probe->list_scan_id);
   if (error != NO_ERROR)
     {
@@ -2467,6 +2722,8 @@ hjoin_execute_grace (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJO
     }
   qfile_close_scan (thread_p, &probe->list_scan_id);
   probe_scan_open = false;
+
+probe_pass_done:
 
   /* ---- reload loop: batches 1..nbatch-1 ---- */
   for (batchno = 1; batchno < nbatch; batchno++)

@@ -83,6 +83,22 @@ struct val_descr
   XASL_STATE *xasl_state;	/* XASL_STATE pointer */
 };				/* Value Descriptor */
 
+/* issue #149 P3: push sink for a hashjoin outer that was excluded from
+ * aptr_list at plan time (XASL_HASHJOIN_OUTER_STREAMED).  While installed in
+ * the XASL_STATE with `owner` set, qexec_end_one_iteration redirects that
+ * node's qualifying rows into push_fn (as a standalone tuple built in the
+ * reusable tplrec buffer) instead of materializing them into owner->list_id
+ * -- the hash join probes each row as it is produced, so the outer's list
+ * file never receives a tuple. */
+typedef struct hashjoin_stream_sink HASHJOIN_STREAM_SINK;
+struct hashjoin_stream_sink
+{
+  xasl_node *owner;		/* only rows of exactly this node are redirected */
+  int (*push_fn) (THREAD_ENTRY * thread_p, void *ctx, qfile_tuple_record * tplrec);
+  void *ctx;
+  qfile_tuple_record tplrec;	/* reusable standalone tuple buffer (private alloc) */
+};
+
 // XASL_STATE
 typedef struct xasl_state XASL_STATE;
 struct xasl_state
@@ -90,6 +106,8 @@ struct xasl_state
   VAL_DESCR vd;			/* Value Descriptor */
   QUERY_ID query_id;		/* Query associated with XASL */
   int qp_xasl_line;		/* Error line */
+  HASHJOIN_STREAM_SINK *stream_sink;	/* issue #149 P3: non-NULL only while a
+					 * streamed hashjoin outer is being driven */
 };
 
 extern qfile_list_id *qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt,

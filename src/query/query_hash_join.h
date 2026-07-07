@@ -425,6 +425,13 @@ typedef struct hashjoin_manager
   QUERY_ID query_id;
   VAL_DESCR *val_descr;
 
+  /* issue #149 P3: the enclosing execution's XASL_STATE, and whether this
+   * join's outer runs in push-stream mode (probe rows pushed straight from
+   * the outer subplan's driver, no outer materialization).  See
+   * hjoin_outer_stream_push_eligible. */
+  struct xasl_state *xasl_state;
+  bool outer_stream_push;
+
   HASHJOIN_CONTEXT single_context;
   HASHJOIN_CONTEXT *contexts;
   UINT32 context_cnt;
@@ -485,7 +492,18 @@ typedef struct hashjoin_manager
  * Function Declarations
  */
 
-int qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, VAL_DESCR * val_descr);
+int qexec_hash_join (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_ID query_id, VAL_DESCR * val_descr,
+		     struct xasl_state * xasl_state);
+
+/* issue #149 P3: true when this HASHJOIN_PROC's plan-time-detached outer
+ * (XASL_HASHJOIN_OUTER_STREAMED) can actually be push-streamed at runtime:
+ * JOIN_LEFT (probe side is always the physical outer -- RIGHT swaps outer
+ * into the build side, which needs real materialized sizes) and the outer is
+ * a narrow-shape BUILDLIST (no sort/group/agg/analytic/connect-by/topn --
+ * every feature whose semantics depend on the materialized list).  The
+ * executor consults this to decide whether to pre-materialize the detached
+ * outer (fallback) or leave it to the join's probe phase. */
+bool hjoin_outer_stream_push_eligible (const XASL_NODE * hashjoin_xasl);
 
 /* issue #147 T1 S2 gate 1: process-wide count of hjoin_probe_key's random-read
  * branches (HYBRID/HASH_FILE -> qfile_jump_scan_tuple_position). Meaningful
