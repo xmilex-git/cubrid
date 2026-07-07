@@ -2388,6 +2388,16 @@ sort_run_flush (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, int out_file, 
   /* Insert each record to the output buffer and flush the buffer when it is full */
   for (i = 0; i < numrecs && should_continue; i++)
     {
+#if defined (__GNUC__)
+      /* index_area[] order is the sort order, so consecutive records live at
+       * unrelated addresses in the sort buffer; prefetch a few records ahead
+       * (the length header sits SORT_RECORD_LENGTH_SIZE before the body) to
+       * overlap the gather misses with the current record's copy. */
+      if (i + 8 < numrecs)
+	{
+	  __builtin_prefetch (index_area[i + 8] - SORT_RECORD_LENGTH_SIZE, 0, 0);
+	}
+#endif
       /* Traverse next link */
       for (key = (SORT_REC *) index_area[i]; key; key = next)
 	{
