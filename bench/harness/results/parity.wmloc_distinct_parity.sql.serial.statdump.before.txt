@@ -1,5 +1,5 @@
 
-	Tue July 07 09:34:48 KST 2026
+	Tue July 07 09:40:25 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          0
@@ -19,14 +19,14 @@ Num_data_page_dirties         =          0
 Num_data_page_ioreads         =          0
 Num_data_page_iowrites        =          0
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      27735
+Num_data_page_private_quota   =      28038
 Num_data_page_private_count   =          0
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          0
-Num_data_page_lru1            =         26
+Num_data_page_lru1            =         24
 Num_data_page_lru2            =         24
-Num_data_page_lru3            =         45
-Num_data_page_victim_candidate =         45
+Num_data_page_lru3            =         46
+Num_data_page_victim_candidate =         46
 Num_log_page_fetches          =          0
 Num_log_page_ioreads          =          0
 Num_log_page_iowrites         =          0
@@ -574,10 +574,10 @@ Total_time_DWB_file_sync_helper =          0
 Max_time_DWB_file_sync_helper =          0
 Avg_time_DWB_file_sync_helper =          0
 The timer values for DWB_flush_block_cond_wait are:
-Num_DWB_flush_block_cond_wait =          0
-Total_time_DWB_flush_block_cond_wait =          0
-Max_time_DWB_flush_block_cond_wait =          0
-Avg_time_DWB_flush_block_cond_wait =          0
+Num_DWB_flush_block_cond_wait =          3
+Total_time_DWB_flush_block_cond_wait =       3000
+Max_time_DWB_flush_block_cond_wait =       1000
+Avg_time_DWB_flush_block_cond_wait =       1000
 The timer values for DWB_flush_block_sort are:
 Num_DWB_flush_block_sort      =          0
 Total_time_DWB_flush_block_sort =          0

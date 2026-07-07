@@ -1,17 +1,21 @@
 ===== serial =====
-cubrid_rel=CUBRID 11.5.0 (11.5.0.2437-0f85fd6) (64bit debug build for Linux) (Jul  2 2026 20:09:31)
+cubrid_rel=CUBRID 11.5.0 (11.5.0.2525-8eeda7e) (64bit release build for Linux) (Jul  7 2026 08:20:51)
 data_buffer_size=512.0M (512.0M)
 parallelism=1 (4)
 max_parallel_workers=1 (100)
-CUBRID_WM_SCAN_NEW=1
-CUBRID_WM_SORT_NEW=1
-CUBRID_WM_HASHJOIN_NEW=1
-serial: new_backed_create_delta=4 old_touch_on_new_delta=0
+CUBRID_WM_SCAN_NEW=<unset>
+CUBRID_WM_SORT_NEW=<unset>
+CUBRID_WM_HASHJOIN_NEW=<unset>
+serial: new_backed_create_delta=6 old_touch_on_new_delta=0
 ===== parallel =====
-cubrid_rel=CUBRID 11.5.0 (11.5.0.2437-0f85fd6) (64bit debug build for Linux) (Jul  2 2026 20:09:31)
+cubrid_rel=CUBRID 11.5.0 (11.5.0.2525-8eeda7e) (64bit release build for Linux) (Jul  7 2026 08:20:51)
 data_buffer_size=512.0M (512.0M)
 parallelism=8 (4)
 max_parallel_workers=8 (100)
-CUBRID_WM_SCAN_NEW=1
-CUBRID_WM_SORT_NEW=1
-CUBRID_WM_HASHJOIN_NEW=1
+CUBRID_WM_SCAN_NEW=<unset>
+CUBRID_WM_SORT_NEW=<unset>
+CUBRID_WM_HASHJOIN_NEW=<unset>
+parallel_engaged=parallel workers: 2,parallel workers: 3,parallel workers: 7
+parallel: new_backed_create_delta=30 old_touch_on_new_delta=0
+serial_md5=81be5531197bd9e977feb1e65d2c748a
+parallel_md5=81be5531197bd9e977feb1e65d2c748a

@@ -1,5 +1,5 @@
 
-	Thu July 02 20:20:31 KST 2026
+	Tue July 07 09:40:56 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          0
@@ -19,14 +19,14 @@ Num_data_page_dirties         =          0
 Num_data_page_ioreads         =          0
 Num_data_page_iowrites        =          0
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      31058
+Num_data_page_private_quota   =      28009
 Num_data_page_private_count   =          0
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          0
-Num_data_page_lru1            =         28
-Num_data_page_lru2            =          9
-Num_data_page_lru3            =          2
-Num_data_page_victim_candidate =          2
+Num_data_page_lru1            =         24
+Num_data_page_lru2            =         24
+Num_data_page_lru3            =         46
+Num_data_page_victim_candidate =         46
 Num_log_page_fetches          =          0
 Num_log_page_ioreads          =          0
 Num_log_page_iowrites         =          0
@@ -106,17 +106,16 @@ Num_query_hashjoins_partitioned =          0
 Num_query_hashjoins_parallel  =          0
 Num_query_objfetches          =          0
 Num_query_holdable_cursors    =          0
-Num_workmem_degrades          =          0
 Num_workmem_reserved_bytes    =          0
 Num_workmem_cap_bytes         =   67108864
-Num_rawfd_read_cache_hit      =          0
-Num_rawfd_read_cache_miss     =          0
-Num_rawfd_decrypt_count       =          0
-Num_rawfd_plaintext_write_count =          0
-Num_rawfd_pgbuf_spill_overflow =          0
-Num_rawfd_create_failure      =          0
-Num_rawfd_alloc_calls         =          0
-Num_rawfd_alloc_retry         =          0
+Num_workmem_op_limit_spills_sort =          0
+Num_workmem_op_limit_spills_hash =          0
+Num_workmem_cap_pressure_spills =          0
+Num_workmem_reserved_peak     =          0
+Num_workmem_soft_reserved_peak =          0
+Num_workmem_spill_read_bytes  =          0
+Num_workmem_spill_write_bytes =          0
+Num_workmem_mro_gate_rejects  =          0
 Num_sort_io_pages             =          0
 Num_sort_data_pages           =          0
 Num_network_requests          =          2
@@ -575,10 +574,10 @@ Total_time_DWB_file_sync_helper =          0
 Max_time_DWB_file_sync_helper =          0
 Avg_time_DWB_file_sync_helper =          0
 The timer values for DWB_flush_block_cond_wait are:
-Num_DWB_flush_block_cond_wait =          1
-Total_time_DWB_flush_block_cond_wait =       1000
-Max_time_DWB_flush_block_cond_wait =       1000
-Avg_time_DWB_flush_block_cond_wait =       1000
+Num_DWB_flush_block_cond_wait =          0
+Total_time_DWB_flush_block_cond_wait =          0
+Max_time_DWB_flush_block_cond_wait =          0
+Avg_time_DWB_flush_block_cond_wait =          0
 The timer values for DWB_flush_block_sort are:
 Num_DWB_flush_block_sort      =          0
 Total_time_DWB_flush_block_sort =          0
@@ -619,7 +618,7 @@ Num_alloc_bcb_wait_threads_low_priority =          0
 Num_flushed_bcbs_wait_for_direct_victim =          0
 Num_lfcq_big_private_lists    =          0
 Num_lfcq_private_lists        =          0
-Num_lfcq_shared_lists         =          2
+Num_lfcq_shared_lists         =         30
 Num_data_page_avoid_dealloc   =          0
 Num_data_page_avoid_victim    =          0
 The timer values for Log_redo_async are:
@@ -640,8 +639,10 @@ Avg_time_Regu_regu_eval_time_msec =          0
 Num_regu_fetches              =          0
 Num_regu_ioreads              =          0
 Num_regu_call_evals           =          0
-Num_qfile_new_backed_create   =          0
-Num_qfile_old_touch_on_new    =          0
+Num_qfile_tapeset_create      =          0
+Num_qfile_pgbuf_touch_on_tapeset =          0
+Num_qfile_client_fetch_serve  =          0
+Num_qfile_client_fetch_materialize =          0
 Num_data_page_fix_ext:
 Num_data_page_promote_ext:
 Num_data_page_promote_time_ext:

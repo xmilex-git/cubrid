@@ -1,5 +1,5 @@
 
-	Tue July 07 09:34:48 KST 2026
+	Tue July 07 09:40:32 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          0
@@ -19,14 +19,14 @@ Num_data_page_dirties         =          0
 Num_data_page_ioreads         =          0
 Num_data_page_iowrites        =          0
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      27735
+Num_data_page_private_quota   =      28018
 Num_data_page_private_count   =          0
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          0
-Num_data_page_lru1            =         26
+Num_data_page_lru1            =         24
 Num_data_page_lru2            =         24
-Num_data_page_lru3            =         45
-Num_data_page_victim_candidate =         45
+Num_data_page_lru3            =         46
+Num_data_page_victim_candidate =         46
 Num_log_page_fetches          =          0
 Num_log_page_ioreads          =          0
 Num_log_page_iowrites         =          0
@@ -393,7 +393,7 @@ Total_time_bt_vacuum_insid_traverse =          0
 Max_time_bt_vacuum_insid_traverse =          0
 Avg_time_bt_vacuum_insid_traverse =          0
 The timer values for vacuum_master are:
-Num_vacuum_master             =          0
+Num_vacuum_master             =          1
 Total_time_vacuum_master      =          0
 Max_time_vacuum_master        =          0
 Avg_time_vacuum_master        =          0
@@ -416,7 +416,7 @@ Time_get_snapshot_acquire_time =          0
 Count_get_snapshot_retry      =          0
 Time_tran_complete_time       =          0
 The timer values for compute_oldest_visible are:
-Num_compute_oldest_visible    =          0
+Num_compute_oldest_visible    =          1
 Total_time_compute_oldest_visible =          0
 Max_time_compute_oldest_visible =          0
 Avg_time_compute_oldest_visible =          0
