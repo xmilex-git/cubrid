@@ -1,5 +1,5 @@
 
-	Tue July 07 09:34:48 KST 2026
+	Tue July 07 11:58:57 KST 2026
 
  *** SERVER EXECUTION STATISTICS *** 
 Num_file_creates              =          0
@@ -19,14 +19,14 @@ Num_data_page_dirties         =          0
 Num_data_page_ioreads         =          0
 Num_data_page_iowrites        =          0
 Num_data_page_flushed         =          0
-Num_data_page_private_quota   =      27735
+Num_data_page_private_quota   =      28029
 Num_data_page_private_count   =          0
 Num_data_page_fixed           =          1
 Num_data_page_dirty           =          0
-Num_data_page_lru1            =         26
+Num_data_page_lru1            =         24
 Num_data_page_lru2            =         24
-Num_data_page_lru3            =         45
-Num_data_page_victim_candidate =         45
+Num_data_page_lru3            =         46
+Num_data_page_victim_candidate =         46
 Num_log_page_fetches          =          0
 Num_log_page_ioreads          =          0
 Num_log_page_iowrites         =          0
@@ -107,7 +107,7 @@ Num_query_hashjoins_parallel  =          0
 Num_query_objfetches          =          0
 Num_query_holdable_cursors    =          0
 Num_workmem_reserved_bytes    =          0
-Num_workmem_cap_bytes         =   67108864
+Num_workmem_cap_bytes         =  267780096
 Num_workmem_op_limit_spills_sort =          0
 Num_workmem_op_limit_spills_hash =          0
 Num_workmem_cap_pressure_spills =          0

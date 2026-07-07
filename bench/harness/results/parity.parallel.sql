@@ -1,9 +1,13 @@
 ;plan detail
 ;trace on
-SELECT /*+ USE_HASH(a,b) PARALLEL(8) */ MOD(a.id,997) g, COUNT(*) c, SUM(CAST(a.id AS NUMERIC(38,0))) s, MIN(a.id) mn, MAX(a.id) mx
-FROM wmloc_t a LEFT OUTER JOIN wmloc_t b ON a.id = b.id + 1
-GROUP BY MOD(a.id,997);
+SELECT MOD(id,997) g, COUNT(*) c, SUM(CAST(id AS NUMERIC(38,0))) s, MIN(id) mn, MAX(id) mx
+FROM (SELECT /*+ PARALLEL(8) */ id FROM wmloc_t WHERE MOD(grp,2) = 0
+      UNION
+      SELECT id FROM wmloc_t WHERE MOD(grp,3) = 0) t
+GROUP BY MOD(id,997);
 
-SELECT /*+ USE_HASH(a,b) PARALLEL(8) */ MOD(a.id,997) g, COUNT(*) c, SUM(CAST(a.id AS NUMERIC(38,0))) s, MIN(a.id) mn, MAX(a.id) mx
-FROM wmloc_t a RIGHT OUTER JOIN wmloc_t b ON a.id = b.id + 1
-GROUP BY MOD(a.id,997);
+SELECT MOD(id,997) g, COUNT(*) c, SUM(CAST(id AS NUMERIC(38,0))) s, MIN(id) mn, MAX(id) mx
+FROM (SELECT /*+ PARALLEL(8) */ id FROM wmloc_t WHERE MOD(grp,2) = 0
+      UNION ALL
+      SELECT id FROM wmloc_t WHERE MOD(grp,3) = 0) t
+GROUP BY MOD(id,997);
