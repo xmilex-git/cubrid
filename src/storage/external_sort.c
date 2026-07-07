@@ -63,8 +63,17 @@
 #include "btree_load.h"
 #include "xasl.h"		/* GROUPBY_STATS / ANALYTIC_STATS — for GROUP_BY / ANALYTIC parallel trace */
 #include "ftab_set.hpp"
+#include "qfile_spill_file.hpp"	/* raw-fd sort run files (#142 D-track) */
+#include "perf_monitor.h"
 
+#include <errno.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <functional>
+#include <mutex>
+#include <string>
+#include <vector>
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -134,11 +143,45 @@ struct vol_list
   VOL_INFO *vol_info;		/* array of volume information */
 };
 
+/* #142 D-track: raw-fd sort run files.
+ *
+ * A sort's run files are private scratch -- written once, read once,
+ * destroyed with the sort.  Backing them with pgbuf-paged temp files costs
+ * two extra copies per page (user buffer <-> pgbuf frame <-> kernel), a
+ * per-page file-map lookup, flush-daemon work and buffer-pool pollution.
+ * When eligible (SERVER_MODE, non-TDE), each temp slot is instead one
+ * unlinked qfile::spill_file addressed at linear page offsets, and
+ * sort_read_area/sort_write_area become single positional syscalls covering
+ * the whole multi-page area.
+ *
+ * Identity plumbing: a raw slot's VFID is a sentinel (volid SORT_RAW_VOLID,
+ * fileid = registry index), so all the existing VFID value copies
+ * (RESULT_RUN, px-worker SORT_PARAM memcpy, merge-queue ctx setup) keep
+ * working -- they are keys into the per-sort registry, which the top-level
+ * SORT_PARAM owns and px workers share.  Workers never free it:
+ * sort_return_used_resources already scopes temp-file teardown to
+ * PX_SINGLE / PX_MAIN_IN_PARALLEL.  TDE sorts and the multipage
+ * (REC_BIGONE) overflow file stay on the legacy pgbuf path.
+ * Kill switch: CUBRID_SORT_RAW_RUNS=0 (D1; escape hatch back to pgbuf). */
+#define SORT_RAW_VOLID ((INT16) -3)
+
+struct sort_raw_file
+{
+  qfile::spill_file file;
+};
+
+struct sort_raw_registry
+{
+  std::mutex mtx;		/* create/get/retire may run on px workers concurrently */
+  std::vector<sort_raw_file *> files;	/* index = sentinel VFID fileid; NULL once retired */
+};
+
 typedef struct sort_param SORT_PARAM;
 struct sort_param
 {
   VFID temp[SORT_MAX_TOT_FILES];	/* Temporary file identifiers */
   VFID multipage_file;		/* Temporary file for multi page sorting records */
+  struct sort_raw_registry *raw_reg;	/* #142: non-NULL = temp[] slots are raw-fd run files */
   FILE_CONTENTS file_contents[SORT_MAX_TOT_FILES];	/* Contents of each temporary file */
 
   bool tde_encrypted;		/* whether related temp files are encrypted (TDE) or not */
@@ -267,12 +310,13 @@ static int sort_get_avg_numpages_of_nonempty_tmpfile (SORT_PARAM * sort_param);
 static void sort_return_used_resources (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, PARALLEL_TYPE parallel_type);
 static void sort_charge_internal_memory_wm (size_t bytes, size_t * charged_bytes_out, int *charged_shard_out);
 static void sort_release_internal_memory_wm (size_t * charged_bytes_inout, int *charged_shard_inout);
-static int sort_add_new_file (THREAD_ENTRY * thread_p, VFID * vfid, int file_pg_cnt_est, bool force_alloc,
-			      bool tde_encrypted);
+static int sort_add_new_file (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, VFID * vfid, int file_pg_cnt_est,
+			      bool force_alloc, bool tde_encrypted);
 
-static int sort_write_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num_pages, char *area_start,
-			    bool tde_encrypted);
-static int sort_read_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num_pages, char *area_start);
+static int sort_write_area (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, VFID * vfid, int first_page,
+			    INT32 num_pages, char *area_start, bool tde_encrypted);
+static int sort_read_area (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, VFID * vfid, int first_page,
+			   INT32 num_pages, char *area_start);
 
 static int sort_get_num_half_tmpfiles (int tot_buffers, int input_pages);
 static int sort_checkalloc_numpages_of_outfiles (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param);
@@ -316,6 +360,127 @@ static int sort_merge_run_for_parallel_index_leaf_build (THREAD_ENTRY * thread_p
 static int sort_merge_worker_runs_to_one (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param,
 					  SORT_PARAM * sort_param, int parallel_num);
 static int sort_run_final_single (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param);
+
+/* ------------------------------------------------------------------------ */
+/* #142 raw-fd sort run files (see the block comment at sort_raw_registry).  */
+
+static std::atomic<unsigned long long> sort_Raw_seq { 0 };
+
+static bool
+sort_raw_vfid (const VFID * vfid)
+{
+  return vfid->volid == SORT_RAW_VOLID;
+}
+
+static int
+sort_raw_create (SORT_PARAM * sort_param, VFID * vfid)
+{
+  std::string dir;
+  int os_error = 0;
+  char name[128];
+
+  assert (sort_param->raw_reg != NULL);
+
+  if (!qfile::spill_scratch_default_dir (dir))
+    {
+      qfile::spill_file::set_os_error (ENOENT);
+      return ER_FAILED;
+    }
+
+  sort_raw_file *rf = new sort_raw_file ();
+
+  snprintf (name, sizeof (name), "sortrun_%llu_p%ld.tmp",
+	    sort_Raw_seq.fetch_add (1, std::memory_order_relaxed) + 1, (long) getpid ());
+  if (rf->file.create (dir.c_str (), name, TDE_ALGORITHM_NONE, &os_error) != NO_ERROR)
+    {
+      delete rf;
+      qfile::spill_file::set_os_error (os_error);
+      return ER_FAILED;
+    }
+
+  std::lock_guard<std::mutex> guard (sort_param->raw_reg->mtx);
+  sort_param->raw_reg->files.push_back (rf);
+  vfid->volid = SORT_RAW_VOLID;
+  vfid->fileid = (INT32) (sort_param->raw_reg->files.size () - 1);
+  return NO_ERROR;
+}
+
+static sort_raw_file *
+sort_raw_get (SORT_PARAM * sort_param, const VFID * vfid)
+{
+  assert (sort_raw_vfid (vfid) && sort_param->raw_reg != NULL);
+  std::lock_guard<std::mutex> guard (sort_param->raw_reg->mtx);
+  return sort_param->raw_reg->files[vfid->fileid];
+}
+
+static int
+sort_raw_write_area (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, const VFID * vfid, int first_page,
+		     INT32 num_pages, const char *area_start)
+{
+  sort_raw_file *rf = sort_raw_get (sort_param, vfid);
+
+  if (rf == NULL
+      || !rf->file.pwrite_full (area_start, (size_t) num_pages * DB_PAGESIZE, (off_t) first_page * DB_PAGESIZE))
+    {
+      qfile::spill_file::set_os_error (rf == NULL ? EBADF : errno);
+      return ER_FAILED;
+    }
+  perfmon_add_stat (thread_p, PSTAT_WORKMEM_SPILL_WRITE_BYTES, (UINT64) num_pages * DB_PAGESIZE);
+  return NO_ERROR;
+}
+
+static int
+sort_raw_read_area (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, const VFID * vfid, int first_page,
+		    INT32 num_pages, char *area_start)
+{
+  sort_raw_file *rf = sort_raw_get (sort_param, vfid);
+
+  if (rf == NULL
+      || !rf->file.pread_full (area_start, (size_t) num_pages * DB_PAGESIZE, (off_t) first_page * DB_PAGESIZE))
+    {
+      qfile::spill_file::set_os_error (rf == NULL ? EBADF : errno);
+      return ER_FAILED;
+    }
+  perfmon_add_stat (thread_p, PSTAT_WORKMEM_SPILL_READ_BYTES, (UINT64) num_pages * DB_PAGESIZE);
+  if (thread_get_sort_stats_active (thread_p))
+    {
+      perfmon_add_stat (thread_p, PSTAT_SORT_NUM_IO_PAGES, (UINT64) num_pages);
+    }
+  return NO_ERROR;
+}
+
+/* sort_temp_retire () - release one temp slot: raw registry entry (close +
+ *   unlink via the spill_file dtor) or legacy pgbuf temp file. */
+static int
+sort_temp_retire (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, VFID * vfid)
+{
+  if (sort_raw_vfid (vfid))
+    {
+      std::lock_guard<std::mutex> guard (sort_param->raw_reg->mtx);
+      delete sort_param->raw_reg->files[vfid->fileid];
+      sort_param->raw_reg->files[vfid->fileid] = NULL;
+      VFID_SET_NULL (vfid);
+      return NO_ERROR;
+    }
+  return file_temp_retire (thread_p, vfid);
+}
+
+/* sort_raw_registry_free () - owner-side teardown; also reclaims any entry
+ *   not individually retired (error-path backstop). */
+static void
+sort_raw_registry_free (SORT_PARAM * sort_param)
+{
+  if (sort_param->raw_reg == NULL)
+    {
+      return;
+    }
+  for (size_t i = 0; i < sort_param->raw_reg->files.size (); i++)
+    {
+      delete sort_param->raw_reg->files[i];
+    }
+  delete sort_param->raw_reg;
+  sort_param->raw_reg = NULL;
+}
 
 /*
  * sort_spage_initialize () - Initialize a slotted page
@@ -1428,6 +1593,8 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->multipage_file.volid = NULL_VOLID;
   sort_param->multipage_file.fileid = NULL_FILEID;
 
+  sort_param->raw_reg = NULL;
+
   /* NOTE: This volume list will not be used any more. */
   /* initialize temporary volume list */
   sort_param->vol_list.volid = volid;
@@ -1501,6 +1668,19 @@ sort_listfile (THREAD_ENTRY * thread_p, INT16 volid, int est_inp_pg_cnt, SORT_GE
   sort_param->tmp_file_pgs = MAX (1, sort_param->tmp_file_pgs);
 
   sort_param->tde_encrypted = includes_tde_class;
+
+#if defined (SERVER_MODE)
+  /* #142: raw-fd run files (see sort_raw_registry). TDE sorts stay on the
+   * legacy pgbuf path (spill_file TDE staging is a follow-up if needed). */
+  if (!sort_param->tde_encrypted)
+    {
+      const char *sort_raw_env = getenv ("CUBRID_SORT_RAW_RUNS");
+      if (sort_raw_env == NULL || strcmp (sort_raw_env, "0") != 0)
+	{
+	  sort_param->raw_reg = new sort_raw_registry ();
+	}
+    }
+#endif /* SERVER_MODE */
   sort_param->px_type = parallel_type;
   sort_param->px_extra_arg = px_extra_arg;
   sort_param->px_chunk_dist = NULL;
@@ -1840,7 +2020,7 @@ sort_listfile_internal (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
       for (i = sort_param->half_files; i < sort_param->tot_tempfiles; i++)
 	{
 	  error =
-	    sort_add_new_file (thread_p, &(sort_param->temp[i]), file_pg_cnt_est, true, sort_param->tde_encrypted);
+	    sort_add_new_file (thread_p, sort_param, &(sort_param->temp[i]), file_pg_cnt_est, true, sort_param->tde_encrypted);
 	  if (error != NO_ERROR)
 	    {
 	      return error;
@@ -2145,7 +2325,8 @@ sort_inphase_sort (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, SORT_GET_FU
 		{
 		  TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
 		  /* Create the multipage file */
-		  sort_param->multipage_file.volid = sort_param->temp[0].volid;
+		  sort_param->multipage_file.volid =
+		    sort_raw_vfid (&sort_param->temp[0]) ? NULL_VOLID : sort_param->temp[0].volid;
 
 		  error = file_create_temp (thread_p, 1, &sort_param->multipage_file);
 		  if (error != NO_ERROR)
@@ -2313,7 +2494,7 @@ sort_inphase_sort (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, SORT_GET_FU
 	      free_and_init (long_recdes.data);
 	    }
 
-	  if (sort_read_area (thread_p, &sort_param->temp[0], 0, 1, output_buffer) != NO_ERROR
+	  if (sort_read_area (thread_p, sort_param, &sort_param->temp[0], 0, 1, output_buffer) != NO_ERROR
 	      || sort_spage_get_record (output_buffer, 0, &temp_recdes, PEEK) != S_SUCCESS
 	      || sort_retrieve_longrec (thread_p, &temp_recdes, &long_recdes) == NULL
 	      || (*sort_param->put_fn) (thread_p, &long_recdes, sort_param->put_arg) != NO_ERROR)
@@ -2371,7 +2552,7 @@ sort_run_flush (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, int out_file, 
   if (sort_param->temp[out_file].volid == NULL_VOLID)
     {
       error =
-	sort_add_new_file (thread_p, &sort_param->temp[out_file], sort_param->tmp_file_pgs, false,
+	sort_add_new_file (thread_p, sort_param, &sort_param->temp[out_file], sort_param->tmp_file_pgs, false,
 			   sort_param->tde_encrypted);
       if (error != NO_ERROR)
 	{
@@ -2426,7 +2607,7 @@ sort_run_flush (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, int out_file, 
 	    {
 	      /* Output buffer is full */
 	      error =
-		sort_write_area (thread_p, &sort_param->temp[out_file], cur_page[out_file], 1, output_buffer,
+		sort_write_area (thread_p, sort_param, &sort_param->temp[out_file], cur_page[out_file], 1, output_buffer,
 				 sort_param->tde_encrypted);
 	      if (error != NO_ERROR)
 		{
@@ -2454,7 +2635,7 @@ sort_run_flush (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, int out_file, 
     {
       /* Flush the partially full output page */
       error =
-	sort_write_area (thread_p, &sort_param->temp[out_file], cur_page[out_file], 1, output_buffer,
+	sort_write_area (thread_p, sort_param, &sort_param->temp[out_file], cur_page[out_file], 1, output_buffer,
 			 sort_param->tde_encrypted);
       if (error != NO_ERROR)
 	{
@@ -2744,7 +2925,7 @@ sort_exphase_merge_elim_dup (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 			    }
 
 			  error =
-			    sort_read_area (thread_p, &sort_param->temp[act], cur_page[act], read_pages,
+			    sort_read_area (thread_p, sort_param, &sort_param->temp[act], cur_page[act], read_pages,
 					    sort_param->internal_memory);
 			  if (error != NO_ERROR)
 			    {
@@ -2753,7 +2934,7 @@ sort_exphase_merge_elim_dup (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 
 			  cur_page[act] += read_pages;
 			  error =
-			    sort_write_area (thread_p, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
+			    sort_write_area (thread_p, sort_param, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
 					     read_pages, sort_param->internal_memory, sort_param->tde_encrypted);
 			  if (error != NO_ERROR)
 			    {
@@ -2800,7 +2981,7 @@ sort_exphase_merge_elim_dup (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 		}
 
 	      error =
-		sort_read_area (thread_p, &sort_param->temp[big_index], cur_page[big_index], read_pages,
+		sort_read_area (thread_p, sort_param, &sort_param->temp[big_index], cur_page[big_index], read_pages,
 				in_sectaddr[i]);
 	      if (error != NO_ERROR)
 		{
@@ -3017,7 +3198,7 @@ sort_exphase_merge_elim_dup (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 
 			      /* Flush output section */
 			      error =
-				sort_write_area (thread_p, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
+				sort_write_area (thread_p, sort_param, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
 						 out_sectsize, out_sectaddr, sort_param->tde_encrypted);
 			      if (error != NO_ERROR)
 				{
@@ -3091,7 +3272,7 @@ sort_exphase_merge_elim_dup (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 
 			  in_last_buf[min] = read_pages;
 
-			  error = sort_read_area (thread_p, &sort_param->temp[big_index], cur_page[big_index],
+			  error = sort_read_area (thread_p, sort_param, &sort_param->temp[big_index], cur_page[big_index],
 						  read_pages, in_cur_bufaddr[min]);
 			  if (error != NO_ERROR)
 			    {
@@ -3252,7 +3433,7 @@ sort_exphase_merge_elim_dup (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 	      out_act_bufno++;	/* Since 0 refers to the first active buffer */
 
 	      error =
-		sort_write_area (thread_p, &sort_param->temp[cur_outfile], cur_page[cur_outfile], out_act_bufno,
+		sort_write_area (thread_p, sort_param, &sort_param->temp[cur_outfile], cur_page[cur_outfile], out_act_bufno,
 				 out_sectaddr, sort_param->tde_encrypted);
 	      if (error != NO_ERROR)
 		{
@@ -3337,7 +3518,7 @@ sort_put_result_from_tmpfile (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, 
       read_pages = (tot_pages > sort_param->tot_buffers) ? sort_param->tot_buffers : tot_pages;
 
       error =
-	sort_read_area (thread_p, &sort_param->temp[result_file_idx], current_pages, read_pages,
+	sort_read_area (thread_p, sort_param, &sort_param->temp[result_file_idx], current_pages, read_pages,
 			sort_param->internal_memory);
       if (error != NO_ERROR)
 	{
@@ -3669,7 +3850,7 @@ sort_exphase_merge (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 			    }
 
 			  error =
-			    sort_read_area (thread_p, &sort_param->temp[act], cur_page[act], read_pages,
+			    sort_read_area (thread_p, sort_param, &sort_param->temp[act], cur_page[act], read_pages,
 					    sort_param->internal_memory);
 			  if (error != NO_ERROR)
 			    {
@@ -3678,7 +3859,7 @@ sort_exphase_merge (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 
 			  cur_page[act] += read_pages;
 			  error =
-			    sort_write_area (thread_p, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
+			    sort_write_area (thread_p, sort_param, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
 					     read_pages, sort_param->internal_memory, sort_param->tde_encrypted);
 			  if (error != NO_ERROR)
 			    {
@@ -3725,7 +3906,7 @@ sort_exphase_merge (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 		}
 
 	      error =
-		sort_read_area (thread_p, &sort_param->temp[big_index], cur_page[big_index], read_pages,
+		sort_read_area (thread_p, sort_param, &sort_param->temp[big_index], cur_page[big_index], read_pages,
 				in_sectaddr[i]);
 	      if (error != NO_ERROR)
 		{
@@ -3922,7 +4103,7 @@ sort_exphase_merge (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 			  /* Output section is full */
 			  /* Flush output section */
 			  error =
-			    sort_write_area (thread_p, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
+			    sort_write_area (thread_p, sort_param, &sort_param->temp[cur_outfile], cur_page[cur_outfile],
 					     out_sectsize, out_sectaddr, sort_param->tde_encrypted);
 			  if (error != NO_ERROR)
 			    {
@@ -3989,7 +4170,7 @@ sort_exphase_merge (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 			  in_last_buf[min] = read_pages;
 
 			  error =
-			    sort_read_area (thread_p, &sort_param->temp[big_index], cur_page[big_index], read_pages,
+			    sort_read_area (thread_p, sort_param, &sort_param->temp[big_index], cur_page[big_index], read_pages,
 					    in_cur_bufaddr[min]);
 			  if (error != NO_ERROR)
 			    {
@@ -4141,7 +4322,7 @@ sort_exphase_merge (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 
 	      out_act_bufno++;	/* Since 0 refers to the first active buffer */
 	      error =
-		sort_write_area (thread_p, &sort_param->temp[cur_outfile], cur_page[cur_outfile], out_act_bufno,
+		sort_write_area (thread_p, sort_param, &sort_param->temp[cur_outfile], cur_page[cur_outfile], out_act_bufno,
 				 out_sectaddr, sort_param->tde_encrypted);
 	      if (error != NO_ERROR)
 		{
@@ -4309,9 +4490,13 @@ sort_return_used_resources (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, PA
 	{
 	  if (sort_param->temp[k].volid != NULL_VOLID)
 	    {
-	      (void) file_temp_retire (thread_p, &sort_param->temp[k]);
+	      (void) sort_temp_retire (thread_p, sort_param, &sort_param->temp[k]);
 	    }
 	}
+
+      /* #142: owner-side raw registry teardown (px workers share the pointer
+       * but never reach this branch) */
+      sort_raw_registry_free (sort_param);
 
       /* Safety net: free the shared chunk distributor if sort_end_parallelism
        * was skipped due to error */
@@ -4423,11 +4608,20 @@ sort_return_used_resources (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, PA
  *   tde_encrypted(in): whether the file has to be encrypted or not for TDE
  */
 static int
-sort_add_new_file (THREAD_ENTRY * thread_p, VFID * vfid, int file_pg_cnt_est, bool force_alloc, bool tde_encrypted)
+sort_add_new_file (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, VFID * vfid, int file_pg_cnt_est,
+		   bool force_alloc, bool tde_encrypted)
 {
   VPID new_vpid;
   TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
   int ret = NO_ERROR;
+
+  if (sort_param->raw_reg != NULL)
+    {
+      /* raw run files grow on write; page-count estimates and preallocation
+       * (force_alloc) do not apply. */
+      assert (!tde_encrypted);
+      return sort_raw_create (sort_param, vfid);
+    }
 
   /* todo: sort file is a case I missed that seems to use file_find_nthpages. I don't know if it can be optimized to
    *       work without numerable files, that remains to be seen. */
@@ -4798,7 +4992,7 @@ sort_merge_queue_run (THREAD_ENTRY * thread_p, SORT_MERGE_QUEUE_CTX * qctx)
 	  RESULT_RUN run = sort_merge_queue_dequeue (qctx);
 	  if (run.temp_file.volid != NULL_VOLID)
 	    {
-	      (void) file_temp_retire (thread_p, &run.temp_file);
+	      (void) sort_temp_retire (thread_p, qctx->sort_param, &run.temp_file);
 	    }
 	}
     }
@@ -4935,7 +5129,7 @@ sort_merge_nruns_queue_cb (cubthread::entry & thread_ref, SORT_PARAM * ctx, SORT
        * will not see it. Retire it here to avoid leaking the temp file. */
       if (ctx->px_result_run->temp_file.volid != NULL_VOLID)
 	{
-	  (void) file_temp_retire (thread_p, &ctx->px_result_run->temp_file);
+	  (void) sort_temp_retire (thread_p, ctx, &ctx->px_result_run->temp_file);
 	  VFID_SET_NULL (&ctx->px_result_run->temp_file);
 	}
     }
@@ -5179,7 +5373,7 @@ sort_merge_nruns (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
 
   for (i = sort_param->half_files; i < sort_param->tot_tempfiles; i++)
     {
-      error = sort_add_new_file (thread_p, &(sort_param->temp[i]), file_pg_cnt_est, true, sort_param->tde_encrypted);
+      error = sort_add_new_file (thread_p, sort_param, &(sort_param->temp[i]), file_pg_cnt_est, true, sort_param->tde_encrypted);
       if (error != NO_ERROR)
 	{
 	  goto retire_all_on_error;
@@ -5211,7 +5405,7 @@ sort_merge_nruns (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param)
     {
       if (sort_param->temp[i].volid != NULL_VOLID && i != sort_param->px_result_file_idx)
 	{
-	  (void) file_temp_retire (thread_p, &sort_param->temp[i]);
+	  (void) sort_temp_retire (thread_p, sort_param, &sort_param->temp[i]);
 	  VFID_SET_NULL (&sort_param->temp[i]);
 	}
     }
@@ -5228,7 +5422,7 @@ retire_all_on_error:
     {
       if (sort_param->temp[i].volid != NULL_VOLID)
 	{
-	  (void) file_temp_retire (thread_p, &sort_param->temp[i]);
+	  (void) sort_temp_retire (thread_p, sort_param, &sort_param->temp[i]);
 	  VFID_SET_NULL (&sort_param->temp[i]);
 	}
     }
@@ -5917,7 +6111,7 @@ sort_end_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
 	    {
 	      /* allocate output temp slot (temp[1]) for sort_run_final_single */
 	      int pg_est = MAX (1, sort_get_avg_numpages_of_nonempty_tmpfile (sort_param));
-	      if (sort_add_new_file (thread_p, &sort_param->temp[1], pg_est, true,
+	      if (sort_add_new_file (thread_p, sort_param, &sort_param->temp[1], pg_est, true,
 				     sort_param->tde_encrypted) != NO_ERROR)
 		{
 		  return ER_FAILED;
@@ -6026,7 +6220,7 @@ sort_end_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
 
       /* allocate output temp slot (temp[1]) for sort_run_final_single */
       int pg_est = MAX (1, sort_get_avg_numpages_of_nonempty_tmpfile (sort_param));
-      if (sort_add_new_file (thread_p, &sort_param->temp[1], pg_est, true, sort_param->tde_encrypted) != NO_ERROR)
+      if (sort_add_new_file (thread_p, sort_param, &sort_param->temp[1], pg_est, true, sort_param->tde_encrypted) != NO_ERROR)
 	{
 	  return ER_FAILED;
 	}
@@ -6067,8 +6261,8 @@ sort_end_parallelism (THREAD_ENTRY * thread_p, SORT_PARAM * px_sort_param, SORT_
  *       returned.
  */
 static int
-sort_write_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num_pages, char *area_start,
-		 bool tde_encrypted)
+sort_write_area (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, VFID * vfid, int first_page, INT32 num_pages,
+		 char *area_start, bool tde_encrypted)
 {
   PAGE_PTR page_ptr = NULL;
   VPID vpid;
@@ -6076,6 +6270,12 @@ sort_write_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num
   int i;
   int ret = NO_ERROR;
   TDE_ALGORITHM tde_algo = TDE_ALGORITHM_NONE;
+
+  if (sort_raw_vfid (vfid))
+    {
+      assert (!tde_encrypted);
+      return sort_raw_write_area (thread_p, sort_param, vfid, first_page, num_pages, area_start);
+    }
 
   if (tde_encrypted)
     {
@@ -6127,13 +6327,19 @@ sort_write_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num
  *       the given memory area until this area becomes full.
  */
 static int
-sort_read_area (THREAD_ENTRY * thread_p, VFID * vfid, int first_page, INT32 num_pages, char *area_start)
+sort_read_area (THREAD_ENTRY * thread_p, SORT_PARAM * sort_param, VFID * vfid, int first_page, INT32 num_pages,
+		char *area_start)
 {
   PAGE_PTR page_ptr = NULL;
   VPID vpid;
   INT32 page_no;
   int i;
   int ret = NO_ERROR;
+
+  if (sort_raw_vfid (vfid))
+    {
+      return sort_raw_read_area (thread_p, sort_param, vfid, first_page, num_pages, area_start);
+    }
 
   vpid.volid = vfid->volid;
   page_no = first_page;
@@ -6284,6 +6490,11 @@ sort_checkalloc_numpages_of_outfiles (THREAD_ENTRY * thread_p, SORT_PARAM * sort
       if (needed_pages[i] > 0)
 	{
 	  assert (!VFID_ISNULL (&sort_param->temp[i]));
+	  if (sort_raw_vfid (&sort_param->temp[i]))
+	    {
+	      /* raw run files grow on write; nothing to preallocate */
+	      continue;
+	    }
 	  error_code = file_get_num_user_pages (thread_p, &sort_param->temp[i], &contains);
 	  if (error_code != NO_ERROR)
 	    {
@@ -6306,7 +6517,7 @@ sort_checkalloc_numpages_of_outfiles (THREAD_ENTRY * thread_p, SORT_PARAM * sort
 	  /* If there is a file not to be used anymore, destroy it in order to reuse spaces. */
 	  if (!VFID_ISNULL (&sort_param->temp[i]))
 	    {
-	      error_code = file_temp_retire (thread_p, &sort_param->temp[i]);
+	      error_code = sort_temp_retire (thread_p, sort_param, &sort_param->temp[i]);
 	      if (error_code != NO_ERROR)
 		{
 		  ASSERT_ERROR ();
