@@ -98,6 +98,17 @@ struct SORT_REC
   } s;
 };
 
+/* SUBKEY_INFO::fast_cmp tags: nonzero iff sort_f is known to be the plain
+ * fixed-width data_cmpdisk for the domain that selected it (no cmp_dom, no
+ * coercion semantics), so compare loops may do the byte-order load + compare
+ * inline instead of the indirect sort_f call. */
+enum
+{
+  SORT_FAST_CMP_NONE = 0,
+  SORT_FAST_CMP_INT,
+  SORT_FAST_CMP_BIGINT
+};
+
 struct SUBKEY_INFO
 {
   /* The actual column number in the list file tuple. */
@@ -126,6 +137,8 @@ struct SUBKEY_INFO
   int is_nulls_first;
 
   bool use_cmp_dom;		/* when true, use cmp_dom to make comparing */
+
+  int fast_cmp;			/* SORT_FAST_CMP_* tag; see enum above */
 };
 
 struct SORTKEY_INFO

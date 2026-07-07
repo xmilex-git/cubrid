@@ -4774,6 +4774,60 @@ qfile_put_next_sort_item (THREAD_ENTRY * thread_p, const RECDES * recdes_p, void
 }
 
 /*
+ * qfile_sort_fast_cmp_tag () - SORT_FAST_CMP_* tag for the domain that
+ *   selected a subkey's sort_f; SORT_FAST_CMP_NONE when the domain has no
+ *   inline-comparable fixed-width disk format.
+ */
+static int
+qfile_sort_fast_cmp_tag (const TP_DOMAIN * dom)
+{
+  if (dom == NULL || dom->type == NULL)
+    {
+      return SORT_FAST_CMP_NONE;
+    }
+
+  switch (TP_DOMAIN_TYPE (dom))
+    {
+    case DB_TYPE_INTEGER:
+      return SORT_FAST_CMP_INT;
+    case DB_TYPE_BIGINT:
+      return SORT_FAST_CMP_BIGINT;
+    default:
+      return SORT_FAST_CMP_NONE;
+    }
+}
+
+/*
+ * qfile_fast_cmp_data () - compare two bound sort-key data pointers through
+ *   the subkey's inline fast path when tagged, else through sort_f.  The
+ *   inline paths mirror mr_data_cmpdisk_int / mr_data_cmpdisk_bigint exactly;
+ *   inlining them here amortizes the indirect call and the out-of-line
+ *   __bswap_32 that dominate integer-key sort compares.
+ */
+static inline int
+qfile_fast_cmp_data (const SUBKEY_INFO * subkey, char *d0, char *d1)
+{
+  if (subkey->fast_cmp == SORT_FAST_CMP_INT)
+    {
+      int v0 = OR_GET_INT (d0);
+      int v1 = OR_GET_INT (d1);
+
+      return (v0 < v1) ? DB_LT : (v0 > v1) ? DB_GT : DB_EQ;
+    }
+  else if (subkey->fast_cmp == SORT_FAST_CMP_BIGINT)
+    {
+      DB_BIGINT v0, v1;
+
+      OR_GET_BIGINT (d0, &v0);
+      OR_GET_BIGINT (d1, &v1);
+
+      return (v0 < v1) ? DB_LT : (v0 > v1) ? DB_GT : DB_EQ;
+    }
+
+  return (*subkey->sort_f) (d0, d1, subkey->col_dom, 0, 1, NULL);
+}
+
+/*
  * qfile_compare_partial_sort_record () -
  *   return: -1, 0, or 1, strcmp-style
  *   pk0(in): Pointer to pointer to first sort record
@@ -4839,7 +4893,7 @@ qfile_compare_partial_sort_record (const void *pk0, const void *pk1, void *arg)
 	      d0 = fp0 + QFILE_TUPLE_VALUE_HEADER_LENGTH;
 	      d1 = fp1 + QFILE_TUPLE_VALUE_HEADER_LENGTH;
 
-	      order = (*key_info_p->key[i].sort_f) (d0, d1, key_info_p->key[i].col_dom, 0, 1, NULL);
+	      order = qfile_fast_cmp_data (&key_info_p->key[i], d0, d1);
 	    }
 
 	  order = key_info_p->key[i].is_desc ? -order : order;
@@ -4888,7 +4942,7 @@ qfile_compare_all_sort_record (const void *pk0, const void *pk1, void *arg)
 	  d0 = (char *) k0 + o0;
 	  d1 = (char *) k1 + o1;
 
-	  order = (*key_info_p->key[i].sort_f) (d0, d1, key_info_p->key[i].col_dom, 0, 1, NULL);
+	  order = qfile_fast_cmp_data (&key_info_p->key[i], d0, d1);
 	  order = key_info_p->key[i].is_desc ? -order : order;
 	}
       else
@@ -5059,10 +5113,12 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
 	  if (p->pos_descr.dom->type->id == DB_TYPE_VARIABLE)
 	    {
 	      subkey->sort_f = types->domp[i]->type->get_data_cmpdisk_function ();
+	      subkey->fast_cmp = qfile_sort_fast_cmp_tag (types->domp[i]);
 	    }
 	  else
 	    {
 	      subkey->sort_f = p->pos_descr.dom->type->get_data_cmpdisk_function ();
+	      subkey->fast_cmp = qfile_sort_fast_cmp_tag (p->pos_descr.dom);
 	    }
 
 	  subkey->is_desc = (p->s_order == S_ASC) ? 0 : 1;
@@ -5090,6 +5146,7 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
 	  subkey->cmp_dom = NULL;
 	  subkey->use_cmp_dom = false;
 	  subkey->sort_f = types->domp[i]->type->get_data_cmpdisk_function ();
+	  subkey->fast_cmp = qfile_sort_fast_cmp_tag (types->domp[i]);
 	  subkey->is_desc = 0;
 	  subkey->is_nulls_first = 1;
 	}
@@ -5208,6 +5265,7 @@ qfile_sort_key_info_extend_all_columns (SORTKEY_INFO * key_info_p, QFILE_TUPLE_V
       subkey->cmp_dom = NULL;
       subkey->use_cmp_dom = false;
       subkey->sort_f = types_p->domp[c]->type->get_data_cmpdisk_function ();
+      subkey->fast_cmp = qfile_sort_fast_cmp_tag (types_p->domp[c]);
       subkey->is_desc = 0;
       subkey->is_nulls_first = 1;
     }
