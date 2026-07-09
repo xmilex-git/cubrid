@@ -30,6 +30,10 @@
 #include <search.h>
 #include <stddef.h>
 #include <assert.h>
+#include <atomic>
+#include <cinttypes>
+#include <mutex>
+#include <unordered_map>
 
 #include "list_file.h"
 
@@ -1147,6 +1151,90 @@ qfile_load_xasl_node_header (THREAD_ENTRY * thread_p, char *xasl_stream, xasl_no
     }
 }
 
+#if !defined (NDEBUG)
+/* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3)
+ * P0.2+/D-G6 byte-volume counters: cumulative bytes written to list files,
+ * attributed to the creation call site of qfile_open_list() (NOT to
+ * QFILE_LIST_ID, per SSOT ownership-contract: no new struct fields).
+ * Attribution key: list_id_p->tfile_vfid pointer -> creation-site return
+ * address (from __builtin_return_address(0) inside qfile_open_list()).
+ * See docs/value-handle/p0/p0.2b-byte-volume.md for method and readout
+ * (map the logged "site=<addr>" back to source with addr2line -e <binary> <addr>).
+ */
+namespace
+{
+  std::mutex vh_p0_bv_mutex;
+  std::unordered_map<const void *, const void *> vh_p0_bv_site_of;	/* tfile_vfid ptr -> creation-site addr */
+  std::unordered_map<const void *, std::uint64_t> vh_p0_bv_bytes_by_site;	/* creation-site addr -> cumulative bytes */
+
+  void
+  vh_p0_bv_register (const void *tfile_vfid_p, const void *site)
+  {
+    if (tfile_vfid_p == NULL)
+      {
+	return;
+      }
+    std::lock_guard<std::mutex> lk (vh_p0_bv_mutex);
+    vh_p0_bv_site_of[tfile_vfid_p] = site;
+  }
+
+  void
+  vh_p0_bv_add_bytes (const void *tfile_vfid_p, std::uint64_t bytes)
+  {
+    if (tfile_vfid_p == NULL)
+      {
+	return;
+      }
+    std::lock_guard<std::mutex> lk (vh_p0_bv_mutex);
+    auto it = vh_p0_bv_site_of.find (tfile_vfid_p);
+    if (it == vh_p0_bv_site_of.end ())
+      {
+	return;
+      }
+    vh_p0_bv_bytes_by_site[it->second] += bytes;
+  }
+
+  void
+  vh_p0_bv_dump_and_forget (const void *tfile_vfid_p)
+  {
+    if (tfile_vfid_p == NULL)
+      {
+	return;
+      }
+    std::lock_guard<std::mutex> lk (vh_p0_bv_mutex);
+    auto it = vh_p0_bv_site_of.find (tfile_vfid_p);
+    if (it == vh_p0_bv_site_of.end ())
+      {
+	return;
+      }
+    const void *site = it->second;
+    std::uint64_t total = vh_p0_bv_bytes_by_site[site];
+    er_log_debug (ARG_FILE_LINE, "VH-P0-TEMP-COUNTER list-byte-volume site=%p cumulative_bytes=%" PRIu64 "\n",
+		  site, total);
+    vh_p0_bv_site_of.erase (it);
+  }
+
+  /* VH-P0-TEMP-COUNTER: comprehensive readout. qfile_destroy_list() is NOT the
+   * only teardown path for a QFILE_LIST_ID's underlying temp file -- the common
+   * per-query result list is released via qmgr_free_query_temp_file_helper()
+   * (query_manager.c), which frees QMGR_TEMP_FILE objects directly and never
+   * calls qfile_destroy_list(). To guarantee every creation site is reported at
+   * least once per server lifetime, dump the full cumulative map here, called
+   * from qfile_finalize() at server/module shutdown. */
+  void
+  vh_p0_bv_dump_all ()
+  {
+    std::lock_guard<std::mutex> lk (vh_p0_bv_mutex);
+    for (const auto &entry : vh_p0_bv_bytes_by_site)
+      {
+	er_log_debug (ARG_FILE_LINE,
+		      "VH-P0-TEMP-COUNTER list-byte-volume-final site=%p cumulative_bytes=%" PRIu64 "\n",
+		      entry.first, entry.second);
+      }
+  }
+}
+#endif /* !NDEBUG */
+
 /*
  * qfile_initialize () -
  *   return: int (true : successful initialization,
@@ -1180,6 +1268,10 @@ qfile_initialize (void)
 void
 qfile_finalize (void)
 {
+#if !defined (NDEBUG)
+  /* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+  vh_p0_bv_dump_all ();
+#endif /* !NDEBUG */
   lf_freelist_destroy (&qfile_sort_list_Freelist);
 }
 
@@ -1252,6 +1344,11 @@ qfile_open_list (THREAD_ENTRY * thread_p, QFILE_TUPLE_VALUE_TYPE_LIST * type_lis
 	}
       return NULL;
     }
+
+#if !defined (NDEBUG)
+  /* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+  vh_p0_bv_register (list_id_p->tfile_vfid, __builtin_return_address (0));
+#endif /* !NDEBUG */
 
   if (QFILE_IS_FLAG_SET (flag, QFILE_NOT_USE_MEMBUF))
     {
@@ -1595,6 +1692,11 @@ static void
 qfile_add_tuple_to_list_id (QFILE_LIST_ID * list_id_p, PAGE_PTR page_p, int tuple_length, int written_tuple_length)
 {
   QFILE_PUT_PREV_TUPLE_LENGTH (page_p, list_id_p->lasttpl_len);
+
+#if !defined (NDEBUG)
+  /* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+  vh_p0_bv_add_bytes (list_id_p->tfile_vfid, (std::uint64_t) written_tuple_length);
+#endif /* !NDEBUG */
 
   list_id_p->tuple_cnt++;
   list_id_p->lasttpl_len = tuple_length;
@@ -2273,6 +2375,11 @@ qfile_destroy_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p)
 {
   if (list_id_p)
     {
+#if !defined (NDEBUG)
+      /* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+      vh_p0_bv_dump_and_forget (list_id_p->tfile_vfid);
+#endif /* !NDEBUG */
+
       if (list_id_p->tfile_vfid)
 	{
 	  qmgr_free_list_temp_file (thread_p, list_id_p->query_id, list_id_p->tfile_vfid);

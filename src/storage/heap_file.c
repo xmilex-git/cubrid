@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <atomic>
 
 #include "heap_file.h"
 
@@ -10362,9 +10363,50 @@ heap_attrinfo_clear_dbvalues (HEAP_CACHE_ATTRINFO * attr_info)
  *   length(out): Disk value length
  *
  */
+#if !defined (NDEBUG)
+/* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3)
+ * P0.3 peek-vs-copy baseline profiling counters. See
+ * docs/value-handle/p0/p0.3-peek-copy-profile.md for method and readout.
+ * Split by attribute category (fixed-length vs variable) per ralplan P0.3.
+ */
+namespace
+{
+  std::atomic<std::uint64_t> vh_p0_peek_count_fixed { 0 };
+  std::atomic<std::uint64_t> vh_p0_peek_count_variable { 0 };
+  std::atomic<std::uint64_t> vh_p0_copy_count_fixed { 0 };
+  std::atomic<std::uint64_t> vh_p0_copy_count_variable { 0 };
+
+  const std::uint64_t VH_P0_DUMP_INTERVAL = 500;
+
+  void
+  vh_p0_maybe_dump ()
+  {
+    std::uint64_t total = (vh_p0_peek_count_fixed.load (std::memory_order_relaxed)
+			   + vh_p0_peek_count_variable.load (std::memory_order_relaxed)
+			   + vh_p0_copy_count_fixed.load (std::memory_order_relaxed)
+			   + vh_p0_copy_count_variable.load (std::memory_order_relaxed));
+    if (total % VH_P0_DUMP_INTERVAL == 0)
+      {
+	er_log_debug (ARG_FILE_LINE,
+		      "VH-P0-TEMP-COUNTER heap peek_fixed=%" PRIu64 " peek_variable=%" PRIu64
+		      " copy_fixed=%" PRIu64 " copy_variable=%" PRIu64 "\n",
+		      vh_p0_peek_count_fixed.load (std::memory_order_relaxed),
+		      vh_p0_peek_count_variable.load (std::memory_order_relaxed),
+		      vh_p0_copy_count_fixed.load (std::memory_order_relaxed),
+		      vh_p0_copy_count_variable.load (std::memory_order_relaxed));
+      }
+  }
+}
+#endif /* !NDEBUG */
+
 static void
 heap_attrvalue_point_fixed (RECDES * recdes, HEAP_CACHE_ATTRINFO * attr_info, OR_ATTRIBUTE * attrepr, RECDES * raw)
 {
+#if !defined (NDEBUG)
+  /* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+  vh_p0_peek_count_fixed.fetch_add (1, std::memory_order_relaxed);
+  vh_p0_maybe_dump ();
+#endif /* !NDEBUG */
   if (OR_FIXED_ATT_IS_UNBOUND (recdes->data, attr_info->read_classrepr->n_variable,
 			       attr_info->read_classrepr->fixed_length, attrepr->position))
     {
@@ -10393,6 +10435,11 @@ heap_attrvalue_point_fixed (RECDES * recdes, HEAP_CACHE_ATTRINFO * attr_info, OR
 static void
 heap_attrvalue_point_variable (RECDES * recdes, HEAP_CACHE_ATTRINFO * attr_info, OR_ATTRIBUTE * attrepr, RECDES * raw)
 {
+#if !defined (NDEBUG)
+  /* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+  vh_p0_peek_count_variable.fetch_add (1, std::memory_order_relaxed);
+  vh_p0_maybe_dump ();
+#endif /* !NDEBUG */
   if (OR_VAR_IS_NULL (recdes->data, attrepr->location))
     {
       /* nothing to do */
@@ -10435,6 +10482,19 @@ heap_attrvalue_transform_to_dbvalue (HEAP_ATTRVALUE * value, OR_ATTRIBUTE * attr
   int rv;
 
   rv = NO_ERROR;
+
+#if !defined (NDEBUG)
+  /* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+  if (attrepr->is_fixed)
+    {
+      vh_p0_copy_count_fixed.fetch_add (1, std::memory_order_relaxed);
+    }
+  else
+    {
+      vh_p0_copy_count_variable.fetch_add (1, std::memory_order_relaxed);
+    }
+  vh_p0_maybe_dump ();
+#endif /* !NDEBUG */
 
   /* clear/decache if old exists */
   if (value->state != HEAP_UNINIT_ATTRVALUE)
