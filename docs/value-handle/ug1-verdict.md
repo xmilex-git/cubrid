@@ -83,11 +83,13 @@
     UG1.5 or UG3 rather than taken as closed — this item does not itself change any threshold, it opens a
     tracked follow-up that could.
 
-## ④ Client-visible framing extension — **APPROVE**
+## ④ Temp framing go/no-go (+ client-visible extension) — **APPROVE**
 
-- **Asked**: approve excluding client-visible framing extension (Option 2/3 of
-  `p1.2-b-sketch.md` §4.2) from stage-1 scope, deferring it to a future B/campaign decision, per the
-  12.12%-class-(d)-share evidence (`p0.2b-byte-volume.md` §9).
+- **Asked** *(clarified per architect review 2026-07-09 — this item covers **two** framing surfaces)*:
+  (1) the packet-④ question proper: approve excluding **temp class-(d) recdes-style framing** from the
+  stage-1/P3 slice per the D-G6.2 volume condition (measured class-(d) share **12.12% < 30%** baseline,
+  `p0.2b-byte-volume.md` §9); and (2) by extension, keep the **client-visible framing extension**
+  (Option 2/3 of `p1.2-b-sketch.md` §4.2) likewise out of stage-1, per the sketch's recommendation.
 - **Decided**: **approved — framing extension excluded from stage-1**, deferred to B/campaign per the
   sketch's own Option-1-now/Option-3-as-the-only-path-to-Option-2 recommendation (`p1.2-b-sketch.md` §4.3).
   **Directive attached**: stage-1's implementation MUST route tuple/value read-write through **one common
