@@ -32,7 +32,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#include <atomic>
+#include <atomic>		/* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+#include <cinttypes>		/* VH-P0-TEMP-COUNTER: PRIu64 portably (inttypes.h above is !WINDOWS-guarded) */
 
 #include "heap_file.h"
 

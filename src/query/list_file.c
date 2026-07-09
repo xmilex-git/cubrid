@@ -30,10 +30,10 @@
 #include <search.h>
 #include <stddef.h>
 #include <assert.h>
-#include <atomic>
-#include <cinttypes>
-#include <mutex>
-#include <unordered_map>
+#include <atomic>		/* VH-P0-TEMP-COUNTER (temporary, debug-only, remove before P3) */
+#include <cinttypes>		/* VH-P0-TEMP-COUNTER */
+#include <mutex>		/* VH-P0-TEMP-COUNTER */
+#include <unordered_map>	/* VH-P0-TEMP-COUNTER */
 
 #include "list_file.h"
 
