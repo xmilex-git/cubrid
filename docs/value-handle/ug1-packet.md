@@ -22,7 +22,7 @@
 ## ③ 셀별 문턱값 [X]×3 + [Y]/[Z] + 예측표 (D-G3)
 
 - **재접지 사유**: 원계획의 "[X]는 P0.3 headroom 상한에서 유도"는 P0.3의 동어반복 발견으로 사용 불가 → cmpdisk 비용 구조로 재유도 (`p1.3-proposals.md` (ii)).
-- **정렬키 저장 결정 (LEADER, binding — ①/③ 공통 컨텍스트)**: CV-sort 정렬키는 정렬 진입 시 **1회 detoast**하여 **정렬 소유 per-entry storage**에 둔다(비교당 재해제 금지, spec f17/사용자 확인 R14) — `datum1`은 그 storage로의 **포인터**(varchar 8B 콘텐츠-프록시는 1단계에 없음 — abbrev sub-cell 전용); 튜플 본체는 temp pass-through에서 압축 유지(R2는 key-only 인플레이션으로 계상); 외부정렬 spill 시 해제된 키가 run 항목에 기록(key-only, counted), run 예산 초과 시 legacy 비교 경로로 폴백(승리 소실, engagement counter로 계상) — 상세는 `p1.1-valueslot-design.md` §s.2/§s.4 revised.
+- **정렬키 저장 결정 (LEADER, binding — ①/③ 공통 컨텍스트)**: CV-sort 정렬키는 정렬 진입 시 **1회 detoast**하여 **정렬 소유 per-entry storage**에 둔다(비교당 재해제 금지, spec f17/사용자 확인 R14) — `datum1`은 그 storage로의 **포인터**(varchar 8B 콘텐츠-프록시는 1단계에 없음 — abbrev sub-cell 전용); 튜플 본체는 temp pass-through에서 압축 유지(R2는 key-only 인플레이션으로 계상). 폴백 트리거는 **entry-build 시점의 per-entry `area_size` 사전 검사**(`expected_decompressed_size`를 압축 헤더에서 선판독) — 실패 시 해당 entry만 legacy 비교 경로(승리 소실, `Num_sort_key_decompress_fallback`로 계상); 외부정렬 spill은 이미 만들어진 bytes를 run에 그대로 기록. **A_sort_key 모드 주의**(키 집합=출력 집합, W1이 정확히 이 형태): 출력 튜플이 SORT_REC에서 재구성되므로 첫 키 컬럼은 출력 리스트에 **비압축 legal form으로 재직렬화**되어 실린다(출력 인플레이션은 LIMIT 바운드, R2 출력항으로 별도 계상) — 상세는 `p1.1-valueslot-design.md` §s.2/§s.2.1/§s.2.2/§s.4 revised.
 - **제안 숫자** (전건 proposal-pending-UG1; 재유도 근거는 `p1.3-proposals.md` (ii)(b) 비용모형 참조):
   | 항목 | 제안값 | 유도 근거 |
   |---|---|---|
