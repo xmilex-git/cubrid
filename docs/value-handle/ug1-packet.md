@@ -1,5 +1,24 @@
 # UG1 Decision Packet — 값 표현 통일 1단계 설계 승인
 
+> **DECIDED 2026-07-09 — see `ug1-verdict.md`.** Per-item outcome (one line each; full rationale,
+> downstream impact, and gate status live in `ug1-verdict.md` — this packet's body below is left
+> unedited as the historical agenda record):
+> - **①** MODIFY — ValueSlot/CopiedFrame design retained; page-copy landing-order plan superseded:
+>   merge `issue154-page-copy-heap-scan` ("cached scan") directly into this branch instead of
+>   wait-for-develop/minimal-self-impl.
+> - **②** MODIFY — 9 EM cost estimate SKIPPED (not approved, informational only); the 2 migration
+>   strategies are approved as documentation only.
+> - **③** APPROVE — thresholds approved as proposed; NL-join copy-elimination review directed
+>   (`p1.3a-nljoin-review.md`).
+> - **④** APPROVE — framing extension excluded from stage-1 (as recommended); common
+>   format-boundary API directive attached.
+> - **⑤** APPROVE — 4B length-prefix rejection confirmed for stage-1.
+> - **⑥** APPROVE — pr_type 3-hook list approved as proposed.
+>
+> **Gate: UG1 PASSED. P2 is unblocked.**
+
+---
+
 - **Base**: feature/value-handle-stage1 @ ebf08d080 (origin/develop), 2026-07-09
 - **Gate**: grilled_plan §User Gates "UG1 안건 재편" — 아래 6건을 승인해야 P2(마이크로벤치)가 시작된다. **P2 CANNOT begin until UG1 approval** (ralplan Option A).
 - **근거 문서**: P0 증거 5건(`docs/value-handle/p0/`), P1 설계 6건(`docs/value-handle/p1/`), 용어 정본(repo-root `CONTEXT.md`).
