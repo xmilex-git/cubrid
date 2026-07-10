@@ -15,12 +15,34 @@
  *    contract ("building cost is prepare()-side").
  *  - run_cell() measures ONLY direct field-access + the cell's operation (filter/sort/merge/agg),
  *    reading exclusively from the FlatBuffer tables built in prepare().
+ *  - [MED-2, architect finding] CV_SORT/CV_MERGE/UV_PEEK are labeled 'BEST-CASE-UPPER-BOUND;
+ *    INGESTION-EXEMPT' in the summary CSV (main.cpp's summary_label()) specifically because, for
+ *    these three cells, prepare() doesn't just build a FlatBuffer table cheaply — it fully
+ *    decodes/decompresses each row's VARCHAR disk image into plain bytes (decode_varchar(), via
+ *    real pr_/or_ decompression machinery) UNTIMED. Every other variant either pays that
+ *    decode/decompress cost inside the timed run_cell() (A-slot's detoast-once-at-sort-entry,
+ *    B-cmpdisk's per-compare decompress in mr_cmpdisk_char_type_common) or never needs it at all
+ *    (FL cells' fixed-length columns). So C's numbers for these three cells are not merely
+ *    "FlatBuffer building cost excluded" (true for every cell) but "the one column-type's actual
+ *    per-row ingestion transform excluded too" — a strictly larger exemption, worth flagging
+ *    distinctly from the FL/NUMERIC cells' plain BEST-CASE-UPPER-BOUND label.
  *  - NUMERIC has no FlatBuffers scalar type. The modeling choice is: store the row's raw
  *    OR_NUMERIC disk bytes verbatim in a ubyte vector field at prepare() time (zero decode cost),
  *    and decode-at-use inside run_cell() for every comparison (NUM_SORT, via
  *    tp_Type_numeric->data_cmpdisk()) or every accumulate step (NUM_AGG_INPUT, via
  *    tp_Type_numeric->data_readval() + numeric_db_value_add()). This intentionally bills
  *    FlatBuffers for the cost of NOT having a native NUMERIC type.
+ *  - [MED-2] NUMERIC-per-use vs VARCHAR-ingestion asymmetry: NUMERIC pays its decode cost EVERY
+ *    use (inside the timed loop, every cell), while VARCHAR pays its decode cost ONCE at
+ *    ingestion (untimed, in prepare()) and never again. This is a deliberate, not accidental,
+ *    asymmetry — it is the direct, honest consequence of the previous bullet's "no native
+ *    NUMERIC scalar type" modeling choice (there is nowhere in a FlatBuffers table to durably
+ *    store a *decoded* NUMERIC the way `build_bytes_row()` durably stores decoded VARCHAR bytes),
+ *    not a shortcut this file is taking for either type. Aligning the two (e.g. decoding NUMERIC
+ *    once at ingestion the way VARCHAR is) was considered and rejected: it would silently erase
+ *    the exact cost this cell exists to measure ("what does FlatBuffers pay for NOT having a
+ *    native NUMERIC type"), trading a real modeling asymmetry for a fake apples-to-apples number.
+ *    Documented here rather than "fixed" — the asymmetry IS the measurement.
  *
  *  Digest convention and predicates — RECONCILED against the landed variant_cmpdisk.cpp header
  *  comment (owned by 30-P2-Harness), which is itself re-derived from variant_valueslot.cpp /
@@ -36,9 +58,12 @@
  *      fixture-serialized bytes (fixture.cols[0].vals[row]), in output order.
  *    - UV_PEEK: buffer = the row's PEEKED CONTENT bytes (header-stripped, via
  *      or_get_varchar_compression_lengths) for survivors, in scan order.
- *    - NUM_AGG_INPUT: buffer = the raw 8 bytes of the accumulated int64 unscaled-value proxy
- *      (exact/lossless for NUMERIC(15,2)), computed as an untimed independent re-derivation
- *      straight from the fixture's raw bytes.
+ *    - NUM_AGG_INPUT [MED-1 fix]: buffer = the raw 8 bytes of the accumulated int64
+ *      unscaled-value proxy (exact/lossless for NUMERIC(15,2)), read directly out of THIS LOOP's
+ *      own timed accumulator DB_VALUE (`acc`'s DB_NUMERIC magnitude buffer) — never an untimed,
+ *      independent re-derivation from the fixture's raw bytes. Mathematically equal to the naive
+ *      per-row proxy sum (numeric_db_value_add is exact decimal arithmetic within int64 range),
+ *      so this still matches variant_cmpdisk.cpp / variant_valueslot.cpp bit for bit.
  *    - bound row for every filter/peek predicate = the fixture's OWN row at index row_count/3
  *      (or row 0 if row_count<3) — never a synthetic constant. FL_FILTER requires the bound
  *      relation to hold on EVERY one of the 5 FL columns (composite "dominates" filter);
@@ -66,6 +91,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace
@@ -81,9 +107,6 @@ namespace
   constexpr flatbuffers::voffset_t VT_DATE = 10;
   constexpr flatbuffers::voffset_t VT_TS = 12;
   constexpr flatbuffers::voffset_t VT_BYTES = 4; /* single-field bytes-vector tables (varchar/numeric) */
-
-  constexpr int k_numeric_header_size = 3; /* NUMERIC_HEADER_SIZE, object_primitive.c */
-  constexpr unsigned char k_numeric_sign_bit = 0x80;
 
   enum class fl_family : std::uint8_t { I32, I64, F64 };
 
@@ -172,33 +195,21 @@ namespace
     return v;
   }
 
-  /* int64 unscaled-value proxy, exact for precision<=18 — same byte-level parse as
-   * variant_cmpdisk.cpp's numeric_int64_proxy(), used only for NUM_AGG_INPUT's digest. */
-  bool
-  numeric_int64_proxy (const unsigned char *raw, std::int64_t &out)
+  /* int64 unscaled-value proxy from an in-memory NUMERIC DB_VALUE's own DB_NUMERIC magnitude
+   * buffer (db_get_numeric(): DB_NUMERIC_BUF_SIZE(17) bytes, big-endian, no on-disk header — sign
+   * lives in DB_VALUE_NUMERIC_IS_VALUE_NEGATIVE()). Exact for precision<=18, matching
+   * variant_cmpdisk.cpp's numeric_int64_proxy_of(); used only for NUM_AGG_INPUT's digest. */
+  std::int64_t
+  numeric_int64_proxy_of (const DB_VALUE &v)
   {
-    int disk_size = raw[0] & 0x7F;
-    bool negative = (raw[0] & k_numeric_sign_bit) != 0;
-    int precision = raw[1] & 0x7F;
-    if (precision > 18)
-      {
-	return false;
-      }
-
-    unsigned char magnitude[DB_NUMERIC_BUF_SIZE] = { 0 };
-    int mag_len = disk_size - k_numeric_header_size;
-    if (mag_len > 0)
-      {
-	std::memcpy (magnitude + (DB_NUMERIC_BUF_SIZE - mag_len), raw + k_numeric_header_size, mag_len);
-      }
-
-    std::uint64_t mag = 0;
+    const unsigned char *mag = reinterpret_cast<const unsigned char *> (db_get_numeric (&v));
+    std::uint64_t umag = 0;
     for (int i = DB_NUMERIC_BUF_SIZE - 8; i < DB_NUMERIC_BUF_SIZE; i++)
       {
-	mag = (mag << 8) | magnitude[i];
+	umag = (umag << 8) | mag[i];
       }
-    out = negative ? -static_cast<std::int64_t> (mag) : static_cast<std::int64_t> (mag);
-    return true;
+    return DB_VALUE_NUMERIC_IS_VALUE_NEGATIVE (&v) ? -static_cast<std::int64_t> (umag)
+						    : static_cast<std::int64_t> (umag);
   }
 
   /* canonical bound row every filter/peek predicate uses — matches variant_cmpdisk.cpp's
@@ -501,6 +512,15 @@ namespace vhb
 	  }
       }
 
+      /* ---- FL_FILTER asymmetry [LOW, architect finding] ---- C short-circuits the per-row
+       * column loop on the first failing column (`ok = false; break;`, below) — same rationale as
+       * variant_cmpdisk.cpp's run_fl_filter(): this mirrors a real predicate evaluator's ability
+       * to stop once the composite AND is already false, whereas variant_valueslot.cpp /
+       * variant_pervalue.cpp's A-side reference deforms/re-dispatches all 5 FL columns
+       * unconditionally every row (no `break`) because their per-row deform is a single up-front
+       * step, not a column-by-column short-circuiting predicate. Deliberate, conservative,
+       * no-behavior-change asymmetry — documented here and at variant_cmpdisk.cpp's
+       * run_fl_filter() so it isn't mistaken for an oversight. */
       cell_result
       run_fl_filter (const fixture &f)
       {
@@ -602,6 +622,11 @@ namespace vhb
 	    std::vector<char> bytes = decode_varchar (col, r, domain);
 	    rows_.push_back (build_bytes_row (fbb, bytes.data (), bytes.size ()));
 	  }
+	/* [LOW hygiene, architect finding] `domain` is a fresh tp_domain_new()-backed, uncached
+	 * TP_DOMAIN (tp_domain_construct() never registers it in the shared domain cache) used only
+	 * for this ingestion pass; nothing below stores or reuses it, so it's safe — and required,
+	 * this is otherwise a straight per-prepare() leak — to free it here. */
+	tp_domain_free (domain);
 	return true;
       }
 
@@ -717,6 +742,18 @@ namespace vhb
 	  {
 	    return false;
 	  }
+	if (numeric_domain_ != nullptr)
+	  {
+	    /* [LOW hygiene, architect finding] this method backs both NUM_SORT and NUM_AGG_INPUT,
+	     * so prepare() can land here twice across one process's run; free the PREVIOUS cell's
+	     * domain before building a fresh one — run_cell() never needs it once prepare() has
+	     * moved on to a different cell. The domain built by the LAST prepare() call is left
+	     * live for the remainder of the process (freed only implicitly at process exit),
+	     * matching main.cpp's documented variant-registry convention of never deleting/tearing
+	     * down variant instances or their owned state mid-run. */
+	    tp_domain_free (numeric_domain_);
+	    numeric_domain_ = nullptr;
+	  }
 	numeric_domain_ = tp_domain_construct (DB_TYPE_NUMERIC, nullptr, 15, 2, nullptr);
 	if (numeric_domain_ == nullptr)
 	  {
@@ -766,6 +803,10 @@ namespace vhb
 	return res;
       }
 
+      /* [MED-1 fix] readval/add errors are now checked and abort the cell (throw) instead of being
+       * (void)-swallowed; digest derives from THIS LOOP's own timed accumulator (`acc`) instead of
+       * an untimed independent re-derivation from the fixture's raw bytes — see numeric_int64_proxy_of()
+       * and the file-header digest-convention note above. */
       cell_result
       run_num_agg_input (const fixture &f)
       {
@@ -774,7 +815,6 @@ namespace vhb
 	  {
 	    return res;
 	  }
-	const serialized_column &col = f.cols[0];
 
 	DB_VALUE acc;
 	db_make_null (&acc);
@@ -788,7 +828,11 @@ namespace vhb
 		     (int) vec->size ());
 	    DB_VALUE cur;
 	    db_make_null (&cur);
-	    (void) tp_Type_numeric->data_readval (&buf, &cur, numeric_domain_, (int) vec->size (), false, nullptr, 0);
+	    if (tp_Type_numeric->data_readval (&buf, &cur, numeric_domain_, (int) vec->size (), false, nullptr, 0)
+		!= NO_ERROR)
+	      {
+		throw std::runtime_error ("variant_c_flatbuffers: NUM_AGG_INPUT readval failed");
+	      }
 
 	    if (r == 0)
 	      {
@@ -798,7 +842,10 @@ namespace vhb
 	      {
 		DB_VALUE next;
 		db_make_null (&next);
-		(void) numeric_db_value_add (&acc, &cur, &next);
+		if (numeric_db_value_add (&acc, &cur, &next) != NO_ERROR)
+		  {
+		    throw std::runtime_error ("variant_c_flatbuffers: NUM_AGG_INPUT accumulate failed");
+		  }
 		pr_clear_value (&acc);
 		pr_clear_value (&cur);
 		acc = next;
@@ -806,22 +853,12 @@ namespace vhb
 	  }
 	auto t1 = std::chrono::steady_clock::now ();
 	res.elapsed_us = (std::uint64_t) std::chrono::duration_cast<std::chrono::microseconds> (t1 - t0).count ();
+
+	std::int64_t proxy_sum = numeric_int64_proxy_of (acc);
 	pr_clear_value (&acc);
 
-	/* digest is an untimed, independent re-derivation straight from the fixture's raw bytes
-	 * (the int64 unscaled-value proxy sum) — matches variant_cmpdisk.cpp bit for bit,
-	 * regardless of this variant's own accumulation mechanism above. */
-	std::int64_t proxy_sum = 0;
-	for (std::size_t r = 0; r < f.row_count; r++)
-	  {
-	    std::int64_t proxy = 0;
-	    if (numeric_int64_proxy (reinterpret_cast<const unsigned char *> (col.vals[r].data ()), proxy))
-	      {
-		proxy_sum += proxy;
-	      }
-	  }
 	res.digest = fnv1a (&proxy_sum, sizeof (proxy_sum), f.seed);
-	res.aux_counter_a = col.vals.size ();
+	res.aux_counter_a = f.row_count;
 	return res;
       }
 

@@ -58,7 +58,13 @@ namespace
   constexpr int NUM_PRECISION = 15;                            /* NUMERIC(15,2)                      */
   constexpr int NUM_SCALE = 2;
 
-  /* LOW-entropy CV fixture MUST actually compress; assert a floor, don't just hope. */
+  /* [LOW hygiene, architect finding] CV fixtures (any entropy) MUST actually compress >=2:1;
+   * assert a floor, don't just hope. Originally only asserted for LOW entropy (HIGH's 8B
+   * pseudo-random prefix was assumed to risk falling short) — re-checked and extended to HIGH
+   * too, see assert_cv_compression_ratio() below: HIGH's random prefix is only 8 of CV_LEN(300)
+   * bytes, leaving an overwhelmingly redundant 'x'-filled tail (292B) that LZ4 crushes just as
+   * effectively as LOW's single differentiator byte does, so no filler-redundancy adjustment
+   * was needed to clear the same floor. */
   constexpr double CV_MIN_COMPRESSION_RATIO = 2.0;
 
   std::size_t
@@ -206,7 +212,14 @@ namespace
    *   LOW  = CHR(65 + content_key % 26) + LPAD filler         (parity/filter fixtures)
    *   HIGH = 8 pseudo-random leading chars + LPAD filler       (D-G5 SORT-cell default)
    * The filler tail is a repeated byte in both modes — that redundancy is what drives the
-   * >=2:1 LZ4 compression ratio; only the differentiator (leading byte(s)) varies per row. */
+   * >=2:1 LZ4 compression ratio; only the differentiator (leading byte(s)) varies per row.
+   *
+   * [HIGH-2, architect finding] LOW's single-byte differentiator only has 26 distinct values
+   * (`content_key % 26`) — fine for its original parity/filter use (row COUNT matters, not
+   * content cardinality), but degenerate for any caller that needs more than 26 distinct
+   * *content* values to survive intact (e.g. CV_MERGE's 50%-duplicate-pair distinct-value
+   * cardinality, which main.cpp's entropy_for_cell() now routes to HIGH specifically to avoid
+   * this). Do not reuse LOW for a high-content-cardinality caller without re-checking this. */
   void
   fill_compressible_content (char *buf, int len, entropy e, std::uint64_t content_key, std::uint32_t seed)
   {
@@ -316,14 +329,16 @@ namespace
     return col;
   }
 
-  /* P2.1 AC: the compressed-varchar (LOW-entropy) fixture must actually compress >=2:1 — assert
-   * it rather than hope; HIGH-entropy sort fixtures are not held to this floor (D-G5's random
-   * prefix legitimately reduces ratio, and the spec only requires the LOW fixture to be
-   * checked). */
+  /* [LOW hygiene, architect finding] the compressed-varchar fixture must actually compress
+   * >=2:1 — assert it rather than hope, for EVERY entropy mode this harness produces (LOW and
+   * HIGH), not just LOW. HIGH-entropy sort fixtures still legitimately compress somewhat less
+   * than LOW (D-G5's random prefix consumes 8 of CV_LEN(300) bytes instead of 1), but the
+   * redundant 'x'-filled tail is still >=97% of the row, so the same 2:1 floor holds
+   * comfortably for both — verified empirically; no filler-redundancy adjustment was needed. */
   void
   assert_cv_compression_ratio (const serialized_column &col, entropy e, int raw_len)
   {
-    if (e != entropy::LOW || col.lengths.empty ())
+    if (col.lengths.empty ())
       {
 	return;
       }
@@ -337,9 +352,9 @@ namespace
     if (ratio < CV_MIN_COMPRESSION_RATIO)
       {
 	throw std::runtime_error (
-	    "vhb::build_fixture: LOW-entropy CV fixture failed >=2:1 compression ratio assertion "
-	    "(raw=" + std::to_string (raw_len) + "B, avg serialized=" + std::to_string (avg)
-	    + "B, ratio=" + std::to_string (ratio) + ")");
+	    std::string ("vhb::build_fixture: CV fixture failed >=2:1 compression ratio assertion (entropy=")
+	    + (e == entropy::LOW ? "LOW" : "HIGH") + ", raw=" + std::to_string (raw_len)
+	    + "B, avg serialized=" + std::to_string (avg) + "B, ratio=" + std::to_string (ratio) + ")");
       }
   }
 } // namespace

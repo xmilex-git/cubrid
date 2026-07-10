@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace vhb
@@ -242,17 +243,27 @@ namespace
    * copied too (§s.2 VC_RAW sort-entry row: "qfile_make_sort_key already durably memcpys the raw key
    * bytes into the entry"), so post-build the sort never touches the original disk image again.
    * `dest` must have at least decompressed_size+1 bytes of headroom (pr_get_compressed_data_from_buffer
-   * writes a trailing NUL); callers reserve that stride. Returns the logical content length. */
+   * writes a trailing NUL); callers reserve that stride. Returns the logical content length.
+   * [LOW hygiene, architect finding] both or_get_varchar_compression_lengths() and
+   * pr_get_compressed_data_from_buffer() return an error code that this function used to ignore;
+   * both are now checked and abort the cell (throw) on failure instead of silently proceeding with
+   * a garbage/zero length or an under-filled `dest`. */
   int
   detoast_into_entry (const char *raw, int raw_len, char *dest)
   {
     OR_BUF buf;
     or_init (&buf, const_cast<char *> (raw), raw_len);
     int compressed_size = 0, decompressed_size = 0;
-    or_get_varchar_compression_lengths (&buf, &compressed_size, &decompressed_size);
+    if (or_get_varchar_compression_lengths (&buf, &compressed_size, &decompressed_size) != NO_ERROR)
+      {
+	throw std::runtime_error ("variant_a_slot: detoast_into_entry: or_get_varchar_compression_lengths failed");
+      }
     if (compressed_size > 0)
       {
-	pr_get_compressed_data_from_buffer (&buf, dest, compressed_size, decompressed_size);
+	if (pr_get_compressed_data_from_buffer (&buf, dest, compressed_size, decompressed_size) != NO_ERROR)
+	  {
+	    throw std::runtime_error ("variant_a_slot: detoast_into_entry: pr_get_compressed_data_from_buffer failed");
+	  }
       }
     else
       {
@@ -262,18 +273,25 @@ namespace
   }
 
   /* Non-sort bound/reference decode: same detoast-once contract as detoast_into_entry(), but sizes
-   * and owns its own destination vector (used once per prepare(), never in the timed per-row path). */
+   * and owns its own destination vector (used once per prepare(), never in the timed per-row path).
+   * [LOW hygiene, architect finding] rc-checked the same way detoast_into_entry() now is. */
   void
   decode_varchar_plain (const char *raw, int raw_len, std::vector<char> &out)
   {
     OR_BUF buf;
     or_init (&buf, const_cast<char *> (raw), raw_len);
     int compressed_size = 0, decompressed_size = 0;
-    or_get_varchar_compression_lengths (&buf, &compressed_size, &decompressed_size);
+    if (or_get_varchar_compression_lengths (&buf, &compressed_size, &decompressed_size) != NO_ERROR)
+      {
+	throw std::runtime_error ("variant_a_slot: decode_varchar_plain: or_get_varchar_compression_lengths failed");
+      }
     out.resize (static_cast<std::size_t> (decompressed_size) + 1);
     if (compressed_size > 0)
       {
-	pr_get_compressed_data_from_buffer (&buf, out.data (), compressed_size, decompressed_size);
+	if (pr_get_compressed_data_from_buffer (&buf, out.data (), compressed_size, decompressed_size) != NO_ERROR)
+	  {
+	    throw std::runtime_error ("variant_a_slot: decode_varchar_plain: pr_get_compressed_data_from_buffer failed");
+	  }
       }
     else
       {
@@ -282,7 +300,10 @@ namespace
     out.resize (static_cast<std::size_t> (decompressed_size));
   }
 
-  /* header-only pass (no decompression) to size the sort-owned arena once, up front */
+  /* header-only pass (no decompression) to size the sort-owned arena once, up front.
+   * [LOW hygiene, architect finding] rc-checked; a header-parse failure here would otherwise
+   * silently under-size the shared arena_ and corrupt every subsequent detoast_into_entry() call
+   * in the same prepare(), so this one aborts loudest of the three. */
   std::size_t
   total_decompressed_len (const serialized_column &col)
   {
@@ -292,7 +313,10 @@ namespace
 	OR_BUF buf;
 	or_init (&buf, const_cast<char *> (col.vals[r].data ()), col.lengths[r]);
 	int csize = 0, dsize = 0;
-	or_get_varchar_compression_lengths (&buf, &csize, &dsize);
+	if (or_get_varchar_compression_lengths (&buf, &csize, &dsize) != NO_ERROR)
+	  {
+	    throw std::runtime_error ("variant_a_slot: total_decompressed_len: or_get_varchar_compression_lengths failed");
+	  }
 	total += static_cast<std::size_t> (dsize);
       }
     return total;
@@ -444,7 +468,15 @@ namespace
       }
   }
 
-  /* ---- FL_FILTER: deform-once per column per row (native compare vs bound), all 5 cols ---- */
+  /* ---- FL_FILTER: deform-once per column per row (native compare vs bound), all 5 cols ----
+   * [LOW asymmetry note, architect finding] this loop deliberately does NOT `break` out of the
+   * inner per-column loop once `survives` goes false — every one of the 5 columns is deformed
+   * unconditionally, every row (matches variant_pervalue.cpp's A-handle sibling). Contrast
+   * variant_cmpdisk.cpp's / variant_flatbuffers.cpp's B/C run_fl_filter(), which DO short-circuit
+   * on the first failing column. This is a deliberate, conservative, no-behavior-change asymmetry
+   * (A's per-row deform is a single up-front step feeding every later access, not a
+   * column-by-column short-circuiting predicate the way B/C's disk-direct/table dispatch is) —
+   * documented at both sides so it isn't mistaken for an oversight. */
   cell_result
   variant_a_slot::run_fl_filter (const fixture &f)
   {

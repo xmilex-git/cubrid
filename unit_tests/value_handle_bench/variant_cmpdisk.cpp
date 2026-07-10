@@ -22,11 +22,11 @@
  *
  * B operates directly on the fixture's serialized disk images via pr_type dispatch — no
  * ValueSlot, no per-value handle, no DB_VALUE materialization except where the *baseline itself*
- * already materializes one (NUM_AGG_INPUT's readval). This is the literal mechanism the P1
- * design docs measure against:
- *   - filter/UV_PEEK/PEEK_VS_COPY: range predicate via pr_type::data_cmpdisk against a bound
- *     value taken directly from the fixture's own row (row_count/3) — object_primitive.h
- *     f_data_cmpdisk generic dispatch (p1.3-proposals.md (ii) §(a)).
+ * already materializes one (NUM_AGG_INPUT's / PEEK_VS_COPY's readval). This is the literal
+ * mechanism the P1 design docs measure against:
+ *   - filter/UV_PEEK: range predicate via pr_type::data_cmpdisk against a bound value taken
+ *     directly from the fixture's own row (row_count/3) — object_primitive.h f_data_cmpdisk
+ *     generic dispatch (p1.3-proposals.md (ii) §(a)).
  *   - FL_SORT/CV_SORT/NUM_SORT/ABBREV_SUBCELL/CV_MERGE: disk-direct sort/merge comparator via
  *     data_cmpdisk, the same dispatch list_file.c:4394/4443/4612-4643 wires as
  *     get_data_cmpdisk_function() — for CV_SORT this is mr_cmpdisk_char_type_common(),
@@ -36,6 +36,12 @@
  *   - NUM_AGG_INPUT: data_readval into a DB_VALUE per row + numeric_db_value_add accumulation
  *     (today's aggregate-input path; mr_data_readval_numeric fires once per row here, vs. the
  *     double-readval-per-comparison NUM_SORT baseline pays during an O(N log N) sort).
+ *   - PEEK_VS_COPY: heap_attrvalue_read's literal chain — heap_attrvalue_point_{fixed,variable}
+ *     (peek: locate raw bytes) ALWAYS followed by heap_attrvalue_transform_to_dbvalue (copy:
+ *     data_readval into a materialized DB_VALUE), modeled here as one data_readval() call per
+ *     attribute access — real byte-copy work performed and counted, never a bare counter++ — for
+ *     BOTH columns and BOTH the k=2 within-row references A-slot/A-handle model for this cell
+ *     (p0.3-peek-copy-profile.md §2; see run_peek_vs_copy() below).
  *   - ABBREV_SUBCELL: per the P2 acceptance criteria, B's contribution is the full-compare
  *     baseline side only — mechanically identical to CV_SORT (the abbreviated 8B-prefix-proxy
  *     "upside" is a campaign-scope/D-G5 measurement target this baseline variant never claims).
@@ -54,7 +60,12 @@
  *   - UV_PEEK/PEEK_VS_COPY: buffer = the row's PEEKED CONTENT bytes (header-stripped, via
  *     or_get_varchar_compression_lengths) for the VARCHAR column, native-u64 for the INT column.
  *   - NUM_AGG_INPUT: buffer = the raw 8 bytes of the accumulated int64 unscaled-value proxy
- *     (exact/lossless for NUMERIC(15,2), p<=18 per p1.1-valueslot-design.md §s.3).
+ *     (exact/lossless for NUMERIC(15,2), p<=18 per p1.1-valueslot-design.md §s.3), read directly
+ *     out of THIS LOOP's own timed accumulator DB_VALUE (`acc`'s DB_NUMERIC magnitude buffer) —
+ *     never an untimed, independent re-derivation from the fixture's raw bytes. Mathematically
+ *     equal to the naive per-row proxy sum (numeric_db_value_add is exact decimal arithmetic, no
+ *     precision loss within int64 range), so the digest still matches variant_valueslot.cpp /
+ *     variant_pervalue.cpp bit for bit.
  *   - bound row for every filter/peek predicate = the fixture's OWN row at index row_count/3
  *     (or row 0 if row_count<3) — never a synthetic constant.
  * The *predicate outcome* and *sort order* this file computes via pr_type::data_cmpdisk are
@@ -83,9 +94,6 @@ namespace vhb
 namespace
 {
   constexpr int NUM_SCALE = 2; /* NUMERIC(15,2) — matches fixture.cpp's NUM_SCALE */
-
-  constexpr int k_numeric_header_size = 3;        /* NUMERIC_HEADER_SIZE, object_primitive.c:131 */
-  constexpr unsigned char k_numeric_sign_bit = 0x80;
 
   enum class fl_family : std::uint8_t { I32, I64, F64 };
 
@@ -173,34 +181,23 @@ namespace
     return v;
   }
 
-  /* int64 unscaled-value proxy, exact for precision<=18 (p1.1-valueslot-design.md §s.3) — reads
-   * the raw NUMERIC disk header/magnitude directly, same byte-level parse
-   * variant_valueslot.cpp's decode_numeric_once() uses, so NUM_AGG_INPUT's digest matches. */
-  bool
-  numeric_int64_proxy (const unsigned char *raw, std::int64_t &out)
+  /* int64 unscaled-value proxy from an in-memory NUMERIC DB_VALUE's own DB_NUMERIC magnitude
+   * buffer (db_get_numeric(): DB_NUMERIC_BUF_SIZE(17) bytes, big-endian, NO on-disk header — the
+   * sign lives in DB_VALUE_NUMERIC_IS_VALUE_NEGATIVE(), not in this buffer). Exact for
+   * precision<=18 (p1.1-valueslot-design.md §s.3), the same low-8-bytes construction
+   * variant_valueslot.cpp's decode_numeric_once() uses on the on-disk byte shape, so
+   * NUM_AGG_INPUT's digest matches bit for bit despite the different source buffer shape. */
+  std::int64_t
+  numeric_int64_proxy_of (const DB_VALUE &v)
   {
-    int disk_size = raw[0] & 0x7F;
-    bool negative = (raw[0] & k_numeric_sign_bit) != 0;
-    int precision = raw[1] & 0x7F;
-    if (precision > 18)
-      {
-	return false;
-      }
-
-    unsigned char magnitude[DB_NUMERIC_BUF_SIZE] = { 0 };
-    int mag_len = disk_size - k_numeric_header_size;
-    if (mag_len > 0)
-      {
-	std::memcpy (magnitude + (DB_NUMERIC_BUF_SIZE - mag_len), raw + k_numeric_header_size, mag_len);
-      }
-
-    std::uint64_t mag = 0;
+    const unsigned char *mag = reinterpret_cast<const unsigned char *> (db_get_numeric (&v));
+    std::uint64_t umag = 0;
     for (int i = DB_NUMERIC_BUF_SIZE - 8; i < DB_NUMERIC_BUF_SIZE; i++)
       {
-	mag = (mag << 8) | magnitude[i];
+	umag = (umag << 8) | mag[i];
       }
-    out = negative ? -static_cast<std::int64_t> (mag) : static_cast<std::int64_t> (mag);
-    return true;
+    return DB_VALUE_NUMERIC_IS_VALUE_NEGATIVE (&v) ? -static_cast<std::int64_t> (umag)
+						    : static_cast<std::int64_t> (umag);
   }
 
   TP_DOMAIN *
@@ -284,6 +281,17 @@ namespace
     cell_result run_peek_vs_copy (const fixture &f);
   };
 
+  /* ---- FL_FILTER asymmetry [LOW, architect finding] ---- B short-circuits the per-row column
+   * loop on the first failing column (`break`, below) — matches a real disk-direct predicate
+   * evaluator's ability to stop dispatching data_cmpdisk once the composite AND is already false.
+   * variant_valueslot.cpp / variant_pervalue.cpp's A-side reference deforms all 5 FL columns
+   * unconditionally every row (no `break`), because ValueSlot's/the rejected handle's per-row
+   * deform is a single up-front step feeding every subsequent access, not a column-by-column
+   * short-circuiting predicate. This is a deliberate, conservative asymmetry: A pays for building
+   * the full row unconditionally; B/C only ever pay for the columns actually needed to decide
+   * survival. It gives B/C a small structural head start on rows that fail on an early column and
+   * is left as-is (no behavior change) — documented here and at variant_flatbuffers.cpp's
+   * run_fl_filter() so it isn't mistaken for an oversight. */
   cell_result
   variant_b_cmpdisk::run_fl_filter (const fixture &f)
   {
@@ -511,19 +519,11 @@ namespace
       }
     auto t1 = std::chrono::steady_clock::now ();
 
-    /* digest is the exact int64 unscaled-value proxy sum (p1.1-valueslot-design.md §s.3,
-     * lossless for our NUMERIC(15,2) fixture) — computed as an untimed, independent re-derivation
-     * from the fixture's raw bytes so it matches variant_valueslot.cpp's digest bit for bit,
-     * regardless of any DB_VALUE-internal-layout assumption. */
-    std::int64_t proxy_sum = 0;
-    for (std::size_t r = 0; r < col.vals.size (); r++)
-      {
-	std::int64_t proxy = 0;
-	if (numeric_int64_proxy (reinterpret_cast<const unsigned char *> (col.vals[r].data ()), proxy))
-	  {
-	    proxy_sum += proxy;
-	  }
-      }
+    /* [MED-1 fix] digest derives from THIS LOOP's own timed accumulator (`acc`, a real DB_VALUE
+     * built via data_readval + numeric_db_value_add) — never an untimed, independent re-derivation
+     * from the fixture's raw bytes. See numeric_int64_proxy_of()'s header comment for why this
+     * still matches variant_valueslot.cpp / variant_pervalue.cpp bit for bit. */
+    std::int64_t proxy_sum = numeric_int64_proxy_of (acc);
 
     cell_result res;
     res.elapsed_us =
@@ -533,6 +533,20 @@ namespace
     return res;
   }
 
+  /* ---- PEEK_VS_COPY [HIGH-1 fix] ---- Models heap_attrvalue_read's literal, unconditional
+   * peek->copy chain (p0.3-peek-copy-profile.md §2): heap_attrvalue_point_{fixed,variable} (peek:
+   * locate the raw bytes) is ALWAYS followed by heap_attrvalue_transform_to_dbvalue (copy: readval
+   * the located bytes into a freshly materialized DB_VALUE — real work, performed via
+   * data_readval(), never a bare counter++), for EVERY attribute access, independent of row
+   * survival. Per the k=2 within-row reference both A-slot and A-handle model for this cell (one
+   * filter-evaluation access, one simulated second/projection access), B — the legacy baseline
+   * that has no slot to skip the re-crossing — pays the full chain again for BOTH columns on the
+   * second reference too: 2 cols x 2 refs x (peek+copy) = 4 peeks + 4 copies per row, every row,
+   * matching A-handle's counter shape exactly (contrast: A-slot's ValueSlot deforms once and the
+   * second reference is a free array read, 2 peeks + 1 copy per row — the whole point of the
+   * cell). The filter predicate itself still goes through B's disk-direct data_cmpdisk mechanism
+   * (mirrors run_fl_filter/run_uv_peek), evaluated off the first reference's materialized values,
+   * exactly as a caller only ever sees heap_attrvalue_read's result after the chain above runs. */
   cell_result
   variant_b_cmpdisk::run_peek_vs_copy (const fixture &f)
   {
@@ -542,7 +556,6 @@ namespace
     TP_DOMAIN *vc_dom = col_domains_[1];
     std::size_t bound_row = bound_row_of (f.row_count);
     const char *bound_int_bytes = int_col.vals[bound_row].data ();
-    const char *bound_vc_bytes = vc_col.vals[bound_row].data ();
 
     std::vector<char> digest_bytes;
     std::uint64_t peeks = 0;
@@ -551,32 +564,60 @@ namespace
 
     for (std::size_t r = 0; r < int_col.vals.size (); r++)
       {
-	/* baseline chains peek->copy unconditionally on every attribute access (P0.3 finding,
-	 * heap_attrvalue_read) — every row pays one peek + one copy, regardless of survival. */
-	peeks++;
-	copies++;
+	DB_VALUE int_val[2];
+	DB_VALUE vc_val[2];
+	bool int_ok = false, vc_ok = false;
 
-	bool int_ok =
-	  int_dom->type->data_cmpdisk (int_col.vals[r].data (), bound_int_bytes, int_dom, 0, 1, nullptr) <= DB_EQ;
-	varchar_view vc = peek_varchar (vc_col.vals[r].data (), vc_col.lengths[r]);
-	varchar_view bound_vc = peek_varchar (bound_vc_bytes, vc_col.lengths[bound_row]);
-	peeks++;
-	bool vc_ok = false;
-	{
-	  int n = std::min (vc.len, bound_vc.len);
-	  int c = n ? std::memcmp (vc.data, bound_vc.data, static_cast<std::size_t> (n)) : 0;
-	  if (c == 0)
-	    {
-	      c = (vc.len < bound_vc.len) ? -1 : (vc.len > bound_vc.len) ? 1 : 0;
-	    }
-	  vc_ok = c <= 0;
-	}
+	for (int k = 0; k < 2; k++)
+	  {
+	    OR_BUF int_buf;
+	    or_init (&int_buf, mutable_ptr (int_col.vals[r]), int_col.lengths[r]);
+	    peeks++; /* heap_attrvalue_point_fixed: locate the raw fixed-length bytes */
+	    if (int_dom->type->data_readval (&int_buf, &int_val[k], int_dom, int_col.lengths[r], true, nullptr, 0)
+		!= NO_ERROR)
+	      {
+		throw std::runtime_error ("variant_b_cmpdisk: PEEK_VS_COPY int readval failed");
+	      }
+	    copies++; /* heap_attrvalue_transform_to_dbvalue: copy, ALWAYS called */
+
+	    OR_BUF vc_buf;
+	    or_init (&vc_buf, mutable_ptr (vc_col.vals[r]), vc_col.lengths[r]);
+	    peeks++; /* heap_attrvalue_point_variable: locate the raw varchar bytes */
+	    if (vc_dom->type->data_readval (&vc_buf, &vc_val[k], vc_dom, vc_col.lengths[r], true, nullptr, 0)
+		!= NO_ERROR)
+	      {
+		throw std::runtime_error ("variant_b_cmpdisk: PEEK_VS_COPY varchar readval failed");
+	      }
+	    copies++;
+
+	    if (k == 0)
+	      {
+		int_ok = int_dom->type->data_cmpdisk (int_col.vals[r].data (), bound_int_bytes, int_dom, 0, 1,
+						       nullptr) <= DB_EQ;
+		varchar_view bound_vc = peek_varchar (vc_col.vals[bound_row].data (), vc_col.lengths[bound_row]);
+		const char *vc_data = db_get_string (&vc_val[0]);
+		int vc_len = db_get_string_size (&vc_val[0]);
+		int n = std::min (vc_len, bound_vc.len);
+		int c = n ? std::memcmp (vc_data, bound_vc.data, static_cast<std::size_t> (n)) : 0;
+		if (c == 0)
+		  {
+		    c = (vc_len < bound_vc.len) ? -1 : (vc_len > bound_vc.len) ? 1 : 0;
+		  }
+		vc_ok = c <= 0;
+	      }
+	  }
 
 	if (int_ok && vc_ok)
 	  {
 	    append_u64_native (digest_bytes, deform_fl_inline (int_col.dbtype, int_col.vals[r].data ()));
-	    append_bytes (digest_bytes, vc.data, static_cast<std::size_t> (vc.len));
+	    append_bytes (digest_bytes, db_get_string (&vc_val[1]),
+			  static_cast<std::size_t> (db_get_string_size (&vc_val[1])));
 	  }
+
+	pr_clear_value (&int_val[0]);
+	pr_clear_value (&int_val[1]);
+	pr_clear_value (&vc_val[0]);
+	pr_clear_value (&vc_val[1]);
       }
 
     auto t1 = std::chrono::steady_clock::now ();

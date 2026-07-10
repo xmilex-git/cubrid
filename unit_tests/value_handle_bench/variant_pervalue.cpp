@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace vhb
@@ -244,7 +245,11 @@ namespace
    * compressed or not — a self-describing handle has no att_class-driven zero-copy peek path
    * (§a.0's rejection point: it "re-invents a lightweight DB_VALUE"), so every access pays the full
    * peek+copy chain P0.3 documents for the legacy path. `peeks`/`copies` are bumped by exactly one
-   * each, faithfully modeling the 1:1 ratio ValueSlot's VC_RAW breaks and this design cannot. */
+   * each, faithfully modeling the 1:1 ratio ValueSlot's VC_RAW breaks and this design cannot.
+   * [LOW hygiene, architect finding] both or_get_varchar_compression_lengths() and
+   * pr_get_compressed_data_from_buffer() return an error code this function used to ignore; both
+   * are now checked and abort the cell (throw) on failure instead of silently proceeding with a
+   * garbage/zero length or an under-filled owned buffer. */
   std::unique_ptr<std::vector<char>>
   make_handle_varchar (const char *raw, int raw_len, value_handle &h, std::uint32_t gen,
 			std::uint64_t &peeks, std::uint64_t &copies)
@@ -252,13 +257,19 @@ namespace
     OR_BUF buf;
     or_init (&buf, const_cast<char *> (raw), raw_len);
     int compressed_size = 0, decompressed_size = 0;
-    or_get_varchar_compression_lengths (&buf, &compressed_size, &decompressed_size);
+    if (or_get_varchar_compression_lengths (&buf, &compressed_size, &decompressed_size) != NO_ERROR)
+      {
+	throw std::runtime_error ("variant_a_handle: make_handle_varchar: or_get_varchar_compression_lengths failed");
+      }
     ++peeks;
 
     auto owned = std::make_unique<std::vector<char>> (static_cast<std::size_t> (decompressed_size) + 1);
     if (compressed_size > 0)
       {
-	pr_get_compressed_data_from_buffer (&buf, owned->data (), compressed_size, decompressed_size);
+	if (pr_get_compressed_data_from_buffer (&buf, owned->data (), compressed_size, decompressed_size) != NO_ERROR)
+	  {
+	    throw std::runtime_error ("variant_a_handle: make_handle_varchar: pr_get_compressed_data_from_buffer failed");
+	  }
       }
     else
       {
@@ -388,7 +399,14 @@ namespace
       }
   }
 
-  /* ---- FL_FILTER: fresh handle per column per row — no hoisted att_types, re-dispatched every call ---- */
+  /* ---- FL_FILTER: fresh handle per column per row — no hoisted att_types, re-dispatched every
+   * call ----
+   * [LOW asymmetry note, architect finding] this loop deliberately does NOT `break` out of the
+   * inner per-column loop once `survives` goes false — every one of the 5 columns gets a fresh
+   * handle built unconditionally, every row (matches variant_valueslot.cpp's A-slot sibling).
+   * Contrast variant_cmpdisk.cpp's / variant_flatbuffers.cpp's B/C run_fl_filter(), which DO
+   * short-circuit on the first failing column. Deliberate, conservative, no-behavior-change
+   * asymmetry — see variant_valueslot.cpp's run_fl_filter() for the full rationale. */
   cell_result
   variant_a_handle::run_fl_filter (const fixture &f)
   {
@@ -739,7 +757,7 @@ namespace
 
   /* ---- ABBREV_SUBCELL: same 8B-prefix content-proxy technique as A-slot, applied on top of the
    * per-value handle's owned (heap-allocated, not arena-carved) storage. Reference order must still
-   * equal the full byte-compare sort; digest formula matches CV_SORT's. ---- */
+   * equal the full byte-compare sort, digest formula matches CV_SORT's. ---- */
   cell_result
   variant_a_handle::run_abbrev_subcell (const fixture &f)
   {

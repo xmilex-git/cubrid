@@ -22,14 +22,17 @@ project (test_value_handle_bench)
 # cmake/version.h.cmake) never carry an actual git revision, only a version NUMBER — since the
 # P2.1 CSV schema wants a "cubrid_rel sha", this harness follows the same CMake-time
 # execute_process()-embeds-a-compile-definition mechanism but sources the value from
-# `git rev-parse --short HEAD`, with a documented fallback when git metadata is unavailable
-# (e.g. a tarball checkout with no .git) — main.cpp then just prints VHB_CUBRID_REL_SHA verbatim
-# into every results-CSV row.
+# `git describe --always --dirty` (LOW hygiene fix, architect finding: `--always` itself already
+# supplies the "short-sha fallback" this value needs whenever no tag is reachable from HEAD, and
+# `--dirty` flags an uncommitted worktree so a results CSV row can never be silently attributed to
+# a clean commit it wasn't actually built from), with a documented fallback when git metadata is
+# unavailable at all (e.g. a tarball checkout with no .git) — main.cpp then just prints
+# VHB_CUBRID_REL_SHA verbatim into every results-CSV row.
 set (VHB_CUBRID_REL_SHA "unknown")
 find_package (Git QUIET)
 if (GIT_FOUND)
   execute_process (
-    COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+    COMMAND ${GIT_EXECUTABLE} describe --always --dirty
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     OUTPUT_VARIABLE VHB_GIT_SHA_OUT
     OUTPUT_STRIP_TRAILING_WHITESPACE
