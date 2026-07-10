@@ -78,6 +78,7 @@ namespace
     cell_id selected_cell = cell_id::FL_FILTER;
     int iters = 0; /* 0 = leave run_options' protocol default (7) untouched */
     bool strict_cov = false; /* --strict-cov: COV_VIOLATION rows make the process exit nonzero */
+    bool reverse = false; /* --reverse: run variants in reverse registry order (order-balanced headline runs) */
   };
 
   void
@@ -101,7 +102,10 @@ namespace
       << "  --strict-cov    exit nonzero if any (variant,cell) row's CoV exceeds the 15% protocol\n"
       << "                  ceiling (rows are always flagged ';COV_VIOLATION' in the summary CSV\n"
       << "                  and warned about on stderr regardless of this flag; this flag only\n"
-      << "                  changes the process exit code)\n";
+      << "                  changes the process exit code)\n"
+      << "  --reverse       run the variants in REVERSE registry order (C,B,A-handle,A-slot); the\n"
+      << "                  official headline protocol pools forward and reverse process runs\n"
+      << "                  (e.g. F,R,R,F) so no variant's number depends on a fixed position\n";
   }
 
   bool
@@ -165,6 +169,10 @@ namespace
 	else if (arg == "--strict-cov")
 	  {
 	    opts.strict_cov = true;
+	  }
+	else if (arg == "--reverse")
+	  {
+	    opts.reverse = true;
 	  }
 	else if (arg.rfind ("--cell=", 0) == 0)
 	  {
@@ -504,6 +512,10 @@ main (int argc, char **argv)
     {
       std::cerr << "test_value_handle_bench: no variants registered (every factory returned nullptr)\n";
       return 1;
+    }
+  if (opts.reverse)
+    {
+      std::reverse (registry.begin (), registry.end ());
     }
 
   if (opts.parity)
