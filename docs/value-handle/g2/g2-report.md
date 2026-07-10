@@ -38,8 +38,10 @@ ABBA(B A A B), warmup 2 + measured 4/block, 8 measured/arm, env -i, 동일 conf(
   4.035 s outlier 1건 포함 — 제외 없이 보고). speedup 1.80x. **정리로 인한 성능 손실 없음.**
 - parity: 전 run MAIL 62071/93045, SHIP 62426/93261. plan/trace: workers 10, lineitem seq scan 지배
   (`feature2-q12-trace.txt`, `develop-g2-q12-trace.txt`).
-- 참고: feature2 b2 첫 start 시도 1회가 wrapper TIMEOUT-후-재시작 아님, `RESULT: FAILED` 후 즉시 정상
-  서빙(직전 실패 블록의 서버 생존) — 트랜스크립트 보존, 측정값 유효.
+- 참고: feature2 b2 직전의 start 호출 1회는 wrapper가 비제로 종료를 보고했으나 실체는
+  "server 'tpch_sf10' is running" — 직전에 중단된 시도에서 살아남은 서버가 그대로 서빙
+  (트랜스크립트: `logs/server-ctl/start-tpch_sf10-20260710-163624.log`; wrapper의 RESULT
+  요약줄은 stdout 전용이라 로그 파일에는 없음). 측정값 유효.
 
 ## 3. Part C — MIDXKEY 보존 검증 (handoff §8.2)
 
@@ -69,11 +71,14 @@ M3 ORDER BY=index order / M4 **강제 index skip scan**(composite PK `USING INDE
 누락한 채 '전 셀 무회귀'라고 썼다. 이는 규칙 위반이므로 다음과 같이 정정한다:
 - 해당 수치는 공개하며(develop 1.104 s vs feature 1.398 s, block 6), 사전 선언된 제외 규칙이
   아니었음을 인정한다.
-- 판정은 **재측정으로 대체**: 정숙(loadavg 3.0–4.3, 양 arm 대칭)·순서균형(ABBA BAAB, 블록당
-  warmup 1 + measured 5, **n=20/arm**) 재측정 결과 **feature −5.45%, mean-diff 95% CI
-  [−6.58%, −0.57%] 전체가 0 미만** — feature가 유의하게 빠름. block-6의 +26.6%는 실행당
-  ~579K 물리 ioread인 이 셀이 코-테넌트 IO 부하에 노출된 결과로 반증됨. 원자료
-  `m5io-runs.csv`, loadavg는 `logs/block-loadavg.log`의 m5io 행.
+- 판정은 **재측정으로 대체**: 순서균형(ABBA BAAB, 블록당 warmup 1 + measured 5, **n=20/arm**),
+  블록별 1분 loadavg 실측 3.05–6.26 범위에서 arm별 평균이 대칭(develop 4.30 vs feature 4.46;
+  균형 배치가 드리프트를 양 arm에 균등 분배). 결과 **feature −5.45%, mean-diff 95% CI
+  [−6.58%, −0.57%] 전체가 0 미만** — feature가 유의하게 빠름. 따라서 block-6의 +26.6%는
+  균형 재측정에서 **재현되지 않았고 판정은 본 재측정이 대체**한다. 원인에 대해서는: 이 셀(v2)이
+  실행당 ~579K 물리 ioread로 IO-bound라는 사실(v2 trace)에서 코-테넌트 IO 간섭 민감성을
+  가설로 두되, block 6 자체의 로그상 부하는 대칭이었으므로 **원인 확정은 하지 않는다**.
+  원자료 `m5io-runs.csv`, loadavg는 `logs/block-loadavg.log`의 m5io 행.
 
 ### 3.2 index build 재측정 — 최초 n=9 단일 시퀀스 판정의 대체
 
@@ -82,8 +87,10 @@ M3 ORDER BY=index order / M4 **강제 index skip scan**(composite PK `USING INDE
 n=16/arm**, warmup 2/arm 선행. 결과: median develop 4.691 s vs feature 4.816 s (+2.69%);
 **쌍별(인접 교차쌍) 분석 +1.83%, 95% CI [−0.62%, +4.27%] — 0 포함, 확정 회귀 아님.**
 교차 조건에서 쌍별 방향은 6/16이 음수로 일관되지 않음 → 최초 9/9 열세는 시퀀스 편향으로
-판정. 원자료 `idxbuild-runs.csv` (per-run loadavg 포함). 잔여 +1.8~2.7% 점추정은 UG3에서
-실제 index-build 워크로드로 재평가할 1급 입력으로 남긴다.
+판정. **`logs/index-build-timings.txt`의 당초 판정문 "delta(median) = +1.41% (<= 2% threshold,
+OK)"는 본 절이 명시적으로 대체(supersede)한다** — 당초 실험은 설계 결함(단일 시퀀스)으로
+판정 능력이 없었다. 원자료 `idxbuild-runs.csv` (per-run loadavg 포함). 잔여 +1.8~2.7%
+점추정은 UG3에서 실제 index-build 워크로드로 재평가할 1급 입력으로 남긴다.
 - plan 동일성: 두 arm trace가 인덱스 선택·key range·covered·filteredkeys까지 일치(readkeys ±1은
   경계 프로브 잡음). 결과 fingerprint 동일(v1 `2805129870`, v2 `2669763051`, v3 `3798931025`).
 - ISS 실증: M4 trace = composite PK에서 readkeys 4,008,000 / fetch 12,011,292 (skip-scan 특유의
@@ -102,7 +109,7 @@ n=16/arm**, warmup 2/arm 선행. 결과: median develop 4.691 s vs feature 4.816
   scratch DB(g2midx, 3M행)는 각 arm의 자체 install로 생성 후 deletedb로 제거. tpch_sf10 무접촉.
 - Q12/MIDX 측정 전후 `~/CUBRID` 심링크 복원 및 cub_* 0 — `logs/restoration-proof.txt`.
 - conf 공정성: `develop-g2-paramdump.txt` == `feature2-paramdump.txt` (error_log 파일명 제외 diff 0).
-- wrapper 트랜스크립트: `logs/server-ctl/` (feature2 b2의 start FAILED-후-정상서빙 건 포함).
+- wrapper 트랜스크립트: `logs/server-ctl/` (b2 건은 `start-...-163624.log`의 already-running 기록).
 
 ## 4. Artifacts
 
