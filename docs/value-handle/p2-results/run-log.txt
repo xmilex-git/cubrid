@@ -1,0 +1,56 @@
+P2 full-scale matrix run log — 2026-07-10
+==========================================
+
+Binary / provenance
+- worktree: /home/cubrid/dev/cubrid-vh, HEAD d7700338b (VH-P2: add --reverse ...)
+  on top of 82f64dafe (bench hygiene L1/L2) on top of 9d86f4840.
+- cubrid_rel_sha stamp in every CSV row: d7700338b-dirty
+  ("-dirty" = build-regenerated cubrid-cci/win/cci_version.h inside the submodule only;
+  no source dirt. The stamp was refreshed by re-running cmake configure before the
+  official passes — an earlier preliminary 4-pass set carried a stale configure-time
+  stamp (065e619ac-dirty) and was archived, unused, in
+  .git_ignored_dir/p2-matrix/prelim-stale-sha/.)
+- target-only rebuild: cmake --build build_preset_release --target test_value_handle_bench
+  (handoff §7.2: benchmark target only; no install/symlink repoint).
+
+Machine state
+- Xeon Silver 4216, 32 threads; load avg ~3.7 at start (one unrelated agent process
+  ~0.5 core; no cub_master/cub_server running; no other benchmark).
+- Bench is single-threaded; CoV ceiling 15% policed every (variant,cell) row.
+
+Smoke parity (1000-row fixtures)
+- forward order : PARITY: 9/9 cells PASS
+- --reverse     : PARITY: 9/9 cells PASS
+
+Official full-scale matrix — order-balanced F,R,R,F (handoff §7.4)
+- pass1-F  --all            rc=0  279 s  COV_VIOLATION rows: 0
+- pass2-R  --all --reverse  rc=0  275 s  COV_VIOLATION rows: 0
+- pass3-R  --all --reverse  rc=0  297 s  COV_VIOLATION rows: 1  -> INVALID, remeasured
+    (B-cmpdisk / FL_FILTER CoV 17.36% > 15%; per protocol CoV>15% is INVALID, not FAIL.
+     Invalid pass archived at .git_ignored_dir/p2-matrix/pass3-R-invalid-cov/, excluded.)
+- pass3-R  (remeasure)      rc=0  275 s  COV_VIOLATION rows: 0
+- pass4-F  --all            rc=0  274 s  COV_VIOLATION rows: 0
+
+Protocol per (variant,cell) per pass: warmup 2 (discarded) + measured 7; official
+numbers pool the 4 passes (n=28 samples) per (variant,cell); pooled median + pooled
+CoV are in bench_summary.csv (samples column added; per-row label semantics unchanged:
+BEST-CASE-UPPER-BOUND, INGESTION-EXEMPT for C-flatbuffers CV_SORT/CV_MERGE/UV_PEEK,
+COV_VIOLATION if pooled CoV > 15% — none).
+
+Digest / correctness
+- Full-size digest equality across ALL variants and ALL 4 official passes: PASS for
+  every cell (order-sensitive FNV-1a over cell output).
+- NUM_AGG_INPUT full-size digest, all variants: 14621492692458723252 (handoff §7.6).
+- SKIPPED (by design): C-flatbuffers on PEEK_VS_COPY and ABBREV_SUBCELL.
+
+Files
+- bench_results.csv : per-iteration rows, pooled across passes (iteration 1..28,
+  pass column appended to the P2.1 schema).
+- bench_summary.csv : pooled median/CoV per (variant,cell) + label + samples.
+- Raw per-pass CSVs/stdout/stderr: .git_ignored_dir/p2-matrix/pass{1-F,2-R,3-R,4-F}/
+  (untracked scratch, retained on disk).
+
+Known caveat
+- B-cmpdisk / FL_FILTER pooled CoV = 14.72%: valid (≤15%) but near the ceiling; each
+  individual official pass was ≤15%, the pooled value reflects inter-pass variance.
+  This row is also the UG1.5 FL-filter comparator — flagged in ug15-packet.md.
