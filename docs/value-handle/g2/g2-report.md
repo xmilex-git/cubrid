@@ -102,7 +102,7 @@ OK)"는 본 절이 명시적으로 대체(supersede)한다** — 당초 실험�
   겹침 — 이 블록들에서만 +5~+60% 편차가 나타났고 부호가 블록마다 반전. block 3의 오염 귀속은
   loadavg 로그가 block 4부터 시작하므로 **값 패턴에서 추론한 것**임을 명시한다. per-cell CoV>15%
   행은 프로토콜대로 INVALID 처리, 오염 블록 원자료는 CSV에 보존. block 6의 M5(v2) +26.6%는
-  §3.1에서 공개·반증.
+  §3.1에서 공개·대체(균형 재측정이 판정을 대체).
 - **M5 v1/v2 (l_partkey 20001키, 실행당 ~579K 물리 ioread)는 2% 질문을 판별 불가능한 IO-bound 셀**로
   판명되어 v3(버퍼 수용 범위, warm CPU-bound)로 교체. v1/v2 원자료 보존.
 - index build는 SA 모드(csql -S) 측정 — 비교기(element별 index_cmpdisk) 경로는 CS와 동일하며,
