@@ -258,10 +258,27 @@ namespace
     bool
     prepare (cell_id /* c */, const fixture &f) override
     {
+      /* [L1 fix, mirrors variant_flatbuffers.cpp's prepare_numeric_passthrough()] prepare() lands
+       * here once per cell across one process's run (col_domains_ persists on the variant
+       * instance across cells) — free the PREVIOUS cell's tp_domain_construct()-owned domains
+       * (VARCHAR/NUMERIC) before rebuilding, or every VARCHAR/NUMERIC cell after the first leaks
+       * one uncached TP_DOMAIN per column. Domains from tp_domain_resolve_default() are shared
+       * cache entries and must never be freed here. */
+      for (std::size_t i = 0; i < col_domains_.size (); i++)
+	{
+	  if (i < col_domains_owned_.size () && col_domains_owned_[i] && col_domains_[i] != nullptr)
+	    {
+	      tp_domain_free (col_domains_[i]);
+	    }
+	}
+
       col_domains_.assign (f.cols.size (), nullptr);
+      col_domains_owned_.assign (f.cols.size (), false);
       for (std::size_t i = 0; i < f.cols.size (); i++)
 	{
 	  col_domains_[i] = resolve_domain (f.cols[i].dbtype, f.cols[i].precision);
+	  DB_TYPE t = static_cast<DB_TYPE> (f.cols[i].dbtype);
+	  col_domains_owned_[i] = (t == DB_TYPE_VARCHAR || t == DB_TYPE_NUMERIC);
 	}
       return true; /* B-cmpdisk implements every cell in the matrix */
     }
@@ -270,6 +287,7 @@ namespace
 
   private:
     std::vector<TP_DOMAIN *> col_domains_;
+    std::vector<bool> col_domains_owned_; /* [L1 fix] parallel to col_domains_: true iff tp_domain_construct()-owned */
 
     cell_result run_fl_filter (const fixture &f);
     cell_result run_fl_sort (const fixture &f);
@@ -556,6 +574,11 @@ namespace
     TP_DOMAIN *vc_dom = col_domains_[1];
     std::size_t bound_row = bound_row_of (f.row_count);
     const char *bound_int_bytes = int_col.vals[bound_row].data ();
+    /* [L2 fix, pro-A bias] the bound row's varchar header peek is per-CELL work (like A's
+     * bound_varchar_ built once in prepare()), not per-row work — hoisted above t0 instead of
+     * being recomputed unconditionally on every row inside the timed loop below, which inflated
+     * B's measured cost relative to A and exaggerated (B-A)/B in A's favor. */
+    varchar_view bound_vc = peek_varchar (vc_col.vals[bound_row].data (), vc_col.lengths[bound_row]);
 
     std::vector<char> digest_bytes;
     std::uint64_t peeks = 0;
@@ -594,7 +617,6 @@ namespace
 	      {
 		int_ok = int_dom->type->data_cmpdisk (int_col.vals[r].data (), bound_int_bytes, int_dom, 0, 1,
 						       nullptr) <= DB_EQ;
-		varchar_view bound_vc = peek_varchar (vc_col.vals[bound_row].data (), vc_col.lengths[bound_row]);
 		const char *vc_data = db_get_string (&vc_val[0]);
 		int vc_len = db_get_string_size (&vc_val[0]);
 		int n = std::min (vc_len, bound_vc.len);
