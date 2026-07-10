@@ -7496,6 +7496,7 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 		 bool * p_mvcc_select_lock_needed, XASL_NODE * xasl)
 {
   bool mvcc_select_lock_needed = false;
+  bool cached_scan;
   int error_code = NO_ERROR;
 
   if (curr_spec->pruning_type == DB_PARTITIONED_CLASS && !curr_spec->pruned)
@@ -7541,10 +7542,8 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 	}
     }
 
-  /* Compute cached-scan activation once per open, before dispatching on access method.
-   * Runtime-only; recomputed at every open, never serialized (see xasl.h / stream_to_xasl.c). */
-  curr_spec->cached_scan =
-    qexec_is_cached_scan_eligible (curr_spec, scan_op_type, mvcc_select_lock_needed, fixed, grouped);
+  /* Compute cached-scan activation once per open and pass it to either scan implementation. */
+  cached_scan = qexec_is_cached_scan_eligible (curr_spec, scan_op_type, mvcc_select_lock_needed, fixed, grouped);
 
   switch (curr_spec->type)
     {
@@ -7556,8 +7555,8 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 	    {
 #if SERVER_MODE && !WINDOWS
 	      error_code =
-		scan_open_parallel_heap_scan (thread_p, s_id, mvcc_select_lock_needed, scan_op_type, fixed, grouped,
-					      vd, curr_spec, &ACCESS_SPEC_CLS_OID (curr_spec),
+		scan_open_parallel_heap_scan (thread_p, s_id, mvcc_select_lock_needed, fixed, grouped, cached_scan, vd,
+					      curr_spec, &ACCESS_SPEC_CLS_OID (curr_spec),
 					      &ACCESS_SPEC_HFID (curr_spec), xasl, query_id);
 	      if (error_code != NO_ERROR)
 		{
@@ -7590,7 +7589,7 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 					 curr_spec->s.cls_node.num_attrs_rest, curr_spec->s.cls_node.attrids_rest,
 					 curr_spec->s.cls_node.cache_rest, S_HEAP_SCAN,
 					 curr_spec->s.cls_node.cache_reserved,
-					 curr_spec->s.cls_node.cls_regu_list_reserved, curr_spec->cached_scan);
+					 curr_spec->s.cls_node.cls_regu_list_reserved, cached_scan);
 		  if (error_code != NO_ERROR)
 		    {
 		      ASSERT_ERROR ();
@@ -7619,7 +7618,7 @@ qexec_open_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec, VAL_LIST
 						curr_spec->s.cls_node.num_attrs_rest,
 						curr_spec->s.cls_node.attrids_rest, curr_spec->s.cls_node.cache_rest,
 						scan_type, curr_spec->s.cls_node.cache_reserved,
-						curr_spec->s.cls_node.cls_regu_list_reserved, curr_spec->cached_scan);
+						curr_spec->s.cls_node.cls_regu_list_reserved, cached_scan);
 	      if (error_code != NO_ERROR)
 		{
 		  ASSERT_ERROR ();
@@ -9131,7 +9130,7 @@ qexec_init_next_partition (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, XAS
 #if SERVER_MODE && !WINDOWS
 	      error =
 		scan_open_parallel_heap_scan (thread_p, &spec->s_id, spec->s_id.mvcc_select_lock_needed,
-					      spec->s_id.scan_op_type, spec->s_id.fixed, spec->s_id.grouped,
+					      spec->s_id.fixed, spec->s_id.grouped, spec->s_id.cached_scan,
 					      spec->s_id.vd, spec, &class_oid, &class_hfid, xasl, query_id);
 	      if (error != NO_ERROR)
 		{

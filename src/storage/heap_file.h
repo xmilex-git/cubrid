@@ -168,6 +168,7 @@ struct heap_scancache
     HEAP_SCANCACHE_NODE_LIST *partition_list;	/* list holding the heap file information for partition nodes involved
 						 * in the scan */
     PGBUF_COPY_BUFFER_HANDLE local_cache_handle;	/* local page cache for a cached scan; NULL unless cached scan */
+    PAGE_PTR local_cache_page;		/* stable page pointer embedded in local_cache_handle */
     VPID local_cache_vpid;		/* VPID currently held in local_cache_handle */
     HEAP_SCAN_READ_MODE read_mode;	/* HEAP_SCAN_READ_COPY or HEAP_SCAN_READ_LOCAL_CACHE */
 

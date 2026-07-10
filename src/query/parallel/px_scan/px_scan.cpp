@@ -356,7 +356,7 @@ extern "C"
 
   int
   scan_open_parallel_heap_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, bool mvcc_select_lock_needed,
-				SCAN_OPERATION_TYPE scan_op_type, int fixed_scan, int grouped_scan, VAL_DESCR *vd,
+				int fixed_scan, int grouped_scan, bool cached_scan, VAL_DESCR *vd,
 				ACCESS_SPEC_TYPE *spec, OID *class_oid, HFID *class_hfid, XASL_NODE *xasl,
 				QUERY_ID query_id)
   {
@@ -375,6 +375,7 @@ extern "C"
     assert (vd != nullptr);
 
     scan_id->type = S_HEAP_SCAN;
+    scan_id->cached_scan = cached_scan;
 
     if (spec->curent == nullptr)
       {
@@ -454,11 +455,6 @@ extern "C"
 	scan_id->s.phsid.result_type = parallel_scan::RESULT_TYPE::XASL_SNAPSHOT;
       }
 
-    /* By construction, mvcc_select_lock_needed is false here: the gate above (spec->curent == nullptr
-     * branch) sets ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN and returns early whenever it is true, and that
-     * flag persists across subsequent calls for the same spec. */
-    bool cached_scan = qexec_is_cached_scan_eligible (spec, scan_op_type, mvcc_select_lock_needed, fixed_scan,
-		       grouped_scan);
 
     scan_id->s.phsid.manager = nullptr;	/* init */
 
