@@ -894,8 +894,6 @@ pgbuf_copy_buffer_alloc (void)
   memcpy (&buf->iopage_buf.iopage.page[DB_PAGESIZE], pgbuf_Guard, sizeof (pgbuf_Guard));
 #endif /* CUBRID_DEBUG */
 
-  er_log_debug (ARG_FILE_LINE, "cached scan buffer allocated");
-
   return buf;
 }
 
