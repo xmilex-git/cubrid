@@ -29,6 +29,8 @@ Official full-scale matrix — order-balanced F,R,R,F (handoff §7.4)
     (B-cmpdisk / FL_FILTER CoV 17.36% > 15%; per protocol CoV>15% is INVALID, not FAIL.
      Invalid pass archived at .git_ignored_dir/p2-matrix/pass3-R-invalid-cov/, excluded.)
 - pass3-R  (remeasure)      rc=0  275 s  COV_VIOLATION rows: 0
+    (chronology note: the remeasure ran AFTER pass4-F, so the wall-clock order of the
+     four VALID passes is F,R,F,R — still 2 forward + 2 reverse, order balance intact.)
 - pass4-F  --all            rc=0  274 s  COV_VIOLATION rows: 0
 
 Protocol per (variant,cell) per pass: warmup 2 (discarded) + measured 7; official
