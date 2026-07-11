@@ -1314,11 +1314,11 @@ btree_save_last_leafrec (THREAD_ENTRY * thread_p, LOAD_ARGS * load_args)
 
       /* Save the current overflow page */
       ret = btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->ovf.pgptr);
+      load_args->ovf.pgptr = NULL;
       if (ret != NO_ERROR)
 	{
 	  goto exit_on_error;
 	}
-      load_args->ovf.pgptr = NULL;
     }
 
   /* Insert leaf record too */
@@ -1370,11 +1370,11 @@ btree_save_last_leafrec (THREAD_ENTRY * thread_p, LOAD_ARGS * load_args)
 
   /* Save the current leaf page */
   ret = btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->leaf.pgptr);
+  load_args->leaf.pgptr = NULL;
   if (ret != NO_ERROR)
     {
       goto exit_on_error;
     }
-  load_args->leaf.pgptr = NULL;
 
   return ret;
 
@@ -1466,6 +1466,7 @@ btree_connect_page (THREAD_ENTRY * thread_p, DB_VALUE * key, int max_key_len, VP
       /* Flush the current non-leaf page */
       if (btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->nleaf.pgptr) != NO_ERROR)
 	{
+	  load_args->nleaf.pgptr = NULL;
 	  return NULL;
 	}
       load_args->nleaf.pgptr = NULL;
@@ -1761,11 +1762,11 @@ btree_build_nleafs (THREAD_ENTRY * thread_p, LOAD_ARGS * load_args, int n_nulls,
 
   /* Flush the last non-leaf page */
   ret = btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->nleaf.pgptr);
+  load_args->nleaf.pgptr = NULL;
   if (ret != NO_ERROR)
     {
       goto end;
     }
-  load_args->nleaf.pgptr = NULL;
 
   /* Insert the pageid to the linked list */
   ret = list_add (&load_args->push_list, &load_args->nleaf.vpid);
@@ -1895,11 +1896,11 @@ btree_build_nleafs (THREAD_ENTRY * thread_p, LOAD_ARGS * load_args, int n_nulls,
 
       /* Flush the last non-leaf page */
       ret = btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->nleaf.pgptr);
+      load_args->nleaf.pgptr = NULL;
       if (ret != NO_ERROR)
 	{
 	  goto end;
 	}
-      load_args->nleaf.pgptr = NULL;
 
       /* Insert the pageid to the linked list */
       ret = list_add (&load_args->push_list, &load_args->nleaf.vpid);
@@ -2008,11 +2009,11 @@ btree_build_nleafs (THREAD_ENTRY * thread_p, LOAD_ARGS * load_args, int n_nulls,
 
   /* The root page must be logged, otherwise, in the event of a crash. The index may be gone. */
   ret = btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->nleaf.pgptr);
+  load_args->nleaf.pgptr = NULL;
   if (ret != NO_ERROR)
     {
       goto end;
     }
-  load_args->nleaf.pgptr = NULL;
 
   assert (ret == NO_ERROR);
 
@@ -2039,7 +2040,8 @@ end:
  * btree_log_page () - Save the contents of the buffer
  *   return: error code
  *   vfid(in):
- *   page_ptr(in): pointer to the page buffer to be saved
+ *   page_ptr(in): pointer to the page buffer to be saved; consumed and
+ *                 unfixed on both success and failure
  *
  * Note: This function logs the contents of the given page and frees
  * the page after setting on the dirty bit.
@@ -2058,7 +2060,9 @@ btree_log_page (THREAD_ENTRY * thread_p, VFID * vfid, PAGE_PTR page_ptr)
   pgbuf_set_dirty (thread_p, page_ptr, DONT_FREE);
   if (pgbuf_flush_with_wal (thread_p, page_ptr) == NULL)
     {
-      return (er_errid () == NO_ERROR) ? ER_FAILED : er_errid ();
+      int error = (er_errid () == NO_ERROR) ? ER_FAILED : er_errid ();
+      pgbuf_unfix (thread_p, page_ptr);
+      return error;
     }
 
   pgbuf_unfix (thread_p, page_ptr);
@@ -2223,6 +2227,8 @@ btree_proceed_leaf (THREAD_ENTRY * thread_p, LOAD_ARGS * load_args)
   /* Flush the current leaf page */
   if (btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->leaf.pgptr) != NO_ERROR)
     {
+      load_args->leaf.pgptr = NULL;
+      pgbuf_unfix_and_init (thread_p, new_leafpgptr);
       return NULL;
     }
   load_args->leaf.pgptr = NULL;
@@ -2694,11 +2700,11 @@ bt_load_make_new_record_on_leaf_page (THREAD_ENTRY * thread_p, LOAD_ARGS * load_
 
       /* Save the current overflow page */
       ret = btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->ovf.pgptr);
+      load_args->ovf.pgptr = NULL;
       if (ret != NO_ERROR)
 	{
 	  return ret;
 	}
-      load_args->ovf.pgptr = NULL;
 
       /* Turn off the overflowing mode */
       load_args->overflowing = false;
@@ -2852,11 +2858,12 @@ bt_load_nospace_for_new_oid (THREAD_ENTRY * thread_p, LOAD_ARGS * load_args, int
 
       /* Save the current overflow page */
       ret = btree_log_page (thread_p, &load_args->btid->sys_btid->vfid, load_args->ovf.pgptr);
+      load_args->ovf.pgptr = NULL;
       if (ret != NO_ERROR)
 	{
+	  pgbuf_unfix_and_init (thread_p, new_ovfpgptr);
 	  return ret;
 	}
-      load_args->ovf.pgptr = NULL;
 
       /* Make the new overflow page become the current one */
       load_args->ovf.vpid = new_ovfpgid;
