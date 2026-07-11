@@ -2057,15 +2057,8 @@ btree_log_page (THREAD_ENTRY * thread_p, VFID * vfid, PAGE_PTR page_ptr)
   addr.offset = -1;		/* irrelevant */
   log_append_redo_data (thread_p, RVBT_COPYPAGE, &addr, DB_PAGESIZE, page_ptr);
 
-  pgbuf_set_dirty (thread_p, page_ptr, DONT_FREE);
-  if (pgbuf_flush_with_wal (thread_p, page_ptr) == NULL)
-    {
-      int error = (er_errid () == NO_ERROR) ? ER_FAILED : er_errid ();
-      pgbuf_unfix (thread_p, page_ptr);
-      return error;
-    }
-
-  pgbuf_unfix (thread_p, page_ptr);
+  pgbuf_set_dirty (thread_p, page_ptr, FREE);
+  page_ptr = NULL;
   return NO_ERROR;
 }
 
