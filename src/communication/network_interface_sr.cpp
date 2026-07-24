@@ -3999,7 +3999,7 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
     {
       int tag, len;
 
-      if (ptr + OR_INT_SIZE * 2 > req_end)
+      if (req_end - ptr < OR_INT_SIZE * 2)
 	{
 	  status = ER_FAILED;
 	  need_abort = true;
@@ -4007,23 +4007,30 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 	}
       ptr = or_unpack_int (ptr, &tag);
       ptr = or_unpack_int (ptr, &len);
+      if (len < 0 || (size_t) len > JDBC_DIRECT_POC_MAX_RESPONSE)
+	{
+	  /* also guards DB_ALIGN () integer overflow below */
+	  status = ER_FAILED;
+	  need_abort = true;
+	  goto cleanup;
+	}
 
       if (tag == JDBC_DIRECT_POC_TYPE_NULL && len == 0)
 	{
 	  db_make_null (&params[i]);
 	}
-      else if (tag == JDBC_DIRECT_POC_TYPE_INT && len == OR_INT_SIZE && ptr + OR_INT_SIZE <= req_end)
+      else if (tag == JDBC_DIRECT_POC_TYPE_INT && len == OR_INT_SIZE && req_end - ptr >= OR_INT_SIZE)
 	{
 	  int int_value;
 
 	  ptr = or_unpack_int (ptr, &int_value);
 	  db_make_int (&params[i], int_value);
 	}
-      else if (tag == JDBC_DIRECT_POC_TYPE_VARCHAR && len >= 0)
+      else if (tag == JDBC_DIRECT_POC_TYPE_VARCHAR)
 	{
 	  int padded_len = DB_ALIGN (len, OR_INT_SIZE);
 
-	  if (ptr + padded_len > req_end)
+	  if (req_end - ptr < padded_len)
 	    {
 	      status = ER_FAILED;
 	      need_abort = true;
@@ -4040,6 +4047,14 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 	  goto cleanup;
 	}
       param_init_count = i + 1;
+    }
+
+  if (ptr != req_end)
+    {
+      /* trailing bytes: reject the whole request instead of guessing */
+      status = ER_FAILED;
+      need_abort = true;
+      goto cleanup;
     }
 
   /* repack as the or_pack_db_value stream xqmgr_execute_query expects in SERVER_MODE */
@@ -4104,6 +4119,7 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
       for (i = 0; i < col_count; i++)
 	{
 	  DB_VALUE value;
+	  size_t needed;
 
 	  db_make_null (&value);
 	  if (qexec_get_tuple_column_value (tuple_record.tpl, i, &value, list_id->type_list.domp[i]) != NO_ERROR)
@@ -4115,11 +4131,22 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 
 	  if (DB_IS_NULL (&value))
 	    {
+	      needed = OR_INT_SIZE * 2;
+	      if (reply_buf.size () + needed > JDBC_DIRECT_POC_MAX_RESPONSE)
+		{
+		  goto response_too_large;
+		}
 	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_NULL);
 	      jdbc_direct_poc_append_int (reply_buf, 0);
 	    }
 	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_INTEGER)
 	    {
+	      needed = OR_INT_SIZE * 3;
+	      if (reply_buf.size () + needed > JDBC_DIRECT_POC_MAX_RESPONSE)
+		{
+		  pr_clear_value (&value);
+		  goto response_too_large;
+		}
 	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_INT);
 	      jdbc_direct_poc_append_int (reply_buf, OR_INT_SIZE);
 	      jdbc_direct_poc_append_int (reply_buf, db_get_int (&value));
@@ -4128,8 +4155,24 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 	    {
 	      int str_size = db_get_string_size (&value);
 	      const char *str = db_get_string (&value);
-	      int padded_size = DB_ALIGN (str_size, OR_INT_SIZE);
+	      int padded_size;
 
+	      if (str_size < 0)
+		{
+		  pr_clear_value (&value);
+		  status = ER_FAILED;
+		  need_abort = true;
+		  goto cleanup;
+		}
+	      padded_size = DB_ALIGN (str_size, OR_INT_SIZE);
+	      /* check the cap BEFORE inserting so a large value never grows the
+	       * buffer past the limit even temporarily */
+	      needed = OR_INT_SIZE * 2 + (size_t) padded_size;
+	      if (reply_buf.size () + needed > JDBC_DIRECT_POC_MAX_RESPONSE)
+		{
+		  pr_clear_value (&value);
+		  goto response_too_large;
+		}
 	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_VARCHAR);
 	      jdbc_direct_poc_append_int (reply_buf, str_size);
 	      reply_buf.insert (reply_buf.end (), str, str + str_size);
@@ -4144,14 +4187,15 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 	    }
 	  pr_clear_value (&value);
 	}
+    }
 
-      if (reply_buf.size () > JDBC_DIRECT_POC_MAX_RESPONSE)
-	{
-	  /* explicit refusal instead of silent truncation */
-	  status = ER_FAILED;
-	  need_abort = true;
-	  goto cleanup;
-	}
+  if (false)
+    {
+    response_too_large:
+      /* explicit refusal instead of silent truncation */
+      status = ER_FAILED;
+      need_abort = true;
+      goto cleanup;
     }
 
   if (scan_code != S_END)

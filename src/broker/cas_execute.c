@@ -888,6 +888,14 @@ ux_jdbc_direct_poc_take_xasl (int srv_h_id, char *packed_xasl_id, int packed_siz
       return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
     }
 
+  if (!as_info->cur_statement_pooling)
+    {
+      /* without statement pooling every CAS auto-commit frees non-holdable srv
+       * handles (ux_end_tran_cleanup), so the handle kept for CAS fallback would
+       * die immediately: decline direct eligibility */
+      return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+    }
+
   srv_handle = hm_find_srv_handle (srv_h_id);
   if (srv_handle == NULL || srv_handle->is_prepared != TRUE || srv_handle->session == NULL
       || srv_handle->q_result == NULL || srv_handle->num_q_result != 1 || srv_handle->num_markers < 0
