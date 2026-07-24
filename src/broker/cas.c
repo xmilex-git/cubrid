@@ -116,7 +116,12 @@ static T_SERVER_FUNC server_fn_table[] = {
   fn_prepare_and_execute,	/* CAS_FC_PREPARE_AND_EXECUTE */
   fn_cursor_close,		/* CAS_FC_CURSOR_CLOSE */
   fn_not_supported,		/* CAS_FC_GET_SHARD_INFO */
-  fn_set_cas_change_mode	/* CAS_FC_SET_CAS_CHANGE_MODE */
+  fn_set_cas_change_mode,	/* CAS_FC_SET_CAS_CHANGE_MODE */
+#if defined (ENABLE_JDBC_DIRECT_POC)
+  fn_jdbc_direct_poc_take_xasl	/* CAS_FC_JDBC_DIRECT_POC_TAKE_XASL */
+#else
+  fn_not_supported		/* CAS_FC_JDBC_DIRECT_POC_TAKE_XASL */
+#endif
 };
 
 static const char *server_func_name[] = {
@@ -163,7 +168,8 @@ static const char *server_func_name[] = {
   "fn_prepare_and_execute",
   "fn_cursor_close",
   "fn_get_shard_info",
-  "fn_set_cas_change_mode"
+  "fn_set_cas_change_mode",
+  "fn_jdbc_direct_poc_take_xasl"
 };
 
 

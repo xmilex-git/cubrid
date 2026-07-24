@@ -90,9 +90,9 @@
 
 
 #cmakedefine ENABLE_SYSTEMTAP 1
+#cmakedefine ENABLE_JDBC_DIRECT_POC 1
 
 #include "system.h"
 #include "version.h"
 
 #endif /* _CONFIG_H_ */
-

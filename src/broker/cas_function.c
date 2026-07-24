@@ -56,6 +56,7 @@
 #include "broker_filename.h"
 #include "dbtype.h"
 #include "db_session.h"
+#include "xasl.h"
 #include "object_primitive.h"
 
 /* ========================================================================
@@ -216,6 +217,39 @@ FN_RETURN
 fn_prepare (SOCKET sock_fd, int argc, void **argv, T_NET_BUF * net_buf, T_REQ_INFO * req_info)
 {
   return (fn_prepare_internal (sock_fd, argc, argv, net_buf, req_info, NULL));
+}
+
+FN_RETURN
+fn_jdbc_direct_poc_take_xasl (SOCKET sock_fd, int argc, void **argv, T_NET_BUF * net_buf, T_REQ_INFO * req_info)
+{
+#if defined (ENABLE_JDBC_DIRECT_POC)
+  int srv_h_id;
+  int error;
+  char packed_xasl_id[OR_XASL_ID_SIZE];
+
+  if (argc != 1)
+    {
+      ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+      NET_BUF_ERR_SET (net_buf);
+      return FN_KEEP_CONN;
+    }
+
+  net_arg_get_int (&srv_h_id, argv[0]);
+  error = ux_jdbc_direct_poc_take_xasl (srv_h_id, packed_xasl_id, sizeof (packed_xasl_id));
+  if (error != NO_ERROR)
+    {
+      NET_BUF_ERR_SET (net_buf);
+      return FN_KEEP_CONN;
+    }
+
+  net_buf_cp_int (net_buf, NO_ERROR, NULL);
+  net_buf_cp_str (net_buf, packed_xasl_id, sizeof (packed_xasl_id));
+  req_info->need_auto_commit = TRAN_AUTOCOMMIT;
+#else
+  ERROR_INFO_SET (CAS_ER_NOT_IMPLEMENTED, CAS_ERROR_INDICATOR);
+  NET_BUF_ERR_SET (net_buf);
+#endif
+  return FN_KEEP_CONN;
 }
 
 

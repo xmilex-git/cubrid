@@ -57,6 +57,8 @@
 #include "arithmetic.h"
 #include "serial.h"
 #include "query_manager.h"
+#include "query_executor.h"
+#include "list_file.h"
 #include "transaction_sr.h"
 #include "release_string.h"
 #include "critical_section.h"
@@ -86,6 +88,7 @@
 #include "xasl_cache.h"
 #include "elo.h"
 #include "transaction_transient.hpp"
+#include "client_credentials.hpp"
 #include "method_invoke_group.hpp"
 #include "log_manager.h"
 #include "crypt_opfunc.h"
@@ -142,6 +145,11 @@ static int trace_log_slow_query (THREAD_ENTRY *thread_p, EXECUTION_INFO *info, i
 static void event_log_many_ioreads (THREAD_ENTRY *thread_p, EXECUTION_INFO *info, int time, UINT64 *diff_stats);
 static void event_log_extend_pages (THREAD_ENTRY *thread_p, EXECUTION_INFO *info);
 static void set_tdes_query_exec_info (int tran_index, char *sql_user_text);
+
+#if defined (ENABLE_JDBC_DIRECT_POC)
+static const int JDBC_DIRECT_POC_PROTOCOL_VERSION = 1;
+static const int JDBC_DIRECT_POC_RESPONSE_INTS = 5;
+#endif
 
 /*
  * stran_server_commit_internal - commit transaction on server.
@@ -3849,6 +3857,172 @@ sboot_register_client (THREAD_ENTRY *thread_p, unsigned int rid, char *request, 
   };
   css_send_reply_and_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply), area, area_size,
 				     std::move (deleter));
+}
+
+void
+sjdbc_direct_poc_attach (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+{
+#if defined (ENABLE_JDBC_DIRECT_POC)
+  BOOT_CLIENT_CREDENTIAL client_credential;
+  BOOT_SERVER_CREDENTIAL server_credential;
+  TRAN_STATE tran_state = TRAN_UNACTIVE_UNKNOWN;
+  SESSION_ID session_id = DB_EMPTY_SESSION;
+  int tran_index;
+  int status = ER_FAILED;
+  char host_name[CUB_MAXHOSTNAMELEN] = "localhost";
+  OR_ALIGNED_BUF (OR_INT_SIZE * 3) a_reply;
+  char *reply = OR_ALIGNED_BUF_START (a_reply);
+  char *ptr = reply;
+
+  (void) request;
+  if (reqlen != 0 || thread_p->conn_entry->get_tran_index () != NULL_TRAN_INDEX)
+    {
+      ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
+      ptr = or_pack_int (ptr, ER_FAILED);
+      ptr = or_pack_int (ptr, NULL_TRAN_INDEX);
+      css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+      return;
+    }
+
+  (void) gethostname (host_name, sizeof (host_name));
+  client_credential.set_ids (DB_CLIENT_TYPE_DEFAULT, "jdbc-direct-poc", "PUBLIC", "cubrid-jdbc-direct-poc",
+			     "jdbc", host_name, "127.0.0.1", 0);
+  memset (&server_credential, 0, sizeof (server_credential));
+
+  tran_index = xboot_register_client (thread_p, &client_credential, TRAN_LOCK_INFINITE_WAIT,
+				      TRAN_DEFAULT_ISOLATION_LEVEL (), &tran_state, &server_credential);
+  if (tran_index != NULL_TRAN_INDEX)
+    {
+      status = xsession_create_new (thread_p, &session_id);
+      if (status != NO_ERROR)
+	{
+	  (void) xboot_unregister_client (thread_p, tran_index);
+	  tran_index = NULL_TRAN_INDEX;
+	}
+    }
+
+  ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
+  ptr = or_pack_int (ptr, tran_index == NULL_TRAN_INDEX ? status : NO_ERROR);
+  ptr = or_pack_int (ptr, tran_index);
+  css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+#else
+  css_send_abort_to_client (thread_p->conn_entry, rid);
+#endif
+}
+
+void
+sjdbc_direct_poc_execute_select1 (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+{
+#if defined (ENABLE_JDBC_DIRECT_POC)
+  XASL_ID xasl_id;
+  XASL_CACHE_ENTRY *xasl_cache_entry_p = NULL;
+  QFILE_LIST_ID *list_id = NULL;
+  QFILE_LIST_SCAN_ID scan_id;
+  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  DB_VALUE value;
+  QUERY_ID query_id = NULL_QUERY_ID;
+  QUERY_FLAG query_flag = (QUERY_FLAG) (TRAN_AUTO_COMMIT | EXECUTE_QUERY_WITH_COMMIT);
+  CACHE_TIME clt_cache_time;
+  CACHE_TIME srv_cache_time;
+  SCAN_CODE scan_code;
+  LOG_TDES *tdes;
+  TRAN_STATE tran_state = TRAN_UNACTIVE_UNKNOWN;
+  bool end_query_allowed = true;
+  bool should_conn_reset = false;
+  bool scan_open = false;
+  bool need_abort = false;
+  int status = NO_ERROR;
+  int row_count = 0;
+  int result_value = 0;
+  OR_ALIGNED_BUF (OR_INT_SIZE * JDBC_DIRECT_POC_RESPONSE_INTS) a_reply;
+  char *reply = OR_ALIGNED_BUF_START (a_reply);
+  char *ptr = reply;
+
+  db_make_null (&value);
+  CACHE_TIME_RESET (&clt_cache_time);
+  CACHE_TIME_RESET (&srv_cache_time);
+
+  if (reqlen != OR_XASL_ID_SIZE || thread_p->conn_entry->get_tran_index () == NULL_TRAN_INDEX)
+    {
+      status = ER_FAILED;
+      need_abort = true;
+      goto cleanup;
+    }
+
+  ptr = request;
+  OR_UNPACK_XASL_ID (ptr, &xasl_id);
+  xsession_set_tran_auto_commit (thread_p, true);
+  list_id = xqmgr_execute_query (thread_p, &xasl_id, &query_id, 0, NULL, &query_flag, &clt_cache_time,
+				 &srv_cache_time, 0, &xasl_cache_entry_p);
+  if (list_id == NULL || list_id->type_list.type_cnt != 1
+      || TP_DOMAIN_TYPE (list_id->type_list.domp[0]) != DB_TYPE_INTEGER)
+    {
+      status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
+      need_abort = true;
+      goto cleanup;
+    }
+
+  if (qfile_open_list_scan (list_id, &scan_id) != NO_ERROR)
+    {
+      status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
+      need_abort = true;
+      goto cleanup;
+    }
+  scan_open = true;
+
+  scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK);
+  if (scan_code != S_SUCCESS
+      || qexec_get_tuple_column_value (tuple_record.tpl, 0, &value, list_id->type_list.domp[0]) != NO_ERROR
+      || DB_IS_NULL (&value) || DB_VALUE_TYPE (&value) != DB_TYPE_INTEGER)
+    {
+      status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
+      need_abort = true;
+      goto cleanup;
+    }
+  row_count = 1;
+  result_value = db_get_int (&value);
+
+  scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK);
+  if (scan_code != S_END)
+    {
+      status = ER_FAILED;
+      need_abort = true;
+    }
+
+cleanup:
+  if (scan_open)
+    {
+      qfile_close_scan (thread_p, &scan_id);
+    }
+  db_value_clear (&value);
+  if (xasl_cache_entry_p != NULL)
+    {
+      xcache_unfix (thread_p, xasl_cache_entry_p);
+    }
+
+  tdes = LOG_FIND_CURRENT_TDES (thread_p);
+  if (tdes != NULL)
+    {
+      tran_state = tdes->state;
+    }
+  stran_server_auto_commit_or_abort (thread_p, rid, &query_id, 1, need_abort, false, &end_query_allowed,
+				     &tran_state, &should_conn_reset);
+
+  if (list_id != NULL)
+    {
+      QFILE_FREE_AND_INIT_LIST_ID (list_id);
+    }
+
+  ptr = reply;
+  ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
+  ptr = or_pack_int (ptr, status);
+  ptr = or_pack_int (ptr, row_count);
+  ptr = or_pack_int (ptr, result_value);
+  ptr = or_pack_int (ptr, (int) tran_state);
+  css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+#else
+  css_send_abort_to_client (thread_p->conn_entry, rid);
+#endif
 }
 
 /*

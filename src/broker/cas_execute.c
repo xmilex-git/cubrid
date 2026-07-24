@@ -76,6 +76,7 @@
 #include "memory_alloc.h"
 #include "object_primitive.h"
 #include "db_session.h"
+#include "xasl.h"
 #include "method_callback.hpp"
 #include "cas_optimization.h"
 #include "cas_db_inc.h"
@@ -872,6 +873,42 @@ prepare_error:
     }
   return err_code;
 }
+
+#if defined (ENABLE_JDBC_DIRECT_POC)
+int
+ux_jdbc_direct_poc_take_xasl (int srv_h_id, char *packed_xasl_id, int packed_size)
+{
+  T_SRV_HANDLE *srv_handle;
+  DB_SESSION *session;
+  PT_NODE *statement;
+  char *ptr;
+
+  if (packed_xasl_id == NULL || packed_size != OR_XASL_ID_SIZE)
+    {
+      return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+    }
+
+  srv_handle = hm_find_srv_handle (srv_h_id);
+  if (srv_handle == NULL || srv_handle->is_prepared != TRUE || srv_handle->session == NULL
+      || srv_handle->q_result == NULL || srv_handle->num_q_result != 1 || srv_handle->num_markers != 0
+      || srv_handle->q_result[0].stmt_type != CUBRID_STMT_SELECT || srv_handle->q_result[0].stmt_id <= 0)
+    {
+      return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+    }
+
+  session = (DB_SESSION *) srv_handle->session;
+  statement = session->statements[srv_handle->q_result[0].stmt_id - 1];
+  if (statement == NULL || statement->xasl_id == NULL || XASL_ID_IS_NULL (statement->xasl_id))
+    {
+      return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+    }
+
+  ptr = packed_xasl_id;
+  OR_PACK_XASL_ID (ptr, statement->xasl_id);
+  hm_srv_handle_free (srv_h_id);
+  return NO_ERROR;
+}
+#endif /* ENABLE_JDBC_DIRECT_POC */
 
 int
 ux_end_tran (int tran_type, bool reset_con_status, bool ddl_audit_log)

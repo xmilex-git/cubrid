@@ -34,6 +34,22 @@
       }
     },
     {
+      "name": "jdbc-direct-poc-debug",
+      "inherits": "debug",
+      "description": "Debug build with the experimental JDBC direct-server PoC",
+      "cacheVariables": {
+        "ENABLE_JDBC_DIRECT_POC": "ON"
+      }
+    },
+    {
+      "name": "jdbc-direct-poc-release",
+      "inherits": "release",
+      "description": "Release build with the experimental JDBC direct-server PoC",
+      "cacheVariables": {
+        "ENABLE_JDBC_DIRECT_POC": "ON"
+      }
+    },
+    {
       "name": "coverage",
       "inherits": "default",
       "description": "Coverage build",
@@ -63,6 +79,14 @@
     {
       "name": "debug",
       "configurePreset": "debug"
+    },
+    {
+      "name": "jdbc-direct-poc-debug",
+      "configurePreset": "jdbc-direct-poc-debug"
+    },
+    {
+      "name": "jdbc-direct-poc-release",
+      "configurePreset": "jdbc-direct-poc-release"
     },
     {
       "name": "coverage",
