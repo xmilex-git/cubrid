@@ -489,9 +489,9 @@ net_server_init (void)
   req_p = &net_Requests[NET_SERVER_JDBC_DIRECT_POC_ATTACH];
   req_p->processing_function = sjdbc_direct_poc_attach;
 
-  req_p = &net_Requests[NET_SERVER_JDBC_DIRECT_POC_EXECUTE_SELECT1];
+  req_p = &net_Requests[NET_SERVER_JDBC_DIRECT_POC_EXECUTE];
   req_p->action_attribute = (SET_DIAGNOSTICS_INFO | IN_TRANSACTION);
-  req_p->processing_function = sjdbc_direct_poc_execute_select1;
+  req_p->processing_function = sjdbc_direct_poc_execute;
 #endif
 
   /* query file */

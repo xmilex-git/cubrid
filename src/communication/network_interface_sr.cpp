@@ -97,6 +97,9 @@
 #include "pl_compile_handler.hpp"
 #include "pl_session.hpp"
 #include "pl_executor.hpp"
+#include "language_support.h"
+
+#include <vector>
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -147,8 +150,23 @@ static void event_log_extend_pages (THREAD_ENTRY *thread_p, EXECUTION_INFO *info
 static void set_tdes_query_exec_info (int tran_index, char *sql_user_text);
 
 #if defined (ENABLE_JDBC_DIRECT_POC)
-static const int JDBC_DIRECT_POC_PROTOCOL_VERSION = 1;
-static const int JDBC_DIRECT_POC_RESPONSE_INTS = 5;
+static const int JDBC_DIRECT_POC_PROTOCOL_VERSION = 2;
+static const int JDBC_DIRECT_POC_RESPONSE_HEADER_INTS = 5;
+static const int JDBC_DIRECT_POC_MAX_PARAMS = 64;
+static const size_t JDBC_DIRECT_POC_MAX_RESPONSE = 1024 * 1024;
+/* value type tags shared with the JDBC direct PoC client (UDirectPocConnection) */
+static const int JDBC_DIRECT_POC_TYPE_NULL = 0;
+static const int JDBC_DIRECT_POC_TYPE_INT = 1;
+static const int JDBC_DIRECT_POC_TYPE_VARCHAR = 2;
+
+static void
+jdbc_direct_poc_append_int (std::vector<char> &buf, int value)
+{
+  char tmp[OR_INT_SIZE];
+
+  or_pack_int (tmp, value);
+  buf.insert (buf.end (), tmp, tmp + OR_INT_SIZE);
+}
 #endif
 
 /*
@@ -3911,7 +3929,7 @@ sjdbc_direct_poc_attach (THREAD_ENTRY *thread_p, unsigned int rid, char *request
 }
 
 void
-sjdbc_direct_poc_execute_select1 (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
 {
 #if defined (ENABLE_JDBC_DIRECT_POC)
   XASL_ID xasl_id;
@@ -3919,30 +3937,39 @@ sjdbc_direct_poc_execute_select1 (THREAD_ENTRY *thread_p, unsigned int rid, char
   QFILE_LIST_ID *list_id = NULL;
   QFILE_LIST_SCAN_ID scan_id;
   QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
-  DB_VALUE value;
   QUERY_ID query_id = NULL_QUERY_ID;
   QUERY_FLAG query_flag = (QUERY_FLAG) (TRAN_AUTO_COMMIT | EXECUTE_QUERY_WITH_COMMIT);
   CACHE_TIME clt_cache_time;
   CACHE_TIME srv_cache_time;
-  SCAN_CODE scan_code;
+  SCAN_CODE scan_code = S_SUCCESS;
   LOG_TDES *tdes;
   TRAN_STATE tran_state = TRAN_UNACTIVE_UNKNOWN;
   bool end_query_allowed = true;
   bool should_conn_reset = false;
   bool scan_open = false;
   bool need_abort = false;
+  bool executed = false;
   int status = NO_ERROR;
   int row_count = 0;
-  int result_value = 0;
-  OR_ALIGNED_BUF (OR_INT_SIZE * JDBC_DIRECT_POC_RESPONSE_INTS) a_reply;
-  char *reply = OR_ALIGNED_BUF_START (a_reply);
-  char *ptr = reply;
+  int col_count = 0;
+  int version = 0;
+  int param_count = 0;
+  int param_init_count = 0;
+  DB_VALUE params[JDBC_DIRECT_POC_MAX_PARAMS];
+  char *packed_params = NULL;
+  char *ptr;
+  char *req_end;
+  int i;
+  std::vector<char> reply_buf;
 
-  db_make_null (&value);
   CACHE_TIME_RESET (&clt_cache_time);
   CACHE_TIME_RESET (&srv_cache_time);
 
-  if (reqlen != OR_XASL_ID_SIZE || thread_p->conn_entry->get_tran_index () == NULL_TRAN_INDEX)
+  /* reserve space for the reply header: version, status, tran_state, row_count, col_count */
+  reply_buf.resize (OR_INT_SIZE * JDBC_DIRECT_POC_RESPONSE_HEADER_INTS, 0);
+
+  if (reqlen < (int) (OR_INT_SIZE * 2 + OR_XASL_ID_SIZE)
+      || thread_p->conn_entry->get_tran_index () == NULL_TRAN_INDEX)
     {
       status = ER_FAILED;
       need_abort = true;
@@ -3950,16 +3977,117 @@ sjdbc_direct_poc_execute_select1 (THREAD_ENTRY *thread_p, unsigned int rid, char
     }
 
   ptr = request;
+  req_end = request + reqlen;
+  ptr = or_unpack_int (ptr, &version);
+  if (version != JDBC_DIRECT_POC_PROTOCOL_VERSION)
+    {
+      status = ER_FAILED;
+      need_abort = true;
+      goto cleanup;
+    }
   OR_UNPACK_XASL_ID (ptr, &xasl_id);
+  ptr = or_unpack_int (ptr, &param_count);
+  if (param_count < 0 || param_count > JDBC_DIRECT_POC_MAX_PARAMS)
+    {
+      status = ER_FAILED;
+      need_abort = true;
+      goto cleanup;
+    }
+
+  /* decode TLV bind parameters: {type tag, byte length, payload padded to 4} */
+  for (i = 0; i < param_count; i++)
+    {
+      int tag, len;
+
+      if (ptr + OR_INT_SIZE * 2 > req_end)
+	{
+	  status = ER_FAILED;
+	  need_abort = true;
+	  goto cleanup;
+	}
+      ptr = or_unpack_int (ptr, &tag);
+      ptr = or_unpack_int (ptr, &len);
+
+      if (tag == JDBC_DIRECT_POC_TYPE_NULL && len == 0)
+	{
+	  db_make_null (&params[i]);
+	}
+      else if (tag == JDBC_DIRECT_POC_TYPE_INT && len == OR_INT_SIZE && ptr + OR_INT_SIZE <= req_end)
+	{
+	  int int_value;
+
+	  ptr = or_unpack_int (ptr, &int_value);
+	  db_make_int (&params[i], int_value);
+	}
+      else if (tag == JDBC_DIRECT_POC_TYPE_VARCHAR && len >= 0)
+	{
+	  int padded_len = DB_ALIGN (len, OR_INT_SIZE);
+
+	  if (ptr + padded_len > req_end)
+	    {
+	      status = ER_FAILED;
+	      need_abort = true;
+	      goto cleanup;
+	    }
+	  /* borrowed pointer into the request buffer; valid for this synchronous handler */
+	  db_make_varchar (&params[i], TP_FLOATING_PRECISION_VALUE, ptr, len, LANG_SYS_CODESET, LANG_SYS_COLLATION);
+	  ptr += padded_len;
+	}
+      else
+	{
+	  status = ER_FAILED;
+	  need_abort = true;
+	  goto cleanup;
+	}
+      param_init_count = i + 1;
+    }
+
+  /* repack as the or_pack_db_value stream xqmgr_execute_query expects in SERVER_MODE */
+  if (param_count > 0)
+    {
+      size_t packed_size = 0;
+      char *pp;
+
+      for (i = 0; i < param_count; i++)
+	{
+	  packed_size += OR_VALUE_ALIGNED_SIZE (&params[i]);
+	}
+      packed_params = (char *) db_private_alloc (thread_p, packed_size);
+      if (packed_params == NULL)
+	{
+	  status = ER_OUT_OF_VIRTUAL_MEMORY;
+	  need_abort = true;
+	  goto cleanup;
+	}
+      pp = packed_params;
+      for (i = 0; i < param_count; i++)
+	{
+	  pp = or_pack_db_value (pp, &params[i]);
+	}
+    }
+
   xsession_set_tran_auto_commit (thread_p, true);
-  list_id = xqmgr_execute_query (thread_p, &xasl_id, &query_id, 0, NULL, &query_flag, &clt_cache_time,
-				 &srv_cache_time, 0, &xasl_cache_entry_p);
-  if (list_id == NULL || list_id->type_list.type_cnt != 1
-      || TP_DOMAIN_TYPE (list_id->type_list.domp[0]) != DB_TYPE_INTEGER)
+  list_id = xqmgr_execute_query (thread_p, &xasl_id, &query_id, param_count, packed_params, &query_flag,
+				 &clt_cache_time, &srv_cache_time, 0, &xasl_cache_entry_p);
+  executed = true;
+  if (list_id == NULL)
     {
       status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
       need_abort = true;
       goto cleanup;
+    }
+
+  col_count = list_id->type_list.type_cnt;
+  for (i = 0; i < col_count; i++)
+    {
+      DB_TYPE col_type = TP_DOMAIN_TYPE (list_id->type_list.domp[i]);
+
+      if (col_type != DB_TYPE_INTEGER && col_type != DB_TYPE_VARCHAR)
+	{
+	  status = ER_FAILED;
+	  need_abort = true;
+	  goto cleanup;
+	}
     }
 
   if (qfile_open_list_scan (list_id, &scan_id) != NO_ERROR)
@@ -3970,22 +4098,65 @@ sjdbc_direct_poc_execute_select1 (THREAD_ENTRY *thread_p, unsigned int rid, char
     }
   scan_open = true;
 
-  scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK);
-  if (scan_code != S_SUCCESS
-      || qexec_get_tuple_column_value (tuple_record.tpl, 0, &value, list_id->type_list.domp[0]) != NO_ERROR
-      || DB_IS_NULL (&value) || DB_VALUE_TYPE (&value) != DB_TYPE_INTEGER)
+  while ((scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK)) == S_SUCCESS)
     {
-      status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
-      need_abort = true;
-      goto cleanup;
-    }
-  row_count = 1;
-  result_value = db_get_int (&value);
+      row_count++;
+      for (i = 0; i < col_count; i++)
+	{
+	  DB_VALUE value;
 
-  scan_code = qfile_scan_list_next (thread_p, &scan_id, &tuple_record, PEEK);
+	  db_make_null (&value);
+	  if (qexec_get_tuple_column_value (tuple_record.tpl, i, &value, list_id->type_list.domp[i]) != NO_ERROR)
+	    {
+	      status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
+	      need_abort = true;
+	      goto cleanup;
+	    }
+
+	  if (DB_IS_NULL (&value))
+	    {
+	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_NULL);
+	      jdbc_direct_poc_append_int (reply_buf, 0);
+	    }
+	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_INTEGER)
+	    {
+	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_INT);
+	      jdbc_direct_poc_append_int (reply_buf, OR_INT_SIZE);
+	      jdbc_direct_poc_append_int (reply_buf, db_get_int (&value));
+	    }
+	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_VARCHAR)
+	    {
+	      int str_size = db_get_string_size (&value);
+	      const char *str = db_get_string (&value);
+	      int padded_size = DB_ALIGN (str_size, OR_INT_SIZE);
+
+	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_VARCHAR);
+	      jdbc_direct_poc_append_int (reply_buf, str_size);
+	      reply_buf.insert (reply_buf.end (), str, str + str_size);
+	      reply_buf.insert (reply_buf.end (), padded_size - str_size, 0);
+	    }
+	  else
+	    {
+	      pr_clear_value (&value);
+	      status = ER_FAILED;
+	      need_abort = true;
+	      goto cleanup;
+	    }
+	  pr_clear_value (&value);
+	}
+
+      if (reply_buf.size () > JDBC_DIRECT_POC_MAX_RESPONSE)
+	{
+	  /* explicit refusal instead of silent truncation */
+	  status = ER_FAILED;
+	  need_abort = true;
+	  goto cleanup;
+	}
+    }
+
   if (scan_code != S_END)
     {
-      status = ER_FAILED;
+      status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
       need_abort = true;
     }
 
@@ -3994,32 +4165,49 @@ cleanup:
     {
       qfile_close_scan (thread_p, &scan_id);
     }
-  db_value_clear (&value);
+  for (i = 0; i < param_init_count; i++)
+    {
+      pr_clear_value (&params[i]);
+    }
+  if (packed_params != NULL)
+    {
+      db_private_free_and_init (thread_p, packed_params);
+    }
   if (xasl_cache_entry_p != NULL)
     {
       xcache_unfix (thread_p, xasl_cache_entry_p);
     }
 
-  tdes = LOG_FIND_CURRENT_TDES (thread_p);
-  if (tdes != NULL)
+  if (executed || need_abort)
     {
-      tran_state = tdes->state;
+      tdes = LOG_FIND_CURRENT_TDES (thread_p);
+      if (tdes != NULL)
+	{
+	  tran_state = tdes->state;
+	}
+      stran_server_auto_commit_or_abort (thread_p, rid, &query_id, 1, need_abort, false, &end_query_allowed,
+					 &tran_state, &should_conn_reset);
     }
-  stran_server_auto_commit_or_abort (thread_p, rid, &query_id, 1, need_abort, false, &end_query_allowed,
-				     &tran_state, &should_conn_reset);
 
   if (list_id != NULL)
     {
       QFILE_FREE_AND_INIT_LIST_ID (list_id);
     }
 
-  ptr = reply;
+  if (status != NO_ERROR)
+    {
+      row_count = 0;
+      col_count = 0;
+      reply_buf.resize (OR_INT_SIZE * JDBC_DIRECT_POC_RESPONSE_HEADER_INTS);
+    }
+
+  ptr = reply_buf.data ();
   ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
   ptr = or_pack_int (ptr, status);
-  ptr = or_pack_int (ptr, row_count);
-  ptr = or_pack_int (ptr, result_value);
   ptr = or_pack_int (ptr, (int) tran_state);
-  css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+  ptr = or_pack_int (ptr, row_count);
+  ptr = or_pack_int (ptr, col_count);
+  css_send_data_to_client (thread_p->conn_entry, rid, reply_buf.data (), (int) reply_buf.size ());
 #else
   css_send_abort_to_client (thread_p->conn_entry, rid);
 #endif

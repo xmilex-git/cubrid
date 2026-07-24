@@ -890,7 +890,7 @@ ux_jdbc_direct_poc_take_xasl (int srv_h_id, char *packed_xasl_id, int packed_siz
 
   srv_handle = hm_find_srv_handle (srv_h_id);
   if (srv_handle == NULL || srv_handle->is_prepared != TRUE || srv_handle->session == NULL
-      || srv_handle->q_result == NULL || srv_handle->num_q_result != 1 || srv_handle->num_markers != 0
+      || srv_handle->q_result == NULL || srv_handle->num_q_result != 1 || srv_handle->num_markers < 0
       || srv_handle->q_result[0].stmt_type != CUBRID_STMT_SELECT || srv_handle->q_result[0].stmt_id <= 0)
     {
       return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
@@ -905,7 +905,8 @@ ux_jdbc_direct_poc_take_xasl (int srv_h_id, char *packed_xasl_id, int packed_siz
 
   ptr = packed_xasl_id;
   OR_PACK_XASL_ID (ptr, statement->xasl_id);
-  hm_srv_handle_free (srv_h_id);
+  /* keep the srv handle alive: the statement may still fall back to the CAS
+   * execute path (e.g. unsupported bind type demotion) and is closed normally */
   return NO_ERROR;
 }
 #endif /* ENABLE_JDBC_DIRECT_POC */

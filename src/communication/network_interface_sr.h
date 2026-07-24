@@ -272,7 +272,7 @@ extern void stdes_set_query_start_info (THREAD_ENTRY * thread_p, unsigned int ri
 extern void stdes_reset_query_start_info (THREAD_ENTRY * thread_p, unsigned int rid, char *request, int reqlen);
 
 extern void sjdbc_direct_poc_attach (THREAD_ENTRY * thread_p, unsigned int rid, char *request, int reqlen);
-extern void sjdbc_direct_poc_execute_select1 (THREAD_ENTRY * thread_p, unsigned int rid, char *request, int reqlen);
+extern void sjdbc_direct_poc_execute (THREAD_ENTRY * thread_p, unsigned int rid, char *request, int reqlen);
 
 /* file manager */
 extern void sfile_tracker_dump_file_list (THREAD_ENTRY * thread_p, unsigned int rid, char *request, int reqlen);
