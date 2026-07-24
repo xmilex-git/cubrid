@@ -899,14 +899,41 @@ ux_jdbc_direct_poc_take_xasl (int srv_h_id, char *packed_xasl_id, int packed_siz
   srv_handle = hm_find_srv_handle (srv_h_id);
   if (srv_handle == NULL || srv_handle->is_prepared != TRUE || srv_handle->session == NULL
       || srv_handle->q_result == NULL || srv_handle->num_q_result != 1 || srv_handle->num_markers < 0
-      || srv_handle->q_result[0].stmt_type != CUBRID_STMT_SELECT || srv_handle->q_result[0].stmt_id <= 0)
+      || srv_handle->q_result[0].stmt_id <= 0)
     {
+      return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+    }
+
+  switch (srv_handle->q_result[0].stmt_type)
+    {
+    case CUBRID_STMT_SELECT:
+    case CUBRID_STMT_UPDATE:
+    case CUBRID_STMT_DELETE:
+    case CUBRID_STMT_INSERT:
+      break;
+    default:
       return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
     }
 
   session = (DB_SESSION *) srv_handle->session;
   statement = session->statements[srv_handle->q_result[0].stmt_id - 1];
   if (statement == NULL || statement->xasl_id == NULL || XASL_ID_IS_NULL (statement->xasl_id))
+    {
+      return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+    }
+
+  /* auto-parameterized literals would not be shipped by the direct client, so
+   * the XASL's host variable count would not match the JDBC markers: decline */
+  if (session->parser == NULL || session->parser->auto_param_count != 0)
+    {
+      return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
+    }
+
+  /* client-side DML needs post-processing the direct path cannot run: decline
+   * anything but fully server-side DML */
+  if ((statement->node_type == PT_UPDATE && !statement->info.update.server_update)
+      || (statement->node_type == PT_DELETE && !statement->info.delete_.server_delete)
+      || (statement->node_type == PT_INSERT && statement->info.insert.server_allowed != SERVER_INSERT_IS_ALLOWED))
     {
       return ERROR_INFO_SET (CAS_ER_ARGS, CAS_ERROR_INDICATOR);
     }

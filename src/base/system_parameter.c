@@ -11269,6 +11269,45 @@ error:
 }
 
 /*
+ * sysprm_alloc_session_parameters_default () - allocates an array of session
+ *		parameters initialized from the current server-side parameter
+ *		values. Used for sessions created without a client parameter
+ *		push (e.g. the experimental JDBC direct attach).
+ *
+ * return : NULL or pointer to array of session parameters (malloc'ed; the
+ *	    caller/session takes ownership)
+ */
+SESSION_PARAM *
+sysprm_alloc_session_parameters_default (void)
+{
+  SESSION_PARAM *session_params;
+  SESSION_PARAM *sprm;
+  int i, n = 0;
+
+  session_params = sysprm_alloc_session_parameters ();
+  if (session_params == NULL)
+    {
+      return NULL;
+    }
+
+  for (i = 0; i < MAX_SYSTEM_PARAMS; i++)
+    {
+      if (PRM_IS_FOR_SESSION (GET_PRM (i)))
+	{
+	  sprm = &session_params[n++];
+	  sprm->prm_id = (PARAM_ID) i;
+	  sprm->flag = GET_PRM (i)->dynamic_flag;
+	  sprm->datatype = GET_PRM (i)->datatype;
+	  sysprm_set_sysprm_value_from_parameter (&sprm->value, GET_PRM (i));
+	  sysprm_update_session_prm_flag_allocated (sprm);
+	}
+    }
+  assert (n == NUM_SESSION_PRM);
+
+  return session_params;
+}
+
+/*
  * sysprm_pack_assign_values () - packs a list of SYSPRM_ASSIGN_VALUEs.
  *
  * return	      : pointer after the packed list.

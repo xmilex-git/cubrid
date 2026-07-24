@@ -759,6 +759,7 @@ extern "C"
   extern int sysprm_get_force_server_parameters (SYSPRM_ASSIGN_VALUE ** change_values);
   extern void sysprm_tune_client_parameters (void);
   extern void sysprm_free_session_parameters (SESSION_PARAM ** session_parameters);
+  extern SESSION_PARAM *sysprm_alloc_session_parameters_default (void);
 
 #if !defined (CS_MODE)
   extern void xsysprm_change_server_parameters (const SYSPRM_ASSIGN_VALUE * assignments);

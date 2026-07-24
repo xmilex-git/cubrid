@@ -150,14 +150,23 @@ static void event_log_extend_pages (THREAD_ENTRY *thread_p, EXECUTION_INFO *info
 static void set_tdes_query_exec_info (int tran_index, char *sql_user_text);
 
 #if defined (ENABLE_JDBC_DIRECT_POC)
-static const int JDBC_DIRECT_POC_PROTOCOL_VERSION = 2;
-static const int JDBC_DIRECT_POC_RESPONSE_HEADER_INTS = 5;
+static const int JDBC_DIRECT_POC_PROTOCOL_VERSION = 3;
+static const int JDBC_DIRECT_POC_RESPONSE_HEADER_INTS = 6;
 static const int JDBC_DIRECT_POC_MAX_PARAMS = 64;
 static const size_t JDBC_DIRECT_POC_MAX_RESPONSE = 1024 * 1024;
+static const size_t JDBC_DIRECT_POC_MAX_ERROR_MSG = 4096;
+static const int JDBC_DIRECT_POC_MAX_USER_LEN = 256;
 /* value type tags shared with the JDBC direct PoC client (UDirectPocConnection) */
 static const int JDBC_DIRECT_POC_TYPE_NULL = 0;
 static const int JDBC_DIRECT_POC_TYPE_INT = 1;
 static const int JDBC_DIRECT_POC_TYPE_VARCHAR = 2;
+static const int JDBC_DIRECT_POC_TYPE_BIGINT = 3;
+static const int JDBC_DIRECT_POC_TYPE_SHORT = 4;
+static const int JDBC_DIRECT_POC_TYPE_FLOAT = 5;
+static const int JDBC_DIRECT_POC_TYPE_DOUBLE = 6;
+static const int JDBC_DIRECT_POC_TYPE_CHAR = 7;
+static const int JDBC_DIRECT_POC_STMT_SELECT = 0;
+static const int JDBC_DIRECT_POC_STMT_DML = 1;
 
 static void
 jdbc_direct_poc_append_int (std::vector<char> &buf, int value)
@@ -3892,8 +3901,11 @@ sjdbc_direct_poc_attach (THREAD_ENTRY *thread_p, unsigned int rid, char *request
   char *reply = OR_ALIGNED_BUF_START (a_reply);
   char *ptr = reply;
 
-  (void) request;
-  if (reqlen != 0 || thread_p->conn_entry->get_tran_index () != NULL_TRAN_INDEX)
+  int version = 0;
+  int user_len = 0;
+  char db_user[JDBC_DIRECT_POC_MAX_USER_LEN + 1] = "PUBLIC";
+
+  if (reqlen < OR_INT_SIZE * 2 || thread_p->conn_entry->get_tran_index () != NULL_TRAN_INDEX)
     {
       ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
       ptr = or_pack_int (ptr, ER_FAILED);
@@ -3902,8 +3914,30 @@ sjdbc_direct_poc_attach (THREAD_ENTRY *thread_p, unsigned int rid, char *request
       return;
     }
 
+  /* request: {version, user_len, user bytes padded to 4}; the db_user was already
+   * authenticated by the CAS at broker connect (au_login) — reuse the same
+   * xboot_register_client credential path CAS-tier clients use */
+  ptr = request;
+  ptr = or_unpack_int (ptr, &version);
+  ptr = or_unpack_int (ptr, &user_len);
+  if (version != JDBC_DIRECT_POC_PROTOCOL_VERSION || user_len < 0 || user_len > JDBC_DIRECT_POC_MAX_USER_LEN
+      || OR_INT_SIZE * 2 + DB_ALIGN (user_len, OR_INT_SIZE) != reqlen)
+    {
+      ptr = reply;
+      ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
+      ptr = or_pack_int (ptr, ER_FAILED);
+      ptr = or_pack_int (ptr, NULL_TRAN_INDEX);
+      css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+      return;
+    }
+  if (user_len > 0)
+    {
+      memcpy (db_user, ptr, user_len);
+      db_user[user_len] = '\0';
+    }
+
   (void) gethostname (host_name, sizeof (host_name));
-  client_credential.set_ids (DB_CLIENT_TYPE_DEFAULT, "jdbc-direct-poc", "PUBLIC", "cubrid-jdbc-direct-poc",
+  client_credential.set_ids (DB_CLIENT_TYPE_DEFAULT, "jdbc-direct-poc", db_user, "cubrid-jdbc-direct-poc",
 			     "jdbc", host_name, "127.0.0.1", 0);
   memset (&server_credential, 0, sizeof (server_credential));
 
@@ -3912,6 +3946,22 @@ sjdbc_direct_poc_attach (THREAD_ENTRY *thread_p, unsigned int rid, char *request
   if (tran_index != NULL_TRAN_INDEX)
     {
       status = xsession_create_new (thread_p, &session_id);
+      if (status == NO_ERROR)
+	{
+	  /* the direct client pushes no session parameters at connect (unlike CS
+	   * clients), so bind server-side defaults: session-scoped prm reads
+	   * (e.g. check_hash_list_scan) dereference them during execution */
+	  SESSION_PARAM *session_prms = sysprm_alloc_session_parameters_default ();
+
+	  if (session_prms == NULL || session_set_session_parameters (thread_p, session_prms) != NO_ERROR)
+	    {
+	      if (session_prms != NULL)
+		{
+		  sysprm_free_session_parameters (&session_prms);
+		}
+	      status = ER_FAILED;
+	    }
+	}
       if (status != NO_ERROR)
 	{
 	  (void) xboot_unregister_client (thread_p, tran_index);
@@ -3919,6 +3969,7 @@ sjdbc_direct_poc_attach (THREAD_ENTRY *thread_p, unsigned int rid, char *request
 	}
     }
 
+  ptr = reply;
   ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
   ptr = or_pack_int (ptr, tran_index == NULL_TRAN_INDEX ? status : NO_ERROR);
   ptr = or_pack_int (ptr, tran_index);
@@ -3952,7 +4003,9 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
   int status = NO_ERROR;
   int row_count = 0;
   int col_count = 0;
+  int affected_rows = -1;
   int version = 0;
+  int stmt_kind = 0;
   int param_count = 0;
   int param_init_count = 0;
   DB_VALUE params[JDBC_DIRECT_POC_MAX_PARAMS];
@@ -3961,14 +4014,15 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
   char *req_end;
   int i;
   std::vector<char> reply_buf;
+  std::string err_msg_saved;
 
   CACHE_TIME_RESET (&clt_cache_time);
   CACHE_TIME_RESET (&srv_cache_time);
 
-  /* reserve space for the reply header: version, status, tran_state, row_count, col_count */
+  /* reserve space for the reply header: version, status, tran_state, affected_rows, row_count, col_count */
   reply_buf.resize (OR_INT_SIZE * JDBC_DIRECT_POC_RESPONSE_HEADER_INTS, 0);
 
-  if (reqlen < (int) (OR_INT_SIZE * 2 + OR_XASL_ID_SIZE)
+  if (reqlen < (int) (OR_INT_SIZE * 3 + OR_XASL_ID_SIZE)
       || thread_p->conn_entry->get_tran_index () == NULL_TRAN_INDEX)
     {
       status = ER_FAILED;
@@ -3980,6 +4034,13 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
   req_end = request + reqlen;
   ptr = or_unpack_int (ptr, &version);
   if (version != JDBC_DIRECT_POC_PROTOCOL_VERSION)
+    {
+      status = ER_FAILED;
+      need_abort = true;
+      goto cleanup;
+    }
+  ptr = or_unpack_int (ptr, &stmt_kind);
+  if (stmt_kind != JDBC_DIRECT_POC_STMT_SELECT && stmt_kind != JDBC_DIRECT_POC_STMT_DML)
     {
       status = ER_FAILED;
       need_abort = true;
@@ -4025,6 +4086,37 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 
 	  ptr = or_unpack_int (ptr, &int_value);
 	  db_make_int (&params[i], int_value);
+	}
+      else if (tag == JDBC_DIRECT_POC_TYPE_SHORT && len == OR_INT_SIZE && req_end - ptr >= OR_INT_SIZE)
+	{
+	  int int_value;
+
+	  ptr = or_unpack_int (ptr, &int_value);
+	  db_make_short (&params[i], (short) int_value);
+	}
+      else if (tag == JDBC_DIRECT_POC_TYPE_BIGINT && len == OR_BIGINT_SIZE && req_end - ptr >= OR_BIGINT_SIZE)
+	{
+	  DB_BIGINT bi;
+
+	  OR_GET_BIGINT (ptr, &bi);
+	  ptr += OR_BIGINT_SIZE;
+	  db_make_bigint (&params[i], bi);
+	}
+      else if (tag == JDBC_DIRECT_POC_TYPE_FLOAT && len == OR_FLOAT_SIZE && req_end - ptr >= OR_FLOAT_SIZE)
+	{
+	  float f;
+
+	  OR_GET_FLOAT (ptr, &f);
+	  ptr += OR_FLOAT_SIZE;
+	  db_make_float (&params[i], f);
+	}
+      else if (tag == JDBC_DIRECT_POC_TYPE_DOUBLE && len == OR_DOUBLE_SIZE && req_end - ptr >= OR_DOUBLE_SIZE)
+	{
+	  double d;
+
+	  OR_GET_DOUBLE (ptr, &d);
+	  ptr += OR_DOUBLE_SIZE;
+	  db_make_double (&params[i], d);
 	}
       else if (tag == JDBC_DIRECT_POC_TYPE_VARCHAR)
 	{
@@ -4089,19 +4181,38 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
     {
       status = er_errid () == NO_ERROR ? ER_FAILED : er_errid ();
       need_abort = true;
+      if (er_errid () == NO_ERROR)
+	{
+	  err_msg_saved = "direct-diag: xqmgr_execute_query returned NULL without error state";
+	  goto cleanup_skip_msg;
+	}
       goto cleanup;
     }
 
+  if (stmt_kind == JDBC_DIRECT_POC_STMT_DML)
+    {
+      /* server-side DML: tuple_cnt carries the affected-row count (the list may
+       * hold an internal OID column for UPDATE/DELETE — never serialized) */
+      affected_rows = list_id->tuple_cnt;
+      goto cleanup;
+    }
   col_count = list_id->type_list.type_cnt;
   for (i = 0; i < col_count; i++)
     {
       DB_TYPE col_type = TP_DOMAIN_TYPE (list_id->type_list.domp[i]);
 
-      if (col_type != DB_TYPE_INTEGER && col_type != DB_TYPE_VARCHAR)
+      if (col_type != DB_TYPE_INTEGER && col_type != DB_TYPE_VARCHAR && col_type != DB_TYPE_BIGINT
+	  && col_type != DB_TYPE_SHORT && col_type != DB_TYPE_FLOAT && col_type != DB_TYPE_DOUBLE
+	  && col_type != DB_TYPE_CHAR)
 	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
+	  err_msg_saved = "direct-diag: unsupported result column type "
+			  + std::to_string ((int) col_type) + " at col " + std::to_string (i)
+			  + " of " + std::to_string (col_count) + ", tuple_cnt="
+			  + std::to_string (list_id->tuple_cnt);
 	  status = ER_FAILED;
 	  need_abort = true;
-	  goto cleanup;
+	  goto cleanup_skip_msg;
 	}
     }
 
@@ -4151,11 +4262,71 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 	      jdbc_direct_poc_append_int (reply_buf, OR_INT_SIZE);
 	      jdbc_direct_poc_append_int (reply_buf, db_get_int (&value));
 	    }
-	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_VARCHAR)
+	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_SHORT)
+	    {
+	      needed = OR_INT_SIZE * 3;
+	      if (reply_buf.size () + needed > JDBC_DIRECT_POC_MAX_RESPONSE)
+		{
+		  pr_clear_value (&value);
+		  goto response_too_large;
+		}
+	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_SHORT);
+	      jdbc_direct_poc_append_int (reply_buf, OR_INT_SIZE);
+	      jdbc_direct_poc_append_int (reply_buf, (int) db_get_short (&value));
+	    }
+	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_BIGINT)
+	    {
+	      char tmp[OR_BIGINT_SIZE];
+	      DB_BIGINT bi = db_get_bigint (&value);
+
+	      needed = OR_INT_SIZE * 2 + OR_BIGINT_SIZE;
+	      if (reply_buf.size () + needed > JDBC_DIRECT_POC_MAX_RESPONSE)
+		{
+		  pr_clear_value (&value);
+		  goto response_too_large;
+		}
+	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_BIGINT);
+	      jdbc_direct_poc_append_int (reply_buf, OR_BIGINT_SIZE);
+	      OR_PUT_BIGINT (tmp, &bi);
+	      reply_buf.insert (reply_buf.end (), tmp, tmp + OR_BIGINT_SIZE);
+	    }
+	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_FLOAT)
+	    {
+	      char tmp[OR_FLOAT_SIZE];
+
+	      needed = OR_INT_SIZE * 2 + OR_FLOAT_SIZE;
+	      if (reply_buf.size () + needed > JDBC_DIRECT_POC_MAX_RESPONSE)
+		{
+		  pr_clear_value (&value);
+		  goto response_too_large;
+		}
+	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_FLOAT);
+	      jdbc_direct_poc_append_int (reply_buf, OR_FLOAT_SIZE);
+	      OR_PUT_FLOAT (tmp, db_get_float (&value));
+	      reply_buf.insert (reply_buf.end (), tmp, tmp + OR_FLOAT_SIZE);
+	    }
+	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_DOUBLE)
+	    {
+	      char tmp[OR_DOUBLE_SIZE];
+
+	      needed = OR_INT_SIZE * 2 + OR_DOUBLE_SIZE;
+	      if (reply_buf.size () + needed > JDBC_DIRECT_POC_MAX_RESPONSE)
+		{
+		  pr_clear_value (&value);
+		  goto response_too_large;
+		}
+	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_DOUBLE);
+	      jdbc_direct_poc_append_int (reply_buf, OR_DOUBLE_SIZE);
+	      OR_PUT_DOUBLE (tmp, db_get_double (&value));
+	      reply_buf.insert (reply_buf.end (), tmp, tmp + OR_DOUBLE_SIZE);
+	    }
+	  else if (DB_VALUE_TYPE (&value) == DB_TYPE_VARCHAR || DB_VALUE_TYPE (&value) == DB_TYPE_CHAR)
 	    {
 	      int str_size = db_get_string_size (&value);
 	      const char *str = db_get_string (&value);
 	      int padded_size;
+	      int tag = DB_VALUE_TYPE (&value) == DB_TYPE_CHAR ? JDBC_DIRECT_POC_TYPE_CHAR
+			: JDBC_DIRECT_POC_TYPE_VARCHAR;
 
 	      if (str_size < 0)
 		{
@@ -4173,7 +4344,7 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
 		  pr_clear_value (&value);
 		  goto response_too_large;
 		}
-	      jdbc_direct_poc_append_int (reply_buf, JDBC_DIRECT_POC_TYPE_VARCHAR);
+	      jdbc_direct_poc_append_int (reply_buf, tag);
 	      jdbc_direct_poc_append_int (reply_buf, str_size);
 	      reply_buf.insert (reply_buf.end (), str, str + str_size);
 	      reply_buf.insert (reply_buf.end (), padded_size - str_size, 0);
@@ -4205,6 +4376,12 @@ sjdbc_direct_poc_execute (THREAD_ENTRY *thread_p, unsigned int rid, char *reques
     }
 
 cleanup:
+  if (status != NO_ERROR && er_msg () != NULL)
+    {
+      /* capture before commit/abort below can overwrite the thread error */
+      err_msg_saved = er_msg ();
+    }
+cleanup_skip_msg:
   if (scan_open)
     {
       qfile_close_scan (thread_p, &scan_id);
@@ -4240,15 +4417,33 @@ cleanup:
 
   if (status != NO_ERROR)
     {
+      size_t msg_len = err_msg_saved.size ();
+      size_t padded_msg_len;
+
+      if (msg_len > JDBC_DIRECT_POC_MAX_ERROR_MSG)
+	{
+	  msg_len = JDBC_DIRECT_POC_MAX_ERROR_MSG;
+	}
+      padded_msg_len = DB_ALIGN (msg_len, OR_INT_SIZE);
+
       row_count = 0;
       col_count = 0;
+      affected_rows = -1;
+      /* failure payload = {msg_len, msg bytes padded to 4} */
       reply_buf.resize (OR_INT_SIZE * JDBC_DIRECT_POC_RESPONSE_HEADER_INTS);
+      jdbc_direct_poc_append_int (reply_buf, (int) msg_len);
+      if (msg_len > 0)
+	{
+	  reply_buf.insert (reply_buf.end (), err_msg_saved.data (), err_msg_saved.data () + msg_len);
+	  reply_buf.insert (reply_buf.end (), padded_msg_len - msg_len, 0);
+	}
     }
 
   ptr = reply_buf.data ();
   ptr = or_pack_int (ptr, JDBC_DIRECT_POC_PROTOCOL_VERSION);
   ptr = or_pack_int (ptr, status);
   ptr = or_pack_int (ptr, (int) tran_state);
+  ptr = or_pack_int (ptr, affected_rows);
   ptr = or_pack_int (ptr, row_count);
   ptr = or_pack_int (ptr, col_count);
   css_send_data_to_client (thread_p->conn_entry, rid, reply_buf.data (), (int) reply_buf.size ());
