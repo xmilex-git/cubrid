@@ -56,7 +56,7 @@ static inline bool eval_rel_cmp_fastpath (DB_VALUE * v1, DB_VALUE * v2, bool tot
 static DB_LOGICAL eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid);
 static bool eval_pred_and_comp_is_comp_term (const PRED_EXPR * pr);
 static DB_LOGICAL eval_pred_and_comp_leaf (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd,
-					    OID * obj_oid);
+					    OID * obj_oid, bool * delegated);
 static DB_LOGICAL eval_some_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator);
 static DB_LOGICAL eval_all_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator);
 static int eval_item_card_set (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator);
@@ -2298,13 +2298,13 @@ exit:
 }
 
 /*
- * eval_pred_and_comp_is_comp_term () - CBRD-27190 [Delta5] P2-A: true iff pr is a "class-1"
- *                       (COMP-inline) leaf per the plan's hybrid-walker design - a plain
- *                       T_COMP_EVAL_TERM leaf that eval_pred_and_comp_leaf ()/eval_fnc ()
- *                       would otherwise dispatch to eval_pred_comp0 () (not comp1/comp2/
- *                       comp3, i.e. not R_NULL/R_EXISTS/TYPE_LIST_ID). Used to recognize the
- *                       xasl_generation.c:1815-1819 two-sided RANGE producer shape (a nested
- *                       B_AND of exactly two such leaves), one bounded lhs level.
+ * eval_pred_and_comp_is_comp_term () - CBRD-27190 [Delta5]: true iff pr is a
+ *                       comp0-class T_COMP_EVAL_TERM leaf: its relational operator is
+ *                       not R_NULL, R_EXISTS or R_EQ_TORDER, and neither operand is TYPE_LIST_ID.
+ *                       Used to recognize both inline leaves and the xasl_generation.c:1815-1819
+ *                       two-sided RANGE producer shape (a nested B_AND of exactly two such
+ *                       leaves), one bounded lhs level. All other term kinds intentionally
+ *                       DELEGATE to eval_pred () so their pre-change behavior is retained.
  *   return: bool
  *   pr(in): a PRED_EXPR node (candidate nested lhs/rhs of a RANGE-pair leaf)
  */
@@ -2320,79 +2320,43 @@ eval_pred_and_comp_is_comp_term (const PRED_EXPR * pr)
 
   et_comp = &pr->pe.m_eval_term.et.et_comp;
 
-  return (et_comp->rel_op != R_NULL && et_comp->rel_op != R_EXISTS && et_comp->lhs->type != TYPE_LIST_ID
-	  && et_comp->rhs->type != TYPE_LIST_ID);
+  return (et_comp->rel_op != R_NULL && et_comp->rel_op != R_EXISTS && et_comp->rel_op != R_EQ_TORDER
+	  && et_comp->lhs->type != TYPE_LIST_ID && et_comp->rhs->type != TYPE_LIST_ID);
 }
 
 /*
- * eval_pred_and_comp_leaf () - CBRD-27190 [Delta5] P2-A: classify and evaluate ONE spine
+ * eval_pred_and_comp_leaf () - CBRD-27190 [Delta5]: classify and evaluate ONE spine
  *                       leaf (or the spine tail) of a B_AND CNF predicate for
- *                       eval_pred_and_comp (), without recursing through eval_pred ()'s
- *                       generic T_PRED/T_EVAL_TERM dispatch.
+ *                       eval_pred_and_comp (), without changing eval_pred () semantics.
  *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
  *   pr(in): one B_AND spine leaf (t_pr->pe.m_pred.lhs, or the final non-B_AND tail)
  *   vd(in): Value descriptor for positional values (optional)
  *   obj_oid(in): Object Identifier
+ *   delegated(out): set true when this leaf goes through the DELEGATE arm
  *
- * Note: classification mirrors eval_fnc ()'s own T_EVAL_TERM switch (COMP-inline/
- *       TERM-dispatch classes 1/3 of the plan's design are unified here into one "leaf is
- *       T_EVAL_TERM" dispatch, since both simply call the same existing single-term
- *       evaluator eval_fnc () would have selected - eval_pred_comp0 () hosts the
- *       eval_rel_cmp_fastpath () same-type fast path via eval_value_rel_cmp (), so
- *       COMP-inline leaves benefit from it here too). RANGE-pair-inline (class 2) recognizes
- *       the xasl_generation.c:1815-1819 two-sided range producer shape - a nested B_AND of
- *       two COMP-inline leaves, ONE bounded lhs level - and evaluates both leaves inline,
- *       combined with the identical 2-term instance of the B_AND truth table used by
- *       eval_pred_and_comp ()'s spine loop and by eval_pred () itself (:1696-1727 above).
- *       Anything else (class 5, DELEGATE: B_OR/B_XOR/B_IS/B_IS_NOT anywhere in the leaf,
- *       T_NOT_TERM incl. NOT BETWEEN xasl_generation.c:1822-1825, multi-range B_OR
- *       xasl_generation.c:1827-1828, deeper/other nesting) recurses into eval_pred () for
- *       THIS LEAF ONLY - the caller's spine walk stays iterative and keeps short-circuiting
- *       across the remaining conjuncts.
+ * Note: only comp0-class T_COMP_EVAL_TERM leaves and one bounded RANGE-pair nested B_AND of
+ *       two such leaves are evaluated inline. R_NULL, R_EXISTS, R_EQ_TORDER, LIST_ID
+ *       comparisons, all T_ALSM/T_LIKE/T_RLIKE terms and non-conforming T_PRED shapes use
+ *       DELEGATE. This deliberate collapse of the former TERM-dispatch class preserves exact
+ *       pre-change behavior: eval_pred ()'s R_EXISTS branch performs sq_get/sq_put subquery
+ *       cache handling, while its ALSM branch sends scalar elemsets through
+ *       eval_value_rel_cmp () ("other cases, use general evaluation routines").
+ *       RANGE-pair-inline recognizes the xasl_generation.c:1815-1819 two-sided range producer
+ *       shape - a nested B_AND of two comp0-class leaves, ONE bounded lhs level - and
+ *       combines both with the same B_AND truth table used by eval_pred_and_comp ()'s spine
+ *       loop and eval_pred ()'s B_AND case. Anything else (B_OR/B_XOR/B_IS/B_IS_NOT anywhere
+ *       in the leaf, T_NOT_TERM incl. NOT BETWEEN xasl_generation.c:1822-1825, multi-range
+ *       B_OR xasl_generation.c:1827-1828, deeper/other nesting) uses eval_pred () for THIS
+ *       LEAF ONLY; the caller's spine walk stays iterative and keeps short-circuiting across
+ *       the remaining conjuncts.
  */
 static DB_LOGICAL
-eval_pred_and_comp_leaf (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
+eval_pred_and_comp_leaf (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid,
+			 bool * delegated)
 {
-  const COMP_EVAL_TERM *et_comp;
-  const ALSM_EVAL_TERM *et_alsm;
-
-  if (pr->type == T_EVAL_TERM)
+  if (pr->type == T_EVAL_TERM && eval_pred_and_comp_is_comp_term (pr))
     {
-      switch (pr->pe.m_eval_term.et_type)
-	{
-	case T_COMP_EVAL_TERM:
-	  et_comp = &pr->pe.m_eval_term.et.et_comp;
-
-	  if (et_comp->rel_op == R_NULL)
-	    {
-	      return eval_pred_comp1 (thread_p, pr, vd, obj_oid);
-	    }
-	  if (et_comp->rel_op == R_EXISTS)
-	    {
-	      return eval_pred_comp2 (thread_p, pr, vd, obj_oid);
-	    }
-	  if (et_comp->lhs->type == TYPE_LIST_ID || et_comp->rhs->type == TYPE_LIST_ID)
-	    {
-	      return eval_pred_comp3 (thread_p, pr, vd, obj_oid);
-	    }
-
-	  return eval_pred_comp0 (thread_p, pr, vd, obj_oid);
-
-	case T_ALSM_EVAL_TERM:
-	  et_alsm = &pr->pe.m_eval_term.et.et_alsm;
-
-	  return (et_alsm->elemset->type != TYPE_LIST_ID)
-	    ? eval_pred_alsm4 (thread_p, pr, vd, obj_oid) : eval_pred_alsm5 (thread_p, pr, vd, obj_oid);
-
-	case T_LIKE_EVAL_TERM:
-	  return eval_pred_like6 (thread_p, pr, vd, obj_oid);
-
-	case T_RLIKE_EVAL_TERM:
-	  return eval_pred_rlike7 (thread_p, pr, vd, obj_oid);
-
-	default:
-	  return V_ERROR;
-	}
+      return eval_pred_comp0 (thread_p, pr, vd, obj_oid);
     }
 
   if (pr->type == T_PRED && pr->pe.m_pred.bool_op == B_AND && eval_pred_and_comp_is_comp_term (pr->pe.m_pred.lhs)
@@ -2411,40 +2375,46 @@ eval_pred_and_comp_leaf (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_desc
       return (r1 == V_UNKNOWN) ? ((r2 == V_TRUE) ? V_UNKNOWN : r2) : r2;
     }
 
-  /* DELEGATE: this leaf's shape is not one the walker specializes; fall back to eval_pred ()
-   * for this subtree only. */
+  /*
+   * DELEGATE: this leaf's shape is not one the walker specializes; fall back to eval_pred ()
+   * for this subtree only. This is also the path for every non-comp0 term kind.
+   */
+  *delegated = true;
   return eval_pred (thread_p, pr, vd, obj_oid);
 }
 
 /*
- * eval_pred_and_comp () - CBRD-27190 [Delta5] P2-A hybrid spine walker. Selected by
- *                       eval_fnc () for any T_PRED/B_AND root; replaces the per-row
- *                       recursive eval_pred () descent across the B_AND CNF spine
- *                       (xasl_generation.c:2182-2183 right-linear chaining) with ONE
- *                       iterative walk plus per-leaf inline dispatch (see
- *                       eval_pred_and_comp_leaf ()).
+ * eval_pred_and_comp () - CBRD-27190 [Delta5] hybrid spine walker. Selected by eval_fnc ()
+ *                       for any T_PRED/B_AND root; replaces the per-row recursive eval_pred ()
+ *                       descent across the B_AND CNF spine (xasl_generation.c:2182-2183
+ *                       right-linear chaining) with ONE iterative walk. Only comp0-class
+ *                       leaves and one bounded RANGE-pair are inline; all other leaves use
+ *                       the DELEGATE arm in eval_pred_and_comp_leaf ().
  *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
  *   pr(in): Predicate Expression Tree; must be T_PRED with bool_op B_AND (eval_fnc ()'s
  *           detection guarantees this - see the eval_fnc () detection block below)
  *   vd(in): Value descriptor for positional values (optional)
  *   obj_oid(in): Object Identifier
  *
- * Note: truth-table equivalence with eval_pred ()'s B_AND case (:1696-1727 above) - left to
- *       right; the first V_FALSE/V_ERROR leaf short-circuits immediately (remaining leaves,
- *       including the tail, are never evaluated); otherwise a V_UNKNOWN leaf sets a sticky
- *       flag that a later V_TRUE cannot clear; final result is V_TRUE only if no leaf was
- *       V_UNKNOWN and none was V_FALSE/V_ERROR. This is the standard three-valued AND and is
- *       associative regardless of whether the "rest of the spine" is folded by continued
- *       iteration (here) or by eval_pred ()'s recursive tail call (there); the difference is
- *       exactly the k recursion frames this walker removes. See the commit message for the
- *       full argument.
+ * Note: truth-table equivalence with eval_pred ()'s B_AND case - left to right; the first
+ *       V_FALSE/V_ERROR leaf short-circuits immediately (remaining leaves, including the tail,
+ *       are never evaluated); otherwise a V_UNKNOWN leaf sets a sticky flag that a later
+ *       V_TRUE cannot clear; final result is V_TRUE only if no leaf was V_UNKNOWN and none was
+ *       V_FALSE/V_ERROR. This is the standard three-valued AND and is associative regardless
+ *       of whether the rest of the spine is folded by continued iteration (here) or by
+ *       eval_pred ()'s recursive tail call (there); the difference is exactly the k recursion
+ *       frames this walker removes.
+ *       The inline-set restriction is deliberate: delegating R_EXISTS preserves eval_pred ()'s
+ *       sq_get/sq_put subquery-cache path, and delegating scalar-elemset ALSM preserves its
+ *       eval_value_rel_cmp () handling. The same rationale covers R_NULL, R_EQ_TORDER, LIST_ID,
+ *       LIKE and RLIKE terms, and non-conforming T_PRED shapes.
  *       [Delta5] F2 recursion-depth resolution: ONE thread_inc/dec_recursion_depth () +
- *       depth check for the WHOLE spine (mirrors :1682-1690 above), which also guards the
- *       DELEGATE eval_pred () calls inside eval_pred_and_comp_leaf () (they then nest
- *       normally on top of this single frame). Documented behavior delta: an all-inline
+ *       depth check for the WHOLE spine (mirrors eval_pred ()'s recursion-depth guard), which
+ *       also guards the DELEGATE eval_pred () calls inside eval_pred_and_comp_leaf () (they
+ *       then nest normally on top of this single frame). Documented behavior delta: an all-inline
  *       B_AND chain longer than max_recursion_sql_depth conjuncts previously returned
- *       ER_MAX_RECURSION_SQL_DEPTH/V_ERROR and now succeeds; the optdebug differential
- *       assert vs eval_pred () excludes that specific generic-side error (V3 row viii).
+ *       ER_MAX_RECURSION_SQL_DEPTH/V_ERROR and now succeeds; the optdebug differential assert
+ *       vs eval_pred () excludes that specific generic-side error.
  */
 static DB_LOGICAL
 eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
@@ -2453,6 +2423,7 @@ eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * v
   DB_LOGICAL leaf_result;
   DB_LOGICAL result;
   bool unknown_seen = false;
+  bool delegated = false;
   static int max_recursion_sql_depth = prm_get_integer_value (PRM_ID_MAX_RECURSION_SQL_DEPTH);
 
   if (thread_get_recursion_depth (thread_p) > max_recursion_sql_depth)
@@ -2463,12 +2434,11 @@ eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * v
 
   thread_inc_recursion_depth (thread_p);
 
-  /* 'pt_to_pred_expr ()' generates a right-linear tree (same spine as eval_pred ()'s B_AND
-   * case, :1697 above); walk it iteratively instead of recursing into eval_pred () once per
-   * spine node. */
+  /* pt_to_pred_expr () generates the right-linear spine; walk it iteratively instead of recursing
+   * into eval_pred () once per spine node. */
   for (t_pr = pr; t_pr->type == T_PRED && t_pr->pe.m_pred.bool_op == B_AND; t_pr = t_pr->pe.m_pred.rhs)
     {
-      leaf_result = eval_pred_and_comp_leaf (thread_p, t_pr->pe.m_pred.lhs, vd, obj_oid);
+      leaf_result = eval_pred_and_comp_leaf (thread_p, t_pr->pe.m_pred.lhs, vd, obj_oid, &delegated);
 
       if (leaf_result == V_FALSE || leaf_result == V_ERROR)
 	{
@@ -2483,7 +2453,7 @@ eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * v
     }
 
   /* t_pr now refers to the spine tail: the final, non-B_AND right-linear leaf. */
-  leaf_result = eval_pred_and_comp_leaf (thread_p, t_pr, vd, obj_oid);
+  leaf_result = eval_pred_and_comp_leaf (thread_p, t_pr, vd, obj_oid, &delegated);
 
   if (leaf_result == V_FALSE || leaf_result == V_ERROR)
     {
@@ -2500,6 +2470,30 @@ eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * v
 
 exit:
   thread_dec_recursion_depth (thread_p);
+
+#if !defined (NDEBUG)
+  if (!delegated)
+    {
+      DB_LOGICAL generic_result;
+
+      /*
+       * This differential assertion is scoped to all-inline spines, so it does not re-execute
+       * subqueries or DELEGATE leaves. Regu fetches are idempotent for same-row data-filter
+       * evaluation, as assumed by the existing fast-path assertion. The generic side can expose
+       * ER_MAX_RECURSION_SQL_DEPTH for a deep spine that this single-frame walker accepts. This
+       * optdebug-only block leaves release builds unaffected.
+       */
+      generic_result = eval_pred (thread_p, pr, vd, obj_oid);
+      if (generic_result == V_ERROR && er_errid () == ER_MAX_RECURSION_SQL_DEPTH)
+	{
+	  er_clear ();
+	}
+      else
+	{
+	  assert (generic_result == result);
+	}
+    }
+#endif /* !NDEBUG */
 
   return result;
 }
@@ -3031,17 +3025,14 @@ eval_fnc (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, DB_TYPE * single_node_t
        * CBRD-27190 [Delta5] P2-A detection (file-level change 7): the ONLY gate is "root is
        * T_PRED with bool_op B_AND" (xasl_generation.c:2182-2183 right-linear CNF spine
        * chaining) - unconditional, regardless of leaf shapes. eval_pred_and_comp () itself
-       * classifies and dispatches every spine leaf (COMP-inline/RANGE-pair-inline/
-       * TERM-dispatch via eval_pred_and_comp_leaf ()) and falls back to a per-LEAF
-       * eval_pred () delegation only for leaf shapes it does not specialize (B_OR/B_XOR/
-       * B_IS[_NOT] anywhere in the leaf, T_NOT_TERM incl. NOT BETWEEN
-       * xasl_generation.c:1822-1825, multi-range B_OR xasl_generation.c:1827-1828, deeper
-       * nesting) - the spine walk itself is never abandoned for those, so gating on leaf
-       * shape here would incorrectly forfeit the walker for spines that mix a few
-       * DELEGATE-class leaves with otherwise-specializable ones (plan V3 shape row iv:
-       * "range + (a=1 OR b=2)" must still select eval_pred_and_comp (), with just that one
-       * leaf delegated). Single-node and non-B_AND roots (B_OR/B_XOR/B_IS/B_IS_NOT,
-       * T_NOT_TERM) are unaffected - they never reach this branch.
+       * inlines only comp0-class leaves and the two-comp0 RANGE-pair shape, while every other
+       * spine leaf goes through eval_pred ()'s DELEGATE arm (R_NULL/R_EXISTS/R_EQ_TORDER,
+       * TYPE_LIST_ID comparisons, T_ALSM/T_LIKE/T_RLIKE, B_OR/B_XOR/B_IS/B_IS_NOT,
+       * T_NOT_TERM incl. NOT BETWEEN xasl_generation.c:1822-1825, multi-range B_OR
+       * xasl_generation.c:1827-1828, and deeper/non-conforming nesting). The spine walk itself
+       * is never abandoned for those mixed leaves, so gating on leaf shape here would
+       * incorrectly forfeit the walker. Single-node and non-B_AND roots (B_OR/B_XOR/B_IS/
+       * B_IS_NOT, T_NOT_TERM) are unaffected - they never reach this branch.
        */
       return (PR_EVAL_FNC) eval_pred_and_comp;
     }
