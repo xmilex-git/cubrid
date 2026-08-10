@@ -52,6 +52,11 @@ static DB_LOGICAL eval_negative (DB_LOGICAL res);
 static DB_LOGICAL eval_logical_result (DB_LOGICAL res1, DB_LOGICAL res2);
 static DB_LOGICAL eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval2,
 				      REL_OP rel_operator, const COMP_EVAL_TERM * et_comp);
+static inline bool eval_rel_cmp_fastpath (DB_VALUE * v1, DB_VALUE * v2, bool total_order, int *result);
+static DB_LOGICAL eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid);
+static bool eval_pred_and_comp_is_comp_term (const PRED_EXPR * pr);
+static DB_LOGICAL eval_pred_and_comp_leaf (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd,
+					    OID * obj_oid);
 static DB_LOGICAL eval_some_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator);
 static DB_LOGICAL eval_all_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator);
 static int eval_item_card_set (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator);
@@ -140,6 +145,82 @@ eval_logical_result (DB_LOGICAL res1, DB_LOGICAL res2)
  */
 
 /*
+ * eval_rel_cmp_fastpath () - CBRD-27190 [Delta5]: same-domain-type whitelist fast path for
+ *                       eval_value_rel_cmp(); calls the identical pr_type->cmpval() that
+ *                       tp_value_compare_with_error() eventually reaches, skipping that
+ *                       function's per-row type-tag/coercion/collation re-derivation.
+ *   return: true if *result was produced by the fast path and the caller may use it
+ *           directly; false if the caller MUST fall back to the unchanged generic
+ *           tp_value_compare_with_error() path (guard miss, or a DB_UNK re-run - see Note)
+ *   v1(in): first db_value
+ *   v2(in): second db_value
+ *   total_order(in): true for R_EQ_TORDER, false for the other ordinal ops
+ *   result(out): DB_VALUE_COMPARE_RESULT, valid only when this function returns true
+ *
+ * Note: whitelist is intentionally narrow and fails closed - any guard miss (NULL operand,
+ *       mismatched or non-whitelisted domain type) returns false so the caller re-runs the
+ *       existing generic path unchanged. NCHAR/VARNCHAR_DEPRECATED, ENUM, OID/OBJECT,
+ *       SET/MULTISET/SEQUENCE, MIDXKEY, JSON, BLOB/CLOB and BIT/VARBIT are excluded by
+ *       construction (they fall through to the final `return false`; MIDXKEY additionally
+ *       can never reach eval_value_rel_cmp - object_domain.c:10829-10836). Collation
+ *       derivation for the CHAR/VARCHAR branch mirrors the same-collation branch of
+ *       tp_value_compare_with_error()'s common_coll derivation (object_domain.c:10729-10736):
+ *       both operands must already share codeset AND collation - no coercion, no
+ *       LANG_RT_COMMON_COLL fallback (that stays on the generic path only). cmpval() is
+ *       read-only on v1/v2, so returning false (guard miss or DB_UNK) is always safe to
+ *       re-run through the generic path (idempotent).
+ */
+static inline bool
+eval_rel_cmp_fastpath (DB_VALUE * v1, DB_VALUE * v2, bool total_order, int *result)
+{
+  DB_TYPE vtype;
+  int coll;
+
+  if (DB_IS_NULL (v1) || DB_IS_NULL (v2))
+    {
+      return false;
+    }
+
+  vtype = DB_VALUE_DOMAIN_TYPE (v1);
+  if (vtype != DB_VALUE_DOMAIN_TYPE (v2))
+    {
+      return false;
+    }
+
+  if (TP_IS_NUMERIC_TYPE (vtype) || TP_IS_DATE_OR_TIME_TYPE (vtype))
+    {
+      coll = 0;
+    }
+  else if (TP_IS_CHAR_TYPE (vtype))
+    {
+      if (db_get_string_codeset (v1) != db_get_string_codeset (v2)
+	  || db_get_string_collation (v1) != db_get_string_collation (v2))
+	{
+	  return false;
+	}
+
+      coll = db_get_string_collation (v1);
+    }
+  else
+    {
+      /* not whitelisted: NCHAR/VARNCHAR_DEPRECATED, ENUM, OID/OBJECT, SET/MULTISET/SEQUENCE,
+       * MIDXKEY, JSON, BLOB/CLOB, BIT/VARBIT, ... */
+      return false;
+    }
+
+  *result = pr_type_from_id (vtype)->cmpval (v1, v2, 1, total_order ? 1 : 0, NULL, coll);
+
+  if (*result == DB_UNK)
+    {
+      /* re-run through the generic path unchanged; cmpval () is read-only on v1/v2 so this
+       * is idempotent. */
+      return false;
+    }
+
+  return true;
+}
+
+/*
  * eval_value_rel_cmp () - Compare two db_values according to the given
  *                       relational operator
  *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
@@ -181,7 +262,14 @@ eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval
 	  assert (et_comp->lhs != NULL);
 	  assert (et_comp->rhs != NULL);
 
-#if 0				/* TODO - do not delete me for future */
+	  /*
+	   * CBRD-27190 [Delta5] M2: lhs twin of the rhs FETCH_ALL_CONST block below - this
+	   * block was previously dead code guarded by "#if 0" (see the JIRA scope note: the
+	   * const-side coercion is a one-time in-place operation, applied at most once per
+	   * XASL predicate term, not per row). Same REGU_VARIABLE_CLEAR_AT_CLONE_DECACHE heap
+	   * dance as the rhs block, plus the M1 date/time-cross branch mirrored lhs-direction
+	   * (coerce dbval1 toward vtype2's default domain).
+	   */
 	  /* check iff value_1 is constant to coerce */
 	  if (REGU_VARIABLE_IS_FLAGED (et_comp->lhs, REGU_VARIABLE_FETCH_ALL_CONST))
 	    {
@@ -190,6 +278,13 @@ eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval
 	      vtype2 = DB_VALUE_DOMAIN_TYPE (dbval2);
 	      if (vtype1 != vtype2)
 		{
+		  HL_HEAPID save_heapid = 0;
+
+		  if (REGU_VARIABLE_IS_FLAGED (et_comp->lhs, REGU_VARIABLE_CLEAR_AT_CLONE_DECACHE))
+		    {
+		      save_heapid = db_change_private_heap (thread_p, 0);
+		    }
+
 		  if (vtype1 == DB_TYPE_OBJECT)
 		    {
 		      ;		/* do nothing */
@@ -213,9 +308,20 @@ eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval
 		      dom = tp_domain_resolve_default (vtype2);
 		      (void) tp_value_coerce (dbval1, dbval1, dom);
 		    }
+		  else if (TP_IS_DATE_OR_TIME_TYPE (vtype1) && TP_IS_DATE_OR_TIME_TYPE (vtype2)
+			   && tp_more_general_type (vtype2, vtype1) > 0)
+		    {
+		      /* CBRD-27190 [Delta5] M1/M2: vtype2 is more general, try to coerce value_1 */
+		      dom = tp_domain_resolve_default (vtype2);
+		      (void) tp_value_coerce (dbval1, dbval1, dom);
+		    }
+
+		  if (save_heapid != 0)
+		    {
+		      (void) db_change_private_heap (thread_p, save_heapid);
+		    }
 		}
 	    }
-#endif
 
 	  /* check iff value_2 is constant to coerce */
 	  if (REGU_VARIABLE_IS_FLAGED (et_comp->rhs, REGU_VARIABLE_FETCH_ALL_CONST))
@@ -255,6 +361,17 @@ eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval
 		      dom = tp_domain_resolve_default (vtype1);
 		      (void) tp_value_coerce (dbval2, dbval2, dom);
 		    }
+		  else if (TP_IS_DATE_OR_TIME_TYPE (vtype1) && TP_IS_DATE_OR_TIME_TYPE (vtype2)
+			   && tp_more_general_type (vtype1, vtype2) > 0)
+		    {
+		      /*
+		       * CBRD-27190 [Delta5] M1: date/time-cross const coercion, rhs direction -
+		       * mirrors the numeric branch immediately above; vtype1 is more general,
+		       * try to coerce value_2.
+		       */
+		      dom = tp_domain_resolve_default (vtype1);
+		      (void) tp_value_coerce (dbval2, dbval2, dom);
+		    }
 
 		  if (save_heapid != 0)
 		    {
@@ -262,10 +379,49 @@ eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval
 		    }
 		}
 	    }
-
 	}
 
-      if (rel_operator == R_EQ_TORDER)
+      /*
+       * CBRD-27190 [Delta5] fast path: try eval_rel_cmp_fastpath () for every ordinal op,
+       * including R_EQ_TORDER (total_order = true), but NEVER for R_NULLSAFE_EQ (its NULL
+       * semantics differ - see the R_NULLSAFE_EQ arm of the REL_OP switch below). Both the
+       * fast path and the generic fallback converge on the same result/comparable pair fed
+       * into the unchanged REL_OP switch further down (set ops above already returned via
+       * their own `break`, so they never reach here).
+       */
+      if (rel_operator != R_NULLSAFE_EQ && eval_rel_cmp_fastpath (dbval1, dbval2, rel_operator == R_EQ_TORDER, &result))
+	{
+#if !defined (NDEBUG)
+	  /*
+	   * CBRD-27190 [Delta5] differential assert (optdebug only): re-derive the same
+	   * comparison via the generic tp_value_compare_with_error () path and assert the two
+	   * agree. Safe to re-run directly on dbval1/dbval2 (no clones needed): the fast-path
+	   * guard above already established vtype1 == vtype2 and, for the CHAR/VARCHAR
+	   * whitelist branch, equal codeset + collation, so tp_value_compare_with_error ()
+	   * takes its no-coercion branch (object_domain.c ~:10715-10736, the same common_coll
+	   * mirror cited in eval_rel_cmp_fastpath ()'s header comment) and never calls
+	   * db_char_string_coerce () on either operand here - it is read-only, exactly like
+	   * eval_rel_cmp_fastpath () itself. This block never runs in a release (NDEBUG) build.
+	   */
+	  {
+	    DB_VALUE_COMPARE_RESULT generic_result;
+	    bool generic_comparable = true;
+
+	    if (rel_operator == R_EQ_TORDER)
+	      {
+		generic_result = tp_value_compare_with_error (dbval1, dbval2, 1, 1, &generic_comparable);
+	      }
+	    else
+	      {
+		generic_result = tp_value_compare_with_error (dbval1, dbval2, 1, 0, &generic_comparable);
+	      }
+
+	    assert (generic_comparable);
+	    assert ((int) generic_result == result);
+	  }
+#endif /* !NDEBUG */
+	}
+      else if (rel_operator == R_EQ_TORDER)
 	{
 	  /* do total order comparison */
 	  result = tp_value_compare_with_error (dbval1, dbval2, 1, 1, &comparable);
@@ -1661,6 +1817,10 @@ eval_set_list_cmp (THREAD_ENTRY * thread_p, const COMP_EVAL_TERM * et_comp, val_
  *              satisfies the indicate predicate. It uses a 3-valued logic
  *              and returns V_TRUE, V_FALSE or V_UNKNOWN. If an error occurs,
  *              necessary error code is set and V_ERROR is returned.
+ * Note: CBRD-27190 [Delta5] the B_AND case below is the truth table that
+ *              eval_pred_and_comp () (defined further below, selected by eval_fnc () for
+ *              whole B_AND spines) must reproduce exactly for its iterative spine walk and
+ *              its inline RANGE-pair-leaf combination.
  */
 DB_LOGICAL
 eval_pred (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
@@ -2138,6 +2298,213 @@ exit:
 }
 
 /*
+ * eval_pred_and_comp_is_comp_term () - CBRD-27190 [Delta5] P2-A: true iff pr is a "class-1"
+ *                       (COMP-inline) leaf per the plan's hybrid-walker design - a plain
+ *                       T_COMP_EVAL_TERM leaf that eval_pred_and_comp_leaf ()/eval_fnc ()
+ *                       would otherwise dispatch to eval_pred_comp0 () (not comp1/comp2/
+ *                       comp3, i.e. not R_NULL/R_EXISTS/TYPE_LIST_ID). Used to recognize the
+ *                       xasl_generation.c:1815-1819 two-sided RANGE producer shape (a nested
+ *                       B_AND of exactly two such leaves), one bounded lhs level.
+ *   return: bool
+ *   pr(in): a PRED_EXPR node (candidate nested lhs/rhs of a RANGE-pair leaf)
+ */
+static bool
+eval_pred_and_comp_is_comp_term (const PRED_EXPR * pr)
+{
+  const COMP_EVAL_TERM *et_comp;
+
+  if (pr->type != T_EVAL_TERM || pr->pe.m_eval_term.et_type != T_COMP_EVAL_TERM)
+    {
+      return false;
+    }
+
+  et_comp = &pr->pe.m_eval_term.et.et_comp;
+
+  return (et_comp->rel_op != R_NULL && et_comp->rel_op != R_EXISTS && et_comp->lhs->type != TYPE_LIST_ID
+	  && et_comp->rhs->type != TYPE_LIST_ID);
+}
+
+/*
+ * eval_pred_and_comp_leaf () - CBRD-27190 [Delta5] P2-A: classify and evaluate ONE spine
+ *                       leaf (or the spine tail) of a B_AND CNF predicate for
+ *                       eval_pred_and_comp (), without recursing through eval_pred ()'s
+ *                       generic T_PRED/T_EVAL_TERM dispatch.
+ *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
+ *   pr(in): one B_AND spine leaf (t_pr->pe.m_pred.lhs, or the final non-B_AND tail)
+ *   vd(in): Value descriptor for positional values (optional)
+ *   obj_oid(in): Object Identifier
+ *
+ * Note: classification mirrors eval_fnc ()'s own T_EVAL_TERM switch (COMP-inline/
+ *       TERM-dispatch classes 1/3 of the plan's design are unified here into one "leaf is
+ *       T_EVAL_TERM" dispatch, since both simply call the same existing single-term
+ *       evaluator eval_fnc () would have selected - eval_pred_comp0 () hosts the
+ *       eval_rel_cmp_fastpath () same-type fast path via eval_value_rel_cmp (), so
+ *       COMP-inline leaves benefit from it here too). RANGE-pair-inline (class 2) recognizes
+ *       the xasl_generation.c:1815-1819 two-sided range producer shape - a nested B_AND of
+ *       two COMP-inline leaves, ONE bounded lhs level - and evaluates both leaves inline,
+ *       combined with the identical 2-term instance of the B_AND truth table used by
+ *       eval_pred_and_comp ()'s spine loop and by eval_pred () itself (:1696-1727 above).
+ *       Anything else (class 5, DELEGATE: B_OR/B_XOR/B_IS/B_IS_NOT anywhere in the leaf,
+ *       T_NOT_TERM incl. NOT BETWEEN xasl_generation.c:1822-1825, multi-range B_OR
+ *       xasl_generation.c:1827-1828, deeper/other nesting) recurses into eval_pred () for
+ *       THIS LEAF ONLY - the caller's spine walk stays iterative and keeps short-circuiting
+ *       across the remaining conjuncts.
+ */
+static DB_LOGICAL
+eval_pred_and_comp_leaf (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
+{
+  const COMP_EVAL_TERM *et_comp;
+  const ALSM_EVAL_TERM *et_alsm;
+
+  if (pr->type == T_EVAL_TERM)
+    {
+      switch (pr->pe.m_eval_term.et_type)
+	{
+	case T_COMP_EVAL_TERM:
+	  et_comp = &pr->pe.m_eval_term.et.et_comp;
+
+	  if (et_comp->rel_op == R_NULL)
+	    {
+	      return eval_pred_comp1 (thread_p, pr, vd, obj_oid);
+	    }
+	  if (et_comp->rel_op == R_EXISTS)
+	    {
+	      return eval_pred_comp2 (thread_p, pr, vd, obj_oid);
+	    }
+	  if (et_comp->lhs->type == TYPE_LIST_ID || et_comp->rhs->type == TYPE_LIST_ID)
+	    {
+	      return eval_pred_comp3 (thread_p, pr, vd, obj_oid);
+	    }
+
+	  return eval_pred_comp0 (thread_p, pr, vd, obj_oid);
+
+	case T_ALSM_EVAL_TERM:
+	  et_alsm = &pr->pe.m_eval_term.et.et_alsm;
+
+	  return (et_alsm->elemset->type != TYPE_LIST_ID)
+	    ? eval_pred_alsm4 (thread_p, pr, vd, obj_oid) : eval_pred_alsm5 (thread_p, pr, vd, obj_oid);
+
+	case T_LIKE_EVAL_TERM:
+	  return eval_pred_like6 (thread_p, pr, vd, obj_oid);
+
+	case T_RLIKE_EVAL_TERM:
+	  return eval_pred_rlike7 (thread_p, pr, vd, obj_oid);
+
+	default:
+	  return V_ERROR;
+	}
+    }
+
+  if (pr->type == T_PRED && pr->pe.m_pred.bool_op == B_AND && eval_pred_and_comp_is_comp_term (pr->pe.m_pred.lhs)
+      && eval_pred_and_comp_is_comp_term (pr->pe.m_pred.rhs))
+    {
+      DB_LOGICAL r1, r2;
+
+      r1 = eval_pred_comp0 (thread_p, pr->pe.m_pred.lhs, vd, obj_oid);
+      if (r1 == V_FALSE || r1 == V_ERROR)
+	{
+	  return r1;
+	}
+
+      r2 = eval_pred_comp0 (thread_p, pr->pe.m_pred.rhs, vd, obj_oid);
+
+      return (r1 == V_UNKNOWN) ? ((r2 == V_TRUE) ? V_UNKNOWN : r2) : r2;
+    }
+
+  /* DELEGATE: this leaf's shape is not one the walker specializes; fall back to eval_pred ()
+   * for this subtree only. */
+  return eval_pred (thread_p, pr, vd, obj_oid);
+}
+
+/*
+ * eval_pred_and_comp () - CBRD-27190 [Delta5] P2-A hybrid spine walker. Selected by
+ *                       eval_fnc () for any T_PRED/B_AND root; replaces the per-row
+ *                       recursive eval_pred () descent across the B_AND CNF spine
+ *                       (xasl_generation.c:2182-2183 right-linear chaining) with ONE
+ *                       iterative walk plus per-leaf inline dispatch (see
+ *                       eval_pred_and_comp_leaf ()).
+ *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
+ *   pr(in): Predicate Expression Tree; must be T_PRED with bool_op B_AND (eval_fnc ()'s
+ *           detection guarantees this - see the eval_fnc () detection block below)
+ *   vd(in): Value descriptor for positional values (optional)
+ *   obj_oid(in): Object Identifier
+ *
+ * Note: truth-table equivalence with eval_pred ()'s B_AND case (:1696-1727 above) - left to
+ *       right; the first V_FALSE/V_ERROR leaf short-circuits immediately (remaining leaves,
+ *       including the tail, are never evaluated); otherwise a V_UNKNOWN leaf sets a sticky
+ *       flag that a later V_TRUE cannot clear; final result is V_TRUE only if no leaf was
+ *       V_UNKNOWN and none was V_FALSE/V_ERROR. This is the standard three-valued AND and is
+ *       associative regardless of whether the "rest of the spine" is folded by continued
+ *       iteration (here) or by eval_pred ()'s recursive tail call (there); the difference is
+ *       exactly the k recursion frames this walker removes. See the commit message for the
+ *       full argument.
+ *       [Delta5] F2 recursion-depth resolution: ONE thread_inc/dec_recursion_depth () +
+ *       depth check for the WHOLE spine (mirrors :1682-1690 above), which also guards the
+ *       DELEGATE eval_pred () calls inside eval_pred_and_comp_leaf () (they then nest
+ *       normally on top of this single frame). Documented behavior delta: an all-inline
+ *       B_AND chain longer than max_recursion_sql_depth conjuncts previously returned
+ *       ER_MAX_RECURSION_SQL_DEPTH/V_ERROR and now succeeds; the optdebug differential
+ *       assert vs eval_pred () excludes that specific generic-side error (V3 row viii).
+ */
+static DB_LOGICAL
+eval_pred_and_comp (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
+{
+  const PRED_EXPR *t_pr;
+  DB_LOGICAL leaf_result;
+  DB_LOGICAL result;
+  bool unknown_seen = false;
+  static int max_recursion_sql_depth = prm_get_integer_value (PRM_ID_MAX_RECURSION_SQL_DEPTH);
+
+  if (thread_get_recursion_depth (thread_p) > max_recursion_sql_depth)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_MAX_RECURSION_SQL_DEPTH, 1, max_recursion_sql_depth);
+      return V_ERROR;
+    }
+
+  thread_inc_recursion_depth (thread_p);
+
+  /* 'pt_to_pred_expr ()' generates a right-linear tree (same spine as eval_pred ()'s B_AND
+   * case, :1697 above); walk it iteratively instead of recursing into eval_pred () once per
+   * spine node. */
+  for (t_pr = pr; t_pr->type == T_PRED && t_pr->pe.m_pred.bool_op == B_AND; t_pr = t_pr->pe.m_pred.rhs)
+    {
+      leaf_result = eval_pred_and_comp_leaf (thread_p, t_pr->pe.m_pred.lhs, vd, obj_oid);
+
+      if (leaf_result == V_FALSE || leaf_result == V_ERROR)
+	{
+	  result = leaf_result;
+	  goto exit;
+	}
+
+      if (leaf_result == V_UNKNOWN)
+	{
+	  unknown_seen = true;
+	}
+    }
+
+  /* t_pr now refers to the spine tail: the final, non-B_AND right-linear leaf. */
+  leaf_result = eval_pred_and_comp_leaf (thread_p, t_pr, vd, obj_oid);
+
+  if (leaf_result == V_FALSE || leaf_result == V_ERROR)
+    {
+      result = leaf_result;
+    }
+  else if (leaf_result == V_UNKNOWN || unknown_seen)
+    {
+      result = V_UNKNOWN;
+    }
+  else
+    {
+      result = V_TRUE;
+    }
+
+exit:
+  thread_dec_recursion_depth (thread_p);
+
+  return result;
+}
+
+/*
  * eval_pred_comp0 () -
  *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
  *   pr(in): Predicate Expression Tree
@@ -2585,6 +2952,12 @@ eval_pred_rlike7 (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd,
  *   return:
  *   pr(in): Predicate Expression Tree
  *   single_node_type(in):
+ *
+ * Note: CBRD-27190 [Delta5] P2-A - for T_PRED/B_AND roots this now returns
+ *              eval_pred_and_comp (), the hybrid spine walker, instead of the generic
+ *              eval_pred (); single-node (T_EVAL_TERM) and non-B_AND T_PRED roots (B_OR/
+ *              B_XOR/B_IS/B_IS_NOT, T_NOT_TERM) keep existing behavior byte-for-byte - see
+ *              the detection block just above the "general case" return below.
  */
 PR_EVAL_FNC
 eval_fnc (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, DB_TYPE * single_node_type)
@@ -2650,6 +3023,27 @@ eval_fnc (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, DB_TYPE * single_node_t
 	default:
 	  return NULL;
 	}
+    }
+
+  if (pr->type == T_PRED && pr->pe.m_pred.bool_op == B_AND)
+    {
+      /*
+       * CBRD-27190 [Delta5] P2-A detection (file-level change 7): the ONLY gate is "root is
+       * T_PRED with bool_op B_AND" (xasl_generation.c:2182-2183 right-linear CNF spine
+       * chaining) - unconditional, regardless of leaf shapes. eval_pred_and_comp () itself
+       * classifies and dispatches every spine leaf (COMP-inline/RANGE-pair-inline/
+       * TERM-dispatch via eval_pred_and_comp_leaf ()) and falls back to a per-LEAF
+       * eval_pred () delegation only for leaf shapes it does not specialize (B_OR/B_XOR/
+       * B_IS[_NOT] anywhere in the leaf, T_NOT_TERM incl. NOT BETWEEN
+       * xasl_generation.c:1822-1825, multi-range B_OR xasl_generation.c:1827-1828, deeper
+       * nesting) - the spine walk itself is never abandoned for those, so gating on leaf
+       * shape here would incorrectly forfeit the walker for spines that mix a few
+       * DELEGATE-class leaves with otherwise-specializable ones (plan V3 shape row iv:
+       * "range + (a=1 OR b=2)" must still select eval_pred_and_comp (), with just that one
+       * leaf delegated). Single-node and non-B_AND roots (B_OR/B_XOR/B_IS/B_IS_NOT,
+       * T_NOT_TERM) are unaffected - they never reach this branch.
+       */
+      return (PR_EVAL_FNC) eval_pred_and_comp;
     }
 
   /* general case */
