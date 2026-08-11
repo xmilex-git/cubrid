@@ -195,9 +195,21 @@ struct lang_collation
   /* collation data init function */
   void (*init_coll) (LANG_COLLATION * lang_coll);
 
-  /* byte-lockstep LIKE eligibility kind, computed at registration; NONE=0 is mandatory and the
-   * field must stay last (built-in collations use positional aggregate initializers) */
+  /* fields below are computed at registration and must stay after all positionally
+   * initialized fields (built-in collations use positional aggregate initializers;
+   * zero-init defaults must mean "ineligible") */
+
+  /* byte-lockstep LIKE eligibility kind; NONE=0 */
   LANG_LOCKSTEP_KIND byte_lockstep_kind;
+
+  /* byte-lockstep comparator/hash candidacy (one shared flag : comparator-equal =>
+   * hash-equal is enforced structurally), decided at registration from the weight
+   * tables; the system parameter condition (oracle_style_empty_string) is applied
+   * once, later, by lang_byte_lockstep_finalize () */
+  bool byte_lockstep_cmp_hash_candidate;
+  /* true when SPACE is a zero-weight pad byte of the trailing-ignore weight table
+   * of this collation (derived from the table, not hardcoded; NUL is always pad) */
+  bool byte_lockstep_pad_space;
 };
 
 /* Language locale data */
@@ -290,6 +302,7 @@ extern "C"
   extern INTL_CODESET lang_Loc_charset;
   extern INTL_CODESET lang_charset (void);
   extern void lang_init_builtin (void);
+  extern void lang_byte_lockstep_finalize (void);
   extern int lang_init (void);
   extern void lang_init_console_txt_conv (void);
   extern int lang_set_charset_lang (const char *lang_charset);

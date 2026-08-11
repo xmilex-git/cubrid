@@ -44,6 +44,7 @@
 #include "tz_support.h"
 #include "db_date.h"
 #include "string_opfunc.h"
+#include "system_parameter.h"
 
 #if !defined (SERVER_MODE)
 #include "authenticate.h"
@@ -211,7 +212,7 @@ static LANG_LOCALE_DATA *find_lang_locale_data (const char *name, const INTL_COD
 static int register_lang_locale_data (LANG_LOCALE_DATA * lld);
 static void free_lang_locale_data (LANG_LOCALE_DATA * lld);
 static int register_collation (LANG_COLLATION * coll);
-static void lang_set_byte_lockstep_like (LANG_COLLATION * lang_coll);
+static void lang_set_byte_lockstep (LANG_COLLATION * lang_coll);
 
 static bool lang_is_codeset_allowed (const INTL_LANG intl_id, const INTL_CODESET codeset);
 static int lang_get_builtin_lang_id_from_name (const char *lang_name, INTL_LANG * lang_id);
@@ -222,6 +223,8 @@ static int lang_strmatch_byte (const LANG_COLLATION * lang_coll, bool is_match, 
 			       const bool has_last_escape, int *str1_match_size, bool ignore_trailing_space);
 static int lang_fastcmp_byte (const LANG_COLLATION * lang_coll, const unsigned char *string1, const int size1,
 			      const unsigned char *string2, const int size2, bool ignore_trailing_space);
+static int lang_fastcmp_lockstep (const LANG_COLLATION * lang_coll, const unsigned char *string1, const int size1,
+				  const unsigned char *string2, const int size2, bool ignore_trailing_space);
 static int lang_fastcmp_binary (const LANG_COLLATION * lang_coll, const unsigned char *string1, const int size1,
 				const unsigned char *string2, const int size2, bool ignore_trailing_space);
 static int lang_strmatch_binary (const LANG_COLLATION * lang_coll, bool is_match, const unsigned char *str1, int size1,
@@ -296,6 +299,10 @@ static int lang_split_key_euckr (const LANG_COLLATION * lang_coll, const bool is
 				 const int size1, const unsigned char *str2, const int size2, const unsigned char **key,
 				 int *byte_size, bool ignore_trailing_space);
 static unsigned int lang_mht2str_byte (const LANG_COLLATION * lang_coll, const unsigned char *str, const int size);
+static unsigned int lang_mht2str_lockstep_byte (const LANG_COLLATION * lang_coll, const unsigned char *str,
+						const int size);
+static unsigned int lang_mht2str_lockstep_utf8 (const LANG_COLLATION * lang_coll, const unsigned char *str,
+						const int size);
 static unsigned int lang_mht2str_default (const LANG_COLLATION * lang_coll, const unsigned char *str, const int size);
 static unsigned int lang_mht2str_utf8 (const LANG_COLLATION * lang_coll, const unsigned char *str, const int size);
 static unsigned int lang_mht2str_utf8_exp (const LANG_COLLATION * lang_coll, const unsigned char *str, const int size);
@@ -872,11 +879,12 @@ lang_init_builtin (void)
       (void) register_collation (built_In_collations[i]);
     }
 
-  /* decide byte-lockstep LIKE eligibility only after all registrations : some built-in
-   * collations (e.g. utf8_bin) share weight arrays filled by another collation's init */
+  /* decide byte-lockstep eligibility (LIKE kind + comparator/hash candidacy) only after
+   * all registrations : some built-in collations (e.g. utf8_bin) share weight arrays
+   * filled by another collation's init */
   for (i = 0; i < (int) (sizeof (built_In_collations) / sizeof (built_In_collations[0])); i++)
     {
-      lang_set_byte_lockstep_like (built_In_collations[i]);
+      lang_set_byte_lockstep (built_In_collations[i]);
     }
 
   /* register all built-in locales allowed in current charset Support for multiple locales is required for switching
@@ -896,6 +904,70 @@ lang_init_builtin (void)
   (void) register_lang_locale_data (&lc_English_binary);
 
   lang_Builtin_initialized = true;
+}
+
+/*
+ * lang_byte_lockstep_finalize - assigns the byte-lockstep comparator/hash fast path
+ *   to the eligible collations, once the system parameters are loaded
+ *
+ *  Note : collation registration (lang_init ()) runs before sysprm loading in every
+ *	   boot path (server, client/CAS, SA utilities), so the
+ *	   oracle_style_empty_string condition of the eligibility gate cannot be
+ *	   checked at registration.  This function applies it once, after
+ *	   sysprm_load_and_init (), from the boot paths; the parameter has no
+ *	   PRM_USER_CHANGE flag so it is immutable afterwards and a one-shot decision
+ *	   is safe.  A boot path that never calls this keeps every collation on the
+ *	   legacy comparators (fail-safe : identical results, no speed-up).
+ *	   The comparator and the hash are swapped together (single candidacy flag) so
+ *	   that "comparator-equal => hash-equal" is preserved structurally.  Each
+ *	   collation keeps its incumbent hash output bit-identical : only incumbents
+ *	   with a per-character weight cost (lang_mht2str_byte (), lang_mht2str_utf8 ())
+ *	   are swapped; lang_mht2str_default () has no weight cost and is left as is.
+ */
+void
+lang_byte_lockstep_finalize (void)
+{
+  static bool finalized = false;
+  int i;
+
+  if (finalized || !lang_Builtin_initialized)
+    {
+      return;
+    }
+  finalized = true;
+
+  if (prm_get_bool_value (PRM_ID_ORACLE_STYLE_EMPTY_STRING))
+    {
+      /* empty-string handling upstream changes comparison semantics : keep every
+       * collation on the legacy comparators */
+      return;
+    }
+
+  for (i = 0; i < LANG_MAX_COLLATIONS; i++)
+    {
+      LANG_COLLATION *lang_coll = lang_Collations[i];
+
+      if (lang_coll == NULL || !lang_coll->byte_lockstep_cmp_hash_candidate)
+	{
+	  continue;
+	}
+
+      /* candidates dispatch through fastcmp only via these two incumbents; anything
+       * else would mean the gate mis-fired, so leave it untouched */
+      if (lang_coll->fastcmp == lang_fastcmp_byte || lang_coll->fastcmp == lang_strcmp_utf8)
+	{
+	  lang_coll->fastcmp = lang_fastcmp_lockstep;
+	}
+
+      if (lang_coll->mht2str == lang_mht2str_byte)
+	{
+	  lang_coll->mht2str = lang_mht2str_lockstep_byte;
+	}
+      else if (lang_coll->mht2str == lang_mht2str_utf8)
+	{
+	  lang_coll->mht2str = lang_mht2str_lockstep_utf8;
+	}
+    }
 }
 
 /*
@@ -1617,29 +1689,38 @@ register_collation (LANG_COLLATION * coll)
   if (!coll->built_in)
     {
       /* loaded collations have complete weight data here; built-in ones are decided in lang_init_builtin () */
-      lang_set_byte_lockstep_like (coll);
+      lang_set_byte_lockstep (coll);
     }
 
   return NO_ERROR;
 }
 
 /*
- * lang_set_byte_lockstep_like - decides which byte-lockstep LIKE matcher instance (kind)
- *   this collation is eligible for; UTF-8 codeset with identity weights makes byte
- *   equality collation equality
+ * lang_set_byte_lockstep - decides which byte-lockstep LIKE matcher instance (kind)
+ *   this collation is eligible for, and whether the collation is a candidate for the
+ *   byte-lockstep comparator/hash fast path; UTF-8 codeset with identity weights makes
+ *   byte equality collation equality
  *   return: void
  *   lang_coll(in/out): collation
+ *
+ *  Note : comparator and hash share one candidacy flag so that "comparator-equal =>
+ *	   hash-equal" is enforced structurally.  The final assignment additionally
+ *	   depends on a system parameter not yet loaded at registration time and is
+ *	   performed by lang_byte_lockstep_finalize ().
  */
 static void
-lang_set_byte_lockstep_like (LANG_COLLATION * lang_coll)
+lang_set_byte_lockstep (LANG_COLLATION * lang_coll)
 {
   const COLL_DATA *coll;
+  const unsigned int *pad_weights;
   int i;
 
   assert (lang_coll != NULL);
 
   coll = &(lang_coll->coll);
   lang_coll->byte_lockstep_kind = LANG_LOCKSTEP_NONE;
+  lang_coll->byte_lockstep_cmp_hash_candidate = false;
+  lang_coll->byte_lockstep_pad_space = false;
 
   if (coll->uca_exp_num > 1 || coll->count_contr > 0)
     {
@@ -1653,6 +1734,8 @@ lang_set_byte_lockstep_like (LANG_COLLATION * lang_coll)
 	{
 	  lang_coll->byte_lockstep_kind = LANG_LOCKSTEP_BINARY;
 	}
+      /* [VERIFY-4] no weight table exists to derive a pad set from : the raw binary
+       * collation keeps its kind (LIKE lockstep) but stays comparator/hash ineligible */
       return;
     }
 
@@ -1679,6 +1762,39 @@ lang_set_byte_lockstep_like (LANG_COLLATION * lang_coll)
     {
       lang_coll->byte_lockstep_kind = LANG_LOCKSTEP_SB;
     }
+  else
+    {
+      return;
+    }
+
+  /* comparator/hash candidacy : the trailing-ignore weight table must also be identity,
+   * except for zero-weight (pad) entries which must stay within {NUL, SPACE}.  The pad
+   * set is derived from the table the legacy trailing scan consults : built-in
+   * collations scan weights_ti (lang_str_utf8_trail_zero_weights (), lang_fastcmp_byte ()),
+   * loaded collations scan weights */
+  pad_weights = (lang_coll->built_in) ? coll->weights_ti : coll->weights;
+  if (pad_weights == NULL)
+    {
+      return;
+    }
+
+  for (i = 0; i < coll->w_count; i++)
+    {
+      if (pad_weights[i] == (unsigned int) i)
+	{
+	  continue;
+	}
+      if (pad_weights[i] == 0 && i == SPACE)
+	{
+	  continue;
+	}
+      /* a zero weight outside {NUL, SPACE}, or any other non-identity entry :
+       * the lockstep folding/pad semantics would diverge */
+      return;
+    }
+
+  lang_coll->byte_lockstep_cmp_hash_candidate = true;
+  lang_coll->byte_lockstep_pad_space = (pad_weights[SPACE] == 0);
 }
 
 /*
@@ -5589,6 +5705,104 @@ lang_fastcmp_byte (const LANG_COLLATION * lang_coll, const unsigned char *string
 }
 
 /*
+ * lang_fastcmp_lockstep () - byte-lockstep comparator for identity-weight collations
+ *
+ * Returns:
+ *   Greater than 0 if string1 > string2
+ *   Equal to 0     if string1 = string2
+ *   Less than 0    if string1 < string2
+ *
+ * Note:
+ *   One body covers UTF-8 and single-byte codesets : identity weights make the weight
+ *   of a codepoint the codepoint itself, and for valid UTF-8 the lexicographic byte
+ *   order equals the codepoint order, so no character decoding is needed.  The three
+ *   preserved semantics of the legacy comparators (lang_fastcmp_byte (),
+ *   lang_strmatch_utf8 () in compare mode) are:
+ *     1. space-NUL equivalence : at a mismatching byte pair fold f(b) = (b == SPACE ?
+ *        0 : b) before deciding the sign; when the folded bytes are equal (space vs
+ *        NUL) advance one byte and resume.  SPACE and NUL never occur inside a valid
+ *        multi-byte character, so the resume point is always a character boundary.
+ *     2. non-ti tail : with an identical prefix the longer string wins, regardless of
+ *        content.
+ *     3. ti tail : equal iff every remaining byte is a zero-weight pad byte; the pad
+ *        set is derived from the weight tables at registration (NUL always;
+ *        SPACE iff byte_lockstep_pad_space).
+ *   Only assigned by lang_byte_lockstep_finalize () when the collation passed the
+ *   registration gate and oracle_style_empty_string is off.  Guarantees results
+ *   identical to the legacy comparator for valid encodings only (invalid byte
+ *   sequences are unguaranteed by spec, same contract as the LIKE lockstep).
+ */
+static int
+lang_fastcmp_lockstep (const LANG_COLLATION * lang_coll, const unsigned char *string1, const int size1,
+		       const unsigned char *string2, const int size2, bool ignore_trailing_space)
+{
+  const int n = (size1 < size2) ? size1 : size2;
+  const unsigned char *tail;
+  int tail_size, tail_sign;
+  int i = 0;
+
+  /* each byte is visited at most twice (once by memcmp, once by the rescan), so the
+   * prefix phase stays O(n) even for pathological space/NUL runs */
+  while (i < n && memcmp (string1 + i, string2 + i, n - i) != 0)
+    {
+      unsigned char b1, b2, f1, f2;
+
+      while (string1[i] == string2[i])
+	{
+	  i++;
+	}
+
+      b1 = string1[i];
+      b2 = string2[i];
+      f1 = (b1 == SPACE) ? (unsigned char) ZERO : b1;
+      f2 = (b2 == SPACE) ? (unsigned char) ZERO : b2;
+
+      if (f1 != f2)
+	{
+	  return (f1 < f2) ? -1 : 1;
+	}
+
+      /* space vs NUL : equal under folding; resume after this byte */
+      i++;
+    }
+
+  if (size1 == size2)
+    {
+      return 0;
+    }
+
+  if (size1 < size2)
+    {
+      tail = string2 + n;
+      tail_size = size2 - n;
+      tail_sign = -1;
+    }
+  else
+    {
+      tail = string1 + n;
+      tail_size = size1 - n;
+      tail_sign = 1;
+    }
+
+  if (!ignore_trailing_space)
+    {
+      return tail_sign;
+    }
+
+  for (i = 0; i < tail_size; i++)
+    {
+      const unsigned char b = tail[i];
+
+      if (b != (unsigned char) ZERO && !(b == SPACE && lang_coll->byte_lockstep_pad_space))
+	{
+	  return tail_sign;
+	}
+    }
+
+  return 0;
+}
+
+/*
  * lang_strmatch_byte () - match or compare two character strings of
  *			        ISO-8859-1 codeset
  *
@@ -5749,6 +5963,101 @@ lang_mht2str_byte (const LANG_COLLATION * lang_coll, const unsigned char *str, c
   for (; str < str_end; str++)
     {
       w = lang_coll->coll.weights[*str];
+      ADD_TO_HASH (pseudo_key, w);
+    }
+
+  return pseudo_key;
+}
+
+/*
+ * lang_mht2str_lockstep_byte () - byte-lockstep hash for identity-weight collations
+ *				   whose incumbent hash is lang_mht2str_byte ()
+ *   return: hash value
+ *   lang_coll(in) : collation data
+ *   str(in):
+ *   size(in):
+ *
+ *  Note : bit-identical output to lang_mht2str_byte () under the registration gate :
+ *	   weights[b] == b for every byte, so the per-byte weight table load is
+ *	   skipped.  Hash values persist in hash partitioning, so speed may change but
+ *	   the output must not.
+ */
+static unsigned int
+lang_mht2str_lockstep_byte (const LANG_COLLATION * lang_coll, const unsigned char *str, const int size)
+{
+  const unsigned char *str_end = str + size;
+  unsigned int pseudo_key = 0;
+
+  for (; str < str_end; str++)
+    {
+      ADD_TO_HASH (pseudo_key, (unsigned int) (*str));
+    }
+
+  return pseudo_key;
+}
+
+/*
+ * lang_mht2str_lockstep_utf8 () - byte-lockstep hash for identity-weight UTF-8
+ *				   collations whose incumbent hash is
+ *				   lang_mht2str_utf8 ()
+ *   return: hash value
+ *   lang_coll(in) : collation data
+ *   str(in):
+ *   size(in):
+ *
+ *  Note : bit-identical output to lang_mht2str_utf8 () under the registration gate,
+ *	   for valid encodings :
+ *	   - identity weights make w == cp both below w_count (weights[cp] == cp) and
+ *	     above it (w = cp), so the weight lookup disappears;
+ *	   - the contraction branch of the incumbent is dead code here because
+ *	     count_contr == 0 is a gate condition, so it is omitted;
+ *	   - ASCII bytes are mixed directly, non-ASCII characters are decoded inline
+ *	     (same arithmetic as intl_utf8_to_cp ()) to avoid the per-character call;
+ *	   - NO space folding, bug-compatible with the incumbent (the comparator folds
+ *	     SPACE, the hash does not; trailing space handling belongs to the caller,
+ *	     memory_hash.c, and is not touched).
+ *	   Hash values persist in hash partitioning : speed may change, output must not.
+ */
+static unsigned int
+lang_mht2str_lockstep_utf8 (const LANG_COLLATION * lang_coll, const unsigned char *str, const int size)
+{
+  const unsigned char *str_end = str + size;
+  unsigned int pseudo_key = 0;
+  unsigned int w;
+
+  while (str < str_end)
+    {
+      const unsigned char b = *str;
+
+      if (b < 0x80)
+	{
+	  w = b;
+	  str += 1;
+	}
+      else if (str_end - str >= 2 && b >= 0xc0 && b < 0xe0)
+	{
+	  w = ((b & 0x1f) << 6) | (str[1] & 0x3f);
+	  str += 2;
+	}
+      else if (str_end - str >= 3 && b >= 0xe0 && b < 0xf0)
+	{
+	  w = ((b & 0x0f) << 12) | ((str[1] & 0x3f) << 6) | (str[2] & 0x3f);
+	  str += 3;
+	}
+      else if (str_end - str >= 4 && b >= 0xf0 && b < 0xf8)
+	{
+	  w = ((b & 0x07) << 18) | ((str[1] & 0x3f) << 12) | ((str[2] & 0x3f) << 6) | (str[3] & 0x3f);
+	  str += 4;
+	}
+      else
+	{
+	  /* invalid or truncated sequence : same fallback as intl_utf8_to_cp ()
+	   * (0xffffffff, advance one byte); results on invalid encodings are
+	   * unguaranteed by spec anyway */
+	  w = 0xffffffff;
+	  str += 1;
+	}
+
       ADD_TO_HASH (pseudo_key, w);
     }
 

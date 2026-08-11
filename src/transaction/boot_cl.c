@@ -336,6 +336,7 @@ boot_client_common (BOOT_CLIENT_CREDENTIAL * client_credential, const char *lang
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_BO_CANT_LOAD_SYSPRM, 0);
       return ER_BO_CANT_LOAD_SYSPRM;
     }
+  lang_byte_lockstep_finalize ();
 
   if (!is_createdb)
     {

@@ -1452,6 +1452,7 @@ xboot_initialize_server (const BOOT_CLIENT_CREDENTIAL * client_credential, BOOT_
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_BO_CANT_LOAD_SYSPRM, 0);
       goto exit_on_error;
     }
+  lang_byte_lockstep_finalize ();
 
   area_init ();
   error_code = set_area_init ();
@@ -2032,6 +2033,7 @@ boot_restart_server (THREAD_ENTRY * thread_p, bool print_restart, const char *db
       error_code = ER_BO_CANT_LOAD_SYSPRM;
       goto error;
     }
+  lang_byte_lockstep_finalize ();
 
   common_ha_mode = HA_GET_MODE ();
 #endif /* SERVER_MODE */
@@ -2852,6 +2854,7 @@ xboot_restart_from_backup (THREAD_ENTRY * thread_p, int print_restart, const cha
     {
       return NULL_TRAN_INDEX;
     }
+  lang_byte_lockstep_finalize ();
 
   prm_set_bool_value (PRM_ID_DBFILES_PROTECT, false);
 
@@ -5348,6 +5351,7 @@ xboot_emergency_patch (const char *db_name, bool recreate_log, DKNPAGES log_npag
       error_code = ER_BO_CANT_LOAD_SYSPRM;
       goto error_exit;
     }
+  lang_byte_lockstep_finalize ();
 
   if (db_name == NULL)
     {
