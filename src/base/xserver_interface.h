@@ -130,7 +130,7 @@ extern int xlocator_check_fk_validity (THREAD_ENTRY * thread_p, OID * cls_oid, H
 extern LOG_LSA *xrepl_log_get_append_lsa (void);
 extern int xrepl_set_info (THREAD_ENTRY * thread_p, REPL_INFO * repl_info);
 
-extern int xheap_create (THREAD_ENTRY * thread_p, HFID * hfid, const OID * class_oid, bool reuse_oid);
+extern int xheap_create (THREAD_ENTRY * thread_p, HFID * hfid, const OID * class_oid, bool reuse_oid, bool columnar);
 extern int xheap_destroy (THREAD_ENTRY * thread_p, const HFID * hfid, const OID * class_oid);
 extern int xheap_destroy_newly_created (THREAD_ENTRY * thread_p, const HFID * hfid, const OID * class_oid,
 					const bool force = false);

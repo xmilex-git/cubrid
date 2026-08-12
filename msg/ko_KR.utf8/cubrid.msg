@@ -1480,7 +1480,9 @@ $ LOADDB
 
 1377 no-logging 인덱스 빌드가 vacuum notification 메모리 한도(%1$d 바이트)를 초과했습니다. 동시 트랜잭션이 없는 상태에서 loaddb를 재시도하거나, no-logging 옵션 없이 인덱스를 다시 빌드하십시오.
 
-1378 마지막 에러
+1378 columnar 테이블에서 지원하지 않는 연산입니다: %1$s
+
+1379 마지막 에러
 
 $set 6 MSGCAT_SET_INTERNAL
 1 에러 서브 시스템에 에러 발생(라인 %1$d):
@@ -1993,6 +1995,7 @@ $set 8 MSGCAT_SET_PARSER_SEMANTIC
 337 파티션 이름이 너무 깁니다.
 
 338 잘못된 인자입니다. UUID는 UUIDv4, 또는 UUIDv7만 지원하며, 버전 인자는 NULL일 수 없습니다.
+339 columnar 테이블에서 지원하지 않는 연산입니다: %1$s.
 
 
 

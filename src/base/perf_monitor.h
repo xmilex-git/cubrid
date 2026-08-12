@@ -228,6 +228,7 @@ typedef enum
   PERF_PAGE_BTREE_OVF,		/* b+tree overflow index page */
   PERF_PAGE_BTREE_LEAF,		/* b+tree leaf index page */
   PERF_PAGE_BTREE_NONLEAF,	/* b+tree nonleaf index page */
+  PERF_PAGE_COLUMNAR,		/* columnar storage page */
   PERF_PAGE_CNT
 } PERF_PAGE_TYPE;
 

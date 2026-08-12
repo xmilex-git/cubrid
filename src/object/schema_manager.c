@@ -15981,6 +15981,12 @@ sm_truncate_using_destroy_heap (MOP class_mop)
   oid = ws_oid (class_mop);
   assert (!OID_ISTEMP (oid));
 
+  if (sm_get_class_flag (class_mop, SM_CLASSFLAG_COLUMNAR) > 0)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "TRUNCATE");
+      return ER_COLUMNAR_NOT_SUPPORTED;
+    }
+
   reuse_oid = sm_is_reuse_oid_class (class_mop);
 
   error = au_fetch_class (class_mop, &class_, AU_FETCH_WRITE, DB_AUTH_ALTER);
@@ -16032,7 +16038,7 @@ sm_truncate_using_destroy_heap (MOP class_mop)
     }
 
   /* Create a new heap */
-  error = heap_create (insts_hfid, oid, reuse_oid);
+  error = heap_create (insts_hfid, oid, reuse_oid, false);
   if (error != NO_ERROR)
     {
       goto end;

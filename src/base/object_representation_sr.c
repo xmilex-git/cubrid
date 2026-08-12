@@ -784,6 +784,24 @@ or_class_tde_algorithm (RECDES * record, TDE_ALGORITHM * tde_algo)
   *(int *) tde_algo = OR_GET_INT (ptr + ORC_CLASS_TDE_ALGORITHM);
 }
 
+/*
+ * or_class_flags () - Extracts the class flags (SM_CLASS_FLAG bits) from the
+ *                     disk representation of a class
+ *   return: void
+ *   record(in): packed disk record containing class
+ *   flags(out): pointer to int to be filled in
+ */
+void
+or_class_flags (RECDES * record, int *flags)
+{
+  char *ptr;
+
+  assert (OR_GET_OFFSET_SIZE (record->data) == BIG_VAR_OFFSET_SIZE);
+
+  ptr = record->data + OR_FIXED_ATTRIBUTES_OFFSET (record->data, ORC_CLASS_VAR_ATT_COUNT);
+  *flags = OR_GET_INT (ptr + ORC_CLASS_FLAGS);
+}
+
 #if defined (ENABLE_UNUSED_FUNCTION)
 /*
  * or_class_statistics () - extracts the OID of the statistics instance for

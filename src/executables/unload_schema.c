@@ -1430,6 +1430,21 @@ extract_schema (extract_context & ctxt, print_output & schema_output_ctx)
       return 1;
     }
 
+  /* columnar tables are not supported by unloaddb */
+  {
+    DB_OBJLIST *cl;
+
+    for (cl = ctxt.classes; cl != NULL; cl = cl->next)
+      {
+	if (db_is_vclass (cl->op) <= 0 && sm_get_class_flag (cl->op, SM_CLASSFLAG_COLUMNAR) > 0)
+	  {
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "unloaddb");
+	    fprintf (stderr, "%s\n", db_error_string (3));
+	    return 1;
+	  }
+      }
+  }
+
   /*
    * Schema
    */

@@ -1656,17 +1656,18 @@ locator_fetch_lockhint_classes (LC_LOCKHINT * lockhint, LC_COPYAREA ** fetch_cop
  *   hfid(in):
  *   class_oid(in):
  *   reuse_oid(in):
+ *   columnar(in): create a FILE_COLUMNAR data file instead of a heap
  *
  * NOTE:
  */
 int
-heap_create (HFID * hfid, const OID * class_oid, bool reuse_oid)
+heap_create (HFID * hfid, const OID * class_oid, bool reuse_oid, bool columnar)
 {
 #if defined(CS_MODE)
   int error = ER_NET_CLIENT_DATA_RECEIVE;
   int req_error;
   char *ptr;
-  OR_ALIGNED_BUF (OR_HFID_SIZE + OR_OID_SIZE + OR_INT_SIZE) a_request;
+  OR_ALIGNED_BUF (OR_HFID_SIZE + OR_OID_SIZE + OR_INT_SIZE + OR_INT_SIZE) a_request;
   char *request;
   OR_ALIGNED_BUF (OR_INT_SIZE + OR_HFID_SIZE) a_reply;
   char *reply;
@@ -1677,6 +1678,7 @@ heap_create (HFID * hfid, const OID * class_oid, bool reuse_oid)
   ptr = or_pack_hfid (request, hfid);
   ptr = or_pack_oid (ptr, (OID *) class_oid);
   ptr = or_pack_int (ptr, (int) reuse_oid);
+  ptr = or_pack_int (ptr, (int) columnar);
   req_error =
     net_client_request (NET_SERVER_HEAP_CREATE, request, OR_ALIGNED_BUF_SIZE (a_request), reply,
 			OR_ALIGNED_BUF_SIZE (a_reply), NULL, 0, NULL, 0);
@@ -1692,7 +1694,7 @@ heap_create (HFID * hfid, const OID * class_oid, bool reuse_oid)
 
   THREAD_ENTRY *thread_p = enter_server ();
 
-  success = xheap_create (thread_p, hfid, class_oid, reuse_oid);
+  success = xheap_create (thread_p, hfid, class_oid, reuse_oid, columnar);
 
   exit_server (*thread_p);
 

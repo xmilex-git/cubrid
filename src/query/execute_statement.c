@@ -7046,6 +7046,12 @@ do_create_trigger (PARSER_CONTEXT * parser, PT_NODE * statement)
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INVALID_PARTITION_REQUEST, 0);
 	  return ER_INVALID_PARTITION_REQUEST;
 	}
+      if (smclass->flags & SM_CLASSFLAG_COLUMNAR)
+	{
+	  /* columnar tables do not support triggers */
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "CREATE TRIGGER");
+	  return ER_COLUMNAR_NOT_SUPPORTED;
+	}
     }
   cond = PT_NODE_COND (statement);
   cond_time = PT_NODE_COND_TIME (statement);

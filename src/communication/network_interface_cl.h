@@ -127,7 +127,7 @@ extern int locator_check_fk_validity (OID * cls_oid, HFID * hfid, TP_DOMAIN * ke
 				      OID * pk_cls_oid, BTID * pk_btid, char *fk_name);
 extern int locator_prefetch_repl_insert (OID * class_oid, RECDES * recdes);
 
-extern int heap_create (HFID * hfid, const OID * class_oid, bool reuse_oid);
+extern int heap_create (HFID * hfid, const OID * class_oid, bool reuse_oid, bool columnar);
 #if defined(ENABLE_UNUSED_FUNCTION)
 extern int heap_destroy (const HFID * hfid);
 #endif

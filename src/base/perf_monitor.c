@@ -2104,6 +2104,8 @@ perfmon_stat_page_type_name (const int page_type)
       return "PAGE_BTREE_L";
     case PERF_PAGE_BTREE_NONLEAF:
       return "PAGE_BTREE_N";
+    case PERF_PAGE_COLUMNAR:
+      return "PAGE_COLUMNAR";
     default:
       break;
     }

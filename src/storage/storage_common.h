@@ -162,7 +162,8 @@ typedef enum
   PAGE_LOG,			/* NONE - log page (unused) */
   PAGE_DROPPED_FILES,		/* Dropped files page.  */
   PAGE_VACUUM_DATA,		/* Vacuum data. */
-  PAGE_LAST = PAGE_VACUUM_DATA
+  PAGE_COLUMNAR,		/* Columnar storage page (metapage/stripe). */
+  PAGE_LAST = PAGE_COLUMNAR
 } PAGE_TYPE;
 
 /* Index scan OID buffer size as set by system parameter. */

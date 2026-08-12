@@ -1535,6 +1535,7 @@ BEGIN_SUPPRESS_WARNING_BISON_FLEX
 %token <cptr> CLOB_TO_CHAR
 %token <cptr> CLOSE
 %token <cptr> COLLATION
+%token <cptr> COLUMNAR
 %token <cptr> COLUMNS
 %token <cptr> COMMENT
 %token <cptr> COMMITTED
@@ -9014,6 +9015,11 @@ table_option
 	: REUSE_OID
 		{{
 			$$ = pt_table_option (this_parser, PT_TABLE_OPTION_REUSE_OID, NULL);
+			PARSER_SAVE_ERR_CONTEXT ($$, @$.buffer_pos)
+		}}
+	| USING COLUMNAR
+		{{
+			$$ = pt_table_option (this_parser, PT_TABLE_OPTION_COLUMNAR, NULL);
 			PARSER_SAVE_ERR_CONTEXT ($$, @$.buffer_pos)
 		}}
 	| DONT_REUSE_OID
@@ -20574,6 +20580,7 @@ identifier
 	| CLOB_TO_CHAR           {{ SET_CPTR_2_PTNAME($$, $1, @1, @$.buffer_pos);  }}
 	| CLOSE                  {{ SET_CPTR_2_PTNAME($$, $1, @1, @$.buffer_pos);  }}
 	| COLLATION              {{ SET_CPTR_2_PTNAME($$, $1, @1, @$.buffer_pos);  }}
+	| COLUMNAR               {{ SET_CPTR_2_PTNAME($$, $1, @1, @$.buffer_pos);  }}
 	| COLUMNS                {{ SET_CPTR_2_PTNAME($$, $1, @1, @$.buffer_pos);  }}
 	| COMMENT                {{ SET_CPTR_2_PTNAME($$, $1, @1, @$.buffer_pos);  }}
 	| COMMITTED              {{ SET_CPTR_2_PTNAME($$, $1, @1, @$.buffer_pos);  }}

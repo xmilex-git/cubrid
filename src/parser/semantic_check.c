@@ -4852,6 +4852,13 @@ pt_check_alter (PARSER_CONTEXT * parser, PT_NODE * alter)
 
   reuse_oid = sm_is_reuse_oid_class (db);
 
+  /* columnar tables do not support schema alteration */
+  if (sm_get_class_flag (db, SM_CLASSFLAG_COLUMNAR) > 0)
+    {
+      PT_ERRORmf (parser, alter, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "ALTER");
+      return;
+    }
+
   /* attach object */
   name->info.name.db_object = db;
   pt_check_user_owns_class (parser, name);
@@ -8332,6 +8339,7 @@ pt_check_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
   bool found_auto_increment = false;
   bool found_tbl_comment = false;
   bool found_tbl_encrypt = false;
+  bool found_columnar = false;
   int error = NO_ERROR;
 
   entity_type = node->info.create_entity.entity_type;
@@ -8459,6 +8467,20 @@ pt_check_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
 	      }
 	  }
 	  break;
+	case PT_TABLE_OPTION_COLUMNAR:
+	  {
+	    if (found_columnar)
+	      {
+		PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_DUPLICATE_TABLE_OPTION,
+			    parser_print_tree (parser, tbl_opt));
+		return;
+	      }
+	    else
+	      {
+		found_columnar = true;
+	      }
+	  }
+	  break;
 	default:
 	  /* should never arrive here */
 	  assert (false);
@@ -8466,8 +8488,58 @@ pt_check_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
 	}
     }
 
+  if (found_columnar)
+    {
+      /* restrictions decided for columnar storage (append-only, no indexes) */
+      if (found_reuse_oid_option)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+		      "REUSE_OID/DONT_REUSE_OID");
+	  return;
+	}
+      if (found_tbl_encrypt)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "ENCRYPT");
+	  return;
+	}
+      if (node->info.create_entity.partition_info != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+		      "PARTITION BY");
+	  return;
+	}
+      if (node->info.create_entity.create_like != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+		      "CREATE TABLE LIKE");
+	  return;
+	}
+      if (node->info.create_entity.create_select != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+		      "CREATE TABLE ... AS SELECT");
+	  return;
+	}
+      if (node->info.create_entity.supclass_list != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+		      "INHERITANCE");
+	  return;
+	}
+      for (r = node->info.create_entity.constraint_list; r != NULL; r = r->next)
+	{
+	  if (r->node_type == PT_CONSTRAINT && r->info.constraint.type != PT_CONSTRAIN_NULL
+	      && r->info.constraint.type != PT_CONSTRAIN_NOT_NULL)
+	    {
+	      PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+			  "PRIMARY KEY/UNIQUE/FOREIGN KEY/INDEX");
+	      return;
+	    }
+	}
+    }
+
   /* get default value of reuse_oid from system parameter and create pt_node and add it into table_option_list, if don't use table option related reuse_oid */
-  if (!found_reuse_oid_option && entity_type == PT_CLASS)
+  if (!found_reuse_oid_option && !found_columnar && entity_type == PT_CLASS)
     {
       PT_NODE *tmp;
 
@@ -8608,6 +8680,12 @@ pt_check_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
 	    {
 	      PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_RUNTIME, MSGCAT_RUNTIME_NOT_ALLOWED_ACCESS_TO_PARTITION,
 			  parent->info.name.original);
+	      break;
+	    }
+	  if (sm_get_class_flag (db_obj, SM_CLASSFLAG_COLUMNAR) > 0)
+	    {
+	      PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+			  "INHERITANCE");
 	      break;
 	    }
 	  pt_check_user_owns_class (parser, parent);
@@ -8817,6 +8895,13 @@ pt_check_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
 			   create_like->info.name.original, pt_show_misc_type (PT_CLASS));
 	      return;
 	    }
+	  if (sm_get_class_flag (db_obj, SM_CLASSFLAG_COLUMNAR) > 0)
+	    {
+	      /* columnar storage may not be inherited through LIKE */
+	      PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+			  "CREATE TABLE LIKE");
+	      return;
+	    }
 	}
     }
 
@@ -8888,6 +8973,14 @@ pt_check_create_index (PARSER_CONTEXT * parser, PT_NODE * node)
       if (is_partition == DB_PARTITION_CLASS)
 	{
 	  PT_ERRORm (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_INVALID_PARTITION_REQUEST);
+	  return;
+	}
+
+      /* columnar tables do not support indexes */
+      if (sm_get_class_flag (db_obj, SM_CLASSFLAG_COLUMNAR) > 0)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+		      "CREATE INDEX");
 	  return;
 	}
 
@@ -10301,6 +10394,11 @@ pt_check_truncate (PARSER_CONTEXT * parser, PT_NODE * node)
 		  PT_ERRORmf2 (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_IS_NOT_A, cls_nam,
 			       pt_show_misc_type (PT_CLASS));
 		}
+	      else if (sm_get_class_flag (db_obj, SM_CLASSFLAG_COLUMNAR) > 0)
+		{
+		  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+			      "TRUNCATE");
+		}
 	    }
 	}
     }
@@ -10489,6 +10587,18 @@ pt_check_update_stats (PARSER_CONTEXT * parser, PT_NODE * node)
 	      return;
 	    }
 	}
+
+      {
+	/* columnar tables have no heap statistics */
+	DB_OBJECT *stats_class_obj = db_find_class (class_name);
+
+	if (stats_class_obj != NULL && sm_get_class_flag (stats_class_obj, SM_CLASSFLAG_COLUMNAR) > 0)
+	  {
+	    PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+			"UPDATE STATISTICS");
+	    return;
+	  }
+      }
     }
 }
 
@@ -10902,6 +11012,37 @@ pt_check_json_table_node (PARSER_CONTEXT * parser, PT_NODE * node)
 }
 
 /*
+ * pt_find_columnar_class_in_spec_list () - find the first spec in the list
+ *                                          that resolves to a columnar class
+ *   return: the flat entity name node of the columnar class, or NULL
+ *   parser(in): parser context
+ *   spec_list(in): list of PT_SPEC nodes
+ */
+static PT_NODE *
+pt_find_columnar_class_in_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec_list)
+{
+  PT_NODE *spec, *flat;
+
+  for (spec = spec_list; spec != NULL; spec = spec->next)
+    {
+      if (spec->node_type != PT_SPEC)
+	{
+	  continue;
+	}
+      for (flat = spec->info.spec.flat_entity_list; flat != NULL; flat = flat->next)
+	{
+	  if (flat->node_type == PT_NAME && flat->info.name.db_object != NULL
+	      && sm_get_class_flag (flat->info.name.db_object, SM_CLASSFLAG_COLUMNAR) > 0)
+	    {
+	      return flat;
+	    }
+	}
+    }
+
+  return NULL;
+}
+
+/*
  * pt_semantic_check_local () - checks semantics on a particular statement
  *   return:
  *   parser(in):
@@ -10937,6 +11078,13 @@ pt_semantic_check_local (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int
       if (top_node->flag.cannot_prepare == 1)
 	{
 	  node->flag.cannot_prepare = 1;
+	}
+
+      /* columnar tables are append-only */
+      if (pt_find_columnar_class_in_spec_list (parser, node->info.delete_.spec) != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "DELETE");
+	  break;
 	}
 
       entity = NULL;
@@ -10991,6 +11139,13 @@ pt_semantic_check_local (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int
       if (top_node && top_node->flag.cannot_prepare == 1)
 	{
 	  node->flag.cannot_prepare = 1;
+	}
+
+      /* interim guard until the columnar write path (INSERT) is implemented */
+      if (pt_find_columnar_class_in_spec_list (parser, node->info.insert.spec) != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "INSERT");
+	  break;
 	}
 
       if (node->info.insert.into_var != NULL && node->info.insert.value_clauses->next != NULL)
@@ -11188,6 +11343,13 @@ pt_semantic_check_local (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int
 	  node->flag.cannot_prepare = 1;
 	}
 
+      /* interim guard until the columnar read path (SELECT) is implemented */
+      if (pt_find_columnar_class_in_spec_list (parser, node->info.query.q.select.from) != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "SELECT");
+	  break;
+	}
+
       if (node->info.query.flag.single_tuple == 1)
 	{
 	  if (pt_length_of_select_list (node->info.query.q.select.list, EXCLUDE_HIDDEN_COLUMNS) != 1)
@@ -11308,6 +11470,13 @@ pt_semantic_check_local (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int
       if (top_node->flag.cannot_prepare == 1)
 	{
 	  node->flag.cannot_prepare = 1;
+	}
+
+      /* columnar tables are append-only */
+      if (pt_find_columnar_class_in_spec_list (parser, node->info.update.spec) != NULL)
+	{
+	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "UPDATE");
+	  break;
 	}
 
       if (pt_has_aggregate (parser, node))

@@ -1771,7 +1771,9 @@
 
 #define ER_BT_LOAD_NOTIFY_VACUUM_LIMIT              -1377
 
-#define ER_LAST_ERROR                               -1378
+#define ER_COLUMNAR_NOT_SUPPORTED                   -1378
+
+#define ER_LAST_ERROR                               -1379
 
 
 

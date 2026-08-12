@@ -1481,7 +1481,9 @@ Check the path of the key file (_keys) and make sure that it includes proper key
 
 1377 The no-logging index build exceeded its vacuum notification memory limit (%1$d bytes). Retry the loaddb while no concurrent transactions are active, or rebuild the index without the no-logging option.
 
-1378 Last Error
+1378 Operation not supported on columnar table: %1$s
+
+1379 Last Error
 
 
 $set 6 MSGCAT_SET_INTERNAL
@@ -1995,6 +1997,7 @@ $set 8 MSGCAT_SET_PARSER_SEMANTIC
 337 The partition name is too long.
 
 338 Undefined argument. UUID only supports UUIDv4, or UUIDv7; the version argument cannot be NULL.
+339 Operation not supported on columnar table: %1$s.
 
 
 

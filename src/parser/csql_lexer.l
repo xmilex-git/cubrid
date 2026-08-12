@@ -259,6 +259,8 @@ IDL       [a-zA-Z0-9_]
 [cC][oO][lL][lL][aA][tT][iI][oO][nN]					{ csql_yylval.cptr = pt_makename(yytext);
 									  return COLLATION; }
 [cC][oO][lL][uU][mM][nN]						{ return COLUMN; }
+[cC][oO][lL][uU][mM][nN][aA][rR]					{ csql_yylval.cptr = pt_makename(yytext);
+									  return COLUMNAR; }
 [cC][oO][lL][uU][mM][nN][sS]						{ csql_yylval.cptr = pt_makename(yytext);
 									  return COLUMNS; }
 [cC][oO][mM][mM][eE][nN][tT]					        { csql_yylval.cptr = pt_makename(yytext);

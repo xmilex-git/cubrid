@@ -42,6 +42,7 @@
 #include "record_descriptor.hpp"
 #include <random>
 #include "slotted_page.h"
+#include "columnar_file.h"
 #include "overflow_file.h"
 #include "boot_sr.h"
 #include "locator_sr.h"
@@ -5370,11 +5371,16 @@ heap_scanrange_isvalid (HEAP_SCANRANGE * scan_range)
  *   reuse_oid(int):
  *
  * Note: Creates an object heap file on the disk volume associated with
- * hfid->vfid->volid.
+ * hfid->vfid->volid. For a columnar class, a FILE_COLUMNAR data file is
+ * created instead and its identifier is stored in the HFID slot.
  */
 int
-xheap_create (THREAD_ENTRY * thread_p, HFID * hfid, const OID * class_oid, bool reuse_oid)
+xheap_create (THREAD_ENTRY * thread_p, HFID * hfid, const OID * class_oid, bool reuse_oid, bool columnar)
 {
+  if (columnar)
+    {
+      return columnar_file_create (thread_p, hfid, class_oid);
+    }
   return heap_create_internal (thread_p, hfid, class_oid, reuse_oid);
 }
 
@@ -5391,6 +5397,13 @@ xheap_destroy (THREAD_ENTRY * thread_p, const HFID * hfid, const OID * class_oid
 {
   VFID vfid;
   LOG_DATA_ADDR addr;
+  FILE_TYPE file_type;
+
+  if (file_get_type (thread_p, &hfid->vfid, &file_type) == NO_ERROR && file_type == FILE_COLUMNAR)
+    {
+      /* columnar data file: no heap header, no overflow, no vacuum interaction */
+      return columnar_file_destroy (thread_p, hfid);
+    }
 
   vacuum_log_add_dropped_file (thread_p, &hfid->vfid, class_oid, VACUUM_LOG_ADD_DROPPED_FILE_POSTPONE);
 
@@ -5432,6 +5445,10 @@ xheap_destroy_newly_created (THREAD_ENTRY * thread_p, const HFID * hfid, const O
     {
       ASSERT_ERROR ();
       return ret;
+    }
+  if (file_type == FILE_COLUMNAR)
+    {
+      return columnar_file_destroy (thread_p, hfid);
     }
   if (file_type == FILE_HEAP_REUSE_SLOTS || force)
     {
@@ -6404,7 +6421,9 @@ heap_scancache_start_internal (THREAD_ENTRY * thread_p, HEAP_SCANCACHE * scan_ca
 	  return ret;
 	}
       assert (hfid == NULL || HFID_EQ (hfid, &scan_cache->node.hfid));
-      assert (scan_cache->file_type == FILE_HEAP || scan_cache->file_type == FILE_HEAP_REUSE_SLOTS);
+      /* FILE_COLUMNAR is tolerated here; the heap operations themselves reject columnar files */
+      assert (scan_cache->file_type == FILE_HEAP || scan_cache->file_type == FILE_HEAP_REUSE_SLOTS
+	      || scan_cache->file_type == FILE_COLUMNAR);
     }
   else
     {
@@ -17420,6 +17439,17 @@ heap_compact_pages (THREAD_ENTRY * thread_p, OID * class_oid)
       return ret;
     }
 
+  {
+    /* columnar classes have no heap pages to compact */
+    FILE_TYPE hfid_file_type = FILE_UNKNOWN_TYPE;
+
+    if (file_get_type (thread_p, &hfid.vfid, &hfid_file_type) == NO_ERROR && hfid_file_type == FILE_COLUMNAR)
+      {
+	lock_unlock_object (thread_p, class_oid, oid_Root_class_oid, IS_LOCK, true);
+	return NO_ERROR;
+      }
+  }
+
   PGBUF_INIT_WATCHER (&pg_watcher, PGBUF_ORDERED_HEAP_NORMAL, &hfid);
   PGBUF_INIT_WATCHER (&old_pg_watcher, PGBUF_ORDERED_HEAP_NORMAL, &hfid);
 
@@ -23294,6 +23324,25 @@ heap_insert_logical (THREAD_ENTRY * thread_p, HEAP_OPERATION_CONTEXT * context, 
       return ER_FAILED;
     }
 
+  /* interim guard until the columnar write path exists: object inserts must never touch a columnar data file */
+  {
+    FILE_TYPE insert_file_type = FILE_UNKNOWN_TYPE;
+
+    if (context->scan_cache_p != NULL)
+      {
+	insert_file_type = context->scan_cache_p->file_type;
+      }
+    else if (file_get_type (thread_p, &context->hfid.vfid, &insert_file_type) != NO_ERROR)
+      {
+	insert_file_type = FILE_UNKNOWN_TYPE;
+      }
+    if (insert_file_type == FILE_COLUMNAR)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "INSERT");
+	return ER_COLUMNAR_NOT_SUPPORTED;
+      }
+  }
+
   is_mvcc_class = !mvcc_is_mvcc_disabled_class (&context->class_oid);
   /*
    * Determine type of operation
@@ -23521,6 +23570,11 @@ heap_delete_logical (THREAD_ENTRY * thread_p, HEAP_OPERATION_CONTEXT * context)
   context->file_type = heap_get_file_type (thread_p, context);
   if (context->file_type != FILE_HEAP && context->file_type != FILE_HEAP_REUSE_SLOTS)
     {
+      if (context->file_type == FILE_COLUMNAR)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "DELETE");
+	  return ER_COLUMNAR_NOT_SUPPORTED;
+	}
       if (context->file_type == FILE_UNKNOWN_TYPE)
 	{
 	  ASSERT_ERROR_AND_SET (rc);
@@ -23708,6 +23762,11 @@ heap_update_logical (THREAD_ENTRY * thread_p, HEAP_OPERATION_CONTEXT * context)
   context->file_type = heap_get_file_type (thread_p, context);
   if (context->file_type != FILE_HEAP && context->file_type != FILE_HEAP_REUSE_SLOTS)
     {
+      if (context->file_type == FILE_COLUMNAR)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "UPDATE");
+	  return ER_COLUMNAR_NOT_SUPPORTED;
+	}
       if (context->file_type == FILE_UNKNOWN_TYPE)
 	{
 	  ASSERT_ERROR_AND_SET (rc);

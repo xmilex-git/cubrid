@@ -4986,20 +4986,20 @@ boot_create_all_volumes (THREAD_ENTRY * thread_p, const BOOT_CLIENT_CREDENTIAL *
       ASSERT_ERROR ();
       goto error;
     }
-  error_code = xheap_create (thread_p, &boot_Db_parm->hfid, NULL, false);
+  error_code = xheap_create (thread_p, &boot_Db_parm->hfid, NULL, false, false);
   if (error_code != NO_ERROR)
     {
       ASSERT_ERROR ();
       goto error;
     }
-  error_code = xheap_create (thread_p, &boot_Db_parm->rootclass_hfid, NULL, false);
+  error_code = xheap_create (thread_p, &boot_Db_parm->rootclass_hfid, NULL, false, false);
   if (error_code != NO_ERROR)
     {
       ASSERT_ERROR ();
       goto error;
     }
 
-  error_code = xheap_create (thread_p, &boot_Db_parm->tde_keyinfo_hfid, NULL, false);
+  error_code = xheap_create (thread_p, &boot_Db_parm->tde_keyinfo_hfid, NULL, false, false);
   if (error_code != NO_ERROR)
     {
       ASSERT_ERROR ();

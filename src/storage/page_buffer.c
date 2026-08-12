@@ -15018,6 +15018,11 @@ pgbuf_get_page_type_for_stat (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
     {
       perf_page_type = btree_get_perf_btree_page_type (thread_p, pgptr);
     }
+  else if (io_pgptr->prv.ptype == PAGE_COLUMNAR)
+    {
+      /* PAGE_COLUMNAR is beyond the value-compatible PERF_PAGE range */
+      perf_page_type = PERF_PAGE_COLUMNAR;
+    }
   else
     {
       perf_page_type = (PERF_PAGE_TYPE) io_pgptr->prv.ptype;
@@ -17311,6 +17316,7 @@ pgbuf_scan_bcb_table ()
 	      break;
 	    case PAGE_OVERFLOW:
 	    case PAGE_HEAP:
+	    case PAGE_COLUMNAR:
 	      show_status_snapshot->num_data_pages++;
 	      break;
 	    case PAGE_CATALOG:

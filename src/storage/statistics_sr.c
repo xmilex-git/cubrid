@@ -227,6 +227,17 @@ stats_update_statistics_internal (THREAD_ENTRY * thread_p, OID * class_id_p, boo
       goto end;
     }
 
+  {
+    /* columnar classes have no heap to scan; leave statistics untouched */
+    FILE_TYPE hfid_file_type = FILE_UNKNOWN_TYPE;
+
+    if (file_get_type (thread_p, &cls_info_p->ci_hfid.vfid, &hfid_file_type) == NO_ERROR
+	&& hfid_file_type == FILE_COLUMNAR)
+      {
+	goto end;
+      }
+  }
+
   error_code = partition_get_partition_oids (thread_p, class_id_p, &partitions, &count);
   if (error_code != NO_ERROR)
     {

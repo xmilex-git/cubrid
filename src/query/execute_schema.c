@@ -8570,6 +8570,17 @@ add_foreign_key (DB_CTMPL * ctemplate, const PT_NODE * cnstr, const char **att_n
 
   fk_info = (PT_FOREIGN_KEY_INFO *) (&cnstr->info.constraint.un.foreign_key);
 
+  /* a columnar table cannot be the target of a foreign key (no primary key) */
+  {
+    DB_OBJECT *ref_obj = db_find_class (fk_info->referenced_class->info.name.original);
+
+    if (ref_obj != NULL && sm_get_class_flag (ref_obj, SM_CLASSFLAG_COLUMNAR) > 0)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "FOREIGN KEY REFERENCES");
+	return ER_COLUMNAR_NOT_SUPPORTED;
+      }
+  }
+
   n_atts = pt_length_of_list (fk_info->attrs);
   i = 0;
   for (p = fk_info->attrs; p; p = p->next)
@@ -9784,6 +9795,7 @@ do_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
   DB_QUERY_TYPE *query_columns = NULL;
   PT_NODE *tbl_opt = NULL;
   bool found_reuse_oid_option = false, reuse_oid = false;
+  bool is_columnar = false;
   bool do_rollback_on_error = false;
   bool do_abort_class_on_error = false;
   bool do_flush_class_mop = false;
@@ -9897,6 +9909,9 @@ do_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
 	      found_reuse_oid_option = true;
 	      reuse_oid = true;
 	      break;
+	    case PT_TABLE_OPTION_COLUMNAR:
+	      is_columnar = true;
+	      break;
 	    case PT_TABLE_OPTION_ENCRYPT:
 	      tbl_opt_encrypt = tbl_opt;
 	      break;
@@ -9934,6 +9949,11 @@ do_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
       if (!found_reuse_oid_option)
 	{
 	  reuse_oid = prm_get_bool_value (PRM_ID_TB_DEFAULT_REUSE_OID);
+	}
+      if (is_columnar)
+	{
+	  /* columnar tables have no heap; the reuse_oid default does not apply */
+	  reuse_oid = false;
 	}
 
       /* validate charset and collation options, if any */
@@ -10115,6 +10135,19 @@ do_create_entity (PARSER_CONTEXT * parser, PT_NODE * node)
 		  break;
 		}
 	    }
+	}
+      if (is_columnar)
+	{
+	  /* the flag must be set before storage creation so that
+	   * locator_create_heap_if_needed creates a FILE_COLUMNAR file */
+	  error = sm_set_class_flag (class_obj, SM_CLASSFLAG_COLUMNAR, 1);
+	  if (error != NO_ERROR)
+	    {
+	      break;
+	    }
+	  /* Need to flush class mop in order to reflect the columnar flag into
+	   * the catalog table, as for reuse_oid below. */
+	  do_flush_class_mop = true;
 	}
       if (locator_create_heap_if_needed (class_obj, reuse_oid) == NULL)
 	{

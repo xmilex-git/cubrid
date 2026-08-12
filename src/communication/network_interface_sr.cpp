@@ -2958,12 +2958,14 @@ shf_create (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
   OR_ALIGNED_BUF (OR_INT_SIZE + OR_HFID_SIZE) a_reply;
   char *reply = OR_ALIGNED_BUF_START (a_reply);
   int reuse_oid = 0;
+  int columnar = 0;
 
   ptr = or_unpack_hfid (request, &hfid);
   ptr = or_unpack_oid (ptr, &class_oid);
   ptr = or_unpack_int (ptr, &reuse_oid);
+  ptr = or_unpack_int (ptr, &columnar);
 
-  error = xheap_create (thread_p, &hfid, &class_oid, (bool) reuse_oid);
+  error = xheap_create (thread_p, &hfid, &class_oid, (bool) reuse_oid, (bool) columnar);
   if (error != NO_ERROR)
     {
       (void) return_error_to_client (thread_p, rid);

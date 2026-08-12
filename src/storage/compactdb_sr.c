@@ -589,6 +589,19 @@ boot_compact_db (THREAD_ENTRY * thread_p, OID * class_oids, int n_classes, int s
 	  continue;
 	}
 
+      {
+	/* columnar classes have no heap to compact; skip */
+	FILE_TYPE hfid_file_type = FILE_UNKNOWN_TYPE;
+
+	if (file_get_type (thread_p, &hfid.vfid, &hfid_file_type) == NO_ERROR && hfid_file_type == FILE_COLUMNAR)
+	  {
+	    lock_unlock_object (thread_p, class_oids + i, oid_Root_class_oid, IX_LOCK, true);
+	    OID_SET_NULL (last_processed_oid);
+	    total_objects[i] = COMPACTDB_INVALID_CLASS;
+	    continue;
+	  }
+      }
+
       if (OID_ISNULL (last_processed_oid))
 	{
 	  initial_last_repr_id[i] = heap_get_class_repr_id (thread_p, class_oids + i);

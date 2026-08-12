@@ -33,6 +33,7 @@
 #include "file_manager.h"
 #include "locator_sr.h"
 #include "log_manager.h"
+#include "columnar_file.h"
 #include "overflow_file.h"
 #include "replication.h"
 #include "system_catalog.h"
@@ -869,6 +870,13 @@ struct rvfun RV_fun[] = {
    "RVBT_NO_LOGGING_INDEX_COMMITTED",
    NULL,
    log_rv_no_logging_index_committed_redo,
+   NULL,
+   NULL},
+
+  {RVCOL_METAPAGE_INIT,
+   "RVCOL_METAPAGE_INIT",
+   NULL,
+   columnar_rv_metapage_init_redo,
    NULL,
    NULL},
 };

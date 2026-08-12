@@ -9178,6 +9178,23 @@ pt_check_for_update_clause (PARSER_CONTEXT * parser, PT_NODE * query, bool root)
 	      return error_code;
 	    }
 	}
+
+      if (!root || (spec->info.spec.flag & PT_SPEC_FLAG_FOR_UPDATE_CLAUSE))
+	{
+	  /* columnar tables have no tuple locks; FOR UPDATE is not allowed */
+	  PT_NODE *flat;
+
+	  for (flat = spec->info.spec.flat_entity_list; flat != NULL; flat = flat->next)
+	    {
+	      if (flat->node_type == PT_NAME && flat->info.name.db_object != NULL
+		  && sm_get_class_flag (flat->info.name.db_object, SM_CLASSFLAG_COLUMNAR) > 0)
+		{
+		  PT_ERRORmf (parser, query, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED,
+			      "SELECT ... FOR UPDATE");
+		  return ER_FAILED;
+		}
+	    }
+	}
     }
 
   return NO_ERROR;

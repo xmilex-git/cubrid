@@ -385,6 +385,12 @@ process_class (THREAD_ENTRY * thread_p, DB_OBJECT * class_, bool verbose_flag)
 
   class_oid = ws_oid (class_);
 
+  if (class_ptr->flags & SM_CLASSFLAG_COLUMNAR)
+    {
+      /* columnar tables have no heap to compact; skip */
+      return;
+    }
+
   if (verbose_flag)
     {
       printf (msgcat_message (MSGCAT_CATALOG_UTILS, MSGCAT_UTIL_SET_COMPACTDB, COMPACTDB_MSG_CLASS),

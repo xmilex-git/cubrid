@@ -1004,6 +1004,14 @@ extract_objects (extract_context & ctxt, const char *output_dirname, int nthread
 			}
 		    }
 		}
+	      if (class_ptr->flags & SM_CLASSFLAG_COLUMNAR)
+		{
+		  /* columnar tables are not supported by unloaddb */
+		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "unloaddb");
+		  fprintf (stderr, "%s\n", db_error_string (3));
+		  status = 1;
+		  goto end;
+		}
 	      unload_class_table[num_unload_classes] = class_table->mops[i];
 	      num_unload_classes++;
 	    }

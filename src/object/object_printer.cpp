@@ -1118,8 +1118,12 @@ void object_printer::describe_class (struct db_object *class_op)
       m_buf += ')';
     }
 
-  /* reuse_oid flag */
-  if (sm_is_reuse_oid_class (class_op))
+  /* storage / reuse_oid flag */
+  if (sm_get_class_flag (class_op, SM_CLASSFLAG_COLUMNAR) > 0)
+    {
+      m_buf (" USING COLUMNAR");
+    }
+  else if (sm_is_reuse_oid_class (class_op))
     {
       m_buf (" REUSE_OID");
     }

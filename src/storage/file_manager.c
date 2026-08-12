@@ -1430,6 +1430,7 @@ file_header_dump_descriptor (THREAD_ENTRY * thread_p, const FILE_HEADER * fhead,
     {
     case FILE_HEAP:
     case FILE_HEAP_REUSE_SLOTS:
+    case FILE_COLUMNAR:
       file_print_name_of_class (thread_p, fp, &fhead->descriptor.heap.class_oid);
       fprintf (fp, "\n");
       break;
@@ -3058,6 +3059,8 @@ file_type_to_string (FILE_TYPE fstruct_type)
       return "UNKNOWN";
     case FILE_HEAP_REUSE_SLOTS:
       return "HEAP_REUSE_SLOTS";
+    case FILE_COLUMNAR:
+      return "COLUMNAR";
     }
   return "UNKNOWN";
 }
@@ -10926,6 +10929,7 @@ file_tracker_get_and_protect (THREAD_ENTRY * thread_p, FILE_TYPE desired_type, F
       /* we need to protect with lock. fall through */
       break;
     case FILE_HEAP_REUSE_SLOTS:
+    case FILE_COLUMNAR:
     case FILE_BTREE:
     case FILE_MULTIPAGE_OBJECT_HEAP:
     case FILE_BTREE_OVERFLOW_KEY:
@@ -10957,6 +10961,7 @@ file_tracker_get_and_protect (THREAD_ENTRY * thread_p, FILE_TYPE desired_type, F
       break;
     case FILE_HEAP:
     case FILE_HEAP_REUSE_SLOTS:
+    case FILE_COLUMNAR:
       *class_oid = fhead->descriptor.heap.class_oid;
       break;
     case FILE_MULTIPAGE_OBJECT_HEAP:
@@ -11332,6 +11337,7 @@ file_tracker_item_dump_file (THREAD_ENTRY * thread_p, PAGE_PTR page_of_item, FIL
 	{
 	case FILE_HEAP:
 	case FILE_HEAP_REUSE_SLOTS:
+	case FILE_COLUMNAR:
 	  class_oid_p = &fhead->descriptor.heap.class_oid;
 	  break;
 	case FILE_MULTIPAGE_OBJECT_HEAP:
@@ -11505,6 +11511,7 @@ file_tracker_item_collect_invalid_file (THREAD_ENTRY * thread_p, PAGE_PTR page_o
     {
     case FILE_HEAP:
     case FILE_HEAP_REUSE_SLOTS:
+    case FILE_COLUMNAR:
       class_oid_p = &fhead->descriptor.heap.class_oid;
       break;
     case FILE_MULTIPAGE_OBJECT_HEAP:
@@ -12213,6 +12220,7 @@ file_tracker_item_spacedb (THREAD_ENTRY * thread_p, PAGE_PTR page_of_item, FILE_
     case FILE_HEAP:
     case FILE_HEAP_REUSE_SLOTS:
     case FILE_MULTIPAGE_OBJECT_HEAP:
+    case FILE_COLUMNAR:
       /* heap file */
       spacedb_ftype = SPACEDB_HEAP_FILE;
       break;

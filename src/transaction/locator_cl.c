@@ -5515,7 +5515,8 @@ locator_create_heap_if_needed (MOP class_mop, bool reuse_oid)
 
       assert (!OID_ISNULL (sm_ch_rep_dir (class_obj)));
 
-      if (heap_create (hfid, oid, reuse_oid) != NO_ERROR)
+      if (heap_create (hfid, oid, reuse_oid, (((SM_CLASS *) class_obj)->flags & SM_CLASSFLAG_COLUMNAR) != 0)
+	  != NO_ERROR)
 	{
 	  return NULL;
 	}
