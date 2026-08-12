@@ -100,6 +100,8 @@ columnar_file_create (THREAD_ENTRY * thread_p, HFID * hfid, const OID * class_oi
   metapage_header.entry_count = 0;
   VPID_SET_NULL (&metapage_header.next_metapage);
   metapage_header.class_oid = *class_oid;
+  metapage_header.next_stripe_id = 0;
+  metapage_header.next_row_number = 0;
 
   memcpy (addr.pgptr, &metapage_header, sizeof (metapage_header));
 

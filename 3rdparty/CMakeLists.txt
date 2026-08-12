@@ -26,6 +26,7 @@ set(WITH_LIBUNIXODBC_URL "https://github.com/CUBRID/3rdparty/raw/develop/unixODB
 set(WITH_LIBTBB_URL "https://github.com/CUBRID/3rdparty/raw/develop/tbb/v2021.11.0.tar.gz")                   # intel oneTBB library sources URL
 set(WITH_RE2_URL "https://github.com/CUBRID/3rdparty/raw/develop/re2/2022-06-01.tar.gz")                      # RE2
 set(WITH_LZ4_URL "https://github.com/CUBRID/3rdparty/raw/develop/lz4/v1.9.4.tar.gz")                          # LZ4
+
 set(WIN_FLEX_BISON_URL "https://github.com/CUBRID/3rdparty/raw/develop/win_flex_bison/win_flex_bison-2.5.22.zip") # Windows
 
 # URL_HASH is a hash value used to verify the integrity of a file downloaded from a specified URL.
@@ -53,6 +54,7 @@ set(WITH_LIBTBB_URL_HASH "SHA256=782ce0cab62df9ea125cdea253a50534862b563f1d85d4c
 set(WITH_RE2_URL_HASH "SHA256=f89c61410a072e5cbcf8c27e3a778da7d6fd2f2b5b1445cd4f4508bee946ab0f")		# RE2
 set(WITH_LZ4_URL_HASH "SHA256=0b0e3aa07c8c063ddf40b082bdf7e37a1562bda40a0ff5272957f3e987e0e54b")		# LZ4
 
+
 # options for external libraries (BUNDLED, EXTERAL or SYSTEM)
 set(WITH_EXTERNAL_PREFIX "EXTERNAL" CACHE STRING "External library prefix (default: EXTERNAL)")
 set(WITH_BUNDLED_PREFIX "BUNDLED" CACHE STRING "Bundled library prefix (default: BUNDLED)")
@@ -71,6 +73,7 @@ set(WITH_LIBOPENSSL   "${WITH_EXTERNAL_PREFIX}" CACHE STRING "Build with openssl
 set(WITH_LIBUNIXODBC  "${WITH_EXTERNAL_PREFIX}" CACHE STRING "Build with unixODBC library (default: EXTERNAL)")
 set(WITH_RE2          "${WITH_EXTERNAL_PREFIX}" CACHE STRING "Build with re2 library (default: EXTERNAL)")
 set(WITH_LZ4          "${WITH_EXTERNAL_PREFIX}" CACHE STRING "Build with lz4 library (default: EXTERNAL)")
+
 set(WITH_LIBTBB       "${WITH_EXTERNAL_PREFIX}" CACHE STRING "Build with TBB library (default: EXTERNAL)")
 
 message(STATUS "Build with flex and bison library: ${WITH_LIBFLEXBISON}")
@@ -345,6 +348,19 @@ endif()
 list(APPEND EP_TARGETS ${LZ4_TARGET})
 list(APPEND EP_LIBS ${LZ4_LIBS})
 list(APPEND EP_INCLUDES ${LZ4_INCLUDES})
+
+# ZSTD — use system shared library (libzstd-devel / libzstd-dev)
+#
+find_library(ZSTD_LIBRARY NAMES zstd)
+find_path(ZSTD_INCLUDE_DIR NAMES zstd.h)
+if(ZSTD_LIBRARY AND ZSTD_INCLUDE_DIR)
+  message(STATUS "Found system ZSTD: ${ZSTD_LIBRARY} (headers: ${ZSTD_INCLUDE_DIR})")
+  list(APPEND EP_LIBS ${ZSTD_LIBRARY})
+  list(APPEND EP_INCLUDES ${ZSTD_INCLUDE_DIR})
+  add_compile_definitions(HAVE_ZSTD)
+else()
+  message(WARNING "ZSTD not found — columnar compression will fall back to LZ4/NONE")
+endif()
 
 # WITH_LOBOPENSSL can have multiple values with different meanings
 # on Linux:

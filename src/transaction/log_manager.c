@@ -99,6 +99,7 @@
 #include "dbtype.h"
 #include "cnv.h"
 #include "flashback.h"
+#include "columnar_writer.h"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -3459,6 +3460,9 @@ log_append_savepoint (THREAD_ENTRY * thread_p, const char *savept_name)
 
   LSA_COPY (&tdes->savept_lsa, &tdes->tail_lsa);
 
+  /* push columnar write state savepoint markers */
+  columnar_on_savepoint (thread_p, savept_name);
+
   perfmon_inc_stat (thread_p, PSTAT_TRAN_NUM_SAVEPOINTS);
 
   return &tdes->savept_lsa;
@@ -5198,6 +5202,9 @@ log_cleanup_modified_class_list (THREAD_ENTRY * thread_p, LOG_TDES * tdes, LOG_L
 TRAN_STATE
 log_commit_local (THREAD_ENTRY * thread_p, LOG_TDES * tdes, bool retain_lock, bool is_local_tran)
 {
+  /* flush any pending columnar write states before commit */
+  (void) columnar_flush_all_write_states (thread_p);
+
   qmgr_clear_trans_wakeup (thread_p, tdes->tran_index, false, false);
 
   /* tx_lob_locator_clear and logtb_complete_mvcc operations must be done before entering unactive state because
@@ -5316,6 +5323,9 @@ log_commit_local (THREAD_ENTRY * thread_p, LOG_TDES * tdes, bool retain_lock, bo
 TRAN_STATE
 log_abort_local (THREAD_ENTRY * thread_p, LOG_TDES * tdes, bool is_local_tran)
 {
+  /* discard any pending columnar write states on abort */
+  columnar_discard_all_write_states (thread_p);
+
   qmgr_clear_trans_wakeup (thread_p, tdes->tran_index, false, true);
 
   tdes->state = TRAN_UNACTIVE_ABORTED;
@@ -5628,6 +5638,9 @@ log_abort_partial (THREAD_ENTRY * thread_p, const char *savepoint_name, LOG_LSA 
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_LOG_UNKNOWN_SAVEPOINT, 1, savepoint_name);
       return TRAN_UNACTIVE_UNKNOWN;
     }
+
+  /* discard unflushed columnar rows added after this savepoint */
+  columnar_on_partial_abort (thread_p, savepoint_name);
 
   if (tdes->topops.last >= 0)
     {

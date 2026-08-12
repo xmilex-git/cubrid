@@ -11141,12 +11141,7 @@ pt_semantic_check_local (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int
 	  node->flag.cannot_prepare = 1;
 	}
 
-      /* interim guard until the columnar write path (INSERT) is implemented */
-      if (pt_find_columnar_class_in_spec_list (parser, node->info.insert.spec) != NULL)
-	{
-	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "INSERT");
-	  break;
-	}
+      /* columnar INSERT: allowed — routed to columnar_insert_row on the server side */
 
       if (node->info.insert.into_var != NULL && node->info.insert.value_clauses->next != NULL)
 	{

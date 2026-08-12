@@ -85,6 +85,7 @@
 #include "porting.h"
 #include "log_manager.h"
 #include "catalog_class.h"
+#include "columnar_writer.h"
 
 #if defined(SERVER_MODE)
 #include "connection_sr.h"
@@ -2272,6 +2273,7 @@ boot_restart_server (THREAD_ENTRY * thread_p, bool print_restart, const char *db
 
   /* Initialize the transaction table */
   logtb_define_trantable (thread_p, -1, -1);
+  columnar_writer_init (log_Gl.trantable.num_total_indices);
 
   /*
    * How to restart the system ?
@@ -5223,6 +5225,7 @@ boot_remove_all_volumes (THREAD_ENTRY * thread_p, const char *db_fullname, const
 
       /* Initialize the transaction table */
       logtb_define_trantable (thread_p, -1, -1);
+      columnar_writer_init (log_Gl.trantable.num_total_indices);
 
       /* The database pagesize is set by log_get_io_page_size */
 
@@ -5468,6 +5471,7 @@ xboot_emergency_patch (const char *db_name, bool recreate_log, DKNPAGES log_npag
 
   /* Initialize the transaction table */
   logtb_define_trantable (thread_p, -1, -1);
+  columnar_writer_init (log_Gl.trantable.num_total_indices);
 
   spage_boot (thread_p);
   error_code = heap_manager_initialize ();

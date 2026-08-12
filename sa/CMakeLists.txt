@@ -520,6 +520,7 @@ set(STORAGE_SOURCES
   ${STORAGE_DIR}/es_owfs.c
   ${STORAGE_DIR}/es_posix.c
   ${STORAGE_DIR}/columnar_file.c
+  ${STORAGE_DIR}/columnar_writer.c
   ${STORAGE_DIR}/extendible_hash.c
   ${STORAGE_DIR}/external_sort.c
   ${STORAGE_DIR}/file_io.c

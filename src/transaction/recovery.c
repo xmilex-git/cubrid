@@ -34,6 +34,7 @@
 #include "locator_sr.h"
 #include "log_manager.h"
 #include "columnar_file.h"
+#include "columnar_writer.h"
 #include "overflow_file.h"
 #include "replication.h"
 #include "system_catalog.h"
@@ -877,6 +878,20 @@ struct rvfun RV_fun[] = {
    "RVCOL_METAPAGE_INIT",
    NULL,
    columnar_rv_metapage_init_redo,
+   NULL,
+   NULL},
+
+  {RVCOL_PAGE_DATA,
+   "RVCOL_PAGE_DATA",
+   NULL,
+   columnar_rv_page_data_redo,
+   NULL,
+   NULL},
+
+  {RVCOL_META_DIR_ENTRY,
+   "RVCOL_META_DIR_ENTRY",
+   columnar_rv_dir_entry_undo,
+   columnar_rv_dir_entry_redo,
    NULL,
    NULL},
 };

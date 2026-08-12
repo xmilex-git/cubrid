@@ -43,6 +43,7 @@
 #include <random>
 #include "slotted_page.h"
 #include "columnar_file.h"
+#include "columnar_writer.h"
 #include "overflow_file.h"
 #include "boot_sr.h"
 #include "locator_sr.h"
@@ -20170,7 +20171,7 @@ heap_get_file_type (THREAD_ENTRY * thread_p, HEAP_OPERATION_CONTEXT * context)
 	  ASSERT_ERROR ();
 	  return FILE_UNKNOWN_TYPE;
 	}
-      assert (file_type == FILE_HEAP || file_type == FILE_HEAP_REUSE_SLOTS);
+      assert (file_type == FILE_HEAP || file_type == FILE_HEAP_REUSE_SLOTS || file_type == FILE_COLUMNAR);
       return file_type;
     }
 }
@@ -23324,7 +23325,7 @@ heap_insert_logical (THREAD_ENTRY * thread_p, HEAP_OPERATION_CONTEXT * context, 
       return ER_FAILED;
     }
 
-  /* interim guard until the columnar write path exists: object inserts must never touch a columnar data file */
+  /* columnar INSERT: redirect to the columnar write path */
   {
     FILE_TYPE insert_file_type = FILE_UNKNOWN_TYPE;
 
@@ -23338,8 +23339,8 @@ heap_insert_logical (THREAD_ENTRY * thread_p, HEAP_OPERATION_CONTEXT * context, 
       }
     if (insert_file_type == FILE_COLUMNAR)
       {
-	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1, "INSERT");
-	return ER_COLUMNAR_NOT_SUPPORTED;
+	return columnar_insert_row (thread_p, &context->class_oid, &context->hfid, context->recdes_p,
+				   &context->res_oid);
       }
   }
 
@@ -24417,7 +24418,7 @@ heap_cache_class_info (THREAD_ENTRY * thread_p, const OID * class_oid, HFID * hf
   int inserted = 0;
 
   assert (hfid != NULL && !HFID_IS_NULL (hfid));
-  assert (ftype == FILE_HEAP || ftype == FILE_HEAP_REUSE_SLOTS);
+  assert (ftype == FILE_HEAP || ftype == FILE_HEAP_REUSE_SLOTS || ftype == FILE_COLUMNAR);
 
   if (class_oid == NULL || OID_ISNULL (class_oid))
     {
@@ -24582,7 +24583,7 @@ heap_hfid_cache_get (THREAD_ENTRY * thread_p, const OID * class_oid, HFID * hfid
 	}
       entry->ftype = ftype_local;
     }
-  assert (entry->ftype == FILE_HEAP || entry->ftype == FILE_HEAP_REUSE_SLOTS);
+  assert (entry->ftype == FILE_HEAP || entry->ftype == FILE_HEAP_REUSE_SLOTS || entry->ftype == FILE_COLUMNAR);
 
   if (hfid_out != NULL)
     {
