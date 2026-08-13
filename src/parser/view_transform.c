@@ -7115,6 +7115,26 @@ mq_push_paths_select (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE * sp
  * 	2) virtual specs of aggregate selects which would translate
  * 	   to a union are rewritten as derived.
  */
+/*
+ * mq_spec_has_columnar_class() - true when the spec's flat entity list
+ *   references a columnar (USING COLUMNAR) class
+ */
+static bool
+mq_spec_has_columnar_class (PT_NODE * spec)
+{
+  PT_NODE *flat;
+
+  for (flat = spec->info.spec.flat_entity_list; flat != NULL; flat = flat->next)
+    {
+      if (flat->node_type == PT_NAME && flat->info.name.db_object != NULL
+	  && sm_get_class_flag (flat->info.name.db_object, SM_CLASSFLAG_COLUMNAR) > 0)
+	{
+	  return true;
+	}
+    }
+  return false;
+}
+
 static PT_NODE *
 mq_check_rewrite_select (PARSER_CONTEXT * parser, PT_NODE * select_statement)
 {
@@ -7185,6 +7205,31 @@ mq_check_rewrite_select (PARSER_CONTEXT * parser, PT_NODE * select_statement)
 	      select_statement->info.query.q.select.from =
 		mq_rewrite_vclass_spec_as_derived (parser, select_statement, from, NULL, false);
 	    }
+	}
+    }
+
+  /* a columnar class joined with anything else cannot be scanned in place:
+   * the columnar block executor only runs single-table blocks, so promote
+   * the columnar reference into a derived table that is materialized ahead
+   * of the join (design ticket: read path / executor integration) */
+  from = select_statement->info.query.q.select.from;
+  if (from != NULL && from->next != NULL)
+    {
+      PT_NODE **spec_ptr = &select_statement->info.query.q.select.from;
+
+      while (*spec_ptr != NULL)
+	{
+	  PT_NODE *spec = *spec_ptr;
+
+	  if (spec->info.spec.derived_table == NULL && mq_spec_has_columnar_class (spec))
+	    {
+	      *spec_ptr = mq_rewrite_vclass_spec_as_derived (parser, select_statement, spec, NULL, false);
+	      if (*spec_ptr == NULL)
+		{
+		  return NULL;
+		}
+	    }
+	  spec_ptr = &(*spec_ptr)->next;
 	}
     }
 

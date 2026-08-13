@@ -59,7 +59,7 @@
 /* ========================================================================== */
 /* These fire at compile time if struct packing changes unexpectedly. */
 typedef char _col_dir_entry_size_check[(sizeof (COLUMNAR_STRIPE_DIR_ENTRY) == 64) ? 1 : -1];
-typedef char _col_chunk_desc_size_check[(sizeof (COLUMNAR_CHUNK_DESC) == 32) ? 1 : -1];
+typedef char _col_chunk_desc_size_check[(sizeof (COLUMNAR_CHUNK_DESC) == 48) ? 1 : -1];
 
 /* ========================================================================== */
 /* Global write-state registry — indexed by tran_index                        */
@@ -82,7 +82,6 @@ static COLUMNAR_WRITE_STATE *columnar_create_write_state (THREAD_ENTRY * thread_
 static void columnar_free_write_state (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws);
 static int columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws);
 static int columnar_serialize_chunks (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws);
-static int columnar_value_disk_size (DB_TYPE type, TP_DOMAIN * domain);
 static int columnar_buffer_value (COLUMNAR_COL_BUFFER * col, const DB_VALUE * val, int row_in_chunk);
 static int columnar_ensure_data_capacity (COLUMNAR_COL_BUFFER * col, int needed);
 static int columnar_ensure_exists_capacity (COLUMNAR_COL_BUFFER * col, int needed_bytes);
@@ -341,7 +340,7 @@ columnar_free_write_state (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
 /* Per-value disk size                                                        */
 /* ========================================================================== */
 
-static int
+int
 columnar_value_disk_size (DB_TYPE type, TP_DOMAIN * domain)
 {
   switch (type)
@@ -747,6 +746,157 @@ end:
 }
 
 /* ========================================================================== */
+/* Chunk min/max (skip-list) collection                                       */
+/* ========================================================================== */
+
+/*
+ * columnar_compute_minmax () - compute the canonical min/max of the non-NULL
+ *   values buffered in a fixed-width column and record them in the chunk
+ *   descriptor.  Variable-width and memcmp-only types get COLUMNAR_MINMAX_NONE.
+ */
+static void
+columnar_compute_minmax (const COLUMNAR_COL_BUFFER * col, COLUMNAR_CHUNK_DESC * desc)
+{
+  int n_rows, r;
+  bool have = false;
+
+  desc->minmax_kind = COLUMNAR_MINMAX_NONE;
+  desc->min_val = 0;
+  desc->max_val = 0;
+
+  if (col->value_size <= 0)
+    {
+      return;			/* variable-width */
+    }
+  n_rows = col->data_size / col->value_size;
+
+  switch (col->type)
+    {
+    case DB_TYPE_SHORT:
+    case DB_TYPE_INTEGER:
+    case DB_TYPE_BIGINT:
+    case DB_TYPE_DATE:
+    case DB_TYPE_TIME:
+    case DB_TYPE_TIMESTAMP:
+    case DB_TYPE_DATETIME:
+      {
+	INT64 mn = 0, mx = 0;
+
+	for (r = 0; r < n_rows; r++)
+	  {
+	    INT64 v;
+	    const char *cell;
+
+	    if (!(col->exists[r / 8] & (1 << (r % 8))))
+	      {
+		continue;
+	      }
+	    cell = col->data + (size_t) r * col->value_size;
+	    switch (col->type)
+	      {
+	      case DB_TYPE_SHORT:
+		v = *(const short *) cell;
+		break;
+	      case DB_TYPE_INTEGER:
+		v = *(const int *) cell;
+		break;
+	      case DB_TYPE_BIGINT:
+		memcpy (&v, cell, sizeof (INT64));
+		break;
+	      case DB_TYPE_DATE:
+	      case DB_TYPE_TIME:
+	      case DB_TYPE_TIMESTAMP:
+		v = (INT64) (*(const unsigned int *) cell);
+		break;
+	      case DB_TYPE_DATETIME:
+	      default:
+		{
+		  unsigned int d, t;
+		  memcpy (&d, cell, sizeof (unsigned int));
+		  memcpy (&t, cell + sizeof (unsigned int), sizeof (unsigned int));
+		  v = ((INT64) d << 32) | (INT64) t;
+		}
+		break;
+	      }
+	    if (!have)
+	      {
+		mn = mx = v;
+		have = true;
+	      }
+	    else if (v < mn)
+	      {
+		mn = v;
+	      }
+	    else if (v > mx)
+	      {
+		mx = v;
+	      }
+	  }
+	if (have)
+	  {
+	    desc->minmax_kind = COLUMNAR_MINMAX_INT64;
+	    desc->min_val = mn;
+	    desc->max_val = mx;
+	  }
+      }
+      break;
+
+    case DB_TYPE_FLOAT:
+    case DB_TYPE_DOUBLE:
+    case DB_TYPE_MONETARY:
+      {
+	double mn = 0.0, mx = 0.0;
+
+	for (r = 0; r < n_rows; r++)
+	  {
+	    double v;
+	    const char *cell;
+
+	    if (!(col->exists[r / 8] & (1 << (r % 8))))
+	      {
+		continue;
+	      }
+	    cell = col->data + (size_t) r * col->value_size;
+	    if (col->type == DB_TYPE_FLOAT)
+	      {
+		float f;
+		memcpy (&f, cell, sizeof (float));
+		v = (double) f;
+	      }
+	    else
+	      {
+		/* DOUBLE, and MONETARY whose amount is the leading double */
+		memcpy (&v, cell, sizeof (double));
+	      }
+	    if (!have)
+	      {
+		mn = mx = v;
+		have = true;
+	      }
+	    else if (v < mn)
+	      {
+		mn = v;
+	      }
+	    else if (v > mx)
+	      {
+		mx = v;
+	      }
+	  }
+	if (have)
+	  {
+	    desc->minmax_kind = COLUMNAR_MINMAX_DOUBLE;
+	    memcpy (&desc->min_val, &mn, sizeof (double));
+	    memcpy (&desc->max_val, &mx, sizeof (double));
+	  }
+      }
+      break;
+
+    default:
+      break;
+    }
+}
+
+/* ========================================================================== */
 /* Chunk serialization                                                        */
 /* ========================================================================== */
 
@@ -776,6 +926,9 @@ columnar_serialize_chunks (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
       int compressed_len = 0;
 
       memset (&desc, 0, sizeof (desc));
+
+      /* min/max skip-list entry (computed on the raw uncompressed array) */
+      columnar_compute_minmax (col, &desc);
 
       /* compress the value data */
       error_code = columnar_compress_buffer (col->data, col->data_size, &compressed, &compressed_len, comp);
@@ -926,19 +1079,14 @@ static int
 columnar_build_footer (COLUMNAR_WRITE_STATE * ws, char **footer_buf, int *footer_len)
 {
   /*
-   * Footer layout:
-   *   INT32 magic
-   *   INT32 version
-   *   INT32 n_columns
-   *   INT32 n_chunk_groups
-   *   COLUMNAR_CHUNK_DESC[n_columns * n_chunk_groups]
+   * Footer layout: COLUMNAR_STRIPE_FOOTER_HEADER, then
+   * COLUMNAR_CHUNK_DESC[n_columns * n_chunk_groups].
    */
-  int header_size = 4 * (int) sizeof (INT32);
+  int header_size = (int) sizeof (COLUMNAR_STRIPE_FOOTER_HEADER);
   int descs_size = ws->n_chunk_descs * (int) sizeof (COLUMNAR_CHUNK_DESC);
   int total = header_size + descs_size;
   char *buf;
-  int offset = 0;
-  INT32 val;
+  COLUMNAR_STRIPE_FOOTER_HEADER hdr;
 
   buf = (char *) malloc (total);
   if (buf == NULL)
@@ -947,23 +1095,15 @@ columnar_build_footer (COLUMNAR_WRITE_STATE * ws, char **footer_buf, int *footer
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
 
-  val = COLUMNAR_FOOTER_MAGIC;
-  memcpy (buf + offset, &val, sizeof (INT32));
-  offset += sizeof (INT32);
+  memset (&hdr, 0, sizeof (hdr));
+  hdr.magic = COLUMNAR_FOOTER_MAGIC;
+  hdr.version = COLUMNAR_FOOTER_VERSION;
+  hdr.n_columns = ws->n_columns;
+  hdr.n_chunk_groups = ws->n_chunk_groups;
+  hdr.chunk_row_count = ws->chunk_max_rows;
+  memcpy (buf, &hdr, sizeof (hdr));
 
-  val = COLUMNAR_FOOTER_VERSION;
-  memcpy (buf + offset, &val, sizeof (INT32));
-  offset += sizeof (INT32);
-
-  val = ws->n_columns;
-  memcpy (buf + offset, &val, sizeof (INT32));
-  offset += sizeof (INT32);
-
-  val = ws->n_chunk_groups;
-  memcpy (buf + offset, &val, sizeof (INT32));
-  offset += sizeof (INT32);
-
-  memcpy (buf + offset, ws->chunk_descs, descs_size);
+  memcpy (buf + header_size, ws->chunk_descs, descs_size);
 
   *footer_buf = buf;
   *footer_len = total;
@@ -1040,6 +1180,20 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
     {
       ASSERT_ERROR ();
       goto sysop_abort;
+    }
+
+  /* the reader locates stripe pages as start_vpid.pageid + i on the same
+   * volume; verify the bulk allocation actually is contiguous and fail the
+   * flush cleanly when it is not (instead of persisting an unreadable stripe) */
+  for (i = 1; i < total_pages; i++)
+    {
+      if (vpids[i].volid != vpids[0].volid || vpids[i].pageid != vpids[0].pageid + i)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1,
+		  "non-contiguous stripe page allocation");
+	  error_code = ER_COLUMNAR_NOT_SUPPORTED;
+	  goto sysop_abort;
+	}
     }
 
   /* write stripe data + footer to pages */
@@ -1129,14 +1283,11 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
     dir_entry.footer_vpid = vpids[footer_page_idx];
     dir_entry.footer_offset = (INT16) (ws->stripe_data_size % DB_PAGESIZE);
   }
-  /* insert_mvccid: current transaction's MVCCID */
-  {
-    LOG_TDES *tdes = LOG_FIND_CURRENT_TDES (thread_p);
-    if (tdes != NULL)
-      {
-	dir_entry.insert_mvccid = tdes->mvccinfo.id;
-      }
-  }
+  /* insert_mvccid: current transaction's MVCCID.  logtb_get_current_mvccid ()
+   * assigns one when the transaction does not have it yet — a columnar-only
+   * transaction must still stamp a valid id, otherwise the reader could treat
+   * an uncommitted stripe as visible. */
+  dir_entry.insert_mvccid = logtb_get_current_mvccid (thread_p);
 
   /* update counters atomically (under X page latch) */
   meta_hdr->next_stripe_id++;

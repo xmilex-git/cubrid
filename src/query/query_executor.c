@@ -41,6 +41,7 @@
 #include "query_aggregate.hpp"
 #include "query_analytic.hpp"
 #include "expr_compile.h"
+#include "columnar_scan.h"
 #include "query_opfunc.h"
 #include "fetch.h"
 #include "dbtype.h"
@@ -401,6 +402,8 @@ typedef enum analytic_stage ANALYTIC_STAGE;
 #define QEXEC_GET_BH_TOPN_TUPLE(heap, index) (*(TOPN_TUPLE **) BH_ELEMENT (heap, index))
 
 static DB_LOGICAL qexec_eval_instnum_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
+static SCAN_CODE qexec_execute_columnar_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
+					      QFILE_TUPLE_RECORD * tplrec);
 static int qexec_add_composite_lock (THREAD_ENTRY * thread_p, REGU_VARIABLE_LIST reg_var_list, XASL_STATE * xasl_state,
 				     LK_COMPOSITE_LOCK * composite_lock, int upd_del_cls_cnt, OID * default_cls_oid);
 static QPROC_TPLDESCR_STATUS qexec_generate_tuple_descriptor (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id,
@@ -9777,6 +9780,139 @@ qexec_intprt_fnc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_s
 }
 
 /*
+ * qexec_execute_columnar_scan () - block executor for a single
+ *   ACCESS_METHOD_COLUMNAR spec: iterate the qualified rows the columnar
+ *   reader decodes into the val_list slots and run the regular per-row
+ *   completion (projection/aggregation) for each
+ *   return: S_SUCCESS or S_ERROR
+ */
+static SCAN_CODE
+qexec_execute_columnar_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
+			     QFILE_TUPLE_RECORD * tplrec)
+{
+  ACCESS_SPEC_TYPE *spec = xasl->spec_list;
+  COLUMNAR_SCAN *cs = NULL;
+  SCAN_CODE sc;
+  XASL_NODE *xptr;
+  DB_LOGICAL ev_res = V_UNKNOWN;
+  bool qualified;
+  TSC_TICKS start_tick, end_tick;
+  TSCTIMEVAL tv_diff;
+  UINT64 old_ioreads = 0;
+  bool on_trace = thread_is_on_trace (thread_p);
+
+  if (spec->next != NULL || xasl->scan_ptr != NULL || xasl->merge_spec != NULL || xasl->bptr_list != NULL
+      || xasl->fptr_list != NULL || XASL_IS_FLAGED (xasl, XASL_HAS_CONNECT_BY))
+    {
+      /* the client promotes columnar references of multi-spec blocks into
+       * derived tables; reaching here means that rewrite was bypassed */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_UNSUPPORTED_EXPR, 1,
+	      "columnar spec in unsupported block shape");
+      return S_ERROR;
+    }
+
+  memset (&spec->col_scan_stats, 0, sizeof (spec->col_scan_stats));
+  if (on_trace)
+    {
+      tsc_getticks (&start_tick);
+      old_ioreads = perfmon_get_from_statistic (thread_p, PSTAT_PB_NUM_IOREADS);
+    }
+
+  if (columnar_scan_open (thread_p, &cs, spec, &xasl_state->vd) != NO_ERROR)
+    {
+      return S_ERROR;
+    }
+  xasl->curr_spec = spec;
+
+  while ((sc = columnar_scan_next (thread_p, cs)) == S_SUCCESS)
+    {
+      /* correlated subqueries of this block */
+      for (xptr = xasl->dptr_list; xptr != NULL; xptr = xptr->next)
+	{
+	  qexec_clear_head_lists (thread_p, xptr);
+	  if (XASL_IS_FLAGED (xptr, XASL_LINK_TO_REGU_VARIABLE))
+	    {
+	      continue;
+	    }
+	  if (qexec_execute_mainblock (thread_p, xptr, xasl_state, NULL) != NO_ERROR)
+	    {
+	      sc = S_ERROR;
+	      goto end;
+	    }
+	}
+
+      /* if predicate (evaluated over the decoded slots) */
+      if (xasl->if_pred != NULL)
+	{
+	  ev_res = eval_pred (thread_p, xasl->if_pred, &xasl_state->vd, NULL);
+	  if (ev_res == V_ERROR)
+	    {
+	      sc = S_ERROR;
+	      goto end;
+	    }
+	  if (ev_res != V_TRUE)
+	    {
+	      continue;
+	    }
+	}
+
+      /* inst_num predicate (LIMIT / ROWNUM) */
+      ev_res = V_UNKNOWN;
+      if (xasl->instnum_val)
+	{
+	  ev_res = qexec_eval_instnum_pred (thread_p, xasl, xasl_state);
+	  if (ev_res == V_ERROR)
+	    {
+	      sc = S_ERROR;
+	      goto end;
+	    }
+	  if (xasl->instnum_flag & XASL_INSTNUM_FLAG_SCAN_LAST_STOP)
+	    {
+	      if (qexec_end_one_iteration (thread_p, xasl, xasl_state, tplrec) != NO_ERROR)
+		{
+		  sc = S_ERROR;
+		  goto end;
+		}
+	      sc = S_END;
+	      goto end;
+	    }
+	  if (xasl->instnum_flag & XASL_INSTNUM_FLAG_SCAN_STOP)
+	    {
+	      sc = S_END;
+	      goto end;
+	    }
+	}
+
+      qualified = (xasl->instnum_pred == NULL || ev_res == V_TRUE);
+      if (qualified)
+	{
+	  if (qexec_end_one_iteration (thread_p, xasl, xasl_state, tplrec) != NO_ERROR)
+	    {
+	      sc = S_ERROR;
+	      goto end;
+	    }
+	  if (XASL_IS_FLAGED (xasl, XASL_NEED_SINGLE_TUPLE_SCAN))
+	    {
+	      sc = S_END;
+	      goto end;
+	    }
+	}
+    }
+
+end:
+  columnar_scan_stats (cs, &spec->col_scan_stats);
+  if (on_trace)
+    {
+      tsc_getticks (&end_tick);
+      tsc_elapsed_time_usec (&tv_diff, end_tick, start_tick);
+      TSC_ADD_TIMEVAL (spec->col_scan_stats.elapsed_time, tv_diff);
+      spec->col_scan_stats.ioreads = perfmon_get_from_statistic (thread_p, PSTAT_PB_NUM_IOREADS) - old_ioreads;
+    }
+  columnar_scan_close (thread_p, cs);
+  return (sc == S_END) ? S_SUCCESS : sc;
+}
+
+/*
  * qexec_merge_fnc () -
  *   return: scan code
  *   xasl(in)   : XASL Tree pointer
@@ -16199,6 +16335,19 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
       /* iterative processing is done only for XASL blocks that has access specification list blocks. */
       if (xasl->spec_list)
 	{
+	  if (xasl->spec_list->access == ACCESS_METHOD_COLUMNAR)
+	    {
+	      /* columnar block executor: no scan_manager, no attr cache; the
+	       * whole scan-open/interpret/close machinery below is bypassed */
+	      qp_scan = qexec_execute_columnar_scan (thread_p, xasl, xasl_state, &tplrec);
+	      if (qp_scan != S_SUCCESS)
+		{
+		  qexec_clear_mainblock_iterations (thread_p, xasl);
+		  GOTO_EXIT_ON_ERROR;
+		}
+	      goto columnar_scan_done;
+	    }
+
 	  /* Decide which scan will use fixed flags and which won't. There are several cases here: 1. Do not use fixed
 	   * scans if locks on objects are required. 2. Disable all fixed scans if any index scan is used (this is
 	   * legacy and should be reconsidered). 3. Disable fixed scan for outer scans. Fixed cannot be allowed while
@@ -16541,6 +16690,8 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 		}
 	    }
 	}
+
+    columnar_scan_done:
 
       if (xasl->type == CTE_PROC)
 	{

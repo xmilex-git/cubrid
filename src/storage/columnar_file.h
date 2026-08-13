@@ -34,12 +34,21 @@
 #endif /* !defined (SERVER_MODE) && !defined (SA_MODE) */
 
 #include "storage_common.h"
+#include "mvcc.h"
 #include "oid.h"
 #include "recovery.h"
 #include "thread_compat.hpp"
 
 #define COLUMNAR_METAPAGE_MAGIC 0x434f4c31	/* "COL1" */
 #define COLUMNAR_METAPAGE_VERSION 2
+
+/* canonical min/max encoding class of a column type (chunk skip) */
+typedef enum
+{
+  COLUMNAR_MINMAX_NONE = 0,	/* type not skippable (NUMERIC, CHAR, VARCHAR, BIT) */
+  COLUMNAR_MINMAX_INT64 = 1,	/* SHORT/INT/BIGINT/DATE/TIME/TIMESTAMP/DATETIME -> INT64 */
+  COLUMNAR_MINMAX_DOUBLE = 2	/* FLOAT/DOUBLE/MONETARY -> double */
+} COLUMNAR_MINMAX_KIND;
 
 /* Default stripe/chunk parameters (Citus defaults) */
 #define COLUMNAR_DEFAULT_STRIPE_ROW_COUNT  150000
@@ -106,7 +115,7 @@ struct columnar_stripe_dir_entry
   /* 8-byte fields first */
   INT64 stripe_id;		/* unique stripe identifier */
   INT64 first_row_number;	/* first row number in this stripe */
-  INT64 insert_mvccid;		/* writer's MVCCID — reader visibility (#12) */
+  MVCCID insert_mvccid;		/* writer's MVCCID — reader visibility (#12) */
   /* 4-byte fields */
   INT32 row_count;		/* number of rows in this stripe */
   INT32 chunk_group_count;	/* number of chunk groups */
@@ -127,10 +136,49 @@ struct columnar_stripe_dir_entry
   ((DB_PAGESIZE - (int) sizeof (COLUMNAR_METAPAGE_HEADER)) / (int) sizeof (COLUMNAR_STRIPE_DIR_ENTRY))
 
 /* ========================================================================== */
-/* Stripe footer magic/version                                                */
+/* Serialized chunk descriptor (on-disk, stripe footer)                       */
+/* ========================================================================== */
+/*
+ * 48 bytes.  INT64 first, then INT32, then INT8 — zero padding.
+ * min_val/max_val hold the canonical encoding (COLUMNAR_MINMAX_KIND) of the
+ * non-NULL values in the chunk; minmax_kind == COLUMNAR_MINMAX_NONE when the
+ * column type is not skippable or the chunk holds no non-NULL value.
+ */
+typedef struct columnar_chunk_desc COLUMNAR_CHUNK_DESC;
+struct columnar_chunk_desc
+{
+  INT64 data_offset;		/* from stripe data start */
+  INT64 exists_offset;		/* from stripe data start */
+  INT64 min_val;		/* canonical min (bit pattern; double stored via memcpy) */
+  INT64 max_val;		/* canonical max */
+  INT32 data_length;		/* compressed bytes on disk */
+  INT32 decompressed_length;	/* original bytes */
+  INT32 exists_length;		/* always uncompressed */
+  INT8 compression;		/* COLUMNAR_COMPRESSION_TYPE */
+  INT8 minmax_kind;		/* COLUMNAR_MINMAX_KIND */
+  INT8 reserved[2];
+};
+
+/* ========================================================================== */
+/* Stripe footer                                                              */
 /* ========================================================================== */
 #define COLUMNAR_FOOTER_MAGIC   0x53465452	/* "SFTR" */
-#define COLUMNAR_FOOTER_VERSION 1
+#define COLUMNAR_FOOTER_VERSION 2
+
+/*
+ * Footer header; COLUMNAR_CHUNK_DESC[n_columns * n_chunk_groups] follows,
+ * column-major within each chunk group (group g, column c at g*n_columns+c).
+ */
+typedef struct columnar_stripe_footer_header COLUMNAR_STRIPE_FOOTER_HEADER;
+struct columnar_stripe_footer_header
+{
+  INT32 magic;			/* COLUMNAR_FOOTER_MAGIC */
+  INT32 version;		/* COLUMNAR_FOOTER_VERSION */
+  INT32 n_columns;
+  INT32 n_chunk_groups;
+  INT32 chunk_row_count;	/* rows per full chunk group (last group may be partial) */
+  INT32 reserved;
+};
 
 /* ========================================================================== */
 /* Public API                                                                 */

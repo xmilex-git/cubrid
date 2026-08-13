@@ -11338,12 +11338,7 @@ pt_semantic_check_local (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int
 	  node->flag.cannot_prepare = 1;
 	}
 
-      /* interim guard until the columnar read path (SELECT) is implemented */
-      if (pt_find_columnar_class_in_spec_list (parser, node->info.query.q.select.from) != NULL)
-	{
-	  PT_ERRORmf (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_COLUMNAR_NOT_SUPPORTED, "SELECT");
-	  break;
-	}
+      /* columnar SELECT guard removed: read path (columnar_scan.c) is now implemented */
 
       if (node->info.query.flag.single_tuple == 1)
 	{

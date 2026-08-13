@@ -12531,6 +12531,14 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
 		  scan_type = TARGET_CLASS;
 		}
 
+	      /* a columnar class always goes through the columnar block executor */
+	      if (scan_type == TARGET_CLASS && access_method == ACCESS_METHOD_SEQUENTIAL
+		  && class_->info.name.db_object != NULL
+		  && sm_get_class_flag (class_->info.name.db_object, SM_CLASSFLAG_COLUMNAR) > 0)
+		{
+		  access_method = ACCESS_METHOD_COLUMNAR;
+		}
+
 	      if (pt_split_attrs (parser, table_info, where_part, &pred_attrs, &rest_attrs, &reserved_attrs,
 				  &pred_offsets, &rest_offsets, &reserved_offsets) != NO_ERROR)
 		{
@@ -12835,6 +12843,12 @@ pt_to_class_spec_list (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * where_
 	      if (spec->info.spec.flag & PT_SPEC_FLAG_FOR_UPDATE_CLAUSE)
 		{
 		  ACCESS_SPEC_SET_FLAG (access, ACCESS_SPEC_FLAG_FOR_UPDATE);
+		}
+
+	      if (access->access == ACCESS_METHOD_COLUMNAR)
+		{
+		  /* the columnar block executor has no parallel scan */
+		  ACCESS_SPEC_SET_FLAG (access, ACCESS_SPEC_FLAG_NO_PARALLEL_SCAN);
 		}
 
 	      if (access->access == ACCESS_METHOD_SEQUENTIAL || access->access == ACCESS_METHOD_INDEX)

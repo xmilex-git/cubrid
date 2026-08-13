@@ -1481,6 +1481,7 @@ $ LOADDB
 1377 no-logging 인덱스 빌드가 vacuum notification 메모리 한도(%1$d 바이트)를 초과했습니다. 동시 트랜잭션이 없는 상태에서 loaddb를 재시도하거나, no-logging 옵션 없이 인덱스를 다시 빌드하십시오.
 
 1378 columnar 테이블에서 지원하지 않는 연산입니다: %1$s
+1379 columnar 스캔이 지원하지 않는 식입니다: %1$s
 
 1379 마지막 에러
 

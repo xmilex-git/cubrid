@@ -757,8 +757,9 @@ typedef enum
   ACCESS_METHOD_SEQUENTIAL_RECORD_INFO,	/* sequential scan that will read record info */
   ACCESS_METHOD_SEQUENTIAL_PAGE_SCAN,	/* sequential scan access that only scans pages without accessing record data */
   ACCESS_METHOD_INDEX_KEY_INFO,	/* indexed access to obtain key information */
-  ACCESS_METHOD_INDEX_NODE_INFO	/* indexed access to obtain b-tree node info */
+  ACCESS_METHOD_INDEX_NODE_INFO,	/* indexed access to obtain b-tree node info */
     /* ACCESS_METHOD_SEQUENTIAL_SAMPLING_SCAN was removed with the query-based statistics sampling path */
+  ACCESS_METHOD_COLUMNAR	/* columnar storage block scan (self-contained executor) */
 } ACCESS_METHOD;
 
 #define IS_ANY_INDEX_ACCESS(access_) \
@@ -1062,6 +1063,21 @@ struct partition_spec_node
   PARTITION_SPEC_TYPE *next;	/* next partition */
   SCAN_STATS scan_stats;
 };
+
+/* columnar block scan runtime counters (ACCESS_METHOD_COLUMNAR; never serialized) */
+typedef struct col_scan_stats COL_SCAN_STATS;
+struct col_scan_stats
+{
+  INT64 stripes_total;		/* directory entries seen */
+  INT64 stripes_read;		/* visible stripes scanned */
+  INT64 stripes_skipped_mvcc;	/* invisible under the snapshot */
+  INT64 chunk_groups_total;
+  INT64 chunk_groups_skipped;	/* skipped through footer min/max */
+  INT64 rows_decoded;		/* rows surviving the vectorized filter */
+  INT64 rows_output;		/* rows handed to the executor */
+  struct timeval elapsed_time;
+  UINT64 ioreads;
+};
 #endif /* defined (SERVER_MODE) || defined (SA_MODE) */
 
 struct access_spec_node
@@ -1082,6 +1098,7 @@ struct access_spec_node
   int num_parallel_threads;	/* number of parallel threads for this spec */
 #if defined (SERVER_MODE) || defined (SA_MODE)
   SCAN_ID s_id;			/* scan identifier */
+  COL_SCAN_STATS col_scan_stats;	/* columnar block scan counters */
   PARTITION_SPEC_TYPE *parts;	/* partitions of the current spec */
   PARTITION_SPEC_TYPE *curent;	/* current partition */
   bool grouped_scan;		/* grouped or regular scan? it is never true!!! */

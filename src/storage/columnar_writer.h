@@ -73,25 +73,6 @@ struct columnar_col_buffer
 };
 
 /* ========================================================================== */
-/* Serialized chunk descriptor — built during chunk serialization             */
-/* ========================================================================== */
-/*
- * 32 bytes (half a cache line).  Two consecutive descs = one line.
- * INT64 first, then INT32, then INT8 — zero padding.
- */
-typedef struct columnar_chunk_desc COLUMNAR_CHUNK_DESC;
-struct columnar_chunk_desc
-{
-  INT64 data_offset;		/* from stripe data start */
-  INT64 exists_offset;		/* from stripe data start */
-  INT32 data_length;		/* compressed bytes on disk */
-  INT32 decompressed_length;	/* original bytes */
-  INT32 exists_length;		/* always uncompressed */
-  INT8 compression;		/* COLUMNAR_COMPRESSION_TYPE */
-  INT8 reserved[3];
-};
-
-/* ========================================================================== */
 /* Write state savepoint marker                                               */
 /* ========================================================================== */
 typedef struct columnar_savept COLUMNAR_SAVEPT;
@@ -150,6 +131,11 @@ struct columnar_write_state
 /* ========================================================================== */
 /* Public API                                                                 */
 /* ========================================================================== */
+
+/* per-value on-disk byte count of a fixed-width column; -1 = variable width,
+ * -2 = type not storable in columnar format (shared with the read path) */
+struct tp_domain;
+extern int columnar_value_disk_size (DB_TYPE type, struct tp_domain * domain);
 
 /* Boot-time init / final */
 extern void columnar_writer_init (int max_tran_indices);

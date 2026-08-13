@@ -488,6 +488,8 @@ qdump_access_method_string (ACCESS_METHOD access)
       return "sequential record info";
     case ACCESS_METHOD_SEQUENTIAL_PAGE_SCAN:
       return "sequential page scan";
+    case ACCESS_METHOD_COLUMNAR:
+      return "columnar";
     default:
       return "undefined";
     }
@@ -2896,6 +2898,41 @@ qdump_print_access_spec_stats_json (ACCESS_SPEC_TYPE * spec_list_p)
       scan = json_object ();
       type = spec->type;
 
+      if (type == TARGET_CLASS && spec->access == ACCESS_METHOD_COLUMNAR)
+	{
+	  /* columnar block scan: the SCAN_ID machinery is never opened */
+	  COL_SCAN_STATS *cst = &spec->col_scan_stats;
+
+	  cls_node = &ACCESS_SPEC_CLS_SPEC (spec);
+	  if (heap_get_class_name (thread_p, &(cls_node->cls_oid), &class_name) != NO_ERROR)
+	    {
+	      if (er_errid () != ER_INTERRUPTED)
+		{
+		  er_clear ();
+		}
+	    }
+	  snprintf (spec_name, sizeof (spec_name), "columnar (%s)", (class_name != NULL) ? class_name : "unknown");
+	  json_object_set_new (scan, "access", json_string (spec_name));
+	  json_object_set_new (scan, "time", json_integer (TO_MSEC (cst->elapsed_time)));
+	  json_object_set_new (scan, "stripes_total", json_integer (cst->stripes_total));
+	  json_object_set_new (scan, "stripes_read", json_integer (cst->stripes_read));
+	  json_object_set_new (scan, "stripes_mvcc_skipped", json_integer (cst->stripes_skipped_mvcc));
+	  json_object_set_new (scan, "chunk_groups", json_integer (cst->chunk_groups_total));
+	  json_object_set_new (scan, "chunk_groups_minmax_skipped", json_integer (cst->chunk_groups_skipped));
+	  json_object_set_new (scan, "rows_filtered", json_integer (cst->rows_decoded));
+	  json_object_set_new (scan, "rows_out", json_integer (cst->rows_output));
+	  json_object_set_new (scan, "ioread", json_integer (cst->ioreads));
+	  if (class_name != NULL)
+	    {
+	      free_and_init (class_name);
+	    }
+	  if (scan_array != NULL)
+	    {
+	      json_array_append_new (scan_array, scan);
+	    }
+	  continue;
+	}
+
       if (type == TARGET_CLASS)
 	{
 	  cls_node = &ACCESS_SPEC_CLS_SPEC (spec);
@@ -3539,6 +3576,35 @@ qdump_print_access_spec_stats_text (FILE * fp, ACCESS_SPEC_TYPE * spec_list_p, i
 	}
 
       type = spec->type;
+      if (type == TARGET_CLASS && spec->access == ACCESS_METHOD_COLUMNAR)
+	{
+	  /* columnar block scan: the SCAN_ID machinery is never opened */
+	  COL_SCAN_STATS *cst = &spec->col_scan_stats;
+
+	  cls_node = &ACCESS_SPEC_CLS_SPEC (spec);
+	  if (heap_get_class_name (thread_p, &(cls_node->cls_oid), &class_name) != NO_ERROR)
+	    {
+	      if (er_errid () != ER_INTERRUPTED)
+		{
+		  er_clear ();
+		}
+	    }
+	  fprintf (fp, "(columnar table: %s), ", (class_name != NULL) ? class_name : "unknown");
+	  fprintf (fp,
+		   "COLUMNAR (time: %d, stripes: %lld/%lld, mvcc_skipped: %lld, chunk_groups: %lld, "
+		   "minmax_skipped: %lld, rows_filtered: %lld, rows_out: %lld, ioread: %llu)",
+		   TO_MSEC (cst->elapsed_time), (long long int) cst->stripes_read,
+		   (long long int) cst->stripes_total, (long long int) cst->stripes_skipped_mvcc,
+		   (long long int) cst->chunk_groups_total, (long long int) cst->chunk_groups_skipped,
+		   (long long int) cst->rows_decoded, (long long int) cst->rows_output,
+		   (unsigned long long) cst->ioreads);
+	  if (class_name != NULL)
+	    {
+	      free_and_init (class_name);
+	    }
+	  fprintf (fp, "\n");
+	  continue;
+	}
       if (type == TARGET_CLASS)
 	{
 	  cls_node = &ACCESS_SPEC_CLS_SPEC (spec);

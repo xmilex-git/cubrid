@@ -1773,7 +1773,9 @@
 
 #define ER_COLUMNAR_NOT_SUPPORTED                   -1378
 
-#define ER_LAST_ERROR                               -1379
+#define ER_COLUMNAR_UNSUPPORTED_EXPR                -1379
+
+#define ER_LAST_ERROR                               -1380
 
 
 
