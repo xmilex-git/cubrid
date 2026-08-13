@@ -863,17 +863,44 @@ col_const_to_dbl (const DB_VALUE * v, DB_TYPE type)
 }
 
 /* find the binding whose val_list slot a TYPE_CONSTANT regu points at */
+/*
+ * col_find_binding () - find the binding index whose val_list slot matches
+ *   the regu variable's output.  The WHERE predicate's column references
+ *   arrive as TYPE_ATTR_ID (pointing at vfetch_to), while the projection
+ *   list's use TYPE_CONSTANT (pointing at dbvalptr).  Both point at the
+ *   same val_list DB_VALUE slot that the binding owns.
+ */
 static int
 col_find_binding (const COLUMNAR_SCAN * cs, const REGU_VARIABLE * regu)
 {
   int i;
-  if (regu == NULL || regu->type != TYPE_CONSTANT)
+  DB_VALUE *target = NULL;
+
+  if (regu == NULL)
     {
       return -1;
     }
+
+  switch (regu->type)
+    {
+    case TYPE_CONSTANT:
+      target = regu->value.dbvalptr;
+      break;
+    case TYPE_ATTR_ID:
+      target = regu->vfetch_to;
+      break;
+    default:
+      return -1;
+    }
+
+  if (target == NULL)
+    {
+      return -1;
+    }
+
   for (i = 0; i < cs->n_bindings; i++)
     {
-      if (cs->bindings[i].slot == regu->value.dbvalptr)
+      if (cs->bindings[i].slot == target)
 	{
 	  return i;
 	}
@@ -2220,7 +2247,12 @@ col_load_binding_chunk (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, COL_BINDING
 	    }
 	}
 
-      if (d->compression == COLUMNAR_COMPRESS_LZ4)
+      if (d->data_length == 0 && d->decompressed_length == 0)
+	{
+	  /* empty chunk (e.g. variable-width column where every row is NULL):
+	   * nothing to decompress, data_buf stays at 0 bytes used */
+	}
+      else if (d->compression == COLUMNAR_COMPRESS_LZ4)
 	{
 	  int out_len = LZ4_decompress_safe (b->comp_buf, b->data_buf, d->data_length, d->decompressed_length);
 	  if (out_len != d->decompressed_length)
