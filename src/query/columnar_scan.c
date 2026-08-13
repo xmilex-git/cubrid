@@ -198,6 +198,10 @@ struct columnar_scan
   int descs_alloc;		/* bytes */
   int footer_n_columns;
 
+  VPID *stripe_vpids;		/* stripe page map snapshot (from stripe page 0) */
+  int stripe_vpids_count;	/* page_count from the map header */
+  int stripe_vpids_alloc;	/* allocated entries */
+
   COL_FILTER_NODE *filter;	/* NULL = no WHERE */
   UINT64 **bm_pool;		/* eval scratch: 2 bitmaps per tree depth */
   int bm_pool_n;		/* number of bitmaps in pool */
@@ -2052,7 +2056,11 @@ col_snapshot_directory (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
   return NO_ERROR;
 }
 
-/* copy [offset, offset+length) of the stripe's page-contiguous byte space */
+/* copy [offset, offset+length) of the stripe's data byte stream.  Offset 0
+ * is the first byte of stripe page 1 — page 0 holds the stripe page map,
+ * which col_open_stripe snapshots into cs->stripe_vpids before any range
+ * read.  Every page lookup is an O(1) index into that map, so
+ * non-contiguous file_alloc placements cost nothing on the hot path. */
 static int
 col_read_range (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, const COLUMNAR_STRIPE_DIR_ENTRY * ent, INT64 offset,
 		int length, char *dst)
@@ -2060,13 +2068,11 @@ col_read_range (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, const COLUMNAR_STRI
   INT64 pos = offset;
   int copied = 0;
 
-  (void) cs;
-
   while (copied < length)
     {
       VPID vpid;
       PAGE_PTR pgptr;
-      int page_idx = (int) (pos / DB_PAGESIZE);
+      int page_idx = 1 + (int) (pos / DB_PAGESIZE);	/* +1: skip the map page */
       int in_page = (int) (pos % DB_PAGESIZE);
       int chunk = DB_PAGESIZE - in_page;
       int error;
@@ -2075,15 +2081,14 @@ col_read_range (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, const COLUMNAR_STRI
 	{
 	  chunk = length - copied;
 	}
-      if (page_idx >= ent->page_count)
+      if (page_idx >= ent->page_count || page_idx >= cs->stripe_vpids_count)
 	{
 	  assert (false);
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
 	  return ER_FAILED;
 	}
 
-      vpid.volid = ent->start_vpid.volid;
-      vpid.pageid = ent->start_vpid.pageid + page_idx;
+      vpid = cs->stripe_vpids[page_idx];
 
       pgptr = pgbuf_fix (thread_p, &vpid, OLD_PAGE, PGBUF_LATCH_READ, PGBUF_UNCONDITIONAL_LATCH);
       if (pgptr == NULL)
@@ -2121,8 +2126,9 @@ col_ensure_buf (char **buf, int *alloc, int needed)
 }
 
 /*
- * col_open_stripe () - read + validate the footer of dir[stripe_idx], reset
- *   the chunk cursor, and grow the bitmap pool for this stripe's chunk size
+ * col_open_stripe () - snapshot the stripe page map from page 0, then read +
+ *   validate the footer of dir[stripe_idx], reset the chunk cursor, and grow
+ *   the bitmap pool for this stripe's chunk size
  */
 static int
 col_open_stripe (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
@@ -2132,7 +2138,49 @@ col_open_stripe (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
   INT64 footer_start;
   int descs_size, error, need_words, i;
 
-  footer_start = (INT64) (ent->footer_vpid.pageid - ent->start_vpid.pageid) * DB_PAGESIZE + ent->footer_offset;
+  /* load the stripe page map from page 0 (dir entry's start_vpid).  One page
+   * fix per stripe; afterwards every page lookup is an array index. */
+  cs->stripe_vpids_count = 0;
+  {
+    PAGE_PTR pgptr;
+    const COLUMNAR_STRIPE_PAGE_MAP_HEADER *mhdr;
+
+    pgptr = pgbuf_fix (thread_p, &ent->start_vpid, OLD_PAGE, PGBUF_LATCH_READ, PGBUF_UNCONDITIONAL_LATCH);
+    if (pgptr == NULL)
+      {
+	ASSERT_ERROR_AND_SET (error);
+	return error;
+      }
+    mhdr = (const COLUMNAR_STRIPE_PAGE_MAP_HEADER *) pgptr;
+    if (mhdr->magic != COLUMNAR_STRIPE_MAP_MAGIC || mhdr->version != COLUMNAR_STRIPE_MAP_VERSION
+	|| mhdr->page_count != ent->page_count || mhdr->page_count > COLUMNAR_STRIPE_PAGE_MAP_CAPACITY)
+      {
+	pgbuf_unfix_and_init (thread_p, pgptr);
+	assert (false);
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	return ER_FAILED;
+      }
+    if (mhdr->page_count > cs->stripe_vpids_alloc)
+      {
+	VPID *nv = (VPID *) realloc (cs->stripe_vpids, mhdr->page_count * sizeof (VPID));
+	if (nv == NULL)
+	  {
+	    pgbuf_unfix_and_init (thread_p, pgptr);
+	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		    mhdr->page_count * sizeof (VPID));
+	    return ER_OUT_OF_VIRTUAL_MEMORY;
+	  }
+	cs->stripe_vpids = nv;
+	cs->stripe_vpids_alloc = mhdr->page_count;
+      }
+    memcpy (cs->stripe_vpids, (const char *) pgptr + sizeof (COLUMNAR_STRIPE_PAGE_MAP_HEADER),
+	    mhdr->page_count * sizeof (VPID));
+    cs->stripe_vpids_count = mhdr->page_count;
+    pgbuf_unfix_and_init (thread_p, pgptr);
+  }
+
+  /* footer byte offset in the data stream (stream offset 0 = stripe page 1) */
+  footer_start = (INT64) (ent->footer_page_idx - 1) * DB_PAGESIZE + ent->footer_offset;
 
   error = col_read_range (thread_p, cs, ent, footer_start, (int) sizeof (fhdr), (char *) &fhdr);
   if (error != NO_ERROR)
@@ -2834,5 +2882,6 @@ columnar_scan_close (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
     }
   free (cs->dir);
   free (cs->descs);
+  free (cs->stripe_vpids);
   free (cs);
 }

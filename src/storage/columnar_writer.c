@@ -722,8 +722,10 @@ columnar_insert_row (THREAD_ENTRY * thread_p, const OID * class_oid, const HFID 
 	}
     }
 
-  /* stripe boundary: flush to disk */
-  if (ws->current_rows >= ws->stripe_max_rows)
+  /* stripe boundary: flush to disk.  The byte cap keeps the stripe's page
+   * map within a single page (COLUMNAR_STRIPE_PAGE_MAP_CAPACITY); it only
+   * changes at chunk boundaries, so the flush still lands on a full chunk. */
+  if (ws->current_rows >= ws->stripe_max_rows || ws->stripe_data_size >= COLUMNAR_STRIPE_MAX_BYTES)
     {
       error_code = columnar_flush_stripe (thread_p, ws);
       if (error_code != NO_ERROR)
@@ -1157,9 +1159,18 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
       return error_code;
     }
 
-  /* compute total pages needed */
+  /* compute total pages: page 0 is the stripe page map, data + footer follow */
   total_data_len = ws->stripe_data_size + footer_len;
-  total_pages = (total_data_len + DB_PAGESIZE - 1) / DB_PAGESIZE;
+  total_pages = 1 + (total_data_len + DB_PAGESIZE - 1) / DB_PAGESIZE;
+
+  if (total_pages > COLUMNAR_STRIPE_PAGE_MAP_CAPACITY)
+    {
+      /* unreachable while COLUMNAR_STRIPE_MAX_BYTES holds; defensive guard */
+      free (footer_buf);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1,
+	      "stripe exceeds page map capacity");
+      return ER_COLUMNAR_NOT_SUPPORTED;
+    }
 
   /* allocate vpid array */
   vpids = (VPID *) malloc (total_pages * sizeof (VPID));
@@ -1174,7 +1185,8 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
   /* ---- BEGIN SYSOP ---- */
   log_sysop_start (thread_p);
 
-  /* allocate pages in bulk */
+  /* allocate pages in bulk — NO contiguity requirement; the page map makes
+   * every page reachable regardless of where file_alloc placed it */
   {
     PAGE_TYPE col_ptype = PAGE_COLUMNAR;
     error_code = file_alloc_multiple (thread_p, &ws->hfid.vfid, file_init_page_type,
@@ -1186,25 +1198,51 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
       goto sysop_abort;
     }
 
-  /* the reader locates stripe pages as start_vpid.pageid + i on the same
-   * volume; verify the bulk allocation actually is contiguous and fail the
-   * flush cleanly when it is not (instead of persisting an unreadable stripe) */
-  for (i = 1; i < total_pages; i++)
-    {
-      if (vpids[i].volid != vpids[0].volid || vpids[i].pageid != vpids[0].pageid + i)
-	{
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1,
-		  "non-contiguous stripe page allocation");
-	  error_code = ER_COLUMNAR_NOT_SUPPORTED;
-	  goto sysop_abort;
-	}
-    }
+  /* write the stripe page map to page 0 (vpids[0]) */
+  {
+    COLUMNAR_STRIPE_PAGE_MAP_HEADER mhdr;
+    PAGE_PTR pgptr;
+    int map_len = (int) sizeof (mhdr) + total_pages * (int) sizeof (VPID);
+    char *map_buf = (char *) malloc (map_len);
 
-  /* write stripe data + footer to pages */
+    if (map_buf == NULL)
+      {
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) map_len);
+	error_code = ER_OUT_OF_VIRTUAL_MEMORY;
+	goto sysop_abort;
+      }
+    memset (&mhdr, 0, sizeof (mhdr));
+    mhdr.magic = COLUMNAR_STRIPE_MAP_MAGIC;
+    mhdr.version = COLUMNAR_STRIPE_MAP_VERSION;
+    mhdr.page_count = total_pages;
+    memcpy (map_buf, &mhdr, sizeof (mhdr));
+    memcpy (map_buf + sizeof (mhdr), vpids, total_pages * sizeof (VPID));
+
+    pgptr = pgbuf_fix (thread_p, &vpids[0], OLD_PAGE, PGBUF_LATCH_WRITE, PGBUF_UNCONDITIONAL_LATCH);
+    if (pgptr == NULL)
+      {
+	free (map_buf);
+	ASSERT_ERROR_AND_SET (error_code);
+	goto sysop_abort;
+      }
+    pgbuf_set_page_ptype (thread_p, pgptr, PAGE_COLUMNAR);
+    memcpy (pgptr, map_buf, map_len);
+    memset ((char *) pgptr + map_len, 0, DB_PAGESIZE - map_len);
+
+    addr.pgptr = pgptr;
+    addr.vfid = &ws->hfid.vfid;
+    addr.offset = 0;
+    log_append_redo_data (thread_p, RVCOL_PAGE_DATA, &addr, map_len, map_buf);
+
+    pgbuf_set_dirty (thread_p, pgptr, DONT_FREE);
+    pgbuf_unfix_and_init (thread_p, pgptr);
+    free (map_buf);
+  }
+
+  /* write stripe data + footer into pages 1..N-1 */
   data_offset = 0;
   pages_written = 0;
   {
-    /* combined buffer: stripe_data + footer */
     int combined_len = ws->stripe_data_size + footer_len;
     char *combined = (char *) malloc (combined_len);
     if (combined == NULL)
@@ -1216,7 +1254,7 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
     memcpy (combined, ws->stripe_data, ws->stripe_data_size);
     memcpy (combined + ws->stripe_data_size, footer_buf, footer_len);
 
-    for (i = 0; i < total_pages; i++)
+    for (i = 1; i < total_pages; i++)
       {
 	PAGE_PTR pgptr;
 	pgptr = pgbuf_fix (thread_p, &vpids[i], OLD_PAGE, PGBUF_LATCH_WRITE, PGBUF_UNCONDITIONAL_LATCH);
@@ -1279,12 +1317,14 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
   dir_entry.first_row_number = meta_hdr->next_row_number;
   dir_entry.row_count = ws->current_rows;
   dir_entry.chunk_group_count = ws->n_chunk_groups;
-  dir_entry.start_vpid = vpids[0];
+  dir_entry.start_vpid = vpids[0];	/* the stripe page map page */
   dir_entry.page_count = total_pages;
-  /* footer location: starts at stripe_data_size offset */
+  /* footer starts at byte offset stripe_data_size of the data stream, which
+   * occupies stripe pages 1..N-1 (page 0 is the page map) */
   {
-    int footer_page_idx = ws->stripe_data_size / DB_PAGESIZE;
+    int footer_page_idx = 1 + ws->stripe_data_size / DB_PAGESIZE;
     dir_entry.footer_vpid = vpids[footer_page_idx];
+    dir_entry.footer_page_idx = (INT16) footer_page_idx;
     dir_entry.footer_offset = (INT16) (ws->stripe_data_size % DB_PAGESIZE);
   }
   /* insert_mvccid: current transaction's MVCCID.  logtb_get_current_mvccid ()

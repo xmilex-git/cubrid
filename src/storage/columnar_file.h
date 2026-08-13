@@ -51,6 +51,7 @@ typedef enum
 } COLUMNAR_MINMAX_KIND;
 
 /* Default stripe/chunk parameters (Citus defaults) */
+/* Default stripe/chunk parameters (Citus defaults) */
 #define COLUMNAR_DEFAULT_STRIPE_ROW_COUNT  150000
 #define COLUMNAR_DEFAULT_CHUNK_ROW_COUNT   10000
 
@@ -125,7 +126,7 @@ struct columnar_stripe_dir_entry
   VPID footer_vpid;		/* page containing stripe footer start */
   /* 2-byte fields */
   INT16 footer_offset;		/* offset within footer page */
-  INT16 reserved1;
+  INT16 footer_page_idx;	/* stripe-relative page index of footer start (page 0 = page map) */
   /* struct-alignment pad to 8 */
   INT32 reserved2;
 };
@@ -173,12 +174,48 @@ typedef struct columnar_stripe_footer_header COLUMNAR_STRIPE_FOOTER_HEADER;
 struct columnar_stripe_footer_header
 {
   INT32 magic;			/* COLUMNAR_FOOTER_MAGIC */
-  INT32 version;		/* COLUMNAR_FOOTER_VERSION */
+  INT32 version;			/* COLUMNAR_FOOTER_VERSION */
   INT32 n_columns;
   INT32 n_chunk_groups;
-  INT32 chunk_row_count;	/* rows per full chunk group (last group may be partial) */
+  INT32 chunk_row_count;		/* rows per full chunk group (last group may be partial) */
   INT32 reserved;
 };
+
+/* ========================================================================== */
+/* Stripe page map (first page of every stripe)                               */
+/* ========================================================================== */
+/*
+ * file_alloc_multiple does NOT guarantee contiguous pages (it loops
+ * file_alloc per page), so the reader cannot address stripe pages as
+ * start_vpid.pageid + i.  Instead, page 0 of every stripe holds a page map:
+ * this header followed by VPID[page_count] in write order (entry 0 is the
+ * map page itself).  The reader fixes dir_entry.start_vpid once per stripe,
+ * snapshots the map, and every subsequent page lookup is an O(1) array
+ * index — the CUBRID analogue of Citus's arithmetic LogicalToPhysical.
+ */
+#define COLUMNAR_STRIPE_MAP_MAGIC   0x534d4150	/* "SMAP" */
+#define COLUMNAR_STRIPE_MAP_VERSION 1
+
+typedef struct columnar_stripe_page_map_header COLUMNAR_STRIPE_PAGE_MAP_HEADER;
+struct columnar_stripe_page_map_header
+{
+  INT32 magic;			/* COLUMNAR_STRIPE_MAP_MAGIC */
+  INT32 version;		/* COLUMNAR_STRIPE_MAP_VERSION */
+  INT32 page_count;		/* stripe pages incl. this map page; VPID[page_count] follows */
+  INT32 reserved;
+};
+
+/* Max stripe pages a single map page can describe */
+#define COLUMNAR_STRIPE_PAGE_MAP_CAPACITY \
+  ((DB_PAGESIZE - (int) sizeof (COLUMNAR_STRIPE_PAGE_MAP_HEADER)) / (int) sizeof (VPID))
+
+/*
+ * Byte cap on serialized stripe data — keeps the page map within a single
+ * page (16K page → 2,046 VPIDs → ~33MB stripe; cap at 24MB leaves headroom
+ * for one more serialized chunk plus the footer).  Checked at chunk
+ * boundaries in the writer, complementing the row-count stripe boundary.
+ */
+#define COLUMNAR_STRIPE_MAX_BYTES  (24 * 1024 * 1024)
 
 /* ========================================================================== */
 /* Public API                                                                 */
