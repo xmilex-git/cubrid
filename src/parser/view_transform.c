@@ -236,6 +236,8 @@ static bool pt_has_non_deterministic_expr (PARSER_CONTEXT * parser, PT_NODE * te
 static bool pt_check_pushable_subquery_select_list (PARSER_CONTEXT * parser, PT_NODE * query, int pos);
 static PT_NODE *pt_find_only_name_id (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg, int *continue_walk);
 static bool pt_check_pushable_term (PARSER_CONTEXT * parser, PT_NODE * term, FIND_ID_INFO * infop);
+static bool mq_spec_has_columnar_class (PT_NODE * spec);
+static bool mq_query_has_columnar_spec (PT_NODE * query);
 static PUSHABLE_TYPE mq_is_pushable_subquery (PARSER_CONTEXT * parser, PT_NODE * subquery, PT_NODE * mainquery,
 					      PT_NODE * class_spec, bool is_vclass, PT_NODE * order_by,
 					      PT_NODE * class_);
@@ -1961,6 +1963,16 @@ mq_is_pushable_subquery (PARSER_CONTEXT * parser, PT_NODE * subquery, PT_NODE * 
   /*****************************/
   /* NO_MERGE and QUERY_CACHE hint check */
   if (subquery->info.query.q.select.hint & (PT_HINT_NO_MERGE | PT_HINT_QUERY_CACHE))
+    {
+      return NON_PUSHABLE;
+    }
+
+  /* a derived table over a columnar class is never merged into the parent:
+   * the columnar block executor only runs single-table blocks, so the
+   * materialization boundary must survive view merging — merging would put
+   * the columnar spec back into a (possibly multi-spec) parent block and
+   * trip the server-side block-shape gate (ER_COLUMNAR_UNSUPPORTED_EXPR) */
+  if (mq_query_has_columnar_spec (subquery))
     {
       return NON_PUSHABLE;
     }
@@ -7133,6 +7145,43 @@ mq_spec_has_columnar_class (PT_NODE * spec)
 	}
     }
   return false;
+}
+
+/*
+ * mq_query_has_columnar_spec() - true when any FROM spec of the query (or of
+ *   a set-operation arm) references a columnar class
+ */
+static bool
+mq_query_has_columnar_spec (PT_NODE * query)
+{
+  PT_NODE *spec;
+
+  if (query == NULL)
+    {
+      return false;
+    }
+
+  switch (query->node_type)
+    {
+    case PT_SELECT:
+      for (spec = query->info.query.q.select.from; spec != NULL; spec = spec->next)
+	{
+	  if (spec->info.spec.flat_entity_list != NULL && mq_spec_has_columnar_class (spec))
+	    {
+	      return true;
+	    }
+	}
+      return false;
+
+    case PT_UNION:
+    case PT_DIFFERENCE:
+    case PT_INTERSECTION:
+      return (mq_query_has_columnar_spec (query->info.query.q.union_.arg1)
+	      || mq_query_has_columnar_spec (query->info.query.q.union_.arg2));
+
+    default:
+      return false;
+    }
 }
 
 static PT_NODE *
