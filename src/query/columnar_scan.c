@@ -919,18 +919,7 @@ col_find_binding (const COLUMNAR_SCAN * cs, const REGU_VARIABLE * regu)
 	      return i;
 	    }
 	}
-      /* diagnostic: log the miss so the next debug pass can see the actual ids */
-      er_log_debug (ARG_FILE_LINE,
-		    "col_find_binding: TYPE_ATTR_ID miss — regu attr_descr.id=%d, "
-		    "regu vfetch_to=%p, target=%p; n_bindings=%d",
-		    (int) aid, (void *) regu->vfetch_to, (void *) target, cs->n_bindings);
-      for (i = 0; i < cs->n_bindings; i++)
-	{
-	  er_log_debug (ARG_FILE_LINE,
-			"  binding[%d]: attr_id=%d slot=%p col_idx=%d type=%d",
-			i, (int) cs->bindings[i].attr_id, (void *) cs->bindings[i].slot,
-			cs->bindings[i].col_idx, (int) cs->bindings[i].type);
-	}
+
     }
 
   return -1;
