@@ -887,24 +887,40 @@ col_find_binding (const COLUMNAR_SCAN * cs, const REGU_VARIABLE * regu)
       target = regu->value.dbvalptr;
       break;
     case TYPE_ATTR_ID:
+      /* pred regu and cls_regu_list regu may have different vfetch_to
+       * pointers but share the same attr_descr.id; try vfetch_to first,
+       * fall back to attr id match */
       target = regu->vfetch_to;
       break;
     default:
       return -1;
     }
 
-  if (target == NULL)
+  /* try pointer match first (same val_list slot) */
+  if (target != NULL)
     {
-      return -1;
-    }
-
-  for (i = 0; i < cs->n_bindings; i++)
-    {
-      if (cs->bindings[i].slot == target)
+      for (i = 0; i < cs->n_bindings; i++)
 	{
-	  return i;
+	  if (cs->bindings[i].slot == target)
+	    {
+	      return i;
+	    }
 	}
     }
+
+  /* pointer didn't match; for TYPE_ATTR_ID fall back to attr id */
+  if (regu->type == TYPE_ATTR_ID)
+    {
+      ATTR_ID aid = regu->value.attr_descr.id;
+      for (i = 0; i < cs->n_bindings; i++)
+	{
+	  if (cs->bindings[i].attr_id == aid)
+	    {
+	      return i;
+	    }
+	}
+    }
+
   return -1;
 }
 
