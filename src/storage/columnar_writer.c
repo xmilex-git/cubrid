@@ -227,9 +227,10 @@ columnar_create_write_state (THREAD_ENTRY * thread_p, const OID * class_oid, con
 	{
 	  col->data_alloc = COL_INIT_DATA_ALLOC;
 	}
-      col->data = (char *) db_private_alloc (thread_p, col->data_alloc);
+      col->data = (char *) malloc (col->data_alloc);
       if (col->data == NULL)
 	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) col->data_alloc);
 	  goto err;
 	}
       col->data_size = 0;
@@ -240,9 +241,10 @@ columnar_create_write_state (THREAD_ENTRY * thread_p, const OID * class_oid, con
 	{
 	  col->exists_alloc = COL_INIT_EXISTS_ALLOC;
 	}
-      col->exists = (char *) db_private_alloc (thread_p, col->exists_alloc);
+      col->exists = (char *) malloc (col->exists_alloc);
       if (col->exists == NULL)
 	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) col->exists_alloc);
 	  goto err;
 	}
       memset (col->exists, 0, col->exists_alloc);
@@ -251,9 +253,10 @@ columnar_create_write_state (THREAD_ENTRY * thread_p, const OID * class_oid, con
 
   /* stripe data accumulator */
   ws->stripe_data_alloc = COL_INIT_STRIPE_ALLOC;
-  ws->stripe_data = (char *) db_private_alloc (thread_p, ws->stripe_data_alloc);
+  ws->stripe_data = (char *) malloc (ws->stripe_data_alloc);
   if (ws->stripe_data == NULL)
     {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) ws->stripe_data_alloc);
       goto err;
     }
   ws->stripe_data_size = 0;
@@ -261,10 +264,11 @@ columnar_create_write_state (THREAD_ENTRY * thread_p, const OID * class_oid, con
   /* chunk descriptor array */
   ws->chunk_descs_alloc = COL_INIT_CHUNKDESC_ALLOC;
   ws->chunk_descs =
-    (COLUMNAR_CHUNK_DESC *) db_private_alloc (thread_p,
-					      ws->chunk_descs_alloc * sizeof (COLUMNAR_CHUNK_DESC));
+    (COLUMNAR_CHUNK_DESC *) malloc (ws->chunk_descs_alloc * sizeof (COLUMNAR_CHUNK_DESC));
   if (ws->chunk_descs == NULL)
     {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+	      (size_t) (ws->chunk_descs_alloc * sizeof (COLUMNAR_CHUNK_DESC)));
       goto err;
     }
   ws->n_chunk_descs = 0;
@@ -304,11 +308,11 @@ columnar_free_write_state (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
 	{
 	  if (ws->columns[i].data != NULL)
 	    {
-	      db_private_free (thread_p, ws->columns[i].data);
+	      free (ws->columns[i].data);
 	    }
 	  if (ws->columns[i].exists != NULL)
 	    {
-	      db_private_free (thread_p, ws->columns[i].exists);
+	      free (ws->columns[i].exists);
 	    }
 	}
       db_private_free (thread_p, ws->columns);
@@ -316,11 +320,11 @@ columnar_free_write_state (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
 
   if (ws->stripe_data != NULL)
     {
-      db_private_free (thread_p, ws->stripe_data);
+      free (ws->stripe_data);
     }
   if (ws->chunk_descs != NULL)
     {
-      db_private_free (thread_p, ws->chunk_descs);
+      free (ws->chunk_descs);
     }
 
   for (sp = ws->savept_stack; sp != NULL; sp = sp_next)
@@ -397,8 +401,8 @@ columnar_ensure_data_capacity (COLUMNAR_COL_BUFFER * col, int needed)
       new_alloc *= 2;
     }
 
-  /* can't use db_private_realloc here because col->data may come from any thread;
-   * but write_state columns are always used by the owning thread, so it's safe */
+  /* col->data is allocated with system malloc and grown with realloc;
+   * freed with system free in columnar_free_write_state */
   char *new_buf = (char *) realloc (col->data, new_alloc);
   if (new_buf == NULL)
     {
