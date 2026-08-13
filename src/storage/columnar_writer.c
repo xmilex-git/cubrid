@@ -1333,48 +1333,117 @@ columnar_flush_stripe (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
    * an uncommitted stripe as visible. */
   dir_entry.insert_mvccid = logtb_get_current_mvccid (thread_p);
 
-  /* update counters atomically (under X page latch) */
+  /* update counters atomically (under X page latch).  Counters are
+   * advance-only: an aborted flush leaves a gap in stripe_id/row_number,
+   * which is harmless (readers use directory entries only), so the counter
+   * update is logged redo-only on the first metapage. */
   meta_hdr->next_stripe_id++;
   meta_hdr->next_row_number += ws->current_rows;
 
-  /* append directory entry to the metapage */
-  if (meta_hdr->entry_count >= COLUMNAR_META_ENTRIES_PER_PAGE)
+  addr.pgptr = meta_pgptr;
+  addr.vfid = &ws->hfid.vfid;
+  addr.offset = 0;
+  log_append_redo_data (thread_p, RVCOL_META_DIR_ENTRY, &addr, (int) sizeof (COLUMNAR_METAPAGE_HEADER), meta_hdr);
+  pgbuf_set_dirty (thread_p, meta_pgptr, DONT_FREE);
+
+  /* find the append target: the first chain page with a free directory
+   * slot.  Forward-only latch crabbing; concurrent flushes serialize on
+   * the page latches. */
+  while (meta_hdr->entry_count >= COLUMNAR_META_ENTRIES_PER_PAGE)
     {
-      /* TODO: allocate a new metapage and chain it. For MVP, single metapage is sufficient. */
-      assert (false);
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-      error_code = ER_FAILED;
-      pgbuf_unfix_and_init (thread_p, meta_pgptr);
-      goto sysop_abort;
+      if (VPID_ISNULL (&meta_hdr->next_metapage))
+	{
+	  /* extend the chain.  The structural extension (page alloc + init +
+	   * link) commits in a nested sysop independent of the outer
+	   * transaction — like a btree split — so an abort of this INSERT
+	   * never leaves a dangling next_metapage link; it only leaves an
+	   * empty, reusable chain page. */
+	  VPID new_vpid;
+	  PAGE_PTR new_pgptr = NULL;
+	  COLUMNAR_METAPAGE_HEADER new_hdr;
+	  PAGE_TYPE col_ptype = PAGE_COLUMNAR;
+
+	  log_sysop_start (thread_p);
+
+	  error_code = file_alloc (thread_p, &ws->hfid.vfid, file_init_page_type, &col_ptype, &new_vpid, &new_pgptr);
+	  if (error_code != NO_ERROR || new_pgptr == NULL)
+	    {
+	      ASSERT_ERROR ();
+	      log_sysop_abort (thread_p);
+	      pgbuf_unfix_and_init (thread_p, meta_pgptr);
+	      goto sysop_abort;
+	    }
+
+	  memset (&new_hdr, 0, sizeof (new_hdr));
+	  new_hdr.magic = COLUMNAR_METAPAGE_MAGIC;
+	  new_hdr.version = COLUMNAR_METAPAGE_VERSION;
+	  new_hdr.entry_count = 0;
+	  VPID_SET_NULL (&new_hdr.next_metapage);
+	  new_hdr.class_oid = meta_hdr->class_oid;
+
+	  pgbuf_set_page_ptype (thread_p, new_pgptr, PAGE_COLUMNAR);
+	  memcpy (new_pgptr, &new_hdr, sizeof (new_hdr));
+	  addr.pgptr = new_pgptr;
+	  addr.vfid = &ws->hfid.vfid;
+	  addr.offset = 0;
+	  log_append_redo_data (thread_p, RVCOL_METAPAGE_INIT, &addr, (int) sizeof (new_hdr), &new_hdr);
+	  pgbuf_set_dirty (thread_p, new_pgptr, DONT_FREE);
+
+	  /* link the old tail to the new page (redo-only header image) */
+	  meta_hdr->next_metapage = new_vpid;
+	  addr.pgptr = meta_pgptr;
+	  addr.offset = 0;
+	  log_append_redo_data (thread_p, RVCOL_META_DIR_ENTRY, &addr, (int) sizeof (COLUMNAR_METAPAGE_HEADER),
+				meta_hdr);
+	  pgbuf_set_dirty (thread_p, meta_pgptr, DONT_FREE);
+
+	  log_sysop_commit (thread_p);
+
+	  pgbuf_unfix_and_init (thread_p, meta_pgptr);
+	  meta_pgptr = new_pgptr;
+	  meta_hdr = (COLUMNAR_METAPAGE_HEADER *) meta_pgptr;
+	  break;		/* a fresh page always has room */
+	}
+      else
+	{
+	  VPID next_vpid = meta_hdr->next_metapage;
+	  PAGE_PTR next_pgptr =
+	    pgbuf_fix (thread_p, &next_vpid, OLD_PAGE, PGBUF_LATCH_WRITE, PGBUF_UNCONDITIONAL_LATCH);
+
+	  if (next_pgptr == NULL)
+	    {
+	      ASSERT_ERROR_AND_SET (error_code);
+	      pgbuf_unfix_and_init (thread_p, meta_pgptr);
+	      goto sysop_abort;
+	    }
+	  pgbuf_unfix_and_init (thread_p, meta_pgptr);
+	  meta_pgptr = next_pgptr;
+	  meta_hdr = (COLUMNAR_METAPAGE_HEADER *) meta_pgptr;
+	  assert (meta_hdr->magic == COLUMNAR_METAPAGE_MAGIC);
+	}
     }
 
+  /* append the directory entry to the tail page.  Redo carries the tail
+   * header AND the entry bytes (a header-only redo would leave the entry
+   * slot unrecovered after a crash); undo restores the previous
+   * entry_count, which removes the entry. */
   {
     int dir_offset =
       (int) sizeof (COLUMNAR_METAPAGE_HEADER) + meta_hdr->entry_count * (int) sizeof (COLUMNAR_STRIPE_DIR_ENTRY);
+    INT32 old_entry_count = meta_hdr->entry_count;
+    char redo_buf[sizeof (COLUMNAR_METAPAGE_HEADER) + sizeof (COLUMNAR_STRIPE_DIR_ENTRY)];
+
     memcpy ((char *) meta_pgptr + dir_offset, &dir_entry, sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
     meta_hdr->entry_count++;
-  }
 
-  /* undo-redo log for directory entry */
-  {
-    int dir_offset =
-      (int) sizeof (COLUMNAR_METAPAGE_HEADER) + (meta_hdr->entry_count - 1) * (int) sizeof (COLUMNAR_STRIPE_DIR_ENTRY);
+    memcpy (redo_buf, meta_hdr, sizeof (COLUMNAR_METAPAGE_HEADER));
+    memcpy (redo_buf + sizeof (COLUMNAR_METAPAGE_HEADER), &dir_entry, sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
 
-    /* redo data: the dir entry at its offset */
-    /* undo data: the previous entry_count (to restore) */
     addr.pgptr = meta_pgptr;
     addr.vfid = &ws->hfid.vfid;
     addr.offset = dir_offset;
-
-    /* For undo, we need the old entry_count (before increment).
-     * Store it as a single INT32 in the undo data. */
-    INT32 old_entry_count = meta_hdr->entry_count - 1;
-
-    /* log entire metapage header + new entry as redo;
-     * old entry_count as undo for rollback */
     log_append_undoredo_data (thread_p, RVCOL_META_DIR_ENTRY, &addr,
-			     (int) sizeof (INT32), (int) sizeof (COLUMNAR_METAPAGE_HEADER),
-			     &old_entry_count, meta_hdr);
+			      (int) sizeof (INT32), (int) sizeof (redo_buf), &old_entry_count, redo_buf);
   }
 
   pgbuf_set_dirty (thread_p, meta_pgptr, DONT_FREE);
@@ -1675,10 +1744,14 @@ columnar_rv_page_data_redo (THREAD_ENTRY * thread_p, LOG_RCV * rcv)
 }
 
 /*
- * columnar_rv_dir_entry_redo () - redo a directory entry append
+ * columnar_rv_dir_entry_redo () - redo a metapage header update, optionally
+ *                                 with an appended directory entry
  *
- *   The redo data is the full metapage header (to restore counters + entry_count).
- *   rcv->offset is the byte offset of the new directory entry.
+ *   Redo data layout: COLUMNAR_METAPAGE_HEADER, optionally followed by one
+ *   COLUMNAR_STRIPE_DIR_ENTRY.  The header is restored at page offset 0
+ *   (counters, entry_count, next_metapage link).  When the entry is present,
+ *   it is restored at rcv->offset — a header-only redo would leave the
+ *   appended entry slot unrecovered after a crash.
  */
 int
 columnar_rv_dir_entry_redo (THREAD_ENTRY * thread_p, LOG_RCV * rcv)
@@ -1687,8 +1760,16 @@ columnar_rv_dir_entry_redo (THREAD_ENTRY * thread_p, LOG_RCV * rcv)
 
   if (rcv->length >= (int) sizeof (COLUMNAR_METAPAGE_HEADER) && rcv->data != NULL)
     {
-      /* restore the full metapage header (includes updated counters and entry_count) */
+      /* restore the full metapage header (counters, entry_count, next link) */
       memcpy (rcv->pgptr, rcv->data, sizeof (COLUMNAR_METAPAGE_HEADER));
+
+      if (rcv->length >= (int) (sizeof (COLUMNAR_METAPAGE_HEADER) + sizeof (COLUMNAR_STRIPE_DIR_ENTRY))
+	  && rcv->offset >= 0 && rcv->offset + (int) sizeof (COLUMNAR_STRIPE_DIR_ENTRY) <= DB_PAGESIZE)
+	{
+	  /* restore the appended directory entry at its slot */
+	  memcpy ((char *) rcv->pgptr + rcv->offset, rcv->data + sizeof (COLUMNAR_METAPAGE_HEADER),
+		  sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
+	}
     }
 
   pgbuf_set_dirty (thread_p, rcv->pgptr, DONT_FREE);

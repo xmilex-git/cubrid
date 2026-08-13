@@ -1971,12 +1971,10 @@ static int
 col_snapshot_directory (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
 {
   VPID meta_vpid;
-  PAGE_PTR pgptr;
-  COLUMNAR_METAPAGE_HEADER *hdr;
   MVCC_SNAPSHOT *snapshot;
   MVCCID my_mvccid = MVCCID_NULL;
   LOG_TDES *tdes = LOG_FIND_CURRENT_TDES (thread_p);
-  int i, n_visible, error;
+  int i, n_visible = 0, total_entries = 0, dir_alloc = 0, error;
 
   if (tdes != NULL)
     {
@@ -1984,75 +1982,89 @@ col_snapshot_directory (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
     }
   snapshot = logtb_get_mvcc_snapshot (thread_p);
 
+  /* walk the metapage chain, accumulating visible directory entries */
   meta_vpid.volid = cs->hfid.vfid.volid;
   meta_vpid.pageid = cs->hfid.hpgid;
 
-  pgptr = pgbuf_fix (thread_p, &meta_vpid, OLD_PAGE, PGBUF_LATCH_READ, PGBUF_UNCONDITIONAL_LATCH);
-  if (pgptr == NULL)
+  while (!VPID_ISNULL (&meta_vpid))
     {
-      ASSERT_ERROR_AND_SET (error);
-      return error;
-    }
+      PAGE_PTR pgptr;
+      const COLUMNAR_METAPAGE_HEADER *hdr;
 
-  hdr = (COLUMNAR_METAPAGE_HEADER *) pgptr;
-  if (hdr->magic != COLUMNAR_METAPAGE_MAGIC)
-    {
-      pgbuf_unfix_and_init (thread_p, pgptr);
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
-      return ER_FAILED;
-    }
+      pgptr = pgbuf_fix (thread_p, &meta_vpid, OLD_PAGE, PGBUF_LATCH_READ, PGBUF_UNCONDITIONAL_LATCH);
+      if (pgptr == NULL)
+	{
+	  ASSERT_ERROR_AND_SET (error);
+	  return error;
+	}
 
-  cs->stats.stripes_total = hdr->entry_count;
-
-  if (hdr->entry_count > 0)
-    {
-      cs->dir = (COLUMNAR_STRIPE_DIR_ENTRY *) malloc (hdr->entry_count * sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
-      if (cs->dir == NULL)
+      hdr = (const COLUMNAR_METAPAGE_HEADER *) pgptr;
+      if (hdr->magic != COLUMNAR_METAPAGE_MAGIC)
 	{
 	  pgbuf_unfix_and_init (thread_p, pgptr);
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-		  hdr->entry_count * sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
-	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
+	  return ER_FAILED;
 	}
 
-      n_visible = 0;
-      for (i = 0; i < hdr->entry_count; i++)
+      if (hdr->entry_count > 0)
 	{
-	  const COLUMNAR_STRIPE_DIR_ENTRY *ent =
-	    (const COLUMNAR_STRIPE_DIR_ENTRY *) ((const char *) pgptr + sizeof (COLUMNAR_METAPAGE_HEADER)
-						  + i * sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
-	  bool visible;
-
-	  if (!MVCCID_IS_VALID (ent->insert_mvccid))
+	  if (n_visible + hdr->entry_count > dir_alloc)
 	    {
-	      visible = true;	/* legacy stripe without id: committed by definition */
-	    }
-	  else if (ent->insert_mvccid == my_mvccid)
-	    {
-	      visible = true;	/* own write */
-	    }
-	  else if (snapshot != NULL)
-	    {
-	      visible = !snapshot->m_active_mvccs.is_active (ent->insert_mvccid);
-	    }
-	  else
-	    {
-	      visible = true;
+	      COLUMNAR_STRIPE_DIR_ENTRY *nd;
+	      dir_alloc = n_visible + hdr->entry_count;
+	      nd = (COLUMNAR_STRIPE_DIR_ENTRY *) realloc (cs->dir, dir_alloc * sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
+	      if (nd == NULL)
+		{
+		  pgbuf_unfix_and_init (thread_p, pgptr);
+		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+			  dir_alloc * sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
+		  return ER_OUT_OF_VIRTUAL_MEMORY;
+		}
+	      cs->dir = nd;
 	    }
 
-	  if (visible)
+	  for (i = 0; i < hdr->entry_count; i++)
 	    {
-	      cs->dir[n_visible++] = *ent;
-	    }
-	  else
-	    {
-	      cs->stats.stripes_skipped_mvcc++;
+	      const COLUMNAR_STRIPE_DIR_ENTRY *ent =
+		(const COLUMNAR_STRIPE_DIR_ENTRY *) ((const char *) pgptr + sizeof (COLUMNAR_METAPAGE_HEADER)
+						      + i * sizeof (COLUMNAR_STRIPE_DIR_ENTRY));
+	      bool visible;
+
+	      if (!MVCCID_IS_VALID (ent->insert_mvccid))
+		{
+		  visible = true;	/* legacy stripe without id: committed by definition */
+		}
+	      else if (ent->insert_mvccid == my_mvccid)
+		{
+		  visible = true;	/* own write */
+		}
+	      else if (snapshot != NULL)
+		{
+		  visible = !snapshot->m_active_mvccs.is_active (ent->insert_mvccid);
+		}
+	      else
+		{
+		  visible = true;
+		}
+
+	      if (visible)
+		{
+		  cs->dir[n_visible++] = *ent;
+		}
+	      else
+		{
+		  cs->stats.stripes_skipped_mvcc++;
+		}
 	    }
 	}
-      cs->n_stripes = n_visible;
+
+      total_entries += hdr->entry_count;
+      meta_vpid = hdr->next_metapage;
+      pgbuf_unfix_and_init (thread_p, pgptr);
     }
 
-  pgbuf_unfix_and_init (thread_p, pgptr);
+  cs->stats.stripes_total = total_entries;
+  cs->n_stripes = n_visible;
   return NO_ERROR;
 }
 
