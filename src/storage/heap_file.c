@@ -2675,6 +2675,16 @@ heap_get_header_stats_ptr (THREAD_ENTRY * thread_p, PAGE_PTR page_header)
 {
   RECDES recdes;
 
+  if (pgbuf_get_page_ptype (thread_p, page_header) == PAGE_COLUMNAR)
+    {
+      /* a columnar file's first page is its metapage, not a slotted heap
+       * header — a heap scan opened on a columnar class (stale or mis-routed
+       * plan) lands here; fail cleanly instead of asserting in spage */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_UNSUPPORTED_EXPR, 1,
+	      "heap access on a columnar class");
+      return NULL;
+    }
+
   if (spage_get_record (thread_p, page_header, HEAP_HEADER_AND_CHAIN_SLOTID, &recdes, PEEK) != S_SUCCESS)
     {
       assert_release (false);
