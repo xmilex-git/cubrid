@@ -686,9 +686,9 @@ qdata_numeric_sum_discard (cubxasl::aggregate_accumulator *acc)
  * accumulate dispatch are all skipped.  Every kernel MIRRORS that tail exactly: the
  * NULL elimination (no accumulation, no tuple count), the accumulate semantics and
  * error propagation, and the unconditional tuple count increment after accumulating.
+ * QDATA_ACC_KERNEL_FN itself lives in query_opfunc.h (the columnar block loop
+ * invokes these kernels through aggregate_list_node::acc_kernel too).
  */
-typedef int (*QDATA_ACC_KERNEL_FN) (cubthread::entry *thread_p, cubxasl::aggregate_list_node *agg_p,
-				    cubxasl::aggregate_accumulator *acc, DB_VALUE *value);
 
 static int
 qdata_acc_kernel_generic (cubthread::entry *thread_p, cubxasl::aggregate_list_node *agg_p,

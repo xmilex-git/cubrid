@@ -70,6 +70,12 @@ extern QPROC_TPLDESCR_STATUS qdata_generate_tuple_desc_for_valptr_list (THREAD_E
 									qfile_tuple_descriptor * tdp);
 extern int qdata_set_valptr_list_unbound (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list, val_descr * vd);
 extern void qdata_free_valptr_list_prog (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list);
+/* per-row accumulate kernel stored in aggregate_list_node::acc_kernel
+ * (implementations in query_aggregate.cpp); consumers invoke it with the
+ * aggregate's operand value already evaluated by the compiled program */
+typedef int (*QDATA_ACC_KERNEL_FN) (cubthread::entry * thread_p, cubxasl::aggregate_list_node * agg_p,
+				    cubxasl::aggregate_accumulator * acc, DB_VALUE * value);
+
 extern const char *qdata_acc_kernel_name (const void *kernel);
 extern int qdata_numeric_sum_flush (cubxasl::aggregate_accumulator * acc);
 extern void qdata_numeric_sum_discard (cubxasl::aggregate_accumulator * acc);

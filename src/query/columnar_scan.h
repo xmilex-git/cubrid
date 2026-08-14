@@ -43,6 +43,27 @@
 /* opaque scan handle */
 typedef struct columnar_scan COLUMNAR_SCAN;
 
+/* one qualified chunk group exposed to the block-aggregation loop (#21 Tier 2):
+ * n_rows rows, qualified rows flagged in bitmap (n_words UINT64 words) */
+typedef struct columnar_chunk_view COLUMNAR_CHUNK_VIEW;
+struct columnar_chunk_view
+{
+  int n_rows;
+  int n_words;
+  const UINT64 *bitmap;
+};
+
+/* raw array of one column inside the current chunk (#21 Tier 2a): the
+ * accumulate kernels read values straight from data without any DB_VALUE */
+typedef struct columnar_raw_col COLUMNAR_RAW_COL;
+struct columnar_raw_col
+{
+  const char *data;		/* decompressed column array */
+  const char *exists;		/* NULL bitmap (1 = value present) */
+  int stride;			/* bytes per value; < 0 = variable width */
+  DB_TYPE type;
+};
+
 /* open a columnar block scan over the given access spec; builds the column
  * bindings and the vectorized filter plan.  Returns
  * ER_COLUMNAR_UNSUPPORTED_EXPR when the WHERE predicate contains a node the
@@ -52,6 +73,33 @@ extern int columnar_scan_open (THREAD_ENTRY * thread_p, COLUMNAR_SCAN ** cs_out,
 
 /* advance to the next qualified row; fills every bound val_list slot */
 extern SCAN_CODE columnar_scan_next (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs);
+
+/* -------- chunk-level API for the BUILDVALUE block-aggregation loop --------
+ * Do not mix with columnar_scan_next () on the same scan: both consume the
+ * chunk cursor. */
+
+/* position on the next chunk group that has at least one qualified row */
+extern SCAN_CODE columnar_scan_next_chunk (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, COLUMNAR_CHUNK_VIEW * view);
+
+/* decode row (chunk-relative) of the current chunk into every bound slot */
+extern void columnar_scan_decode_row (COLUMNAR_SCAN * cs, int row);
+
+/* raw array of the binding whose val_list slot is slot_addr, for the current
+ * chunk; false when no binding owns that slot.  Pointers are valid until the
+ * next columnar_scan_next_chunk () call. */
+extern bool columnar_scan_raw_column (COLUMNAR_SCAN * cs, const DB_VALUE * slot_addr, COLUMNAR_RAW_COL * raw);
+
+/* true (with the directory total row count) when the scan reads no column and
+ * has no filter, so a COUNT(*)-style consumer needs no page reads at all */
+extern bool columnar_scan_total_rows (COLUMNAR_SCAN * cs, INT64 * total);
+
+/* -------- raw accumulate kernels (#21 Tier 2a) --------
+ * Accumulate the qualified non-NULL rows of one raw column; return the number
+ * of accumulated rows.  Row order matches the interpreted per-row path. */
+extern int columnar_raw_sum_int64 (const COLUMNAR_RAW_COL * raw, const UINT64 * bitmap, int n_rows, INT64 * sum_out,
+				   bool * overflow);
+extern int columnar_raw_sum_double (const COLUMNAR_RAW_COL * raw, const UINT64 * bitmap, int n_rows, double *sum_out);
+extern int columnar_raw_count (const COLUMNAR_RAW_COL * raw, const UINT64 * bitmap, int n_rows);
 
 /* snapshot runtime counters into the access spec's col_scan_stats */
 extern void columnar_scan_stats (COLUMNAR_SCAN * cs, COL_SCAN_STATS * out);

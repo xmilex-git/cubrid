@@ -157,6 +157,8 @@ struct col_binding
   TP_DOMAIN *domain;
   DB_TYPE type;
   bool used_in_filter;
+  bool stamped;			/* slot type tag stamped once at open (#21 Tier 3d):
+				 * decode writes only the value bytes + is_null */
 
   char *data_buf;		/* owned decompress target */
   int data_buf_alloc;
@@ -429,6 +431,126 @@ col_select_decode_fn (DB_TYPE type)
       return col_decode_varbit;
     default:
       return NULL;
+    }
+}
+
+/* ========================================================================== */
+/* Batch-type-stamped decode (#21 Tier 3d)                                    */
+/* ========================================================================== */
+/*
+ * For fixed-width types whose DB_VALUE header never changes across rows, the
+ * slot's type tag / need_clear are stamped ONCE at scan open (db_make_* with a
+ * zero value); the per-row decode then writes only the value bytes and the
+ * is_null flag.  NULL rows flip is_null without touching the type tag, so the
+ * stamp survives the whole scan.  Types whose header varies per value
+ * (MONETARY currency, NUMERIC precision/scale, CHAR/VARCHAR pointers) keep
+ * the full db_make_* decode.
+ */
+
+#define COL_DEF_FAST_DECODE(NAME, DBTYPE, FIELD, CTYPE)                       \
+  static void                                                                 \
+  NAME (const COL_BINDING * b, int row, DB_VALUE * out)                       \
+  {                                                                           \
+    assert (out->domain.general_info.type == (DBTYPE) && !out->need_clear);   \
+    memcpy (&out->data.FIELD, COL_CELL (b, row), sizeof (CTYPE));             \
+    out->domain.general_info.is_null = 0;                                     \
+  }
+
+/* *INDENT-OFF* */
+COL_DEF_FAST_DECODE (col_decode_int_fast, DB_TYPE_INTEGER, i, int)
+COL_DEF_FAST_DECODE (col_decode_short_fast, DB_TYPE_SHORT, sh, short)
+COL_DEF_FAST_DECODE (col_decode_bigint_fast, DB_TYPE_BIGINT, bigint, INT64)
+COL_DEF_FAST_DECODE (col_decode_float_fast, DB_TYPE_FLOAT, f, float)
+COL_DEF_FAST_DECODE (col_decode_double_fast, DB_TYPE_DOUBLE, d, double)
+COL_DEF_FAST_DECODE (col_decode_date_fast, DB_TYPE_DATE, date, DB_DATE)
+COL_DEF_FAST_DECODE (col_decode_time_fast, DB_TYPE_TIME, time, DB_TIME)
+COL_DEF_FAST_DECODE (col_decode_timestamp_fast, DB_TYPE_TIMESTAMP, utime, DB_TIMESTAMP)
+/* *INDENT-ON* */
+
+static void
+col_decode_datetime_fast (const COL_BINDING * b, int row, DB_VALUE * out)
+{
+  const char *cell = COL_CELL (b, row);
+  assert (out->domain.general_info.type == DB_TYPE_DATETIME && !out->need_clear);
+  memcpy (&out->data.datetime.date, cell, sizeof (unsigned int));
+  memcpy (&out->data.datetime.time, cell + sizeof (unsigned int), sizeof (unsigned int));
+  out->domain.general_info.is_null = 0;
+}
+
+/* stamp the slot header and switch the binding to the fast decode; no-op for
+ * types whose header varies per value */
+static void
+col_stamp_slot (COL_BINDING * b)
+{
+  COL_DECODE_FN fast = NULL;
+
+  switch (b->type)
+    {
+    case DB_TYPE_INTEGER:
+      db_make_int (b->slot, 0);
+      fast = col_decode_int_fast;
+      break;
+    case DB_TYPE_SHORT:
+      db_make_short (b->slot, 0);
+      fast = col_decode_short_fast;
+      break;
+    case DB_TYPE_BIGINT:
+      db_make_bigint (b->slot, 0);
+      fast = col_decode_bigint_fast;
+      break;
+    case DB_TYPE_FLOAT:
+      db_make_float (b->slot, 0.0f);
+      fast = col_decode_float_fast;
+      break;
+    case DB_TYPE_DOUBLE:
+      db_make_double (b->slot, 0.0);
+      fast = col_decode_double_fast;
+      break;
+    case DB_TYPE_DATE:
+      {
+	DB_DATE d = 0;
+	db_value_put_encoded_date (b->slot, &d);
+	fast = col_decode_date_fast;
+      }
+      break;
+    case DB_TYPE_TIME:
+      {
+	DB_TIME t = 0;
+	db_value_put_encoded_time (b->slot, &t);
+	fast = col_decode_time_fast;
+      }
+      break;
+    case DB_TYPE_TIMESTAMP:
+      db_make_timestamp (b->slot, 0);
+      fast = col_decode_timestamp_fast;
+      break;
+    case DB_TYPE_DATETIME:
+      {
+	DB_DATETIME dt = { 0, 0 };
+	db_make_datetime (b->slot, &dt);
+	fast = col_decode_datetime_fast;
+      }
+      break;
+    default:
+      return;
+    }
+
+  b->slot->domain.general_info.is_null = 1;	/* no row decoded yet */
+  b->decode = fast;
+  b->stamped = true;
+}
+
+/* NULL row: a stamped slot only flips is_null (the type tag must survive) */
+static void
+col_slot_set_null (COL_BINDING * b)
+{
+  if (b->stamped)
+    {
+      b->slot->domain.general_info.is_null = 1;
+    }
+  else
+    {
+      db_make_null (b->slot);
     }
 }
 
@@ -2627,11 +2749,13 @@ columnar_scan_open (THREAD_ENTRY * thread_p, COLUMNAR_SCAN ** cs_out, ACCESS_SPE
       goto error_exit;
     }
 
-  /* the scan owns the bound slots for its lifetime */
+  /* the scan owns the bound slots for its lifetime; fixed-width slots are
+   * type-stamped once here so the per-row decode writes only value bytes */
   for (i = 0; i < cs->n_bindings; i++)
     {
       pr_clear_value (cs->bindings[i].slot);
       db_make_null (cs->bindings[i].slot);
+      col_stamp_slot (&cs->bindings[i]);
     }
 
   error = col_build_filter (thread_p, cs, spec->where_pred, &cs->filter, true);
@@ -2671,10 +2795,60 @@ error_exit:
   return error;
 }
 
+/*
+ * col_advance_chunk () - position on the next chunk group with at least one
+ *   qualified row (col_load_chunk reports empty ones as skipped)
+ */
+static SCAN_CODE
+col_advance_chunk (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
+{
+  int error;
+
+  for (;;)
+    {
+      if (cs->stripe_opened && cs->chunk_idx < cs->n_chunks - 1)
+	{
+	  bool skipped;
+	  cs->chunk_idx++;
+	  /* the main bitmap is the last pool slot (sized in col_open_stripe) */
+	  cs->bitmap = cs->bm_pool[cs->bm_pool_n - 2];
+	  error = col_load_chunk (thread_p, cs, &skipped);
+	  if (error != NO_ERROR)
+	    {
+	      return S_ERROR;
+	    }
+	  if (skipped)
+	    {
+	      cs->chunk_rows = 0;
+	      continue;
+	    }
+	  return S_SUCCESS;
+	}
+
+      /* next stripe */
+      cs->stripe_idx++;
+      if (cs->stripe_idx >= cs->n_stripes)
+	{
+	  return S_END;
+	}
+      if (cs->dir[cs->stripe_idx].row_count <= 0)
+	{
+	  cs->stripe_opened = false;
+	  continue;
+	}
+      error = col_open_stripe (thread_p, cs);
+      if (error != NO_ERROR)
+	{
+	  return S_ERROR;
+	}
+      cs->stripe_opened = true;
+    }
+}
+
 SCAN_CODE
 columnar_scan_next (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
 {
-  int i, error;
+  SCAN_CODE sc;
 
   for (;;)
     {
@@ -2717,62 +2891,231 @@ columnar_scan_next (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
 	  if (r < cs->chunk_rows)
 	    {
 	      cs->row_in_chunk = r + 1;
-	      for (i = 0; i < cs->n_bindings; i++)
-		{
-		  COL_BINDING *b = &cs->bindings[i];
-		  if (COL_EXISTS_BIT (b->chunk_exists, r))
-		    {
-		      b->decode (b, r, b->slot);
-		    }
-		  else
-		    {
-		      db_make_null (b->slot);
-		    }
-		}
+	      columnar_scan_decode_row (cs, r);
 	      cs->stats.rows_output++;
 	      return S_SUCCESS;
 	    }
 	  /* chunk exhausted */
 	}
 
-      /* advance to next chunk / stripe */
-      if (cs->stripe_opened && cs->chunk_idx < cs->n_chunks - 1)
+      sc = col_advance_chunk (thread_p, cs);
+      if (sc != S_SUCCESS)
 	{
-	  bool skipped;
-	  cs->chunk_idx++;
-	  /* the main bitmap is the last pool slot (sized in col_open_stripe) */
-	  cs->bitmap = cs->bm_pool[cs->bm_pool_n - 2];
-	  error = col_load_chunk (thread_p, cs, &skipped);
-	  if (error != NO_ERROR)
+	  return sc;
+	}
+    }
+}
+
+/* ========================================================================== */
+/* Chunk-level API (#21 Tier 2: BUILDVALUE block aggregation)                 */
+/* ========================================================================== */
+
+SCAN_CODE
+columnar_scan_next_chunk (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, COLUMNAR_CHUNK_VIEW * view)
+{
+  SCAN_CODE sc;
+  int w;
+
+  assert (!cs->count_only);
+
+  sc = col_advance_chunk (thread_p, cs);
+  if (sc != S_SUCCESS)
+    {
+      return sc;
+    }
+
+  view->n_rows = cs->chunk_rows;
+  view->n_words = cs->n_words;
+  view->bitmap = cs->bitmap;
+
+  /* every qualified row of the chunk is consumed by the block loop */
+  for (w = 0; w < cs->n_words; w++)
+    {
+      cs->stats.rows_output += __builtin_popcountll (cs->bitmap[w]);
+    }
+  return S_SUCCESS;
+}
+
+void
+columnar_scan_decode_row (COLUMNAR_SCAN * cs, int row)
+{
+  int i;
+
+  for (i = 0; i < cs->n_bindings; i++)
+    {
+      COL_BINDING *b = &cs->bindings[i];
+      if (COL_EXISTS_BIT (b->chunk_exists, row))
+	{
+	  b->decode (b, row, b->slot);
+	}
+      else
+	{
+	  col_slot_set_null (b);
+	}
+    }
+}
+
+bool
+columnar_scan_raw_column (COLUMNAR_SCAN * cs, const DB_VALUE * slot_addr, COLUMNAR_RAW_COL * raw)
+{
+  int i;
+
+  for (i = 0; i < cs->n_bindings; i++)
+    {
+      COL_BINDING *b = &cs->bindings[i];
+      if (b->slot == slot_addr)
+	{
+	  raw->data = b->chunk_data;
+	  raw->exists = b->chunk_exists;
+	  raw->stride = b->value_size;
+	  raw->type = b->type;
+	  return true;
+	}
+    }
+  return false;
+}
+
+bool
+columnar_scan_total_rows (COLUMNAR_SCAN * cs, INT64 * total)
+{
+  INT64 sum = 0;
+  int i;
+
+  if (!cs->count_only)
+    {
+      return false;
+    }
+  for (i = 0; i < cs->n_stripes; i++)
+    {
+      sum += cs->dir[i].row_count;
+    }
+  *total = sum;
+  return true;
+}
+
+/* ========================================================================== */
+/* Raw accumulate kernels (#21 Tier 2a)                                       */
+/* ========================================================================== */
+/*
+ * Each kernel walks the qualified (bitmap) AND non-NULL (exists) rows of one
+ * raw column array and accumulates without any DB_VALUE, step program or
+ * function dispatch.  Row order matches the interpreted path, so sequential
+ * overflow/rounding behavior is identical.  Returns the number of accumulated
+ * rows; the caller merges the subtotal into the aggregate accumulator.
+ */
+
+int
+columnar_raw_sum_int64 (const COLUMNAR_RAW_COL * raw, const UINT64 * bitmap, int n_rows, INT64 * sum_out,
+			bool * overflow)
+{
+  INT64 sum = 0;
+  int n_words = (n_rows + 63) / 64;
+  int w, cnt = 0;
+
+  *overflow = false;
+  for (w = 0; w < n_words; w++)
+    {
+      UINT64 bits = bitmap[w];
+      while (bits)
+	{
+	  int r = (w << 6) + __builtin_ctzll (bits);
+	  bits &= bits - 1;
+	  if (!COL_EXISTS_BIT (raw->exists, r))
 	    {
-	      return S_ERROR;
-	    }
-	  if (skipped)
-	    {
-	      cs->chunk_rows = 0;
 	      continue;
 	    }
-	  continue;
+	  {
+	    INT64 v;
+	    switch (raw->type)
+	      {
+	      case DB_TYPE_SHORT:
+		{
+		  short t;
+		  memcpy (&t, raw->data + (size_t) r * raw->stride, sizeof (t));
+		  v = t;
+		}
+		break;
+	      case DB_TYPE_INTEGER:
+		{
+		  int t;
+		  memcpy (&t, raw->data + (size_t) r * raw->stride, sizeof (t));
+		  v = t;
+		}
+		break;
+	      default:		/* DB_TYPE_BIGINT */
+		memcpy (&v, raw->data + (size_t) r * raw->stride, sizeof (v));
+		break;
+	      }
+	    if (__builtin_add_overflow (sum, v, &sum))
+	      {
+		*overflow = true;
+		return cnt;
+	      }
+	  }
+	  cnt++;
 	}
-
-      /* next stripe */
-      cs->stripe_idx++;
-      if (cs->stripe_idx >= cs->n_stripes)
-	{
-	  return S_END;
-	}
-      if (cs->dir[cs->stripe_idx].row_count <= 0)
-	{
-	  cs->stripe_opened = false;
-	  continue;
-	}
-      error = col_open_stripe (thread_p, cs);
-      if (error != NO_ERROR)
-	{
-	  return S_ERROR;
-	}
-      cs->stripe_opened = true;
     }
+  *sum_out = sum;
+  return cnt;
+}
+
+int
+columnar_raw_sum_double (const COLUMNAR_RAW_COL * raw, const UINT64 * bitmap, int n_rows, double *sum_out)
+{
+  double sum = 0.0;
+  int n_words = (n_rows + 63) / 64;
+  int w, cnt = 0;
+
+  for (w = 0; w < n_words; w++)
+    {
+      UINT64 bits = bitmap[w];
+      while (bits)
+	{
+	  int r = (w << 6) + __builtin_ctzll (bits);
+	  bits &= bits - 1;
+	  if (!COL_EXISTS_BIT (raw->exists, r))
+	    {
+	      continue;
+	    }
+	  if (raw->type == DB_TYPE_FLOAT)
+	    {
+	      float t;
+	      memcpy (&t, raw->data + (size_t) r * raw->stride, sizeof (t));
+	      sum += (double) t;
+	    }
+	  else			/* DB_TYPE_DOUBLE */
+	    {
+	      double t;
+	      memcpy (&t, raw->data + (size_t) r * raw->stride, sizeof (t));
+	      sum += t;
+	    }
+	  cnt++;
+	}
+    }
+  *sum_out = sum;
+  return cnt;
+}
+
+int
+columnar_raw_count (const COLUMNAR_RAW_COL * raw, const UINT64 * bitmap, int n_rows)
+{
+  int n_words = (n_rows + 63) / 64;
+  int w, cnt = 0;
+
+  for (w = 0; w < n_words; w++)
+    {
+      UINT64 bits = bitmap[w];
+      while (bits)
+	{
+	  int r = (w << 6) + __builtin_ctzll (bits);
+	  bits &= bits - 1;
+	  if (COL_EXISTS_BIT (raw->exists, r))
+	    {
+	      cnt++;
+	    }
+	}
+    }
+  return cnt;
 }
 
 void

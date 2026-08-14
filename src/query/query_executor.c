@@ -402,6 +402,10 @@ typedef enum analytic_stage ANALYTIC_STAGE;
 #define QEXEC_GET_BH_TOPN_TUPLE(heap, index) (*(TOPN_TUPLE **) BH_ELEMENT (heap, index))
 
 static DB_LOGICAL qexec_eval_instnum_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
+static void qexec_resolve_buildvalue_outptr_domains (XASL_NODE * xasl);
+static bool qexec_columnar_block_eligible (XASL_NODE * xasl);
+static SCAN_CODE qexec_execute_columnar_block_agg (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
+						   QFILE_TUPLE_RECORD * tplrec, COLUMNAR_SCAN * cs, bool * handled);
 static SCAN_CODE qexec_execute_columnar_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 					      QFILE_TUPLE_RECORD * tplrec);
 static int qexec_add_composite_lock (THREAD_ENTRY * thread_p, REGU_VARIABLE_LIST reg_var_list, XASL_STATE * xasl_state,
@@ -1308,9 +1312,6 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
     {
       if (xasl->proc.buildvalue.agg_list != NULL)
 	{
-	  AGGREGATE_TYPE *agg_node = NULL;
-	  REGU_VARIABLE_LIST out_list_val = NULL;
-
 	  if (xasl->proc.buildvalue.agg_list != NULL && !xasl->proc.buildvalue.agg_domains_resolved)
 	    {
 	      if (qexec_resolve_domains_for_aggregation
@@ -1330,31 +1331,7 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
 	    }
 
 	  /* resolve domains for aggregates */
-	  for (out_list_val = xasl->outptr_list->valptrp; out_list_val != NULL; out_list_val = out_list_val->next)
-	    {
-	      assert (out_list_val->value.domain != NULL);
-
-	      /* aggregates corresponds to CONSTANT regu vars in outptr_list */
-	      if (out_list_val->value.type != TYPE_CONSTANT
-		  || (TP_DOMAIN_TYPE (out_list_val->value.domain) != DB_TYPE_VARIABLE
-		      && TP_DOMAIN_COLLATION_FLAG (out_list_val->value.domain) == TP_DOMAIN_COLL_NORMAL))
-		{
-		  continue;
-		}
-
-	      /* search in aggregate list by comparing DB_VALUE pointers */
-	      for (agg_node = xasl->proc.buildvalue.agg_list; agg_node != NULL; agg_node = agg_node->next)
-		{
-		  if (out_list_val->value.value.dbvalptr == agg_node->accumulator.value
-		      && TP_DOMAIN_TYPE (agg_node->domain) != DB_TYPE_NULL)
-		    {
-		      assert (agg_node->domain != NULL);
-		      assert (TP_DOMAIN_COLLATION_FLAG (agg_node->domain) == TP_DOMAIN_COLL_NORMAL);
-		      out_list_val->value.domain = agg_node->domain;
-		    }
-		}
-
-	    }
+	  qexec_resolve_buildvalue_outptr_domains (xasl);
 	}
     }
 
@@ -9780,6 +9757,483 @@ qexec_intprt_fnc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_s
 }
 
 /*
+ * qexec_resolve_buildvalue_outptr_domains () - propagate the resolved
+ *   aggregate result domains onto the outptr_list CONSTANT regu vars that
+ *   point at the accumulators (shared by the per-row BUILDVALUE completion
+ *   and the columnar block-aggregation loop)
+ */
+static void
+qexec_resolve_buildvalue_outptr_domains (XASL_NODE * xasl)
+{
+  AGGREGATE_TYPE *agg_node = NULL;
+  REGU_VARIABLE_LIST out_list_val = NULL;
+
+  for (out_list_val = xasl->outptr_list->valptrp; out_list_val != NULL; out_list_val = out_list_val->next)
+    {
+      assert (out_list_val->value.domain != NULL);
+
+      /* aggregates corresponds to CONSTANT regu vars in outptr_list */
+      if (out_list_val->value.type != TYPE_CONSTANT
+	  || (TP_DOMAIN_TYPE (out_list_val->value.domain) != DB_TYPE_VARIABLE
+	      && TP_DOMAIN_COLLATION_FLAG (out_list_val->value.domain) == TP_DOMAIN_COLL_NORMAL))
+	{
+	  continue;
+	}
+
+      /* search in aggregate list by comparing DB_VALUE pointers */
+      for (agg_node = xasl->proc.buildvalue.agg_list; agg_node != NULL; agg_node = agg_node->next)
+	{
+	  if (out_list_val->value.value.dbvalptr == agg_node->accumulator.value
+	      && TP_DOMAIN_TYPE (agg_node->domain) != DB_TYPE_NULL)
+	    {
+	      assert (agg_node->domain != NULL);
+	      assert (TP_DOMAIN_COLLATION_FLAG (agg_node->domain) == TP_DOMAIN_COLL_NORMAL);
+	      out_list_val->value.domain = agg_node->domain;
+	    }
+	}
+    }
+}
+
+/*
+ * qexec_columnar_block_eligible () - static shape check for the columnar
+ *   BUILDVALUE block-aggregation loop (design #21 Tier 2).  Anything that
+ *   needs the per-row protocol (row predicates, LIMIT, correlated
+ *   subqueries, exotic aggregate functions) keeps the row loop.
+ */
+static bool
+qexec_columnar_block_eligible (XASL_NODE * xasl)
+{
+  AGGREGATE_TYPE *agg_p;
+
+  if (xasl->type != BUILDVALUE_PROC || xasl->proc.buildvalue.agg_list == NULL)
+    {
+      return false;
+    }
+  if (xasl->if_pred != NULL || xasl->instnum_val != NULL || xasl->instnum_pred != NULL || xasl->dptr_list != NULL
+      || xasl->selected_upd_list != NULL || XASL_IS_FLAGED (xasl, XASL_NEED_SINGLE_TUPLE_SCAN)
+      || COMPOSITE_LOCK (xasl->scan_op_type))
+    {
+      return false;
+    }
+
+  for (agg_p = xasl->proc.buildvalue.agg_list; agg_p != NULL; agg_p = agg_p->next)
+    {
+      if (agg_p->flag.agg_optimized)
+	{
+	  continue;
+	}
+      switch (agg_p->function)
+	{
+	case PT_COUNT_STAR:
+	  break;
+	case PT_COUNT:
+	case PT_SUM:
+	case PT_AVG:
+	case PT_MIN:
+	case PT_MAX:
+	  if (agg_p->option == Q_DISTINCT || agg_p->sort_list != NULL || agg_p->flag.min_max_optimized
+	      || agg_p->operands == NULL || agg_p->operands->next != NULL)
+	    {
+	      return false;
+	    }
+	  break;
+	default:
+	  return false;
+	}
+    }
+  return true;
+}
+
+/* per-aggregate accumulation mode of the block loop */
+typedef enum
+{
+  COL_AGG_SKIP,			/* agg_optimized: never accumulated by the scan */
+  COL_AGG_CNT_STAR,		/* COUNT(*): popcount of the qualified bitmap */
+  COL_AGG_CNT_RAW,		/* COUNT(col): popcount of qualified AND exists */
+  COL_AGG_SUM_I64,		/* SUM/AVG over SHORT/INT/BIGINT: raw array subtotal */
+  COL_AGG_SUM_DBL,		/* SUM/AVG over FLOAT/DOUBLE: raw array subtotal */
+  COL_AGG_PROG			/* operand program cell + acc_kernel per row */
+} COL_AGG_MODE;
+
+typedef struct col_agg_plan COL_AGG_PLAN;
+struct col_agg_plan
+{
+  AGGREGATE_TYPE *agg;
+  COL_AGG_MODE mode;
+  const DB_VALUE *slot;		/* bare-column operand's val_list slot (raw modes) */
+  COLUMNAR_RAW_COL raw;		/* refreshed each chunk */
+  int prog_root;		/* COL_AGG_PROG: program root index of the operand */
+};
+
+/*
+ * qexec_columnar_plan_aggregates () - decide each aggregate's accumulation
+ *   mode.  false when some accumulating aggregate has no fast mode; the
+ *   caller then keeps the whole list on qdata_evaluate_aggregate_list ().
+ */
+static bool
+qexec_columnar_plan_aggregates (COLUMNAR_SCAN * cs, AGGREGATE_TYPE * agg_list, COL_AGG_PLAN * plans, int *n_out)
+{
+  AGGREGATE_TYPE *agg_p;
+  EXPR_PROG *prog = (agg_list->operand_prog_state == 1) ? (EXPR_PROG *) agg_list->operand_prog : NULL;
+  int n = 0;
+
+  for (agg_p = agg_list; agg_p != NULL; agg_p = agg_p->next, n++)
+    {
+      COL_AGG_PLAN *plan = &plans[n];
+      REGU_VARIABLE *opr;
+      DB_TYPE acc_type;
+      bool raw_ok;
+
+      plan->agg = agg_p;
+      plan->slot = NULL;
+      plan->prog_root = -1;
+
+      if (agg_p->flag.agg_optimized)
+	{
+	  plan->mode = COL_AGG_SKIP;
+	  continue;
+	}
+      if (agg_p->function == PT_COUNT_STAR)
+	{
+	  plan->mode = COL_AGG_CNT_STAR;
+	  continue;
+	}
+
+      opr = &agg_p->operands->value;
+      plan->slot = (opr->type == TYPE_CONSTANT) ? opr->value.dbvalptr : NULL;
+      raw_ok = (plan->slot != NULL && columnar_scan_raw_column (cs, plan->slot, &plan->raw));
+      acc_type = (agg_p->accumulator_domain.value_dom != NULL)
+	? TP_DOMAIN_TYPE (agg_p->accumulator_domain.value_dom) : DB_TYPE_NULL;
+
+      if (raw_ok && agg_p->function == PT_COUNT)
+	{
+	  plan->mode = COL_AGG_CNT_RAW;
+	}
+      else if (raw_ok && (agg_p->function == PT_SUM || agg_p->function == PT_AVG) && acc_type == DB_TYPE_BIGINT
+	       && (plan->raw.type == DB_TYPE_SHORT || plan->raw.type == DB_TYPE_INTEGER
+		   || plan->raw.type == DB_TYPE_BIGINT))
+	{
+	  plan->mode = COL_AGG_SUM_I64;
+	}
+      else if (raw_ok && (agg_p->function == PT_SUM || agg_p->function == PT_AVG) && acc_type == DB_TYPE_DOUBLE
+	       && (plan->raw.type == DB_TYPE_FLOAT || plan->raw.type == DB_TYPE_DOUBLE))
+	{
+	  plan->mode = COL_AGG_SUM_DBL;
+	}
+      else if (prog != NULL && agg_p->acc_kernel != NULL && agg_p->operand_prog_base >= 0
+	       && agg_list->operand_prog_idx[agg_p->operand_prog_base] >= 0)
+	{
+	  plan->mode = COL_AGG_PROG;
+	  plan->prog_root = agg_list->operand_prog_idx[agg_p->operand_prog_base];
+	}
+      else
+	{
+	  return false;
+	}
+    }
+  *n_out = n;
+  return true;
+}
+
+/*
+ * qexec_execute_columnar_block_agg () - BUILDVALUE block-aggregation loop
+ *   (design #21 Tier 2/2a): consume the scan chunk by chunk, accumulating
+ *   COUNT(*) by popcount, bare-column SUM/AVG/COUNT straight from the raw
+ *   arrays, and everything else through one operand-program evaluation plus
+ *   the per-aggregate accumulate kernels.  qexec_end_one_iteration () is
+ *   never called.  Aggregates outside the fast modes keep the whole list on
+ *   the interpreted qdata_evaluate_aggregate_list () per qualified row --
+ *   still without the per-row completion overhead.
+ *
+ *   return: S_END (with *handled = true when the scan was fully consumed) or
+ *           S_ERROR.  *handled = false leaves the scan untouched.
+ */
+static SCAN_CODE
+qexec_execute_columnar_block_agg (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
+				  QFILE_TUPLE_RECORD * tplrec, COLUMNAR_SCAN * cs, bool * handled)
+{
+  BUILDVALUE_PROC_NODE *bv = &xasl->proc.buildvalue;
+  AGGREGATE_TYPE *agg_list = bv->agg_list, *agg_p;
+  COL_AGG_PLAN *plans = NULL;
+  COLUMNAR_CHUNK_VIEW view;
+  SCAN_CODE sc;
+  EXPR_PROG *prog = NULL;
+  INT64 total_rows;
+  int n_aggs = 0, n_plans = 0, i, w;
+  bool setup_done = false, interp_all = false, any_prog = false;
+
+  *handled = false;
+
+  for (agg_p = agg_list; agg_p != NULL; agg_p = agg_p->next)
+    {
+      n_aggs++;
+    }
+
+  /* count-only scan (no column read, no filter): COUNT(*) completes from the
+   * directory row counts without touching a single data page */
+  if (columnar_scan_total_rows (cs, &total_rows))
+    {
+      for (agg_p = agg_list; agg_p != NULL; agg_p = agg_p->next)
+	{
+	  if (!agg_p->flag.agg_optimized && agg_p->function != PT_COUNT_STAR)
+	    {
+	      return S_END;	/* needs per-row values; keep the row loop */
+	    }
+	}
+      if (!bv->agg_domains_resolved
+	  && qexec_resolve_domains_for_aggregation (thread_p, agg_list, &xasl_state->vd, tplrec, NULL,
+						    &bv->agg_domains_resolved) != NO_ERROR)
+	{
+	  return S_ERROR;
+	}
+      for (agg_p = agg_list; agg_p != NULL; agg_p = agg_p->next)
+	{
+	  if (!agg_p->flag.agg_optimized)
+	    {
+	      agg_p->accumulator.curr_cnt += total_rows;
+	    }
+	}
+      qexec_resolve_buildvalue_outptr_domains (xasl);
+      *handled = true;
+      return S_END;
+    }
+
+  plans = (COL_AGG_PLAN *) db_private_alloc (thread_p, n_aggs * sizeof (COL_AGG_PLAN));
+  if (plans == NULL)
+    {
+      return S_ERROR;
+    }
+
+  while ((sc = columnar_scan_next_chunk (thread_p, cs, &view)) == S_SUCCESS)
+    {
+      int n_sel = 0;
+
+      if (!setup_done)
+	{
+	  /* domain resolution reads the operand values of the first
+	   * qualified row; decode it (accumulation happens below) */
+	  int r0 = -1;
+	  for (w = 0; w < view.n_words && r0 < 0; w++)
+	    {
+	      if (view.bitmap[w] != 0)
+		{
+		  r0 = (w << 6) + __builtin_ctzll (view.bitmap[w]);
+		}
+	    }
+	  assert (r0 >= 0);
+	  columnar_scan_decode_row (cs, r0);
+
+	  if (!bv->agg_domains_resolved
+	      && qexec_resolve_domains_for_aggregation (thread_p, agg_list, &xasl_state->vd, tplrec, NULL,
+							&bv->agg_domains_resolved) != NO_ERROR)
+	    {
+	      goto error;
+	    }
+
+	  if (bv->agg_domains_resolved)
+	    {
+	      if (agg_list->operand_prog_state == 0)
+		{
+		  qdata_agg_operand_prog_compile (thread_p, agg_list, &xasl_state->vd);
+		}
+	      else if (agg_list->operand_prog_state == 1
+		       && !expr_prog_signature_matches ((EXPR_PROG *) agg_list->operand_prog, &xasl_state->vd))
+		{
+		  /* different bind types than the program was specialized for */
+		  expr_prog_free ((EXPR_PROG *) agg_list->operand_prog);
+		  free_and_init (agg_list->operand_prog_idx);
+		  agg_list->operand_prog = NULL;
+		  agg_list->operand_prog_state = 0;
+		  qdata_agg_operand_prog_compile (thread_p, agg_list, &xasl_state->vd);
+		}
+	      interp_all = !qexec_columnar_plan_aggregates (cs, agg_list, plans, &n_plans);
+	      if (!interp_all)
+		{
+		  prog = (agg_list->operand_prog_state == 1) ? (EXPR_PROG *) agg_list->operand_prog : NULL;
+		  for (i = 0; i < n_plans; i++)
+		    {
+		      any_prog = any_prog || (plans[i].mode == COL_AGG_PROG);
+		    }
+		}
+	      setup_done = true;
+	    }
+	}
+
+      if (!setup_done || interp_all)
+	{
+	  /* whole aggregate list per row through the interpreted evaluator
+	   * (mirrors the per-row completion, minus its overhead) */
+	  for (w = 0; w < view.n_words; w++)
+	    {
+	      UINT64 bits = view.bitmap[w];
+	      while (bits)
+		{
+		  int r = (w << 6) + __builtin_ctzll (bits);
+		  bits &= bits - 1;
+		  columnar_scan_decode_row (cs, r);
+		  if (!bv->agg_domains_resolved
+		      && qexec_resolve_domains_for_aggregation (thread_p, agg_list, &xasl_state->vd, tplrec, NULL,
+								&bv->agg_domains_resolved) != NO_ERROR)
+		    {
+		      goto error;
+		    }
+		  if (qdata_evaluate_aggregate_list (thread_p, agg_list, &xasl_state->vd, NULL, false) != NO_ERROR)
+		    {
+		      goto error;
+		    }
+		}
+	    }
+	  continue;
+	}
+
+      for (w = 0; w < view.n_words; w++)
+	{
+	  n_sel += __builtin_popcountll (view.bitmap[w]);
+	}
+
+      /* raw-array and popcount modes: whole chunk, no DB_VALUE */
+      for (i = 0; i < n_plans; i++)
+	{
+	  COL_AGG_PLAN *plan = &plans[i];
+	  AGGREGATE_ACCUMULATOR *acc = &plan->agg->accumulator;
+
+	  switch (plan->mode)
+	    {
+	    case COL_AGG_CNT_STAR:
+	      acc->curr_cnt += n_sel;
+	      break;
+
+	    case COL_AGG_CNT_RAW:
+	      {
+		int cnt;
+		columnar_scan_raw_column (cs, plan->slot, &plan->raw);
+		cnt = columnar_raw_count (&plan->raw, view.bitmap, view.n_rows);
+		if (cnt > 0)
+		  {
+		    db_make_bigint (acc->value, (acc->curr_cnt < 1 ? 0 : db_get_bigint (acc->value)) + cnt);
+		    acc->curr_cnt += cnt;
+		  }
+	      }
+	      break;
+
+	    case COL_AGG_SUM_I64:
+	      {
+		INT64 subtotal = 0, base, merged;
+		bool overflow = false;
+		int cnt;
+
+		columnar_scan_raw_column (cs, plan->slot, &plan->raw);
+		cnt = columnar_raw_sum_int64 (&plan->raw, view.bitmap, view.n_rows, &subtotal, &overflow);
+		if (cnt > 0 && !overflow)
+		  {
+		    if (acc->curr_cnt < 1 || DB_IS_NULL (acc->value))
+		      {
+			db_make_bigint (acc->value, subtotal);
+		      }
+		    else
+		      {
+			base = db_get_bigint (acc->value);
+			merged = base + subtotal;
+			overflow = OR_CHECK_ADD_OVERFLOW (base, subtotal, merged);
+			if (!overflow)
+			  {
+			    db_make_bigint (acc->value, merged);
+			  }
+		      }
+		    acc->curr_cnt += cnt;
+		  }
+		if (overflow)
+		  {
+		    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OVERFLOW_ADDITION, 0);
+		    goto error;
+		  }
+	      }
+	      break;
+
+	    case COL_AGG_SUM_DBL:
+	      {
+		double subtotal = 0.0, merged;
+		int cnt;
+
+		columnar_scan_raw_column (cs, plan->slot, &plan->raw);
+		cnt = columnar_raw_sum_double (&plan->raw, view.bitmap, view.n_rows, &subtotal);
+		if (cnt > 0)
+		  {
+		    if (acc->curr_cnt < 1 || DB_IS_NULL (acc->value))
+		      {
+			merged = subtotal;
+		      }
+		    else
+		      {
+			merged = db_get_double (acc->value) + subtotal;
+		      }
+		    if (OR_CHECK_DOUBLE_OVERFLOW (merged))
+		      {
+			er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OVERFLOW_ADDITION, 0);
+			goto error;
+		      }
+		    db_make_double (acc->value, merged);
+		    acc->curr_cnt += cnt;
+		  }
+	      }
+	      break;
+
+	    default:
+	      break;
+	    }
+	}
+
+      /* program-covered aggregates: one program evaluation per qualified
+       * row, accumulate straight from the program cells */
+      if (any_prog)
+	{
+	  for (w = 0; w < view.n_words; w++)
+	    {
+	      UINT64 bits = view.bitmap[w];
+	      while (bits)
+		{
+		  int r = (w << 6) + __builtin_ctzll (bits);
+		  bits &= bits - 1;
+		  columnar_scan_decode_row (cs, r);
+		  if (expr_prog_eval (prog, thread_p, &xasl_state->vd, NULL, NULL) != NO_ERROR)
+		    {
+		      goto error;
+		    }
+		  for (i = 0; i < n_plans; i++)
+		    {
+		      if (plans[i].mode == COL_AGG_PROG)
+			{
+			  AGGREGATE_TYPE *agg = plans[i].agg;
+			  if (((QDATA_ACC_KERNEL_FN) agg->acc_kernel) (thread_p, agg, &agg->accumulator,
+								       expr_prog_value (prog,
+											plans[i].prog_root)) !=
+			      NO_ERROR)
+			    {
+			      goto error;
+			    }
+			}
+		    }
+		}
+	    }
+	}
+    }
+
+  if (sc == S_ERROR)
+    {
+      goto error;
+    }
+
+  qexec_resolve_buildvalue_outptr_domains (xasl);
+  db_private_free_and_init (thread_p, plans);
+  *handled = true;
+  return S_END;
+
+error:
+  db_private_free_and_init (thread_p, plans);
+  return S_ERROR;
+}
+
+/*
  * qexec_execute_columnar_scan () - block executor for a single
  *   ACCESS_METHOD_COLUMNAR spec: iterate the qualified rows the columnar
  *   reader decodes into the val_list slots and run the regular per-row
@@ -9823,6 +10277,19 @@ qexec_execute_columnar_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
       return S_ERROR;
     }
   xasl->curr_spec = spec;
+
+  /* BUILDVALUE aggregation without row-level predicates completes inside the
+   * block loop (design #21 Tier 2); everything else keeps the row loop */
+  if (qexec_columnar_block_eligible (xasl))
+    {
+      bool block_handled = false;
+
+      sc = qexec_execute_columnar_block_agg (thread_p, xasl, xasl_state, tplrec, cs, &block_handled);
+      if (block_handled || sc == S_ERROR)
+	{
+	  goto end;
+	}
+    }
 
   while ((sc = columnar_scan_next (thread_p, cs)) == S_SUCCESS)
     {
