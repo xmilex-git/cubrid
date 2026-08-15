@@ -345,6 +345,11 @@ struct buildlist_proc_node
   EHID *upddel_oid_locator_ehids;	/* array of temporary extensible hash for UPDATE/DELETE generated SELECT
 					 * statement */
   AGGREGATE_HASH_CONTEXT *agg_hash_context;	/* hash aggregate context, not serialized */
+
+  /* RAW_AGG *: columnar raw hash aggregation that already produced every
+   * group during the scan (#23 D3), so qexec_groupby () emits from it instead
+   * of sorting an input list file.  Server runtime state, never serialized. */
+  void *columnar_rawagg;
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
   int g_agg_domains_resolved;	/* domain status (not serialized) */
 };

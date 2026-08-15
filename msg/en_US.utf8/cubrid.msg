@@ -1483,8 +1483,9 @@ Check the path of the key file (_keys) and make sure that it includes proper key
 
 1378 Operation not supported on columnar table: %1$s
 1379 Expression not supported by columnar scan: %1$s
+1380 Columnar aggregation exceeded its hash memory budget (%1$d MB). Raise the columnar_agg_hash_size system parameter.
 
-1379 Last Error
+1381 Last Error
 
 
 $set 6 MSGCAT_SET_INTERNAL

@@ -808,6 +808,10 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_ENABLE_LAZY_PREDICATE_READ "enable_lazy_predicate_read"
 
+/* fixed budget of the columnar raw hash aggregation table (#23 D8); exceeding
+ * it raises a runtime error -- there is no spill path */
+#define PRM_NAME_COLUMNAR_AGG_HASH_SIZE "columnar_agg_hash_size"
+
 // #endregion 
 
 /*
@@ -5436,6 +5440,18 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.b = true}},
    NULL_SYSPRM_PARAM_VALUE,
    NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_COLUMNAR_AGG_HASH_SIZE,
+   PRM_NAME_COLUMNAR_AGG_HASH_SIZE,
+   (PRM_FOR_SERVER | PRM_USER_CHANGE | PRM_SIZE_UNIT),
+   PRM_BIGINT,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.bi = 64 * 1024 * 1024 /* 64 MB */ }},
+   {false, {.bi = 64 * 1024 * 1024 /* 64 MB */ }},
+   {false, {.bi = (INT64) 8 * 1024 * 1024 * 1024 /* 8 GB */ }},
+   {false, {.bi = 1024 * 1024 /* 1 MB */ }},
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL}

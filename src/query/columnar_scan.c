@@ -43,6 +43,7 @@
 #include "columnar_scan.h"
 
 #include "columnar_file.h"
+#include "columnar_numeric.h"
 #include "columnar_writer.h"
 #include "dbtype.h"
 #include "error_manager.h"
@@ -94,7 +95,7 @@ typedef enum
   COL_KRN_DT,			/* DATETIME: (date << 32) | time */
   COL_KRN_F32,			/* FLOAT */
   COL_KRN_F64,			/* DOUBLE / MONETARY (leading double, runtime stride) */
-  COL_KRN_NUM,			/* NUMERIC: 17B big-endian two's complement */
+  COL_KRN_NUM,			/* NUMERIC: PG base-10000 variable-width stream */
   COL_KRN_CHARN,		/* CHAR(n): fixed n-byte memcmp (binary collation) */
   COL_KRN_VARCHAR		/* VARCHAR: length-prefixed stream (binary collation) */
 } COL_KERNEL;
@@ -117,7 +118,7 @@ struct col_filter_node
   DB_VALUE cval;		/* owned; cleared at close */
   INT64 ci64;			/* canonical integer form */
   double cdbl;			/* canonical double form */
-  unsigned char cnum[DB_NUMERIC_BUF_SIZE];	/* NUMERIC raw */
+  COL_NUMVAR cnum;		/* NUMERIC, coerced to the column domain */
   char *cstr;			/* CHAR padded to n / VARCHAR bytes / LIKE pattern */
   int cstr_len;
 
@@ -125,7 +126,7 @@ struct col_filter_node
   INT64 *in_i64;		/* canonical integer elements */
   double *in_dbl;		/* canonical double elements */
   char *in_str;			/* concatenated fixed-width CHAR elements */
-  unsigned char *in_num;	/* concatenated NUMERIC raw elements */
+  COL_NUMVAR *in_num;		/* NUMERIC elements */
   int n_in;
   bool in_has_null;		/* IN list contains NULL -> UNKNOWN when no match */
 
@@ -351,11 +352,23 @@ col_decode_datetime (const COL_BINDING * b, int row, DB_VALUE * out)
   db_make_datetime (out, &dt);
 }
 
+/* NUMERIC is stored in the PG base-10000 stream (#23 D11), so materializing a
+ * DB_VALUE converts back into the engine representation.  Only the legacy
+ * per-row path needs this; the raw path computes on the stored digits. */
 static void
 col_decode_numeric (const COL_BINDING * b, int row, DB_VALUE * out)
 {
-  db_make_numeric (out, (DB_C_NUMERIC) COL_CELL (b, row), b->domain->precision, b->domain->scale, DB_NUMERIC_BUF_SIZE,
-		   false, false);
+  COL_NUMREF ref;
+  COL_NUMVAR nv;
+  int off = b->var_offsets[row];
+
+  assert (off >= 0);
+  columnar_num_ref (b->chunk_data + off + (int) sizeof (int), &ref);
+  columnar_num_from_ref (&ref, &nv);
+  if (columnar_num_to_dbvalue (&nv, b->domain->precision, b->domain->scale, out) != NO_ERROR)
+    {
+      db_make_null (out);
+    }
 }
 
 static void
@@ -679,19 +692,9 @@ col_cmp_f32 (const char *data, int stride, const char *ex, int n, REL_OP op, dou
 COL_DEF_CMP_KERNEL (col_cmp_f64, double, { memcpy (&v, data + (size_t) r * stride, sizeof (v)); })
 /* *INDENT-ON* */
 
-/* NUMERIC: DB_NUMERIC_BUF_SIZE-byte big-endian two's complement; flipping
- * the sign bit of the first byte makes unsigned byte order the value order */
-static int
-col_num_cmp (const unsigned char *a, const unsigned char *b)
-{
-  unsigned char a0 = (unsigned char) (a[0] ^ 0x80);
-  unsigned char b0 = (unsigned char) (b[0] ^ 0x80);
-  if (a0 != b0)
-    {
-      return (a0 < b0) ? -1 : 1;
-    }
-  return memcmp (a + 1, b + 1, DB_NUMERIC_BUF_SIZE - 1);
-}
+/* view the NUMERIC of a row inside the variable-width stream */
+#define COL_NUM_AT(data, offsets, r, ref) \
+  columnar_num_ref ((data) + (offsets)[r] + (int) sizeof (int), (ref))
 
 static bool
 col_rel_match (REL_OP op, int c)
@@ -717,14 +720,23 @@ col_rel_match (REL_OP op, int c)
 }
 
 static void
-col_cmp_num (const char *data, int stride, const char *ex, int n, REL_OP op, const unsigned char *cval,
+col_cmp_num (const char *data, const int *offsets, const char *ex, int n, REL_OP op, const COL_NUMVAR * cval,
 	     UINT64 * t_bm)
 {
+  COL_NUMREF cref;
   int r;
+
+  columnar_num_ref_var (cval, &cref);
   for (r = 0; r < n; r++)
     {
-      if (COL_EXISTS_BIT (ex, r)
-	  && col_rel_match (op, col_num_cmp ((const unsigned char *) data + (size_t) r * stride, cval)))
+      COL_NUMREF v;
+
+      if (!COL_EXISTS_BIT (ex, r))
+	{
+	  continue;
+	}
+      COL_NUM_AT (data, offsets, r, &v);
+      if (col_rel_match (op, columnar_num_cmp (&v, &cref)))
 	{
 	  COL_BM_SET (t_bm, r);
 	}
@@ -1149,7 +1161,13 @@ col_prepare_const (COLUMNAR_SCAN * cs, COL_FILTER_NODE * f, const DB_VALUE * val
       f->cdbl = col_const_to_dbl (&f->cval, b->type);
       break;
     case COL_KRN_NUM:
-      memcpy (f->cnum, db_get_numeric (&f->cval), DB_NUMERIC_BUF_SIZE);
+      {
+	int error = columnar_num_from_dbvalue (&f->cval, &f->cnum);
+	if (error != NO_ERROR)
+	  {
+	    return error;
+	  }
+      }
       break;
     case COL_KRN_CHARN:
       {
@@ -1293,8 +1311,10 @@ col_build_comp (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, const COMP_EVAL_TER
       COL_BINDING *b2 = &cs->bindings[rbind];
       COL_KERNEL k = col_select_kernel (b1->type);
 
-      if (b1->type != b2->type || b1->value_size <= 0 || b1->value_size != b2->value_size || k == COL_KRN_NONE
-	  || k == COL_KRN_VARCHAR)
+      /* NUMERIC is variable-width but still comparable digit-wise, so it is
+       * the one variable-width kernel column-op-column covers */
+      if (b1->type != b2->type || k == COL_KRN_NONE || k == COL_KRN_VARCHAR
+	  || (k != COL_KRN_NUM && (b1->value_size <= 0 || b1->value_size != b2->value_size)))
 	{
 	  return col_unsupported ("column-op-column on unsupported/mismatched types");
 	}
@@ -1416,7 +1436,7 @@ col_build_in (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, const ALSM_EVAL_TERM 
       error = (f->in_dbl == NULL) ? ER_OUT_OF_VIRTUAL_MEMORY : NO_ERROR;
       break;
     case COL_KRN_NUM:
-      f->in_num = (unsigned char *) malloc ((size_t) n * DB_NUMERIC_BUF_SIZE);
+      f->in_num = (COL_NUMVAR *) malloc ((size_t) n * sizeof (COL_NUMVAR));
       error = (f->in_num == NULL) ? ER_OUT_OF_VIRTUAL_MEMORY : NO_ERROR;
       break;
     case COL_KRN_CHARN:
@@ -1474,7 +1494,12 @@ col_build_in (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs, const ALSM_EVAL_TERM 
 	  f->in_dbl[f->n_in++] = col_const_to_dbl (&coerced, b->type);
 	  break;
 	case COL_KRN_NUM:
-	  memcpy (f->in_num + (size_t) f->n_in * DB_NUMERIC_BUF_SIZE, db_get_numeric (&coerced), DB_NUMERIC_BUF_SIZE);
+	  if (columnar_num_from_dbvalue (&coerced, &f->in_num[f->n_in]) != NO_ERROR)
+	    {
+	      pr_clear_value (&coerced);
+	      col_free_filter (f);
+	      return ER_IT_DATA_OVERFLOW;
+	    }
 	  f->n_in++;
 	  break;
 	case COL_KRN_CHARN:
@@ -1746,7 +1771,7 @@ col_eval_leaf_cmp (COLUMNAR_SCAN * cs, const COL_FILTER_NODE * f, int n_rows, UI
       col_cmp_f64 (b->chunk_data, b->value_size, b->chunk_exists, n_rows, f->op, f->cdbl, t_bm);
       break;
     case COL_KRN_NUM:
-      col_cmp_num (b->chunk_data, b->value_size, b->chunk_exists, n_rows, f->op, f->cnum, t_bm);
+      col_cmp_num (b->chunk_data, b->var_offsets, b->chunk_exists, n_rows, f->op, &f->cnum, t_bm);
       break;
     case COL_KRN_CHARN:
       col_cmp_charn (b->chunk_data, b->value_size, b->chunk_exists, n_rows, f->op, f->cstr, t_bm);
@@ -1797,8 +1822,12 @@ col_eval_leaf_cmpcol (COLUMNAR_SCAN * cs, const COL_FILTER_NODE * f, int n_rows,
 	  }
 	  break;
 	case COL_KRN_NUM:
-	  c = col_num_cmp ((const unsigned char *) b1->chunk_data + (size_t) r * b1->value_size,
-			   (const unsigned char *) b2->chunk_data + (size_t) r * b2->value_size);
+	  {
+	    COL_NUMREF v1, v2;
+	    COL_NUM_AT (b1->chunk_data, b1->var_offsets, r, &v1);
+	    COL_NUM_AT (b2->chunk_data, b2->var_offsets, r, &v2);
+	    c = columnar_num_cmp (&v1, &v2);
+	  }
 	  break;
 	case COL_KRN_CHARN:
 	  c = memcmp (b1->chunk_data + (size_t) r * b1->value_size, b2->chunk_data + (size_t) r * b2->value_size,
@@ -1835,7 +1864,7 @@ col_eval_leaf_in (COLUMNAR_SCAN * cs, const COL_FILTER_NODE * f, int n_rows, UIN
 	  COL_BM_SET (n_bm, r);
 	  continue;
 	}
-      cell = b->chunk_data + (size_t) r * b->value_size;
+      cell = (b->value_size > 0) ? b->chunk_data + (size_t) r * b->value_size : NULL;
       switch (f->kernel)
 	{
 	case COL_KRN_I16:
@@ -1870,14 +1899,20 @@ col_eval_leaf_in (COLUMNAR_SCAN * cs, const COL_FILTER_NODE * f, int n_rows, UIN
 	  }
 	  break;
 	case COL_KRN_NUM:
-	  for (k = 0; k < f->n_in; k++)
-	    {
-	      if (memcmp (cell, f->in_num + (size_t) k * DB_NUMERIC_BUF_SIZE, DB_NUMERIC_BUF_SIZE) == 0)
-		{
-		  match = true;
-		  break;
-		}
-	    }
+	  {
+	    COL_NUMREF v;
+	    COL_NUM_AT (b->chunk_data, b->var_offsets, r, &v);
+	    for (k = 0; k < f->n_in; k++)
+	      {
+		COL_NUMREF e;
+		columnar_num_ref_var (&f->in_num[k], &e);
+		if (columnar_num_cmp (&v, &e) == 0)
+		  {
+		    match = true;
+		    break;
+		  }
+	      }
+	  }
 	  break;
 	case COL_KRN_CHARN:
 	  for (k = 0; k < f->n_in; k++)
@@ -2045,6 +2080,36 @@ col_chunk_skippable_leaf (const COLUMNAR_SCAN * cs, const COL_FILTER_NODE * f, i
       double mn, mx, c = f->cdbl;
       memcpy (&mn, &d->min_val, sizeof (double));
       memcpy (&mx, &d->max_val, sizeof (double));
+      switch (f->op)
+	{
+	case R_EQ:
+	  return (c < mn || c > mx);
+	case R_LT:
+	  return (mn >= c);
+	case R_LE:
+	  return (mn > c);
+	case R_GT:
+	  return (mx <= c);
+	case R_GE:
+	  return (mx < c);
+	case R_NE:
+	  return (mn == c && mx == c);
+	default:
+	  return false;
+	}
+    }
+  else if (d->minmax_kind == COLUMNAR_MINMAX_NUMERIC)
+    {
+      /* bounds are exact unscaled integers at d->minmax_dscale; the skip
+       * applies only when the constant is exactly representable there too */
+      INT64 mn = d->min_val, mx = d->max_val, c;
+      COL_NUMREF cref;
+
+      columnar_num_ref_var (&f->cnum, &cref);
+      if (!columnar_num_unscaled_int64 (&cref, d->minmax_dscale, &c))
+	{
+	  return false;
+	}
       switch (f->op)
 	{
 	case R_EQ:
@@ -2321,11 +2386,24 @@ col_open_stripe (THREAD_ENTRY * thread_p, COLUMNAR_SCAN * cs)
     {
       return error;
     }
-  if (fhdr.magic != COLUMNAR_FOOTER_MAGIC || fhdr.version != COLUMNAR_FOOTER_VERSION)
+  if (fhdr.magic != COLUMNAR_FOOTER_MAGIC)
     {
-      assert (false);
+      assert (false);		/* not a footer at all: a real corruption */
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
       return ER_FAILED;
+    }
+  if (fhdr.version != COLUMNAR_FOOTER_VERSION)
+    {
+      /*
+       * A stripe written by an older build.  This is an EXPECTED condition
+       * once the on-disk format changes (#23 D11 moved NUMERIC to a different
+       * representation and bumped the footer version), so it must be a clean
+       * error the caller can act on -- asserting here aborts the server, and
+       * an abnormal death is far worse than a failed query (see #27).
+       */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_COLUMNAR_NOT_SUPPORTED, 1,
+	      "table was written by an incompatible older build; drop and reload it");
+      return ER_COLUMNAR_NOT_SUPPORTED;
     }
 
   descs_size = fhdr.n_columns * fhdr.n_chunk_groups * (int) sizeof (COLUMNAR_CHUNK_DESC);
@@ -2953,6 +3031,26 @@ columnar_scan_decode_row (COLUMNAR_SCAN * cs, int row)
 	  col_slot_set_null (b);
 	}
     }
+}
+
+int
+columnar_scan_bind_regu (const COLUMNAR_SCAN * cs, const REGU_VARIABLE * regu)
+{
+  return col_find_binding (cs, regu);
+}
+
+void
+columnar_scan_bind_view (const COLUMNAR_SCAN * cs, int bind_idx, COLUMNAR_BIND_VIEW * out)
+{
+  const COL_BINDING *b = &cs->bindings[bind_idx];
+
+  assert (bind_idx >= 0 && bind_idx < cs->n_bindings);
+  out->data = b->chunk_data;
+  out->exists = b->chunk_exists;
+  out->offsets = b->var_offsets;
+  out->stride = b->value_size;
+  out->type = b->type;
+  out->domain = b->domain;
 }
 
 bool

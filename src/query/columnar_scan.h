@@ -89,6 +89,28 @@ extern void columnar_scan_decode_row (COLUMNAR_SCAN * cs, int row);
  * next columnar_scan_next_chunk () call. */
 extern bool columnar_scan_raw_column (COLUMNAR_SCAN * cs, const DB_VALUE * slot_addr, COLUMNAR_RAW_COL * raw);
 
+/* -------- binding access for the raw program (#23 D1/D2) -------- */
+
+/* per-chunk raw view of one binding */
+typedef struct columnar_bind_view COLUMNAR_BIND_VIEW;
+struct columnar_bind_view
+{
+  const char *data;		/* decompressed column array of the current chunk */
+  const char *exists;		/* NULL bitmap (1 = value present) */
+  const int *offsets;		/* variable width: per-row byte offset (-1 = NULL) */
+  int stride;			/* bytes per value; < 0 = variable width */
+  DB_TYPE type;
+  TP_DOMAIN *domain;
+};
+
+/* binding index the regu variable resolves to (val_list slot or attribute id),
+ * or -1 when it is not a column of this scan */
+extern int columnar_scan_bind_regu (const COLUMNAR_SCAN * cs, const REGU_VARIABLE * regu);
+
+/* layout + current-chunk pointers of a binding; pointers are valid until the
+ * next columnar_scan_next_chunk () call */
+extern void columnar_scan_bind_view (const COLUMNAR_SCAN * cs, int bind_idx, COLUMNAR_BIND_VIEW * out);
+
 /* true (with the directory total row count) when the scan reads no column and
  * has no filter, so a COUNT(*)-style consumer needs no page reads at all */
 extern bool columnar_scan_total_rows (COLUMNAR_SCAN * cs, INT64 * total);

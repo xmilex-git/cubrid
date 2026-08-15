@@ -1775,7 +1775,9 @@
 
 #define ER_COLUMNAR_UNSUPPORTED_EXPR                -1379
 
-#define ER_LAST_ERROR                               -1380
+#define ER_COLUMNAR_AGG_HASH_FULL                   -1380
+
+#define ER_LAST_ERROR                               -1381
 
 
 

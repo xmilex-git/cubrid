@@ -1482,8 +1482,9 @@ $ LOADDB
 
 1378 columnar 테이블에서 지원하지 않는 연산입니다: %1$s
 1379 columnar 스캔이 지원하지 않는 식입니다: %1$s
+1380 columnar 집계가 해시 메모리 예산(%1$d MB)을 초과했습니다. columnar_agg_hash_size 시스템 파라미터를 높이십시오.
 
-1379 마지막 에러
+1381 마지막 에러
 
 $set 6 MSGCAT_SET_INTERNAL
 1 에러 서브 시스템에 에러 발생(라인 %1$d):

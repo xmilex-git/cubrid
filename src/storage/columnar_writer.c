@@ -29,6 +29,7 @@
 #include "columnar_writer.h"
 
 #include "columnar_file.h"
+#include "columnar_numeric.h"
 #include "dbtype.h"
 #include "error_manager.h"
 #include "file_manager.h"
@@ -370,7 +371,7 @@ columnar_value_disk_size (DB_TYPE type, TP_DOMAIN * domain)
     case DB_TYPE_DATETIME:
       return (int) sizeof (int) + (int) sizeof (int);	/* date + time */
     case DB_TYPE_NUMERIC:
-      return DB_NUMERIC_BUF_SIZE;	/* 17 bytes */
+      return -1;		/* PG base-10000 variable-width stream (#23 D11) */
     case DB_TYPE_CHAR:
       return (domain != NULL && domain->precision > 0) ? domain->precision : -1;
     case DB_TYPE_BIT:
@@ -561,12 +562,6 @@ columnar_buffer_value (COLUMNAR_COL_BUFFER * col, const DB_VALUE * val, int row_
 	    memcpy (dst + sizeof (int), &dt->time, sizeof (int));
 	  }
 	  break;
-	case DB_TYPE_NUMERIC:
-	  {
-	    DB_C_NUMERIC num = db_get_numeric (val);
-	    memcpy (dst, num, DB_NUMERIC_BUF_SIZE);
-	  }
-	  break;
 	case DB_TYPE_CHAR:
 	  {
 	    const char *str = db_get_string (val);
@@ -611,6 +606,31 @@ columnar_buffer_value (COLUMNAR_COL_BUFFER * col, const DB_VALUE * val, int row_
       /* variable-width: length-prefix stream */
       const char *str = NULL;
       int len = 0;
+
+      if (col->type == DB_TYPE_NUMERIC)
+	{
+	  /* PG base-10000 payload behind the same 4-byte length prefix, so the
+	   * reader's per-row offset table needs no special case (#23 D11).
+	   * The conversion happens once here, at INSERT; the read path then
+	   * computes directly on the stored digits. */
+	  COL_NUMVAR nv;
+
+	  error_code = columnar_num_from_dbvalue (val, &nv);
+	  if (error_code != NO_ERROR)
+	    {
+	      return error_code;
+	    }
+	  len = columnar_num_serialized_size (&nv);
+	  error_code = columnar_ensure_data_capacity (col, (int) sizeof (int) + len);
+	  if (error_code != NO_ERROR)
+	    {
+	      return error_code;
+	    }
+	  memcpy (col->data + col->data_size, &len, sizeof (int));
+	  col->data_size += (int) sizeof (int);
+	  col->data_size += columnar_num_serialize (&nv, col->data + col->data_size);
+	  return NO_ERROR;
+	}
 
       switch (col->type)
 	{
@@ -756,23 +776,105 @@ end:
 /* ========================================================================== */
 
 /*
- * columnar_compute_minmax () - compute the canonical min/max of the non-NULL
- *   values buffered in a fixed-width column and record them in the chunk
- *   descriptor.  Variable-width and memcmp-only types get COLUMNAR_MINMAX_NONE.
+ * columnar_compute_minmax_numeric () - min/max of a PG base-10000 NUMERIC
+ *   chunk.  The bounds are kept as exact unscaled integers at a single
+ *   display scale (the largest one present), so the reader's skip test is an
+ *   INT64 comparison and stays sound.  Any value that is not exactly
+ *   representable that way disables the skip for the whole chunk.
  */
 static void
-columnar_compute_minmax (const COLUMNAR_COL_BUFFER * col, COLUMNAR_CHUNK_DESC * desc)
+columnar_compute_minmax_numeric (const COLUMNAR_COL_BUFFER * col, int rows_in_chunk, COLUMNAR_CHUNK_DESC * desc)
+{
+  INT64 mn = 0, mx = 0;
+  int dscale = 0, off, r;
+  bool have = false;
+
+  /* pass 1: the common display scale */
+  for (r = 0, off = 0; r < rows_in_chunk; r++)
+    {
+      COL_NUMREF ref;
+      int len;
+
+      if (!(col->exists[r / 8] & (1 << (r % 8))))
+	{
+	  continue;
+	}
+      memcpy (&len, col->data + off, sizeof (int));
+      columnar_num_ref (col->data + off + (int) sizeof (int), &ref);
+      if (ref.dscale > dscale)
+	{
+	  dscale = ref.dscale;
+	}
+      off += (int) sizeof (int) + len;
+    }
+
+  /* pass 2: exact unscaled bounds at that scale */
+  for (r = 0, off = 0; r < rows_in_chunk; r++)
+    {
+      COL_NUMREF ref;
+      INT64 v;
+      int len;
+
+      if (!(col->exists[r / 8] & (1 << (r % 8))))
+	{
+	  continue;
+	}
+      memcpy (&len, col->data + off, sizeof (int));
+      columnar_num_ref (col->data + off + (int) sizeof (int), &ref);
+      off += (int) sizeof (int) + len;
+
+      if (!columnar_num_unscaled_int64 (&ref, dscale, &v))
+	{
+	  return;		/* leave COLUMNAR_MINMAX_NONE */
+	}
+      if (!have)
+	{
+	  mn = mx = v;
+	  have = true;
+	}
+      else if (v < mn)
+	{
+	  mn = v;
+	}
+      else if (v > mx)
+	{
+	  mx = v;
+	}
+    }
+
+  if (have)
+    {
+      desc->minmax_kind = COLUMNAR_MINMAX_NUMERIC;
+      desc->minmax_dscale = (INT8) dscale;
+      desc->min_val = mn;
+      desc->max_val = mx;
+    }
+}
+
+/*
+ * columnar_compute_minmax () - compute the canonical min/max of the non-NULL
+ *   values buffered in a column and record them in the chunk descriptor.
+ *   Types with no order-preserving canonical encoding get
+ *   COLUMNAR_MINMAX_NONE.
+ */
+static void
+columnar_compute_minmax (const COLUMNAR_COL_BUFFER * col, int rows_in_chunk, COLUMNAR_CHUNK_DESC * desc)
 {
   int n_rows, r;
   bool have = false;
 
   desc->minmax_kind = COLUMNAR_MINMAX_NONE;
+  desc->minmax_dscale = 0;
   desc->min_val = 0;
   desc->max_val = 0;
 
   if (col->value_size <= 0)
     {
-      return;			/* variable-width */
+      if (col->type == DB_TYPE_NUMERIC)
+	{
+	  columnar_compute_minmax_numeric (col, rows_in_chunk, desc);
+	}
+      return;			/* other variable-width types are not skippable */
     }
   n_rows = col->data_size / col->value_size;
 
@@ -915,7 +1017,15 @@ static int
 columnar_serialize_chunks (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
 {
   int i, error_code = NO_ERROR;
+  int rows_in_chunk;
   COLUMNAR_COMPRESSION_TYPE comp = COLUMNAR_COMPRESS_NONE;	/* MVP: no compression first pass */
+
+  /* the chunk being serialized is full unless this is the flush-time tail */
+  rows_in_chunk = ws->current_rows % ws->chunk_max_rows;
+  if (rows_in_chunk == 0)
+    {
+      rows_in_chunk = ws->chunk_max_rows;
+    }
 
   /* TODO: select compression based on system parameter */
 #if defined (HAVE_ZSTD)
@@ -934,7 +1044,7 @@ columnar_serialize_chunks (THREAD_ENTRY * thread_p, COLUMNAR_WRITE_STATE * ws)
       memset (&desc, 0, sizeof (desc));
 
       /* min/max skip-list entry (computed on the raw uncompressed array) */
-      columnar_compute_minmax (col, &desc);
+      columnar_compute_minmax (col, rows_in_chunk, &desc);
 
       /* compress the value data */
       error_code = columnar_compress_buffer (col->data, col->data_size, &compressed, &compressed_len, comp);

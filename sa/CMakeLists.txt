@@ -294,6 +294,8 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/query_executor.c
   ${QUERY_DIR}/query_manager.c
   ${QUERY_DIR}/expr_compile.c
+  ${QUERY_DIR}/columnar_rawagg.c
+  ${QUERY_DIR}/columnar_rawprog.c
   ${QUERY_DIR}/columnar_scan.c
   ${QUERY_DIR}/query_opfunc.c
   ${QUERY_DIR}/query_reevaluation.cpp
@@ -522,6 +524,7 @@ set(STORAGE_SOURCES
   ${STORAGE_DIR}/es_owfs.c
   ${STORAGE_DIR}/es_posix.c
   ${STORAGE_DIR}/columnar_file.c
+  ${STORAGE_DIR}/columnar_numeric.c
   ${STORAGE_DIR}/columnar_writer.c
   ${STORAGE_DIR}/extendible_hash.c
   ${STORAGE_DIR}/external_sort.c

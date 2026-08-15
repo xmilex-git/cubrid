@@ -41,6 +41,7 @@
 #include "query_aggregate.hpp"
 #include "query_analytic.hpp"
 #include "expr_compile.h"
+#include "columnar_rawagg.h"
 #include "columnar_scan.h"
 #include "query_opfunc.h"
 #include "fetch.h"
@@ -2574,6 +2575,13 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
 	      {
 		qexec_free_agg_hash_context (thread_p, buildlist);
 	      }
+	    if (buildlist->columnar_rawagg != NULL)
+	      {
+		/* the scan built it but qexec_groupby () never consumed it
+		 * (the statement errored out in between) */
+		columnar_rawagg_free ((RAW_AGG *) buildlist->columnar_rawagg);
+		buildlist->columnar_rawagg = NULL;
+	      }
 	  }
       }
       break;
@@ -3198,6 +3206,13 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
 	    if (buildlist->g_hash_eligible)
 	      {
 		qexec_free_agg_hash_context (thread_p, buildlist);
+	      }
+	    if (buildlist->columnar_rawagg != NULL)
+	      {
+		/* the scan built it but qexec_groupby () never consumed it
+		 * (the statement errored out in between) */
+		columnar_rawagg_free ((RAW_AGG *) buildlist->columnar_rawagg);
+		buildlist->columnar_rawagg = NULL;
 	      }
 	  }
       }
@@ -5439,6 +5454,47 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
 
     gbstate.output_file = output_list_id;
   }
+
+  /*
+   * The columnar raw hash aggregation (#23 D3) already produced every group
+   * during the scan, so there is no input list file to sort: emit the groups
+   * straight into the output file.  Each group's key values go into the very
+   * value-list slots the per-row path would have refilled from a tuple.
+   */
+  if (buildlist->columnar_rawagg != NULL)
+    {
+      RAW_AGG *ra = (RAW_AGG *) buildlist->columnar_rawagg;
+      DB_VALUE **key_targets = columnar_rawagg_key_targets (ra);
+      int n_groups = columnar_rawagg_group_count (ra);
+      int g;
+
+      for (g = 0; g < n_groups; g++)
+	{
+	  qexec_gby_start_group_dim (thread_p, &gbstate, NULL);
+	  if (gbstate.state != NO_ERROR)
+	    {
+	      GOTO_EXIT_ON_ERROR;
+	    }
+	  if (columnar_rawagg_load_group (ra, g, key_targets, gbstate.g_dim[0].d_agg_list) != NO_ERROR)
+	    {
+	      GOTO_EXIT_ON_ERROR;
+	    }
+	  (void) qexec_gby_finalize_group_dim (thread_p, &gbstate, NULL);
+	  if (gbstate.state != NO_ERROR)
+	    {
+	      GOTO_EXIT_ON_ERROR;
+	    }
+	}
+      gbstate.input_recs = columnar_rawagg_row_count (ra);
+
+      columnar_rawagg_free (ra);
+      buildlist->columnar_rawagg = NULL;
+
+      qfile_destroy_list (thread_p, list_id);
+      qfile_close_list (thread_p, gbstate.output_file);
+      qfile_copy_list_id (list_id, gbstate.output_file, true, QFILE_PROHIBIT_DEPENDENT);
+      goto wrapup;
+    }
 
   /* check for quick finalization scenarios */
   if (list_id->tuple_cnt == 0)
@@ -10234,6 +10290,366 @@ error:
 }
 
 /*
+ * qexec_execute_columnar_raw_agg () - BUILDVALUE aggregation with no DB_VALUE
+ *   in the row loop (design #23 D1/D2/D4/D7).  One RAW_PROG evaluation per
+ *   qualified row completes argument evaluation, group lookup (degenerate
+ *   here: a single fixed accumulator) and accumulation; a DB_VALUE appears
+ *   only once, when the finished accumulators are handed to the engine's own
+ *   finalization.
+ *
+ *   *handled stays false when the aggregate list is outside the raw coverage,
+ *   which leaves the scan untouched for the existing DB_VALUE block path to
+ *   take (D13: the two coexist until the parity gate).
+ *
+ *   return: S_END or S_ERROR
+ */
+static SCAN_CODE
+qexec_execute_columnar_raw_agg (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
+				QFILE_TUPLE_RECORD * tplrec, COLUMNAR_SCAN * cs, bool * handled)
+{
+  BUILDVALUE_PROC_NODE *bv = &xasl->proc.buildvalue;
+  RAW_AGG *ra = NULL;
+  INT64 total_rows;
+  int error;
+
+  *handled = false;
+
+  /* a COUNT(*) that needs no column and no filter completes from the stripe
+   * directory without reading a page; the existing block path owns that */
+  if (columnar_scan_total_rows (cs, &total_rows))
+    {
+      return S_END;
+    }
+
+  if (!bv->agg_domains_resolved
+      && qexec_resolve_domains_for_aggregation (thread_p, bv->agg_list, &xasl_state->vd, tplrec, NULL,
+						&bv->agg_domains_resolved) != NO_ERROR)
+    {
+      return S_ERROR;
+    }
+
+  error = columnar_rawagg_build (thread_p, cs, NULL, 0, bv->agg_list, NULL, &ra);
+  if (error != NO_ERROR)
+    {
+      if (error == ER_COLUMNAR_UNSUPPORTED_EXPR)
+	{
+	  er_clear ();		/* not an error: the DB_VALUE block path takes it */
+#if !defined(NDEBUG)
+	  er_log_debug (ARG_FILE_LINE, "columnar raw buildvalue agg declined: outside raw coverage");
+#endif
+	  return S_END;
+	}
+      return S_ERROR;
+    }
+
+  error = columnar_rawagg_run (thread_p, ra, cs);
+  if (error == NO_ERROR)
+    {
+      error = columnar_rawagg_load_group (ra, 0, NULL, bv->agg_list);
+    }
+  columnar_rawagg_free (ra);
+  if (error != NO_ERROR)
+    {
+      return S_ERROR;
+    }
+
+  qexec_resolve_buildvalue_outptr_domains (xasl);
+#if !defined(NDEBUG)
+  er_log_debug (ARG_FILE_LINE, "columnar raw buildvalue agg used");
+#endif
+  *handled = true;
+  return S_END;
+}
+
+/*
+ * qexec_columnar_scan_source () - the SCAN-time expression that fills the
+ *   value-list slot an aggregate operand reads.
+ *
+ *   In a GROUP BY block the aggregate operands do not reference the scan's
+ *   columns directly; they reference g_val_list slots that g_scan_regu_list
+ *   refills from each scanned row.  Compiling the operand as-is would bind
+ *   whatever the slot happened to hold, so the operand is resolved back to
+ *   the scan-time regu that produces it.  Returns NULL when no scan-time
+ *   producer owns that slot.
+ */
+static REGU_VARIABLE *
+qexec_columnar_scan_source (BUILDLIST_PROC_NODE * buildlist, REGU_VARIABLE * operand)
+{
+  REGU_VARIABLE_LIST v;
+
+  if (operand->type != TYPE_CONSTANT || operand->value.dbvalptr == NULL)
+    {
+      return operand;		/* already an expression, not a slot reference */
+    }
+  for (v = buildlist->g_scan_regu_list; v != NULL; v = v->next)
+    {
+      if (v->value.vfetch_to == operand->value.dbvalptr)
+	{
+	  return &v->value;
+	}
+    }
+  return NULL;
+}
+
+/*
+ * qexec_columnar_rawagg_gby_eligible () - can the columnar raw hash
+ *   aggregation own this GROUP BY block?
+ *
+ *   Every value-list slot the group-by output reads is refilled per tuple by
+ *   the row path; the raw path fills them once per GROUP.  So each scan-time
+ *   group-by regu must be either a group key (its value is constant within
+ *   the group) or an aggregate operand (consumed during accumulation, never
+ *   read at output time).  Anything else is a column selected without being
+ *   grouped — CUBRID accepts that, standard SQL does not — and it would be
+ *   served a stale row's value, so the block is declined instead.
+ */
+static bool
+qexec_columnar_rawagg_gby_eligible (XASL_NODE * xasl)
+{
+  BUILDLIST_PROC_NODE *buildlist = &xasl->proc.buildlist;
+  REGU_VARIABLE_LIST v, k;
+  AGGREGATE_TYPE *agg_p;
+
+  if (xasl->type != BUILDLIST_PROC || buildlist->groupby_list == NULL || buildlist->g_agg_list == NULL
+      || buildlist->g_hk_scan_regu_list == NULL)
+    {
+      return false;
+    }
+  if (buildlist->g_with_rollup || buildlist->a_eval_list != NULL || xasl->if_pred != NULL
+      || xasl->instnum_val != NULL || xasl->instnum_pred != NULL || xasl->dptr_list != NULL
+      || xasl->selected_upd_list != NULL || XASL_IS_FLAGED (xasl, XASL_NEED_SINGLE_TUPLE_SCAN)
+      || COMPOSITE_LOCK (xasl->scan_op_type))
+    {
+      return false;
+    }
+
+  for (k = buildlist->g_hk_scan_regu_list; k != NULL; k = k->next)
+    {
+      if (k->value.vfetch_to == NULL)
+	{
+	  return false;
+	}
+    }
+
+  /* the emitted groups must be ordered by the block's group-by sort list, so
+   * that list has to correspond one-to-one with the scan-time key list */
+  {
+    SORT_LIST *sl;
+    int n_sort = 0, n_keys = 0;
+
+    for (sl = buildlist->groupby_list; sl != NULL; sl = sl->next)
+      {
+	n_sort++;
+      }
+    for (k = buildlist->g_hk_scan_regu_list; k != NULL; k = k->next)
+      {
+	n_keys++;
+      }
+    if (n_sort != n_keys)
+      {
+	return false;
+      }
+  }
+
+  for (v = buildlist->g_scan_regu_list; v != NULL; v = v->next)
+    {
+      bool covered = false;
+
+      for (k = buildlist->g_hk_scan_regu_list; k != NULL && !covered; k = k->next)
+	{
+	  covered = (k->value.vfetch_to == v->value.vfetch_to);
+	}
+      for (agg_p = buildlist->g_agg_list; agg_p != NULL && !covered; agg_p = agg_p->next)
+	{
+	  if (agg_p->operands != NULL && agg_p->operands->value.type == TYPE_CONSTANT)
+	    {
+	      covered = (agg_p->operands->value.value.dbvalptr == v->value.vfetch_to);
+	    }
+	}
+      if (!covered)
+	{
+	  return false;
+	}
+    }
+  return true;
+}
+
+/*
+ * qexec_execute_columnar_gby_agg () - GROUP BY over a columnar block with no
+ *   DB_VALUE in the row loop (design #23 D3/D7).
+ *
+ *   The existing hash aggregation materializes the whole output tuple for
+ *   EVERY row before it probes the hash table, including rows that only fold
+ *   into a group that already exists (qexec_end_one_iteration () ->
+ *   qexec_generate_tuple_descriptor () -> qexec_hash_gby_agg_tuple ()).  The
+ *   raw path removes that materialization structurally: group keys and
+ *   accumulators are raw, and the groups are handed to qexec_groupby () which
+ *   emits them without an input list file or a sort.
+ *
+ *   *handled stays false when the block is outside the raw coverage, leaving
+ *   the scan untouched for the normal row loop (D13 coexistence).
+ */
+static SCAN_CODE
+qexec_execute_columnar_gby_agg (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
+				QFILE_TUPLE_RECORD * tplrec, COLUMNAR_SCAN * cs, bool * handled)
+{
+  BUILDLIST_PROC_NODE *buildlist = &xasl->proc.buildlist;
+  REGU_VARIABLE **keys = NULL;
+  REGU_VARIABLE **operands = NULL;
+  REGU_VARIABLE_LIST k;
+  RAW_AGG *ra = NULL;
+  int n_keys = 0, i, error;
+
+  *handled = false;
+
+  if (!qexec_columnar_rawagg_gby_eligible (xasl))
+    {
+#if !defined(NDEBUG)
+      er_log_debug (ARG_FILE_LINE, "columnar raw group-by agg declined: block shape not eligible");
+#endif
+      return S_END;
+    }
+
+  if (!buildlist->g_agg_domains_resolved
+      && qexec_resolve_domains_for_aggregation (thread_p, buildlist->g_agg_list, &xasl_state->vd, tplrec, NULL,
+						&buildlist->g_agg_domains_resolved) != NO_ERROR)
+    {
+      return S_ERROR;
+    }
+
+  for (k = buildlist->g_hk_scan_regu_list; k != NULL; k = k->next)
+    {
+      n_keys++;
+    }
+  keys = (REGU_VARIABLE **) db_private_alloc (thread_p, (size_t) n_keys * sizeof (REGU_VARIABLE *));
+  if (keys == NULL)
+    {
+      return S_ERROR;
+    }
+  for (k = buildlist->g_hk_scan_regu_list, i = 0; k != NULL; k = k->next, i++)
+    {
+      keys[i] = &k->value;
+    }
+
+  /* resolve each aggregate operand back to the scan-time expression that
+   * fills its value-list slot (see qexec_columnar_scan_source) */
+  {
+    AGGREGATE_TYPE *agg_p;
+    int n_aggs = 0;
+
+    for (agg_p = buildlist->g_agg_list; agg_p != NULL; agg_p = agg_p->next)
+      {
+	n_aggs++;
+      }
+    operands = (REGU_VARIABLE **) db_private_alloc (thread_p, (size_t) n_aggs * sizeof (REGU_VARIABLE *));
+    if (operands == NULL)
+      {
+	db_private_free_and_init (thread_p, keys);
+	return S_ERROR;
+      }
+    for (agg_p = buildlist->g_agg_list, i = 0; agg_p != NULL; agg_p = agg_p->next, i++)
+      {
+	operands[i] = NULL;
+	if (agg_p->function == PT_COUNT_STAR || agg_p->operands == NULL)
+	  {
+	    continue;
+	  }
+	operands[i] = qexec_columnar_scan_source (buildlist, &agg_p->operands->value);
+	if (operands[i] == NULL)
+	  {
+	    db_private_free_and_init (thread_p, keys);
+	    db_private_free_and_init (thread_p, operands);
+#if !defined(NDEBUG)
+	    er_log_debug (ARG_FILE_LINE, "columnar raw group-by agg declined: aggregate operand has no scan source");
+#endif
+	    return S_END;
+	  }
+      }
+  }
+
+  error = columnar_rawagg_build (thread_p, cs, keys, n_keys, buildlist->g_agg_list, operands, &ra);
+  db_private_free_and_init (thread_p, keys);
+  db_private_free_and_init (thread_p, operands);
+  if (error != NO_ERROR)
+    {
+      if (error == ER_COLUMNAR_UNSUPPORTED_EXPR)
+	{
+	  er_clear ();		/* not an error: the row loop takes it */
+#if !defined(NDEBUG)
+	  er_log_debug (ARG_FILE_LINE, "columnar raw group-by agg declined: outside raw coverage");
+#endif
+	  return S_END;
+	}
+      return S_ERROR;
+    }
+
+  error = columnar_rawagg_run (thread_p, ra, cs);
+  if (error != NO_ERROR)
+    {
+      columnar_rawagg_free (ra);
+      return S_ERROR;
+    }
+
+  /* Emit in group-key order.  The optimizer already removed any
+   * ORDER BY <group key> at compile time — by the time this runs there is no
+   * orderby_list left to re-enable — so the ordering the sort-based group-by
+   * would have produced has to be reproduced here. */
+  {
+    bool desc[32], nulls_last[32];
+    SORT_LIST *sl;
+    int n = 0;
+
+    for (sl = buildlist->groupby_list; sl != NULL && n < (int) (sizeof (desc) / sizeof (desc[0])); sl = sl->next, n++)
+      {
+	desc[n] = (sl->s_order == S_DESC);
+	nulls_last[n] = (sl->s_nulls == S_NULLS_LAST);
+      }
+    if (sl != NULL)
+      {
+	columnar_rawagg_free (ra);	/* more keys than the scratch holds */
+	return S_END;
+      }
+    error = columnar_rawagg_sort_groups (ra, desc, nulls_last);
+    if (error != NO_ERROR)
+      {
+	columnar_rawagg_free (ra);
+	return S_ERROR;
+      }
+  }
+
+  /*
+   * The raw path emits groups in first-seen order, not group-key order.  The
+   * sort-based group-by sorts its input by the key, so the optimizer is
+   * entitled to elide an ORDER BY that matches the group key -- and does, via
+   * XASL_SKIP_ORDERBY_LIST.  That assumption does not hold here, so the flag
+   * is cleared and the engine sorts the output itself.  This is the same
+   * hazard the engine guards with agg_hash_respect_order before emitting
+   * straight out of its own hash table; sorting N groups is negligible next
+   * to the per-row materialization the raw path removes.
+   */
+  if (xasl->orderby_list != NULL && !XASL_IS_FLAGED (xasl, XASL_USES_MRO))
+    {
+      XASL_CLEAR_FLAG (xasl, XASL_SKIP_ORDERBY_LIST);
+    }
+#if !defined(NDEBUG)
+  er_log_debug (ARG_FILE_LINE, "columnar raw group-by ordering: orderby_list=%s skip_flag=%s mro=%s",
+		(xasl->orderby_list != NULL) ? "present" : "ABSENT",
+		XASL_IS_FLAGED (xasl, XASL_SKIP_ORDERBY_LIST) ? "set" : "clear",
+		XASL_IS_FLAGED (xasl, XASL_USES_MRO) ? "yes" : "no");
+#endif
+
+#if !defined(NDEBUG)
+  er_log_debug (ARG_FILE_LINE, "columnar raw group-by agg used: %d groups from %lld rows",
+		columnar_rawagg_group_count (ra), (long long) columnar_rawagg_row_count (ra));
+#endif
+
+  /* qexec_groupby () owns it from here, and frees it */
+  buildlist->columnar_rawagg = ra;
+  *handled = true;
+  return S_END;
+}
+
+/*
  * qexec_execute_columnar_scan () - block executor for a single
  *   ACCESS_METHOD_COLUMNAR spec: iterate the qualified rows the columnar
  *   reader decodes into the val_list slots and run the regular per-row
@@ -10279,13 +10695,32 @@ qexec_execute_columnar_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
   xasl->curr_spec = spec;
 
   /* BUILDVALUE aggregation without row-level predicates completes inside the
-   * block loop (design #21 Tier 2); everything else keeps the row loop */
+   * block loop; everything else keeps the row loop.  The raw path (#23) goes
+   * first and the DB_VALUE block path (#21 Tier 2) catches what it declines,
+   * which is the compile-time branch D13 keeps until the parity gate. */
   if (qexec_columnar_block_eligible (xasl))
     {
       bool block_handled = false;
 
+      sc = qexec_execute_columnar_raw_agg (thread_p, xasl, xasl_state, tplrec, cs, &block_handled);
+      if (block_handled || sc == S_ERROR)
+	{
+	  goto end;
+	}
+
       sc = qexec_execute_columnar_block_agg (thread_p, xasl, xasl_state, tplrec, cs, &block_handled);
       if (block_handled || sc == S_ERROR)
+	{
+	  goto end;
+	}
+    }
+  else
+    {
+      /* GROUP BY completed by the raw hash aggregation (#23 D3) */
+      bool gby_handled = false;
+
+      sc = qexec_execute_columnar_gby_agg (thread_p, xasl, xasl_state, tplrec, cs, &gby_handled);
+      if (gby_handled || sc == S_ERROR)
 	{
 	  goto end;
 	}
