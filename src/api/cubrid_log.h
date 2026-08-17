@@ -83,6 +83,8 @@ typedef struct dml DML;
 struct dml
 {
   int dml_type;
+  int64_t rec_lsa;		/* orderable lsa key of the source log record (pageid:48 | offset:16);
+				 * compare against ROLLBACK_TO.lsa to drop undone items */
   uint64_t classoid;
   int num_changed_column;
   int *changed_column_index;
@@ -107,6 +109,13 @@ struct timer
   time_t timestamp;
 };
 
+typedef struct rollback_to ROLLBACK_TO;
+struct rollback_to
+{
+  int64_t lsa;			/* rewind target: buffered items of this transaction whose
+				 * DML.rec_lsa is greater than this key were undone by the server */
+};
+
 typedef union cubrid_data_item CUBRID_DATA_ITEM;
 union cubrid_data_item
 {
@@ -114,6 +123,7 @@ union cubrid_data_item
   DML dml;
   DCL dcl;
   TIMER timer;
+  ROLLBACK_TO rollback_to;
 };
 
 typedef struct cubrid_log_item CUBRID_LOG_ITEM;

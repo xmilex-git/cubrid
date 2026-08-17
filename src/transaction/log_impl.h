@@ -897,7 +897,10 @@ typedef enum cdc_dataitem_type
   CDC_DDL = 0,
   CDC_DML,
   CDC_DCL,
-  CDC_TIMER
+  CDC_TIMER,
+  CDC_ROLLBACK_TO		/* partial rollback marker: every buffered DML of the trid whose
+				 * record lsa key is greater than the marker's lsa key was undone
+				 * by the server and must be discarded by the consumer */
 } CDC_DATAITEM_TYPE;
 
 typedef enum cdc_dcl_type

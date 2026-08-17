@@ -961,7 +961,7 @@ flashback_make_loginfo (THREAD_ENTRY * thread_p, FLASHBACK_LOGINFO_CONTEXT * con
 	      error =
 		cdc_make_dml_loginfo (thread_p, trid, context->user,
 				      rec_type == LOG_SUPPLEMENT_INSERT ? CDC_INSERT : CDC_TRIGGER_INSERT, classoid,
-				      NULL, &redo_recdes, log_info_entry, true);
+				      NULL, &redo_recdes, log_info_entry, NULL, true);
 
 	      if (error != NO_ERROR)
 		{
@@ -1014,14 +1014,14 @@ flashback_make_loginfo (THREAD_ENTRY * thread_p, FLASHBACK_LOGINFO_CONTEXT * con
 
 		  error =
 		    cdc_make_dml_loginfo (thread_p, trid, context->user, CDC_TRIGGER_INSERT, classoid, NULL,
-					  &redo_recdes, log_info_entry, true);
+					  &redo_recdes, log_info_entry, NULL, true);
 		}
 	      else
 		{
 		  error =
 		    cdc_make_dml_loginfo (thread_p, trid, context->user,
 					  rec_type == LOG_SUPPLEMENT_UPDATE ? CDC_UPDATE : CDC_TRIGGER_UPDATE, classoid,
-					  &undo_recdes, &redo_recdes, log_info_entry, true);
+					  &undo_recdes, &redo_recdes, log_info_entry, NULL, true);
 		}
 
 	      if (error != NO_ERROR)
@@ -1064,7 +1064,7 @@ flashback_make_loginfo (THREAD_ENTRY * thread_p, FLASHBACK_LOGINFO_CONTEXT * con
 	      error =
 		cdc_make_dml_loginfo (thread_p, trid, context->user,
 				      rec_type == LOG_SUPPLEMENT_DELETE ? CDC_DELETE : CDC_TRIGGER_DELETE, classoid,
-				      &undo_recdes, NULL, log_info_entry, true);
+				      &undo_recdes, NULL, log_info_entry, NULL, true);
 
 	      if (error != NO_ERROR)
 		{

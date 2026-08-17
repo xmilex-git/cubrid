@@ -269,7 +269,7 @@ extern int cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES *
 			   RECDES * redo_recdes, bool is_flashback);
 extern int cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYPE dml_type, OID classoid,
 				 RECDES * undo_recdes, RECDES * redo_recdes, CDC_LOGINFO_ENTRY * dml_entry,
-				 bool is_flashback);
+				 const LOG_LSA * rec_lsa, bool is_flashback);
 
 //
 // log critical section

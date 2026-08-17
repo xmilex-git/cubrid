@@ -96,7 +96,8 @@ typedef enum
   DATA_ITEM_TYPE_DDL = 0,
   DATA_ITEM_TYPE_DML,
   DATA_ITEM_TYPE_DCL,
-  DATA_ITEM_TYPE_TIMER
+  DATA_ITEM_TYPE_TIMER,
+  DATA_ITEM_TYPE_ROLLBACK_TO
 } DATA_ITEM_TYPE;
 
 CUBRID_LOG_STAGE g_stage = CUBRID_LOG_STAGE_CONFIGURATION;
@@ -145,6 +146,8 @@ data_item_type_to_string (int data_item_type)
       return "DCL";
     case 3:
       return "TIMER";
+    case 4:
+      return "ROLLBACK_TO";
     default:
       assert (0);
       return "";
@@ -1578,6 +1581,8 @@ cubrid_log_make_dml (char **data_info, DML * dml)
 	}
     }
 
+  ptr = or_unpack_int64 (ptr, (INT64 *) &dml->rec_lsa);
+
   *data_info = ptr;
 
   return CUBRID_LOG_SUCCESS;
@@ -1603,6 +1608,20 @@ cubrid_log_make_dcl (char **data_info, DCL * dcl)
 
   ptr = or_unpack_int (ptr, &dcl->dcl_type);
   ptr = or_unpack_int64 (ptr, &dcl->timestamp);
+
+  *data_info = ptr;
+
+  return CUBRID_LOG_SUCCESS;
+}
+
+inline static int
+cubrid_log_make_rollback_to (char **data_info, ROLLBACK_TO * rollback_to)
+{
+  char *ptr;
+
+  ptr = *data_info;
+
+  ptr = or_unpack_int64 (ptr, (INT64 *) &rollback_to->lsa);
 
   *data_info = ptr;
 
@@ -1661,6 +1680,14 @@ cubrid_log_make_data_item (char **data_info, DATA_ITEM_TYPE data_item_type, CUBR
 
     case DATA_ITEM_TYPE_TIMER:
       if ((err_code = cubrid_log_make_timer (data_info, &data_item->timer)) != CUBRID_LOG_SUCCESS)
+	{
+	  CUBRID_LOG_ERROR_HANDLING (err_code, NULL);
+	}
+
+      break;
+
+    case DATA_ITEM_TYPE_ROLLBACK_TO:
+      if ((err_code = cubrid_log_make_rollback_to (data_info, &data_item->rollback_to)) != CUBRID_LOG_SUCCESS)
 	{
 	  CUBRID_LOG_ERROR_HANDLING (err_code, NULL);
 	}
@@ -1908,6 +1935,10 @@ cubrid_log_clear_data_item (DATA_ITEM_TYPE data_item_type, CUBRID_DATA_ITEM * da
       break;
 
     case DATA_ITEM_TYPE_TIMER:
+      /* nothing to do */
+      break;
+
+    case DATA_ITEM_TYPE_ROLLBACK_TO:
       /* nothing to do */
       break;
 

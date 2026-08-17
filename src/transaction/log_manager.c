@@ -337,8 +337,14 @@ static int cdc_get_ovfdata_from_log (THREAD_ENTRY * thread_p, LOG_PAGE * log_pag
 static int cdc_find_primary_key (THREAD_ENTRY * thread_p, OID classoid, int repr_id, int *num_attr, int **pk_attr_id);
 static int cdc_make_ddl_loginfo (char *supplement_data, int trid, const char *user, CDC_LOGINFO_ENTRY * ddl_entry);
 static int cdc_make_dcl_loginfo (time_t at_time, int trid, char *user, int log_type, CDC_LOGINFO_ENTRY * dcl_entry);
+static int cdc_make_rollback_loginfo (int trid, char *user, const LOG_LSA * rollback_lsa,
+				      CDC_LOGINFO_ENTRY * rollback_entry);
 static int cdc_make_timer_loginfo (time_t at_time, int trid, char *user, CDC_LOGINFO_ENTRY * timer_entry);
 static int cdc_find_user (THREAD_ENTRY * thread_p, LOG_LSA lsa, int trid, char **user);
+
+/* 64-bit orderable key for an LSA (pageid:48 | offset:16); numeric order == LSA order.
+ * Shared with the cubrid_log consumer: DML data items and CDC_ROLLBACK_TO markers carry this key. */
+#define CDC_LSA_TO_KEY(lsa) ((INT64) ((((INT64) (lsa)->pageid) << 16) | ((INT64) (lsa)->offset & 0xFFFF)))
 static int cdc_compare_undoredo_dbvalue (const db_value * new_value, const db_value * old_value);
 static int cdc_put_value_to_loginfo (db_value * new_value, char **ptr);
 
@@ -10814,6 +10820,59 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 
       break;
 
+    case LOG_SYSOP_END:
+      {
+	/* Partial rollback visibility: every server-side undo of logged changes — user ROLLBACK TO
+	 * SAVEPOINT and statement-savepoint rollback (log_abort_partial) as well as statement-level
+	 * system operation aborts (qexec_execute_insert/update/delete/merge) — ends with a
+	 * LOG_SYSOP_END record of type LOG_SYSOP_END_ABORT whose lastparent_lsa is the rewind
+	 * target.  Surface it as a CDC_ROLLBACK_TO marker so the consumer can discard the
+	 * supplemental DML items that were produced inside the undone range (their record lsa key
+	 * is greater than the marker's).  Without this, undone DML stays in the stream as phantoms. */
+	LOG_REC_SYSOP_END *sysop_end;
+
+	LOG_READ_ADVANCE_WHEN_DOESNT_FIT (thread_p, sizeof (*sysop_end), process_lsa, log_page_p);
+
+	CDC_CHECK_TEMP_LOGPAGE (process_lsa, &tmpbuf_index, log_page_p);
+
+	sysop_end = (LOG_REC_SYSOP_END *) (log_page_p->area + process_lsa->offset);
+
+	if (sysop_end->type != LOG_SYSOP_END_ABORT)
+	  {
+	    /* only an abort undoes the enclosed changes; the other end types keep them */
+	    goto end;
+	  }
+
+	if (cdc_Gl.producer.tran_ignore.count (trid) != 0)
+	  {
+	    goto end;
+	  }
+
+	if (cdc_Gl.producer.tran_user.count (trid) == 0)
+	  {
+	    /* no CDC-relevant item has been produced for this trid; nothing to discard */
+	    goto end;
+	  }
+
+        /* *INDENT-OFF* */
+        tran_user = cdc_Gl.producer.tran_user.at (trid);
+        /* *INDENT-ON* */
+
+	if (!cdc_is_filtered_user (tran_user))
+	  {
+	    break;
+	  }
+
+	if ((error =
+	     cdc_make_rollback_loginfo (trid, tran_user, &sysop_end->lastparent_lsa,
+					log_info_entry)) != ER_CDC_LOGINFO_ENTRY_GENERATED)
+	  {
+	    goto error;
+	  }
+
+	break;
+      }
+
     case LOG_SUPPLEMENTAL_INFO:
       {
 	/*supplemental log info types : time, tran_user, undo image */
@@ -10944,7 +11003,7 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 	    error =
 	      cdc_make_dml_loginfo (thread_p, trid, tran_user,
 				    rec_type == LOG_SUPPLEMENT_INSERT ? CDC_INSERT : CDC_TRIGGER_INSERT, classoid, NULL,
-				    &redo_recdes, log_info_entry, false);
+				    &redo_recdes, log_info_entry, &cur_log_rec_lsa, false);
 
 	    if (error != ER_CDC_LOGINFO_ENTRY_GENERATED)
 	      {
@@ -10985,14 +11044,14 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 
 		error =
 		  cdc_make_dml_loginfo (thread_p, trid, tran_user, CDC_TRIGGER_INSERT, classoid, NULL, &redo_recdes,
-					log_info_entry, false);
+					log_info_entry, &cur_log_rec_lsa, false);
 	      }
 	    else
 	      {
 		error =
 		  cdc_make_dml_loginfo (thread_p, trid, tran_user,
 					rec_type == LOG_SUPPLEMENT_UPDATE ? CDC_UPDATE : CDC_TRIGGER_UPDATE, classoid,
-					&undo_recdes, &redo_recdes, log_info_entry, false);
+					&undo_recdes, &redo_recdes, log_info_entry, &cur_log_rec_lsa, false);
 	      }
 
 	    if (error == ER_CDC_IGNORE_LOG_INFO || error == ER_CDC_IGNORE_LOG_INFO_INTERNAL)
@@ -11028,7 +11087,7 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 	    error =
 	      cdc_make_dml_loginfo (thread_p, trid, tran_user,
 				    rec_type == LOG_SUPPLEMENT_DELETE ? CDC_DELETE : CDC_TRIGGER_DELETE, classoid,
-				    &undo_recdes, NULL, log_info_entry, false);
+				    &undo_recdes, NULL, log_info_entry, &cur_log_rec_lsa, false);
 
 	    if (error != ER_CDC_LOGINFO_ENTRY_GENERATED)
 	      {
@@ -12906,7 +12965,7 @@ cdc_get_attribute_size (DB_VALUE * value)
 int
 cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYPE dml_type,
 		      OID classoid, RECDES * undo_recdes, RECDES * redo_recdes, CDC_LOGINFO_ENTRY * dml_entry,
-		      bool is_flashback)
+		      const LOG_LSA * rec_lsa, bool is_flashback)
 {
   /*this is for constructing dml data item */
   int has_pk = 0;
@@ -13125,7 +13184,7 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
 
   metadata_length = OR_INT_SIZE + OR_INT_SIZE + DB_MAX_USER_LENGTH + OR_INT_SIZE + OR_INT_SIZE + OR_BIGINT_SIZE +
     OR_INT_SIZE + (attr_info.num_values * OR_INT_SIZE) + OR_INT_SIZE + (attr_info.num_values * OR_INT_SIZE) +
-    attr_info.num_values * OR_INT_SIZE * 2;
+    attr_info.num_values * OR_INT_SIZE * 2 + OR_BIGINT_SIZE /* trailing record lsa key (CDC only) */ ;
 
   /* sum of the pad size through aligning the attributes (changed column, cond column) */
   align_size = MAX_ALIGNMENT * attr_info.num_values * 2;
@@ -13326,6 +13385,15 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
 	}
       break;
     }
+  if (!is_flashback)
+    {
+      /* trailing record lsa key: lets the consumer apply CDC_ROLLBACK_TO markers
+       * (discard buffered items of the trid whose key is greater than the marker's).
+       * flashback keeps its original layout untouched. */
+      assert (rec_lsa != NULL);
+      ptr = or_pack_int64 (ptr, CDC_LSA_TO_KEY (rec_lsa));
+    }
+
   /*malloc the size of log_info and packing and  entry->log_info will pointing it  */
 
   dml_entry->length = ptr - start_ptr;
@@ -13552,6 +13620,70 @@ cdc_make_dcl_loginfo (time_t at_time, int trid, char *user, int log_type, CDC_LO
 
   free_and_init (loginfo_buf);
   cdc_log ("cdc_make_dcl_loginfo : success to generated dcl log info. length:%d", dcl_entry->length);
+
+  return ER_CDC_LOGINFO_ENTRY_GENERATED;
+
+error:
+
+  if (loginfo_buf != NULL)
+    {
+      free_and_init (loginfo_buf);
+    }
+
+  return error_code;
+}
+
+/*
+ * cdc_make_rollback_loginfo - pack a CDC_ROLLBACK_TO marker data item
+ *
+ *   rollback_lsa(in): rewind target (lastparent_lsa of the aborted system operation);
+ *                     packed as the orderable lsa key so the consumer can compare it
+ *                     with the key carried by each DML data item
+ */
+static int
+cdc_make_rollback_loginfo (int trid, char *user, const LOG_LSA * rollback_lsa, CDC_LOGINFO_ENTRY * rollback_entry)
+{
+  CDC_DATAITEM_TYPE dataitem_type = CDC_ROLLBACK_TO;
+  char *ptr, *start_ptr;
+  int length = 0;
+  char *loginfo_buf = NULL;
+
+  int error_code = NO_ERROR;
+
+  cdc_log ("cdc_make_rollback_loginfo : started with trid:%d, transaction user:%s, rollback lsa:(%lld|%d)", trid,
+	   user, (long long int) rollback_lsa->pageid, (int) rollback_lsa->offset);
+
+  length = (OR_INT_SIZE + OR_INT_SIZE + or_packed_string_length (user, NULL) + OR_INT_SIZE + OR_BIGINT_SIZE);
+
+  loginfo_buf = (char *) malloc (length * 2 + MAX_ALIGNMENT);
+  if (loginfo_buf == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, length * 2 + MAX_ALIGNMENT);
+      error_code = ER_OUT_OF_VIRTUAL_MEMORY;
+      goto error;
+    }
+
+  ptr = start_ptr = PTR_ALIGN (loginfo_buf, MAX_ALIGNMENT);
+  ptr = or_pack_int (ptr, 0);	/* dummy for log info length */
+  ptr = or_pack_int (ptr, trid);
+  ptr = or_pack_string (ptr, user);
+  ptr = or_pack_int (ptr, dataitem_type);
+  ptr = or_pack_int64 (ptr, CDC_LSA_TO_KEY (rollback_lsa));
+  rollback_entry->length = ptr - start_ptr;
+  or_pack_int (start_ptr, rollback_entry->length);
+
+  rollback_entry->log_info = (char *) malloc (rollback_entry->length);
+  if (rollback_entry->log_info == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, rollback_entry->length);
+      error_code = ER_OUT_OF_VIRTUAL_MEMORY;
+      goto error;
+    }
+
+  memcpy (rollback_entry->log_info, start_ptr, rollback_entry->length);
+
+  free_and_init (loginfo_buf);
+  cdc_log ("cdc_make_rollback_loginfo : success to generated rollback log info. length:%d", rollback_entry->length);
 
   return ER_CDC_LOGINFO_ENTRY_GENERATED;
 
