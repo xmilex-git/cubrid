@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#define CUBRID_LOG_INVALID_TABLE_NAME_ARR_SIZE  (-36)
+#define CUBRID_LOG_INVALID_TABLE_NAME           (-35)
 #define CUBRID_LOG_UNAVAILABLE_CDC_SERVER        (-34)
 #define CUBRID_LOG_FAILED_LOGIN                 (-33)
 #define CUBRID_LOG_INVALID_PASSWORD             (-32)
@@ -116,6 +118,22 @@ struct rollback_to
 				 * DML.rec_lsa is greater than this key were undone by the server */
 };
 
+typedef struct relation RELATION;
+struct relation
+{
+  /* relation dictionary item: maps a classoid to its current owner/table name so the
+   * consumer can route events without reading the (DBA-only) _db_class catalog.
+   * The server guarantees it precedes the first DML/DDL item of the classoid in a
+   * session and re-sends it after every reconnect/find_lsa (workspace#67, ADR 0011 D4).
+   * owner and table are separated by the engine; both point into the extraction
+   * buffer (valid until cubrid_log_clear_log_item). Empty strings mean the name
+   * could no longer be resolved (class already dropped when the lagging log was
+   * extracted — narrow window in 1.0 since captured-table DDL halts the stream). */
+  uint64_t classoid;
+  char *owner;
+  char *table;
+};
+
 typedef union cubrid_data_item CUBRID_DATA_ITEM;
 union cubrid_data_item
 {
@@ -124,6 +142,7 @@ union cubrid_data_item
   DCL dcl;
   TIMER timer;
   ROLLBACK_TO rollback_to;
+  RELATION relation;
 };
 
 typedef struct cubrid_log_item CUBRID_LOG_ITEM;
@@ -147,6 +166,7 @@ extern "C"
   extern int cubrid_log_set_max_log_item (int max_log_item);
   extern int cubrid_log_set_all_in_cond (int retrieve_all);
   extern int cubrid_log_set_extraction_table (uint64_t * classoid_arr, int arr_size);
+  extern int cubrid_log_set_extraction_table_names (char **table_name_arr, int arr_size);
   extern int cubrid_log_set_extraction_user (char **user_arr, int arr_size);
 
 /* API for the preparation step */

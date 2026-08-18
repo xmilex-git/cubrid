@@ -97,7 +97,8 @@ typedef enum
   DATA_ITEM_TYPE_DML,
   DATA_ITEM_TYPE_DCL,
   DATA_ITEM_TYPE_TIMER,
-  DATA_ITEM_TYPE_ROLLBACK_TO
+  DATA_ITEM_TYPE_ROLLBACK_TO,
+  DATA_ITEM_TYPE_RELATION
 } DATA_ITEM_TYPE;
 
 CUBRID_LOG_STAGE g_stage = CUBRID_LOG_STAGE_CONFIGURATION;
@@ -111,6 +112,9 @@ bool g_all_in_cond = false;
 
 uint64_t *g_extraction_table;
 int g_extraction_table_count = 0;
+
+char **g_extraction_table_names;
+int g_extraction_table_name_count = 0;
 
 char **g_extraction_user;
 int g_extraction_user_count = 0;
@@ -148,6 +152,8 @@ data_item_type_to_string (int data_item_type)
       return "TIMER";
     case 4:
       return "ROLLBACK_TO";
+    case 5:
+      return "RELATION";
     default:
       assert (0);
       return "";
@@ -539,6 +545,76 @@ cubrid_log_set_extraction_table (uint64_t * classoid_arr, int arr_size)
 }
 
 /*
+ * cubrid_log_set_extraction_table_names () - name-based extraction target list
+ *   return:
+ *   table_name_arr(in): array of "owner.table" names (CUBRID unique_name syntax);
+ *                       the server resolves each name to a classoid at session start
+ *                       and warns/skips names that do not resolve (workspace#67, ADR 0011 D3)
+ *   arr_size(in):
+ */
+int
+cubrid_log_set_extraction_table_names (char **table_name_arr, int arr_size)
+{
+  int i, j;
+  char **new_extraction_table_names = NULL;
+
+  if (g_stage != CUBRID_LOG_STAGE_CONFIGURATION)
+    {
+      return CUBRID_LOG_INVALID_FUNC_CALL_STAGE;
+    }
+
+  if ((table_name_arr == NULL && arr_size != 0) || (table_name_arr != NULL && arr_size == 0))
+    {
+      return CUBRID_LOG_INVALID_TABLE_NAME_ARR_SIZE;
+    }
+
+  for (i = 0; i < arr_size; i++)
+    {
+      if (table_name_arr[i] == NULL)
+	{
+	  return CUBRID_LOG_INVALID_TABLE_NAME;
+	}
+    }
+
+  if (arr_size > 0)
+    {
+      new_extraction_table_names = (char **) malloc (sizeof (char *) * arr_size);
+      if (new_extraction_table_names == NULL)
+	{
+	  return CUBRID_LOG_FAILED_MALLOC;
+	}
+
+      for (i = 0; i < arr_size; i++)
+	{
+	  new_extraction_table_names[i] = strdup (table_name_arr[i]);
+	  if (new_extraction_table_names[i] == NULL)
+	    {
+	      for (j = 0; j < i; j++)
+		{
+		  free_and_init (new_extraction_table_names[j]);
+		}
+	      free_and_init (new_extraction_table_names);
+	      return CUBRID_LOG_FAILED_MALLOC;
+	    }
+	}
+    }
+
+  if (g_extraction_table_names != NULL)
+    {
+      for (i = 0; i < g_extraction_table_name_count; i++)
+	{
+	  free_and_init (g_extraction_table_names[i]);
+	}
+      free_and_init (g_extraction_table_names);
+    }
+
+  g_extraction_table_names = new_extraction_table_names;
+  g_extraction_table_name_count = arr_size;
+
+  return CUBRID_LOG_SUCCESS;
+}
+
+/*
  * cubrid_log_set_extraction_user () -
  *   return:
  *   user_arr(in):
@@ -754,6 +830,12 @@ cubrid_log_send_configurations (void)
 
   request_size += (OR_BIGINT_SIZE * g_extraction_table_count);
 
+  request_size += OR_INT_SIZE;
+  for (i = 0; i < g_extraction_table_name_count; i++)
+    {
+      request_size += or_packed_string_length (g_extraction_table_names[i], NULL);
+    }
+
   a_request = (char *) malloc (request_size + MAX_ALIGNMENT);
   if (a_request == NULL)
     {
@@ -778,6 +860,13 @@ cubrid_log_send_configurations (void)
   for (i = 0; i < g_extraction_table_count; i++)
     {
       ptr = or_pack_int64 (ptr, (INT64) g_extraction_table[i]);
+    }
+
+  ptr = or_pack_int (ptr, g_extraction_table_name_count);
+
+  for (i = 0; i < g_extraction_table_name_count; i++)
+    {
+      ptr = or_pack_string (ptr, g_extraction_table_names[i]);
     }
 
   request_size = (int) (ptr - request);
@@ -1629,6 +1718,22 @@ cubrid_log_make_rollback_to (char **data_info, ROLLBACK_TO * rollback_to)
 }
 
 inline static int
+cubrid_log_make_relation (char **data_info, RELATION * relation)
+{
+  char *ptr;
+
+  ptr = *data_info;
+
+  ptr = or_unpack_int64 (ptr, (INT64 *) &relation->classoid);
+  ptr = or_unpack_string_nocopy (ptr, &relation->owner);
+  ptr = or_unpack_string_nocopy (ptr, &relation->table);
+
+  *data_info = ptr;
+
+  return CUBRID_LOG_SUCCESS;
+}
+
+inline static int
 cubrid_log_make_timer (char **data_info, TIMER * timer)
 {
   char *ptr;
@@ -1688,6 +1793,14 @@ cubrid_log_make_data_item (char **data_info, DATA_ITEM_TYPE data_item_type, CUBR
 
     case DATA_ITEM_TYPE_ROLLBACK_TO:
       if ((err_code = cubrid_log_make_rollback_to (data_info, &data_item->rollback_to)) != CUBRID_LOG_SUCCESS)
+	{
+	  CUBRID_LOG_ERROR_HANDLING (err_code, NULL);
+	}
+
+      break;
+
+    case DATA_ITEM_TYPE_RELATION:
+      if ((err_code = cubrid_log_make_relation (data_info, &data_item->relation)) != CUBRID_LOG_SUCCESS)
 	{
 	  CUBRID_LOG_ERROR_HANDLING (err_code, NULL);
 	}
@@ -1942,6 +2055,10 @@ cubrid_log_clear_data_item (DATA_ITEM_TYPE data_item_type, CUBRID_DATA_ITEM * da
       /* nothing to do */
       break;
 
+    case DATA_ITEM_TYPE_RELATION:
+      /* owner/table point into the extraction buffer; nothing to free */
+      break;
+
     default:
       assert (0);
     }
@@ -2094,6 +2211,19 @@ cubrid_log_reset_globals (void)
     }
 
   g_extraction_user_count = 0;
+
+  if (g_extraction_table_names != NULL)
+    {
+      for (i = 0; i < g_extraction_table_name_count; i++)
+	{
+	  free_and_init (g_extraction_table_names[i]);
+	}
+
+      free_and_init (g_extraction_table_names);
+      g_extraction_table_names = NULL;
+    }
+
+  g_extraction_table_name_count = 0;
 
   g_next_lsa = LSA_INITIALIZER;
 

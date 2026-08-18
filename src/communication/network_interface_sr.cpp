@@ -11418,6 +11418,7 @@ scdc_start_session (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int
   char *ptr;
   int error_code;
   int max_log_item, extraction_timeout, all_in_cond, num_extraction_user, num_extraction_class;
+  int num_extraction_name = 0;
   uint64_t *extraction_classoids = NULL;
   char **extraction_user = NULL;
 
@@ -11525,9 +11526,98 @@ scdc_start_session (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int
 	}
     }
 
+  /* name-based extraction targets ("owner.table" unique_name), resolved to classoids here so the
+   * classoid never has to cross the client API (workspace#67, ADR 0011 D3).  A name that does not
+   * resolve (not created yet, or dropped) is warned and skipped — same rule as ADR 0008 D3: a
+   * mid-stream CREATE is not captured.  Resolved classoids are appended to the classoid filter. */
+  if ((int) (ptr - request) < reqlen)
+    {
+      ptr = or_unpack_int (ptr, &num_extraction_name);
+    }
+  else
+    {
+      /* request from a client built before the name field existed (lockstep shipping should
+       * prevent this, but reading past the request would be garbage — #61's skew lesson) */
+      num_extraction_name = 0;
+    }
+
+  if (num_extraction_name > 0)
+    {
+      uint64_t *merged_classoids;
+      int num_merged = num_extraction_class;
+
+      merged_classoids = (uint64_t *) malloc (sizeof (uint64_t) * (num_extraction_class + num_extraction_name));
+      if (merged_classoids == NULL)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
+		  sizeof (uint64_t) * (num_extraction_class + num_extraction_name));
+	  error_code = ER_OUT_OF_VIRTUAL_MEMORY;
+	  goto error;
+	}
+
+      if (num_extraction_class > 0)
+	{
+	  memcpy (merged_classoids, extraction_classoids, sizeof (uint64_t) * num_extraction_class);
+	}
+
+      for (int i = 0; i < num_extraction_name; i++)
+	{
+	  char *extraction_name = NULL;
+	  OID resolved_oid = OID_INITIALIZER;
+
+	  ptr = or_unpack_string_nocopy (ptr, &extraction_name);
+
+	  if (extraction_name == NULL)
+	    {
+	      continue;
+	    }
+
+	  if (xlocator_find_class_oid (thread_p, extraction_name, &resolved_oid, NULL_LOCK) == LC_CLASSNAME_EXIST
+	      && !OID_ISNULL (&resolved_oid))
+	    {
+	      uint64_t b_classoid;
+
+	      memcpy (&b_classoid, &resolved_oid, sizeof (uint64_t));
+	      merged_classoids[num_merged++] = b_classoid;
+
+	      cdc_log ("%s : extraction table '%s' resolved to classoid (%llu)", __func__, extraction_name,
+		       (unsigned long long) b_classoid);
+	    }
+	  else
+	    {
+	      /* warn and skip (ADR 0011 D3) — a notification is enough: the operator-visible
+	       * trace must survive a release build, where er_log_debug is compiled out */
+	      er_set (ER_NOTIFICATION_SEVERITY, ARG_FILE_LINE, ER_LC_UNKNOWN_CLASSNAME, 1, extraction_name);
+	      cdc_log ("%s : extraction table '%s' does not resolve to a class; skipped", __func__, extraction_name);
+	    }
+	}
+
+      if (num_merged == 0)
+	{
+	  /* every requested name failed to resolve and no classoid filter was given.  An empty
+	   * filter means "capture everything" (cdc_is_filtered_class), which would silently turn
+	   * a fully-mistyped table list into a full-log session; keep a never-matching NULL
+	   * classoid instead so the session starts but captures nothing until reconfigured. */
+	  OID null_oid = OID_INITIALIZER;
+
+	  memcpy (&merged_classoids[0], &null_oid, sizeof (uint64_t));
+	  num_merged = 1;
+
+	  cdc_log ("%s : no extraction table name resolved; session captures nothing", __func__);
+	}
+
+      if (extraction_classoids != NULL)
+	{
+	  free_and_init (extraction_classoids);
+	}
+      extraction_classoids = merged_classoids;
+      num_extraction_class = num_merged;
+    }
+
   cdc_log
-  ("%s : max_log_item (%d), extraction_timeout (%d), all_in_cond (%d), num_extraction_user (%d), num_extraction_class (%d)",
-   __func__, max_log_item, extraction_timeout, all_in_cond, num_extraction_user, num_extraction_class);
+  ("%s : max_log_item (%d), extraction_timeout (%d), all_in_cond (%d), num_extraction_user (%d), num_extraction_class (%d), num_extraction_name (%d)",
+   __func__, max_log_item, extraction_timeout, all_in_cond, num_extraction_user, num_extraction_class,
+   num_extraction_name);
 
   error_code =
 	  cdc_set_configuration (max_log_item, extraction_timeout, all_in_cond, extraction_user, num_extraction_user,

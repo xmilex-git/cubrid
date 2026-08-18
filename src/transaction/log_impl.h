@@ -845,6 +845,10 @@ typedef struct cdc_producer
 /* *INDENT-OFF* */
   std::unordered_map <TRANID, char *> tran_user; /*to clear when log producer ends suddenly */
   std::unordered_map<TRANID, int > tran_ignore;
+  std::unordered_set<UINT64> announced_classes; /* classoids whose CDC_RELATION dictionary item was
+                                                 * already queued in this session; cleared whenever the
+                                                 * session/queue restarts so the dictionary is re-sent
+                                                 * (workspace#67, ADR 0011 D4) */
   /* *INDENT-ON* */
 } CDC_PRODUCER;
 
@@ -898,9 +902,12 @@ typedef enum cdc_dataitem_type
   CDC_DML,
   CDC_DCL,
   CDC_TIMER,
-  CDC_ROLLBACK_TO		/* partial rollback marker: every buffered DML of the trid whose
+  CDC_ROLLBACK_TO,		/* partial rollback marker: every buffered DML of the trid whose
 				 * record lsa key is greater than the marker's lsa key was undone
 				 * by the server and must be discarded by the consumer */
+  CDC_RELATION			/* relation dictionary: (classoid, owner, table) announced before
+				 * the first item of the classoid in a session so the consumer can
+				 * route events without reading _db_class (workspace#67, ADR 0011 D4) */
 } CDC_DATAITEM_TYPE;
 
 typedef enum cdc_dcl_type

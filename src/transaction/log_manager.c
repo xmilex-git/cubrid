@@ -339,6 +339,10 @@ static int cdc_make_ddl_loginfo (char *supplement_data, int trid, const char *us
 static int cdc_make_dcl_loginfo (time_t at_time, int trid, char *user, int log_type, CDC_LOGINFO_ENTRY * dcl_entry);
 static int cdc_make_rollback_loginfo (int trid, char *user, const LOG_LSA * rollback_lsa,
 				      CDC_LOGINFO_ENTRY * rollback_entry);
+static int cdc_make_relation_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, OID classoid,
+				      CDC_LOGINFO_ENTRY * relation_entry);
+static void cdc_announce_relation (THREAD_ENTRY * thread_p, int trid, char *user, OID classoid,
+				   const LOG_LSA * rec_lsa);
 static int cdc_make_timer_loginfo (time_t at_time, int trid, char *user, CDC_LOGINFO_ENTRY * timer_entry);
 static int cdc_find_user (THREAD_ENTRY * thread_p, LOG_LSA lsa, int trid, char **user);
 
@@ -11000,6 +11004,8 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 		goto error;
 	      }
 
+	    cdc_announce_relation (thread_p, trid, tran_user, classoid, &cur_log_rec_lsa);
+
 	    error =
 	      cdc_make_dml_loginfo (thread_p, trid, tran_user,
 				    rec_type == LOG_SUPPLEMENT_INSERT ? CDC_INSERT : CDC_TRIGGER_INSERT, classoid, NULL,
@@ -11030,6 +11036,8 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 	      {
 		goto error;
 	      }
+
+	    cdc_announce_relation (thread_p, trid, tran_user, classoid, &cur_log_rec_lsa);
 
 	    if (undo_recdes.type == REC_ASSIGN_ADDRESS)
 	      {
@@ -11084,6 +11092,8 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 		goto error;
 	      }
 
+	    cdc_announce_relation (thread_p, trid, tran_user, classoid, &cur_log_rec_lsa);
+
 	    error =
 	      cdc_make_dml_loginfo (thread_p, trid, tran_user,
 				    rec_type == LOG_SUPPLEMENT_DELETE ? CDC_DELETE : CDC_TRIGGER_DELETE, classoid,
@@ -11096,6 +11106,23 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 
 	    break;
 	  case LOG_SUPPLEMENT_DDL:
+	    {
+	      /* peek the class OID (| ddl_type | obj type | class OID | ... |) so the relation
+	       * dictionary precedes the DDL item as well; the same filter conditions as
+	       * cdc_make_ddl_loginfo apply */
+	      char *supp_ptr = PTR_ALIGN (supplement_data, MAX_ALIGNMENT);
+	      int peek_dummy;
+
+	      supp_ptr = or_unpack_int (supp_ptr, &peek_dummy);
+	      supp_ptr = or_unpack_int (supp_ptr, &peek_dummy);
+	      supp_ptr = or_unpack_oid (supp_ptr, &classoid);
+
+	      if (!OID_ISNULL (&classoid) && !oid_is_system_class (&classoid) && cdc_is_filtered_class (classoid))
+		{
+		  cdc_announce_relation (thread_p, trid, tran_user, classoid, &cur_log_rec_lsa);
+		}
+	    }
+
 	    error = cdc_make_ddl_loginfo (supplement_data, trid, tran_user, log_info_entry);
 
 	    if (error == ER_CDC_IGNORE_LOG_INFO)
@@ -13697,6 +13724,192 @@ error:
   return error_code;
 }
 
+/*
+ * cdc_make_relation_loginfo - pack a CDC_RELATION dictionary data item (classoid, owner, table)
+ *
+ *   The name is resolved at extraction time, so it is the class's *current* name; a rename or
+ *   drop between the logged operation and extraction could make it stale, but in 1.0 that
+ *   window is narrow because captured-table DDL halts the stream (ADR 0008).  When the class
+ *   is already gone (lagging log of a dropped table — flashback's invalid_class case), owner
+ *   and table are packed as empty strings so the consumer can surface the classoid explicitly.
+ */
+static int
+cdc_make_relation_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, OID classoid,
+			   CDC_LOGINFO_ENTRY * relation_entry)
+{
+  char *ptr, *start_ptr;
+  int length = 0;
+  char *loginfo_buf = NULL;
+  char *classname = NULL;
+  const char *owner_name = "";
+  const char *table_name = "";
+  char owner_buf[DB_MAX_IDENTIFIER_LENGTH + 1];
+  uint64_t b_classoid;
+  const char *dot;
+
+  int error_code = NO_ERROR;
+
+  if (heap_get_class_name (thread_p, &classoid, &classname) != NO_ERROR || classname == NULL)
+    {
+      /* class already dropped when this lagging log record was extracted; announce with
+       * empty names (flashback invalid_class precedent) so routing failure is explicit */
+      er_clear ();
+      cdc_log ("cdc_make_relation_loginfo : cannot resolve a name for class (%d|%d|%d); "
+	       "announcing with empty owner/table", OID_AS_ARGS (&classoid));
+    }
+  else
+    {
+      /* class names are stored as unique_name "owner.table"; a CUBRID identifier can never
+       * contain a dot, so the first dot is an unambiguous separator */
+      dot = strchr (classname, '.');
+      if (dot != NULL && (dot - classname) <= DB_MAX_IDENTIFIER_LENGTH)
+	{
+	  memcpy (owner_buf, classname, dot - classname);
+	  owner_buf[dot - classname] = '\0';
+	  owner_name = owner_buf;
+	  table_name = dot + 1;
+	}
+      else
+	{
+	  table_name = classname;
+	}
+    }
+
+  memcpy (&b_classoid, &classoid, sizeof (uint64_t));
+
+  cdc_log ("cdc_make_relation_loginfo : started with trid:%d, transaction user:%s, classoid:%llu, "
+	   "owner:%s, table:%s", trid, user, (unsigned long long) b_classoid, owner_name, table_name);
+
+  length = (OR_INT_SIZE + OR_INT_SIZE + or_packed_string_length (user, NULL) + OR_INT_SIZE
+	    + OR_BIGINT_SIZE + or_packed_string_length (owner_name, NULL)
+	    + or_packed_string_length (table_name, NULL));
+
+  loginfo_buf = (char *) malloc (length * 2 + MAX_ALIGNMENT);
+  if (loginfo_buf == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, length * 2 + MAX_ALIGNMENT);
+      error_code = ER_OUT_OF_VIRTUAL_MEMORY;
+      goto error;
+    }
+
+  ptr = start_ptr = PTR_ALIGN (loginfo_buf, MAX_ALIGNMENT);
+  ptr = or_pack_int (ptr, 0);	/* dummy for log info length */
+  ptr = or_pack_int (ptr, trid);
+  ptr = or_pack_string (ptr, user);
+  ptr = or_pack_int (ptr, CDC_RELATION);
+  ptr = or_pack_int64 (ptr, (INT64) b_classoid);
+  ptr = or_pack_string (ptr, owner_name);
+  ptr = or_pack_string (ptr, table_name);
+  relation_entry->length = ptr - start_ptr;
+  or_pack_int (start_ptr, relation_entry->length);
+
+  relation_entry->log_info = (char *) malloc (relation_entry->length);
+  if (relation_entry->log_info == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, relation_entry->length);
+      error_code = ER_OUT_OF_VIRTUAL_MEMORY;
+      goto error;
+    }
+
+  memcpy (relation_entry->log_info, start_ptr, relation_entry->length);
+
+  free_and_init (loginfo_buf);
+
+  if (classname != NULL)
+    {
+      free_and_init (classname);
+    }
+
+  cdc_log ("cdc_make_relation_loginfo : success to generated relation log info. length:%d",
+	   relation_entry->length);
+
+  return ER_CDC_LOGINFO_ENTRY_GENERATED;
+
+error:
+
+  if (loginfo_buf != NULL)
+    {
+      free_and_init (loginfo_buf);
+    }
+
+  if (classname != NULL)
+    {
+      free_and_init (classname);
+    }
+
+  return error_code;
+}
+
+/*
+ * cdc_announce_relation - queue a CDC_RELATION dictionary item for the classoid unless it was
+ *                         already announced in this session (workspace#67, ADR 0011 D4)
+ *
+ *   Called from cdc_log_extract (producer thread only) right before the first DML/DDL item of a
+ *   filtered-in classoid is generated, so the dictionary always precedes the classoid's first use
+ *   in the stream.  Scope therefore equals the extraction filter (ADR 0011 D5).  The announce set
+ *   is cleared on session start / queue reinit so every (re)connected client receives it again.
+ *   Failures are not fatal: the class stays unannounced and the next item retries.
+ *
+ *   rec_lsa(in): lsa of the triggering log record; used as the entry's next_lsa so a client that
+ *                repositions to it re-reads the triggering record itself
+ */
+static void
+cdc_announce_relation (THREAD_ENTRY * thread_p, int trid, char *user, OID classoid, const LOG_LSA * rec_lsa)
+{
+  uint64_t b_classoid;
+  CDC_LOGINFO_ENTRY relation_entry;
+  CDC_LOGINFO_ENTRY *queue_entry = NULL;
+
+  memcpy (&b_classoid, &classoid, sizeof (uint64_t));
+
+  /* *INDENT-OFF* */
+  if (cdc_Gl.producer.announced_classes.count (b_classoid) != 0)
+    {
+      return;
+    }
+  /* *INDENT-ON* */
+
+  relation_entry.length = 0;
+  relation_entry.log_info = NULL;
+
+  if (cdc_make_relation_loginfo (thread_p, trid, user, classoid, &relation_entry) != ER_CDC_LOGINFO_ENTRY_GENERATED)
+    {
+      cdc_log ("cdc_announce_relation : failed to generate relation log info for classoid (%llu)",
+	       (unsigned long long) b_classoid);
+      return;
+    }
+
+  queue_entry = (CDC_LOGINFO_ENTRY *) malloc (sizeof (CDC_LOGINFO_ENTRY));
+  if (queue_entry == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (CDC_LOGINFO_ENTRY));
+      free_and_init (relation_entry.log_info);
+      return;
+    }
+
+  queue_entry->length = relation_entry.length;
+  queue_entry->log_info = relation_entry.log_info;
+  LSA_COPY (&queue_entry->next_lsa, rec_lsa);
+
+  /* *INDENT-OFF* */
+  if (cdc_Gl.loginfo_queue->produce (queue_entry))
+    {
+      cdc_Gl.producer.produced_queue_size += queue_entry->length;
+      LSA_COPY (&cdc_Gl.last_loginfo_queue_lsa, rec_lsa);
+      cdc_Gl.producer.announced_classes.insert (b_classoid);
+
+      cdc_log ("cdc_announce_relation : relation dictionary for classoid (%llu) is produced on LOG_LSA (%lld | %d)",
+	       (unsigned long long) b_classoid, LSA_AS_ARGS (rec_lsa));
+    }
+  else
+    {
+      /* queue full: drop and retry at the classoid's next item */
+      free_and_init (queue_entry->log_info);
+      free_and_init (queue_entry);
+    }
+  /* *INDENT-ON* */
+}
+
 static int
 cdc_make_timer_loginfo (time_t at_time, int trid, char *user, CDC_LOGINFO_ENTRY * timer_entry)
 {
@@ -14801,57 +15014,36 @@ cdc_reinitialize_queue (LOG_LSA * start_lsa)
       goto end;
     }
 
-  if (LSA_LT (&cdc_Gl.first_loginfo_queue_lsa, start_lsa) && LSA_GE (&cdc_Gl.last_loginfo_queue_lsa, start_lsa))
+  /* Always rebuild the queue from scratch and let the producer re-extract from start_lsa.
+   * The previous partial-trim reuse (keep entries in [start_lsa, last]) is no longer safe:
+   * a retained DML entry may have lost the CDC_RELATION dictionary entry that preceded it
+   * (already consumed or trimmed), which would break the dictionary-before-first-use
+   * contract for the repositioned client (workspace#67, ADR 0011 D4).  Re-extraction of
+   * the buffered range only costs a one-time producer catch-up per find_lsa. */
+  cdc_log ("cdc_reinitialize_queue : initialize the whole log infos in the queue (reposition to (%lld | %d))",
+	   LSA_AS_ARGS (start_lsa));
+
+  while (!cdc_Gl.loginfo_queue->is_empty ())
     {
-      cdc_log
-	("cdc_reinitialize_queue : reconstruct existing log info queue to remove the log infos before the LOG_LSA (%lld | %d)",
-	 LSA_AS_ARGS (start_lsa));
-
-      LOG_LSA next_consume_lsa = LSA_INITIALIZER;
-      LSA_COPY (&next_consume_lsa, &cdc_Gl.first_loginfo_queue_lsa);
-      while (LSA_LT (&next_consume_lsa, start_lsa))
+      cdc_Gl.loginfo_queue->consume (consume);
+      // TODO: please check consume is NULL
+      if (consume->log_info != NULL)
 	{
-	  cdc_Gl.loginfo_queue->consume (consume);
-	  // TODO: please check consume is NULL
-	  cdc_Gl.consumer.consumed_queue_size += consume->length;
-	  LSA_COPY (&next_consume_lsa, &consume->next_lsa);
-
-	  if (consume->log_info != NULL)
-	    {
-	      free_and_init (consume->log_info);
-	    }
-
-	  free_and_init (consume);
+	  free_and_init (consume->log_info);
 	}
 
-      LSA_COPY (&cdc_Gl.first_loginfo_queue_lsa, &next_consume_lsa);
-      cdc_Gl.producer.produced_queue_size -= cdc_Gl.consumer.consumed_queue_size;
-      cdc_Gl.consumer.consumed_queue_size = 0;
+      free_and_init (consume);
     }
-  else
-    {
-      cdc_log ("cdc_reinitialize_queue : initialize the whole log infos in the queue");
+  cdc_Gl.producer.produced_queue_size = 0;
+  cdc_Gl.consumer.consumed_queue_size = 0;
+  cdc_Gl.producer.is_reset_process_lsa = true;
 
-      while (!cdc_Gl.loginfo_queue->is_empty ())
-	{
-	  cdc_Gl.loginfo_queue->consume (consume);
-	  // TODO: please check consume is NULL
-	  if (consume->log_info != NULL)
-	    {
-	      free_and_init (consume->log_info);
-	    }
+  /* *INDENT-OFF* */
+  cdc_Gl.producer.announced_classes.clear ();
 
-	  free_and_init (consume);
-	}
-      cdc_Gl.producer.produced_queue_size = 0;
-      cdc_Gl.consumer.consumed_queue_size = 0;
-      cdc_Gl.producer.is_reset_process_lsa = true;
-
-          /* *INDENT-OFF* */
-    delete cdc_Gl.loginfo_queue;
-    cdc_Gl.loginfo_queue = new lockfree::circular_queue <CDC_LOGINFO_ENTRY *> (MAX_CDC_LOGINFO_QUEUE_ENTRY);
-          /* *INDENT-ON* */
-    }
+  delete cdc_Gl.loginfo_queue;
+  cdc_Gl.loginfo_queue = new lockfree::circular_queue <CDC_LOGINFO_ENTRY *> (MAX_CDC_LOGINFO_QUEUE_ENTRY);
+  /* *INDENT-ON* */
 
 end:
 
@@ -15410,6 +15602,10 @@ cdc_cleanup ()
 
   cdc_free_extraction_filter ();
 
+  /* *INDENT-OFF* */
+  cdc_Gl.producer.announced_classes.clear ();
+  /* *INDENT-ON* */
+
   assert (cdc_Gl.loginfo_queue != NULL);
 
   while (!cdc_Gl.loginfo_queue->is_empty ())
@@ -15527,6 +15723,11 @@ cdc_set_configuration (int max_log_item, int timeout, int all_in_cond, char **us
   /* if CDC client exits abnomaly, extraction user and classoids are not freed. 
    * So, reconnection requires these variables to be reset */
   cdc_free_extraction_filter ();
+
+  /* *INDENT-OFF* */
+  /* new session: the (re)connected client has no relation dictionary yet (ADR 0011 D4) */
+  cdc_Gl.producer.announced_classes.clear ();
+  /* *INDENT-ON* */
 
   cdc_Gl.consumer.extraction_timeout = timeout;
   cdc_Gl.consumer.max_log_item = max_log_item;
