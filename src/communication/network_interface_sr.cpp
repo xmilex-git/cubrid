@@ -11413,7 +11413,10 @@ smethod_invoke_fold_constants (THREAD_ENTRY *thread_p, unsigned int rid, char *r
 void
 scdc_start_session (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
 {
-  OR_ALIGNED_BUF (OR_INT_SIZE) a_reply;
+  /* success reply = error_code + node facts (ha_server_state string, db_creation) — workspace#70:
+   * the CDC client's HA halt guard (ADR 0010 D2) needs both, and serving them in-band removes the
+   * connector's last DBA-only dependency (SHOW LOG HEADER).  The error reply stays a bare int. */
+  OR_ALIGNED_BUF (OR_INT_SIZE + OR_INT_SIZE + 32 + OR_INT64_SIZE + MAX_ALIGNMENT) a_reply;
   char *reply = OR_ALIGNED_BUF_START (a_reply);
   char *ptr;
   int error_code;
@@ -11627,9 +11630,11 @@ scdc_start_session (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int
       goto error;
     }
 
-  or_pack_int (reply, error_code);
+  ptr = or_pack_int (reply, error_code);
+  ptr = or_pack_string (ptr, css_ha_server_state_string (css_ha_server_state ()));
+  ptr = or_pack_int64 (ptr, (INT64) log_Gl.hdr.db_creation);
 
-  (void) css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+  (void) css_send_data_to_client (thread_p->conn_entry, rid, reply, (int) (ptr - reply));
 
   return;
 
@@ -11655,7 +11660,7 @@ error:
 
   or_pack_int (reply, error_code);
 
-  (void) css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+  (void) css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_INT_SIZE);
 
   return;
 }

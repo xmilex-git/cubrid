@@ -106,6 +106,10 @@ CUBRID_LOG_STAGE g_stage = CUBRID_LOG_STAGE_CONFIGURATION;
 CSS_CONN_ENTRY *g_conn_entry;
 
 int g_connection_timeout = 300;	/* min/max: -1/360 (sec) */
+
+/* node facts from the START_SESSION reply (workspace#70) */
+char g_node_ha_state[32] = { 0, };
+INT64 g_node_db_creation = 0;
 int g_extraction_timeout = 300;	/* min/max: -1/360 (sec) */
 int g_max_log_item = 512;	/* min/max: 1/1024 */
 bool g_all_in_cond = false;
@@ -809,7 +813,9 @@ cubrid_log_send_configurations (void)
   unsigned short rid = 0;
 
   char *a_request;
-  OR_ALIGNED_BUF (OR_INT_SIZE) a_reply;
+  /* reply = error_code + node facts (ha_server_state string, db_creation) — workspace#70; a
+   * too-small registered buffer would make css_receive_data truncate the packet and fail */
+  OR_ALIGNED_BUF (OR_INT_SIZE + OR_INT_SIZE + 32 + OR_INT64_SIZE + MAX_ALIGNMENT) a_reply;
   char *request, *ptr;
   char *reply = OR_ALIGNED_BUF_START (a_reply);
   int request_size, i;
@@ -887,13 +893,13 @@ cubrid_log_send_configurations (void)
 				 g_connection_timeout);
     }
 
-  if (recv_data == NULL || recv_data_size != sizeof (int))
+  if (recv_data == NULL || recv_data_size < (int) sizeof (int))
     {
-      CUBRID_LOG_ERROR_HANDLING (CUBRID_LOG_FAILED_CONNECT, "recv_data is %s, receive data size : %d (should be %d)\n",
+      CUBRID_LOG_ERROR_HANDLING (CUBRID_LOG_FAILED_CONNECT, "recv_data is %s, receive data size : %d (should be >= %d)\n",
 				 recv_data ? "not null" : "null", recv_data_size, sizeof (int));
     }
 
-  or_unpack_int (recv_data, &reply_code);
+  ptr = or_unpack_int (recv_data, &reply_code);
 
   if (reply_code == ER_CDC_NOT_AVAILABLE)
     {
@@ -904,6 +910,24 @@ cubrid_log_send_configurations (void)
     {
       CUBRID_LOG_ERROR_HANDLING (CUBRID_LOG_FAILED_CONNECT,
 				 "Failed to connect to the server. reply code from server is %d\n", reply_code);
+    }
+
+  /* node facts appended to the success reply (workspace#70): live ha_server_state + db_creation.
+   * Absent on a pre-#70 server; this diagnostic harness stays tolerant (facts zeroed), unlike the
+   * Debezium connector, which requires them (ADR 0011 D10). */
+  g_node_ha_state[0] = '\0';
+  g_node_db_creation = 0;
+  if (recv_data_size > (int) (ptr - recv_data))
+    {
+      char *state_str = NULL;
+
+      ptr = or_unpack_string_nocopy (ptr, &state_str);
+      if (state_str != NULL)
+	{
+	  strncpy (g_node_ha_state, state_str, sizeof (g_node_ha_state) - 1);
+	  g_node_ha_state[sizeof (g_node_ha_state) - 1] = '\0';
+	}
+      ptr = or_unpack_int64 (ptr, &g_node_db_creation);
     }
 
   free_and_init (a_request);
@@ -925,6 +949,32 @@ cubrid_log_error:
     }
 
   return err_code;
+}
+
+/*
+ * cubrid_log_get_node_facts () - node facts of the connected server, from the START_SESSION
+ *                                reply (workspace#70): live ha_server_state string and
+ *                                db_creation (epoch seconds).  Empty/0 when the server did
+ *                                not send them (pre-#70 build).
+ */
+int
+cubrid_log_get_node_facts (char *ha_state_buf, int buf_size, int64_t * db_creation)
+{
+  if (ha_state_buf == NULL || buf_size <= 0 || db_creation == NULL)
+    {
+      return CUBRID_LOG_INVALID_OUT_PARAM;
+    }
+
+  if (g_stage != CUBRID_LOG_STAGE_PREPARATION && g_stage != CUBRID_LOG_STAGE_EXTRACTION)
+    {
+      return CUBRID_LOG_INVALID_FUNC_CALL_STAGE;
+    }
+
+  strncpy (ha_state_buf, g_node_ha_state, buf_size - 1);
+  ha_state_buf[buf_size - 1] = '\0';
+  *db_creation = (int64_t) g_node_db_creation;
+
+  return CUBRID_LOG_SUCCESS;
 }
 
 /* er_errid () is overwritten with ER_BO_CONNECT_FAILED at the end of every connect failure path

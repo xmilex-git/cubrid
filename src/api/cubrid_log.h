@@ -172,6 +172,7 @@ extern "C"
 
 /* API for the preparation step */
   extern int cubrid_log_connect_server (char *host, int port, char *dbname, char *id, char *password);
+  extern int cubrid_log_get_node_facts (char *ha_state_buf, int buf_size, int64_t * db_creation);
   extern int cubrid_log_find_lsa (time_t * timestamp, uint64_t * lsa);
 
 /* API for the extraction step */
