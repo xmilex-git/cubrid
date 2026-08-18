@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <time.h>
 
+#define CUBRID_LOG_NO_TABLE_PRIVILEGE           (-37)
 #define CUBRID_LOG_INVALID_TABLE_NAME_ARR_SIZE  (-36)
 #define CUBRID_LOG_INVALID_TABLE_NAME           (-35)
 #define CUBRID_LOG_UNAVAILABLE_CDC_SERVER        (-34)

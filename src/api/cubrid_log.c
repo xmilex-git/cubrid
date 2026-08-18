@@ -964,7 +964,7 @@ cubrid_log_db_login (char *hostname, char *dbname, char *username, char *passwor
 {
   MOP user;
   char dbname_at_hostname[CUB_MAXHOSTNAMELEN + CUBRID_LOG_MAX_DBNAME_LEN + 2] = { '\0', };
-  int restart_error, err_code;
+  int restart_error, err_code = CUBRID_LOG_FAILED_LOGIN;
 
   snprintf (dbname_at_hostname, sizeof (dbname_at_hostname), "%s@%s", dbname, hostname);
 
@@ -991,11 +991,53 @@ cubrid_log_db_login (char *hostname, char *dbname, char *username, char *passwor
       goto error;
     }
 
+  /* CDC authorization (ADR 0011 D1/D2, workspace#68): a DBA-group member may capture anything
+   * (backward compatible).  Any other account is authorized by holding SELECT on every requested
+   * capture target, so it must name its targets with cubrid_log_set_extraction_table_names ();
+   * an empty list means the whole log and a classoid list bypasses the name check, so both stay
+   * DBA-only.  Like every CUBRID object privilege this is client-side enforcement (D11) — the
+   * server-side CDC session carries no user identity — and it runs once at login, so a REVOKE
+   * does not stop a running session (it takes effect at the next reconnect). */
   if (!au_is_dba_group_member (user))
     {
-      cubrid_log_tracelog (__FILE__, __LINE__, __func__, true, CUBRID_LOG_FAILED_LOGIN,
-			   "DBA authorization failed. %s is not a member of DBA group\n", username);
-      goto error;
+      int i;
+
+      if (g_extraction_table_name_count == 0 || g_extraction_table_count > 0)
+	{
+	  err_code = CUBRID_LOG_NO_TABLE_PRIVILEGE;
+	  cubrid_log_tracelog (__FILE__, __LINE__, __func__, true, err_code,
+			       "CDC authorization failed. user %s is not a member of DBA group and %s. "
+			       "a non-DBA CDC session must specify its capture targets with "
+			       "cubrid_log_set_extraction_table_names ()\n", username,
+			       g_extraction_table_name_count ==
+			       0 ? "no extraction table names are specified" :
+			       "a classoid-based extraction list is specified");
+	  goto error;
+	}
+
+      for (i = 0; i < g_extraction_table_name_count; i++)
+	{
+	  MOP classmop = db_find_class (g_extraction_table_names[i]);
+
+	  if (classmop == NULL)
+	    {
+	      /* an unresolved name is skipped by the server at session start as well
+	       * (ADR 0011 D3, same rule as ADR 0008 D3), so there is nothing to check */
+	      cubrid_log_tracelog (__FILE__, __LINE__, __func__, false, CUBRID_LOG_SUCCESS,
+				   "extraction table %s does not resolve; privilege check skipped "
+				   "(the server will also skip it)\n", g_extraction_table_names[i]);
+	      continue;
+	    }
+
+	  if (au_check_class_authorization (classmop, AU_SELECT) != NO_ERROR)
+	    {
+	      err_code = CUBRID_LOG_NO_TABLE_PRIVILEGE;
+	      cubrid_log_tracelog (__FILE__, __LINE__, __func__, true, err_code,
+				   "CDC authorization failed. user %s has no SELECT privilege on "
+				   "extraction table %s\n", username, g_extraction_table_names[i]);
+	      goto error;
+	    }
+	}
     }
 
   db_shutdown ();
@@ -1006,7 +1048,7 @@ error:
 
   db_shutdown ();
 
-  return CUBRID_LOG_FAILED_LOGIN;
+  return err_code;
 }
 
 /*
