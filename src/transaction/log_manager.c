@@ -14162,14 +14162,17 @@ cdc_put_value_to_loginfo (db_value * new_value, char **data_ptr)
   const char *date_format = "YYYY-MM-DD";
   const char *datetime_frmt = "YYYY-MM-DD HH24:MI:SS.FF";
   const char *datetimetz_frmt = "YYYY-MM-DD HH24:MI:SS.FF TZH:TZM";
-  const char *datetimeltz_frmt = "YYYY-MM-DD HH24:MI:SS.FF TZR";
+  const char *datetimeltz_frmt = "YYYY-MM-DD HH24:MI:SS.FF TZH:TZM";
 
   const char *time_format = "HH24:MI:SS";
   const char *timestamp_frmt = "YYYY-MM-DD HH24:MI:SS";
   const char *timestamptz_frmt = "YYYY-MM-DD HH24:MI:SS TZH:TZM";
-  const char *timestampltz_frmt = "YYYY-MM-DD HH24:MI:SS TZR";
+  const char *timestampltz_frmt = "YYYY-MM-DD HH24:MI:SS TZH:TZM";
 
-  lang_set_flag_from_lang (NULL, false, false, &flag);
+  /* CDC wire v2: has_user_format must be true or db_to_char ignores the formats above
+   * and falls back to the locale default (e.g. "03:04:05 AM 01/02/2026").
+   * LTZ formats use TZH:TZM, not TZR (docs/htap-cdc-wire-v2.md D1). */
+  lang_set_flag_from_lang (NULL, true, false, &flag);
   db_make_int (&lang_str, flag);
   db_make_null (&result);
 

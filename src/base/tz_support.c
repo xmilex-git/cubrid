@@ -4684,7 +4684,10 @@ tz_get_server_tz_region_session (void)
 
   if (thread_p->type == TT_DAEMON && thread_p->is_cdc_daemon && prm_get_integer_value (PRM_ID_SUPPLEMENTAL_LOG) > 0)
     {
-      return &tz_Region_system;
+      /* CDC wire v2: session-tz-rendered temporals (TIMESTAMP, *LTZ) are emitted in UTC
+       * regardless of server_timezone (docs/htap-cdc-wire-v2.md 3.1). Callers only copy
+       * the region, so dropping const is safe here. */
+      return (TZ_REGION *) tz_get_utc_tz_region ();
     }
 
   session_tz_region = session_get_session_tz_region (thread_p);
