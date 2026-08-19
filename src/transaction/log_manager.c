@@ -335,6 +335,7 @@ static int cdc_get_overflow_recdes (THREAD_ENTRY * thread_p, LOG_PAGE * log_page
 static int cdc_get_ovfdata_from_log (THREAD_ENTRY * thread_p, LOG_PAGE * log_page_p, LOG_LSA * process_lsa, int *length,
 				     char **data, LOG_RCVINDEX rcvindex, bool is_redo);
 static int cdc_find_primary_key (THREAD_ENTRY * thread_p, OID classoid, int repr_id, int *num_attr, int **pk_attr_id);
+static void cdc_resolve_dml_classoid (THREAD_ENTRY * thread_p, OID * classoid);
 static int cdc_make_ddl_loginfo (char *supplement_data, int trid, const char *user, CDC_LOGINFO_ENTRY * ddl_entry);
 static int cdc_make_dcl_loginfo (time_t at_time, int trid, char *user, int log_type, CDC_LOGINFO_ENTRY * dcl_entry);
 static int cdc_make_rollback_loginfo (int trid, char *user, const LOG_LSA * rollback_lsa,
@@ -10707,6 +10708,38 @@ log_build_full_path (const char *input_path, char *full_path)
     }
 }
 
+/*
+ * cdc_resolve_dml_classoid () - resolve the class OID of a DML supplement to its root class
+ *   thread_p(in)     : thread entry
+ *   classoid(in/out) : class OID from the supplement; replaced by the root class OID
+ *
+ * Note: DML supplements of a partitioned class carry the partition class OID
+ *   (heap_file.c), but the extraction filter and the relation announcements are keyed
+ *   by the root class, so the root must be resolved before any of them run
+ *   (workspace#75 D12). If the resolution fails (stale log of a class that has already
+ *   been dropped), the raw OID is kept: a captured root still passes the filter and
+ *   produces the error log info in cdc_make_dml_loginfo, everything else is skipped
+ *   by the filter after this explicit log line.
+ */
+static void
+cdc_resolve_dml_classoid (THREAD_ENTRY * thread_p, OID * classoid)
+{
+  OID root_oid = OID_INITIALIZER;
+
+  if (partition_find_root_class_oid (thread_p, classoid, &root_oid) != NO_ERROR)
+    {
+      cdc_log ("cdc_resolve_dml_classoid : failed to resolve the root class of (%d|%d|%d); the class is gone",
+	       OID_AS_ARGS (classoid));
+      er_clear ();
+      return;
+    }
+
+  if (!OID_ISNULL (&root_oid))
+    {
+      COPY_OID (classoid, &root_oid);
+    }
+}
+
 static int
 cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENTRY * log_info_entry)
 {
@@ -10888,6 +10921,7 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 	bool is_unzip_supplement = false;
 
 	OID classoid;
+	OID root_classoid;
 
 	LOG_LSA undo_lsa, redo_lsa;
 
@@ -10989,7 +11023,14 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 	  case LOG_SUPPLEMENT_TRIGGER_INSERT:
 	    memcpy (&classoid, supplement_data, sizeof (OID));
 
-	    if (!cdc_is_filtered_class (classoid) || oid_is_system_class (&classoid))
+	    /* partition DML supplements carry the partition class OID; filter and announce
+	     * by the root class while the record itself is decoded with its owning class
+	     * (cdc_make_dml_loginfo) — a partition's repr lineage need not align with the
+	     * root's, so decoding must not use the root repr catalog */
+	    COPY_OID (&root_classoid, &classoid);
+	    cdc_resolve_dml_classoid (thread_p, &root_classoid);
+
+	    if (!cdc_is_filtered_class (root_classoid) || oid_is_system_class (&root_classoid))
 	      {
 		error = ER_CDC_IGNORE_LOG_INFO;
 		cdc_log ("cdc_log_extract : Skip producing log info for an invalid class (%d|%d|%d)",
@@ -11004,7 +11045,7 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 		goto error;
 	      }
 
-	    cdc_announce_relation (thread_p, trid, tran_user, classoid, &cur_log_rec_lsa);
+	    cdc_announce_relation (thread_p, trid, tran_user, root_classoid, &cur_log_rec_lsa);
 
 	    error =
 	      cdc_make_dml_loginfo (thread_p, trid, tran_user,
@@ -11021,7 +11062,14 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 	  case LOG_SUPPLEMENT_TRIGGER_UPDATE:
 	    memcpy (&classoid, supplement_data, sizeof (OID));
 
-	    if (!cdc_is_filtered_class (classoid) || oid_is_system_class (&classoid))
+	    /* partition DML supplements carry the partition class OID; filter and announce
+	     * by the root class while the record itself is decoded with its owning class
+	     * (cdc_make_dml_loginfo) — a partition's repr lineage need not align with the
+	     * root's, so decoding must not use the root repr catalog */
+	    COPY_OID (&root_classoid, &classoid);
+	    cdc_resolve_dml_classoid (thread_p, &root_classoid);
+
+	    if (!cdc_is_filtered_class (root_classoid) || oid_is_system_class (&root_classoid))
 	      {
 		error = ER_CDC_IGNORE_LOG_INFO;
 		cdc_log ("cdc_log_extract : Skip producing log info for an invalid class (%d|%d|%d)",
@@ -11037,7 +11085,7 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 		goto error;
 	      }
 
-	    cdc_announce_relation (thread_p, trid, tran_user, classoid, &cur_log_rec_lsa);
+	    cdc_announce_relation (thread_p, trid, tran_user, root_classoid, &cur_log_rec_lsa);
 
 	    if (undo_recdes.type == REC_ASSIGN_ADDRESS)
 	      {
@@ -11077,7 +11125,14 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 	  case LOG_SUPPLEMENT_TRIGGER_DELETE:
 	    memcpy (&classoid, supplement_data, sizeof (OID));
 
-	    if (!cdc_is_filtered_class (classoid) || oid_is_system_class (&classoid))
+	    /* partition DML supplements carry the partition class OID; filter and announce
+	     * by the root class while the record itself is decoded with its owning class
+	     * (cdc_make_dml_loginfo) — a partition's repr lineage need not align with the
+	     * root's, so decoding must not use the root repr catalog */
+	    COPY_OID (&root_classoid, &classoid);
+	    cdc_resolve_dml_classoid (thread_p, &root_classoid);
+
+	    if (!cdc_is_filtered_class (root_classoid) || oid_is_system_class (&root_classoid))
 	      {
 		error = ER_CDC_IGNORE_LOG_INFO;
 		cdc_log ("cdc_log_extract : Skip producing log info for an invalid class (%d|%d|%d)",
@@ -11092,7 +11147,7 @@ cdc_log_extract (THREAD_ENTRY * thread_p, LOG_LSA * process_lsa, CDC_LOGINFO_ENT
 		goto error;
 	      }
 
-	    cdc_announce_relation (thread_p, trid, tran_user, classoid, &cur_log_rec_lsa);
+	    cdc_announce_relation (thread_p, trid, tran_user, root_classoid, &cur_log_rec_lsa);
 
 	    error =
 	      cdc_make_dml_loginfo (thread_p, trid, tran_user,
@@ -13040,16 +13095,23 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
 
   char *loginfo_buf = NULL;
   OID partitioned_classoid = OID_INITIALIZER;
+  OID entry_classoid = OID_INITIALIZER;
 
   char *classname = NULL;
 
-  /* when partition class oid input, it is required to be changed to partitioned class oid  */
+  /* when a partition class oid is input, the emitted entry must carry the partitioned (root)
+   * class oid, but the record itself must keep being decoded with its OWNING class: a
+   * partition created after ALTERs on the root has repr ids that do not align with the
+   * root's repr lineage, so attrinfo/repr/PK lookups below stay on the raw classoid and
+   * only entry_classoid is switched to the root (workspace#75 D12). */
+
+  COPY_OID (&entry_classoid, &classoid);
 
   if ((error_code = partition_find_root_class_oid (thread_p, &classoid, &partitioned_classoid)) == NO_ERROR)
     {
       if (!OID_ISNULL (&partitioned_classoid))
 	{
-	  COPY_OID (&classoid, &partitioned_classoid);
+	  COPY_OID (&entry_classoid, &partitioned_classoid);
 	}
     }
   else
@@ -13057,9 +13119,9 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
       /* can not get class schema of classoid due to drop */
 
       /* if schema is changed, flashback error handling first then cdc error handling */
-      FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, classoid, classname);
+      FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, entry_classoid, classname);
 
-      error_code = cdc_make_error_loginfo (trid, user, dml_type, classoid, dml_entry);
+      error_code = cdc_make_error_loginfo (trid, user, dml_type, entry_classoid, dml_entry);
       cdc_log ("cdc_make_dml_loginfo : failed to find class old representation ");
       goto exit;
     }
@@ -13069,9 +13131,9 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
 
   if ((error_code = heap_attrinfo_start (thread_p, &classoid, -1, NULL, &attr_info)) != NO_ERROR)
     {
-      FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, classoid, classname);
+      FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, entry_classoid, classname);
 
-      error_code = cdc_make_error_loginfo (trid, user, dml_type, classoid, dml_entry);
+      error_code = cdc_make_error_loginfo (trid, user, dml_type, entry_classoid, dml_entry);
       cdc_log ("cdc_make_dml_loginfo : failed to find class representation ");
 
       goto exit;
@@ -13085,9 +13147,9 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
     {
       if (cdc_check_if_schema_changed (undo_recdes, &attr_info))
 	{
-	  FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, classoid, classname);
+	  FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, entry_classoid, classname);
 
-	  error_code = cdc_make_error_loginfo (trid, user, dml_type, classoid, dml_entry);
+	  error_code = cdc_make_error_loginfo (trid, user, dml_type, entry_classoid, dml_entry);
 	  cdc_log ("cdc_make_dml_loginfo : failed to find class old representation ");
 
 	  goto exit;
@@ -13146,9 +13208,9 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
     {
       if (cdc_check_if_schema_changed (redo_recdes, &attr_info))
 	{
-	  FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, classoid, classname);
+	  FLASHBACK_ERROR_HANDLING (is_flashback, ER_FLASHBACK_SCHEMA_CHANGED, entry_classoid, classname);
 
-	  error_code = cdc_make_error_loginfo (trid, user, dml_type, classoid, dml_entry);
+	  error_code = cdc_make_error_loginfo (trid, user, dml_type, entry_classoid, dml_entry);
 	  cdc_log ("cdc_make_dml_loginfo : failed to find class old representation ");
 
 	  goto exit;
@@ -13239,7 +13301,7 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
   ptr = or_pack_int (ptr, trid);
   ptr = or_pack_string (ptr, user);
   ptr = or_pack_int (ptr, dataitem_type);
-  memcpy (&b_classoid, &classoid, sizeof (uint64_t));
+  memcpy (&b_classoid, &entry_classoid, sizeof (uint64_t));
 
   switch (dml_type)
     {
@@ -13437,7 +13499,7 @@ cdc_make_dml_loginfo (THREAD_ENTRY * thread_p, int trid, char *user, CDC_DML_TYP
 
   memcpy (dml_entry->log_info, start_ptr, dml_entry->length);
 
-  FLASHBACK_ERROR_HANDLING (is_flashback, NO_ERROR, classoid, classname);
+  FLASHBACK_ERROR_HANDLING (is_flashback, NO_ERROR, entry_classoid, classname);
 
   error_code = ER_CDC_LOGINFO_ENTRY_GENERATED;
 

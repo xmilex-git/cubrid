@@ -220,6 +220,7 @@ static MOP server_find (PT_NODE * node_server, PT_NODE * node_owner);
 
 static int do_supplemental_statement (PARSER_CONTEXT * parser, PT_NODE * statement,
 				      RESERVED_CLASS_INFO_LIST & reserved_cls_info, OID * reserved_oid);
+static bool do_is_encoding_safe_alter (const PT_NODE * statement);
 
 static int do_reserve_classinfo (PARSER_CONTEXT * parser, PT_NODE * statement,
 				 RESERVED_CLASS_INFO_LIST & reserved_cls_info);
@@ -16227,6 +16228,82 @@ do_free_reserved_classinfo (RESERVED_CLASS_INFO_LIST & reserved_cls_info)
   reserved_cls_info.num_classes = 0;
 }
 
+/*
+ * do_is_encoding_safe_alter () - true iff every clause of the ALTER chain leaves the row
+ *   encoding, the table identity, the event key identity and the logical table content
+ *   intact, so the DDL supplement may ride as CDC_INDEX instead of CDC_TABLE and CDC
+ *   consumers do not have to treat it as a capture-breaking change (workspace#75 D10/D11/D13).
+ *   Any clause outside the explicit allowlist keeps the CDC_TABLE classification (fail-safe).
+ */
+static bool
+do_is_encoding_safe_alter (const PT_NODE * statement)
+{
+  const PT_NODE *clause, *cons;
+
+  for (clause = statement; clause != NULL; clause = clause->next)
+    {
+      if (clause->node_type != PT_ALTER)
+	{
+	  return false;
+	}
+
+      switch (clause->info.alter.code)
+	{
+	case PT_DROP_INDEX_CLAUSE:
+	case PT_REBUILD_INDEX:
+	case PT_CHANGE_INDEX_COMMENT:
+	case PT_CHANGE_INDEX_STATUS:
+	case PT_DROP_FK_CLAUSE:
+	  break;
+
+	  /* Partition reshuffles keep the logical content of the root class: row movement
+	   * between partitions is intentionally unlogged because it is content-neutral.
+	   * Only DROP/PROMOTE PARTITION delete or detach rows without any log event, so
+	   * they fall through to the default (CDC_TABLE) below. */
+	case PT_APPLY_PARTITION:
+	case PT_REMOVE_PARTITION:
+	case PT_ADD_PARTITION:
+	case PT_ADD_HASHPARTITION:
+	case PT_REORG_PARTITION:
+	case PT_COALESCE_PARTITION:
+	case PT_ANALYZE_PARTITION:
+	  break;
+
+	case PT_ADD_INDEX_CLAUSE:
+	case PT_ADD_ATTR_MTHD:
+	  /* ADD INDEX / constraint-only ADD CONSTRAINT (FK, UNIQUE). A clause that also
+	   * defines attributes or methods changes the row encoding; adding a PRIMARY KEY
+	   * changes the event key identity. Both must keep halting. */
+	  if (clause->info.alter.alter_clause.attr_mthd.attr_def_list != NULL
+	      || clause->info.alter.alter_clause.attr_mthd.mthd_def_list != NULL
+	      || clause->info.alter.alter_clause.attr_mthd.mthd_file_list != NULL)
+	    {
+	      return false;
+	    }
+	  if (clause->info.alter.code == PT_ADD_ATTR_MTHD && clause->info.alter.constraint_list == NULL
+	      && clause->info.alter.create_index == NULL)
+	    {
+	      return false;
+	    }
+	  for (cons = clause->info.alter.constraint_list; cons != NULL; cons = cons->next)
+	    {
+	      if (cons->node_type != PT_CONSTRAINT
+		  || (cons->info.constraint.type != PT_CONSTRAIN_FOREIGN_KEY
+		      && cons->info.constraint.type != PT_CONSTRAIN_UNIQUE))
+		{
+		  return false;
+		}
+	    }
+	  break;
+
+	default:
+	  return false;
+	}
+    }
+
+  return true;
+}
+
 static int
 do_supplemental_statement (PARSER_CONTEXT * parser, PT_NODE * statement,
 			   RESERVED_CLASS_INFO_LIST & reserved_cls_info, OID * reserved_oid)
@@ -16295,6 +16372,13 @@ do_supplemental_statement (PARSER_CONTEXT * parser, PT_NODE * statement,
       if (objtype == CDC_TABLE)
 	{
 	  classoid = ws_oid (sm_find_class (classname));
+
+	  /* encoding-safe ALTERs (index/constraint-only, content-neutral partition
+	   * reshuffles) ride as CDC_INDEX so CDC consumers do not halt on them */
+	  if (do_is_encoding_safe_alter (statement))
+	    {
+	      objtype = CDC_INDEX;
+	    }
 	}
 
       break;
