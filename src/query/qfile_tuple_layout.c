@@ -40,7 +40,8 @@
 /*
  * qfile_type_list_compute () - pure layout computation (D-181-6 finalize algorithm, spec #180 v1).
  *   Fills col[type_cnt] and the list-level fields from (domp, type_cnt, hdr_size). Idempotent.
- *   An unresolved DB_TYPE_VARIABLE column is laid out as VAR (its tuples so far hold NULL there, #186).
+ *   An unresolved DB_TYPE_VARIABLE column is laid out as VAR (its tuples so far hold NULL there: the assembler resolves
+ *   the column at its first bound value, D-199-13).
  */
 static void
 qfile_type_list_compute (TP_DOMAIN ** domp, int type_cnt, int hdr_size, QFILE_COL_LAYOUT * col,
@@ -49,65 +50,34 @@ qfile_type_list_compute (TP_DOMAIN ** domp, int type_cnt, int hdr_size, QFILE_CO
   int i, off = 0;
 
   *bitmap_size = (int16_t) ((type_cnt + 7) >> 3);
-  data_off[0] = (int16_t) DB_ALIGN (hdr_size, INT_ALIGNMENT);
-  data_off[1] = (int16_t) DB_ALIGN (hdr_size + *bitmap_size, INT_ALIGNMENT);
+  data_off[0] = (int16_t) DB_ALIGN (hdr_size, QFILE_TUPLE_ALIGNMENT);
+  data_off[1] = (int16_t) DB_ALIGN (hdr_size + *bitmap_size, QFILE_TUPLE_ALIGNMENT);
   *first_non_cached_col = type_cnt;
 
   for (i = 0; i < type_cnt; i++)
     {
-      const TP_DOMAIN *dom = domp[i];
-      const PR_TYPE *t;
-      int a;
+      qfile_col_layout_of_domain (domp[i], &col[i]);
 
-      assert (dom != NULL && dom->type != NULL);
-      t = dom->type;
-
-      col[i]._pad = 0;
-
-      if (TP_DOMAIN_TYPE (dom) == DB_TYPE_VARIABLE || t->has_computed_disk_size ())
+      if (*first_non_cached_col != type_cnt)
 	{
-	  col[i].off = -1;
-	  col[i].size = -1;
-	  col[i].kind = QFILE_COL_VAR;
-	  col[i].var_access = t->has_index_readval () ? QFILE_VAR_DIRECT : QFILE_VAR_SCRATCH;
-	  col[i].alignby = 1;
-	  if (*first_non_cached_col == type_cnt)
-	    {
-	      *first_non_cached_col = i;
-	    }
+	  continue;		/* past the constant prefix: off stays -1 */
+	}
+
+      if (col[i].kind == QFILE_COL_VAR)
+	{
+	  *first_non_cached_col = i;
 	  continue;
 	}
 
-      a = MIN (t->alignment, INT_ALIGNMENT);	/* D-180-4: BIGINT/DOUBLE align 4 and are read by memcpy */
-      if (a < 1)
+      off = DB_ALIGN (off, col[i].alignby);
+      if (off > INT16_MAX)
 	{
-	  a = 1;
+	  /* D-181-4: give up the constant-offset cache from here on; correctness is unaffected */
+	  *first_non_cached_col = i;
+	  continue;
 	}
-
-      col[i].size = (int16_t) t->disksize;
-      col[i].kind = QFILE_COL_FIXED;
-      col[i].var_access = 0;
-      col[i].alignby = (uint8_t) a;
-
-      if (*first_non_cached_col == type_cnt)
-	{
-	  off = DB_ALIGN (off, a);
-	  if (off > INT16_MAX)
-	    {
-	      /* D-181-4: give up the constant-offset cache from here on; correctness is unaffected */
-	      *first_non_cached_col = i;
-	      col[i].off = -1;
-	    }
-	  else
-	    {
-	      col[i].off = (int16_t) off;
-	      off += t->disksize;
-	    }
-	}
-      else
-	{
-	  col[i].off = -1;
-	}
+      col[i].off = (int16_t) off;
+      off += col[i].size;
     }
 }
 
@@ -121,7 +91,7 @@ int
 qfile_type_list_alloc (QFILE_TUPLE_VALUE_TYPE_LIST * tl, int type_cnt, int hdr_size)
 {
   assert (type_cnt >= 0);
-  assert (hdr_size == 4 || hdr_size == 8);
+  assert (hdr_size == QFILE_TUPLE_HDR_SIZE_FORWARD || hdr_size == QFILE_TUPLE_HDR_SIZE_BACKWARD);
 
   tl->type_cnt = type_cnt;
   tl->domp = NULL;
@@ -154,7 +124,16 @@ qfile_type_list_alloc (QFILE_TUPLE_VALUE_TYPE_LIST * tl, int type_cnt, int hdr_s
 int
 qfile_type_list_copy (QFILE_TUPLE_VALUE_TYPE_LIST * dest, const QFILE_TUPLE_VALUE_TYPE_LIST * src)
 {
-  int hdr_size = (src->hdr_size == 4 || src->hdr_size == 8) ? src->hdr_size : QFILE_TL_HDR_SIZE_LEGACY;
+  int hdr_size = src->hdr_size;
+
+  if (hdr_size != QFILE_TUPLE_HDR_SIZE_FORWARD && hdr_size != QFILE_TUPLE_HDR_SIZE_BACKWARD)
+    {
+      /* a list id that was never opened (QFILE_CLEAR_LIST_ID leaves hdr_size 0; e.g. xasl->list_id copied out by
+       * qexec_get_xasl_list_id after an error exit, CTP _003_manipulation/1020.sql) or an INPUT type list: it holds no
+       * tuples, so the header is immaterial; qfile_open_list () decides it when the list is actually created */
+      assert (!src->finalized);
+      hdr_size = QFILE_TUPLE_HDR_SIZE_FORWARD;
+    }
 
   if (qfile_type_list_alloc (dest, src->type_cnt, hdr_size) != NO_ERROR)
     {
@@ -191,7 +170,7 @@ qfile_type_list_copy (QFILE_TUPLE_VALUE_TYPE_LIST * dest, const QFILE_TUPLE_VALU
 void
 qfile_type_list_finalize (QFILE_TUPLE_VALUE_TYPE_LIST * tl)
 {
-  assert (tl->hdr_size == 4 || tl->hdr_size == 8);
+  assert (tl->hdr_size == QFILE_TUPLE_HDR_SIZE_FORWARD || tl->hdr_size == QFILE_TUPLE_HDR_SIZE_BACKWARD);
 
   if (tl->type_cnt > 0)
     {
@@ -204,7 +183,7 @@ qfile_type_list_finalize (QFILE_TUPLE_VALUE_TYPE_LIST * tl)
     {
       tl->first_non_cached_col = 0;
       tl->bitmap_size = 0;
-      tl->data_off[0] = (int16_t) DB_ALIGN (tl->hdr_size, INT_ALIGNMENT);
+      tl->data_off[0] = (int16_t) DB_ALIGN (tl->hdr_size, QFILE_TUPLE_ALIGNMENT);
       tl->data_off[1] = tl->data_off[0];
     }
 
@@ -230,7 +209,8 @@ qfile_type_list_check (const QFILE_TUPLE_VALUE_TYPE_LIST * tl)
        * may legitimately never have been finalized; no column can be read from it anyway */
       return tl->domp == NULL && tl->col == NULL;
     }
-  if (!tl->finalized || !(tl->hdr_size == 4 || tl->hdr_size == 8))
+  if (!tl->finalized
+      || !(tl->hdr_size == QFILE_TUPLE_HDR_SIZE_FORWARD || tl->hdr_size == QFILE_TUPLE_HDR_SIZE_BACKWARD))
     {
       return false;
     }
@@ -258,46 +238,47 @@ qfile_type_list_check (const QFILE_TUPLE_VALUE_TYPE_LIST * tl)
 #endif /* !NDEBUG */
 
 /*
- * qfile_slot_clear () - release the slot-owned scratch area and unbind the descriptor.
- *   Called by the slot owner when the scan/cursor is closed (D-182-10). Does not touch rec->tpl / rec->size:
- *   the owned tuple buffer is still freed by the record owner as before.
+ * qfile_slot_clear () - unbind the descriptor. Called by the slot owner when the scan/cursor is closed.
+ *   Does not touch rec->tpl / rec->size: the owned tuple buffer is still freed by the record owner as before.
  */
 void
 qfile_slot_clear (QFILE_TUPLE_RECORD * rec)
 {
-  if (rec->scratch != NULL)
-    {
-      db_private_free (NULL, rec->scratch);
-      rec->scratch = NULL;
-    }
-  rec->scratch_size = 0;
   rec->tl = NULL;
-  rec->nvalid = 0;
-  rec->fast_limit = 0;
-  rec->off = QFILE_TUPLE_LENGTH_SIZE;
+  rec->nvalid = -1;
 }
 
 /*
  * qfile_slot_overwrite_value () - in-place rewrite of column col with value (D-182-13, #185).
  *   return: NO_ERROR or ER_FAILED
  *   Contract (asserted in debug, ER_FAILED in release): value is not NULL, the stored column is bound, the
- *   value's type is the column's decoding type, and the value's legacy encoded size equals the stored body
- *   length. The five in-place sites (orderby_num, inst_num, CONNECT BY ISLEAF/ISCYCLE/parent_pos) all satisfy it.
- *   Only the body is rewritten; the value header is untouched (it already says bound/len).
+ *   value's type is the column's decoding type, and the value's body size in the column's encoding equals the stored
+ *   body length. The five in-place sites (orderby_num, inst_num, CONNECT BY ISLEAF/ISCYCLE/parent_pos) all satisfy
+ *   it. Only the body is rewritten; the length header of a VAR column is untouched (same length by contract).
  */
 int
 qfile_slot_overwrite_value (QFILE_TUPLE_RECORD * rec, int col, const TP_DOMAIN * dom, const DB_VALUE * value)
 {
   OR_BUF buf;
+  const QFILE_COL_LAYOUT *c;
   const char *body;
-  int len;
+  const PR_TYPE *t;
+  int len, new_len;
   bool is_null;
 
   body = qfile_slot_locate (rec, col, &len, &is_null);
 
   if (value == NULL || DB_IS_NULL (value) || is_null || dom == NULL || dom->type == NULL
-      || TP_DOMAIN_TYPE (dom) != DB_VALUE_DOMAIN_TYPE (value)
-      || (int) QFILE_LEGACY_VALUE_ENCODED_SIZE (pr_data_writeval_disk_size ((DB_VALUE *) value)) != len)
+      || TP_DOMAIN_TYPE (dom) != DB_VALUE_DOMAIN_TYPE (value))
+    {
+      assert (false);
+      return ER_FAILED;
+    }
+  c = &rec->tl->col[col];
+  t = pr_type_from_id (DB_VALUE_DOMAIN_TYPE (value));
+  new_len = qfile_value_direct (c, value) ? pr_index_writeval_disk_size ((DB_VALUE *) value)
+    : pr_data_writeval_disk_size ((DB_VALUE *) value);
+  if (new_len != len)
     {
       assert (false);
       return ER_FAILED;
@@ -306,11 +287,43 @@ qfile_slot_overwrite_value (QFILE_TUPLE_RECORD * rec, int col, const TP_DOMAIN *
   assert (TP_DOMAIN_TYPE (rec->tl->domp[col]) == DB_TYPE_VARIABLE
 	  || TP_DOMAIN_TYPE (rec->tl->domp[col]) == TP_DOMAIN_TYPE (dom));
 
-  or_init (&buf, (char *) body, len);
-  if (dom->type->data_writeval (&buf, (DB_VALUE *) value) != NO_ERROR)
+  if (c->kind == QFILE_COL_FIXED)
     {
-      return ER_FAILED;
+      or_init (&buf, (char *) body, len);
+      return (t->data_writeval (&buf, value) == NO_ERROR) ? NO_ERROR : ER_FAILED;
+    }
+  if (qfile_value_direct (c, value))
+    {
+      or_init (&buf, (char *) body, len);
+      if (t->index_writeval (&buf, value) != NO_ERROR || CAST_BUFLEN (buf.ptr - buf.buffer) != len)
+	{
+	  assert (false);
+	  return ER_FAILED;
+	}
+      return NO_ERROR;
     }
 
-  return NO_ERROR;
+  /* VAR/SCRATCH: encode into a transient aligned copy, then overwrite the body */
+  {
+    char stack_buf[QFILE_SCRATCH_STACK + MAX_ALIGNMENT];
+    char *aligned = QFILE_SCRATCH_ACQUIRE (stack_buf, len);
+    int rc = NO_ERROR;
+
+    if (aligned == NULL)
+      {
+	return ER_FAILED;
+      }
+    or_init (&buf, aligned, len);
+    if (t->data_writeval (&buf, value) != NO_ERROR || CAST_BUFLEN (buf.ptr - buf.buffer) != len)
+      {
+	assert (false);
+	rc = ER_FAILED;
+      }
+    else
+      {
+	memcpy ((char *) body, aligned, len);
+      }
+    QFILE_SCRATCH_RELEASE (aligned, stack_buf);
+    return rc;
+  }
 }

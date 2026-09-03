@@ -5377,7 +5377,13 @@ or_unpack_listid (char *ptr, void *listid_ptr)
   ptr += OR_INT_SIZE;
   listid->type_list.type_cnt = OR_GET_INT (ptr);
   ptr += OR_INT_SIZE;
-  listid->type_list.hdr_size = (uint8_t) OR_GET_INT (ptr);	/* layout flags (D-181-9) */
+  {
+    /* layout flags (D-181-9): keep an unexpected value out of range of the narrowing cast so the caller's check sees it */
+    int hdr_size = OR_GET_INT (ptr);
+
+    listid->type_list.hdr_size = (hdr_size == QFILE_TUPLE_HDR_SIZE_FORWARD || hdr_size == QFILE_TUPLE_HDR_SIZE_BACKWARD)
+      ? (uint8_t) hdr_size : 0;
+  }
   ptr += OR_INT_SIZE;
 
   return ptr;
@@ -5419,8 +5425,15 @@ or_unpack_unbound_listid (char *ptr, void **listid_ptr)
 
   if (count > 0)
     {
-      int hdr_size = (listid->type_list.hdr_size == 4 || listid->type_list.hdr_size == 8)
-	? listid->type_list.hdr_size : QFILE_TL_HDR_SIZE_LEGACY;
+      int hdr_size = listid->type_list.hdr_size;
+
+      if (hdr_size != QFILE_TUPLE_HDR_SIZE_FORWARD && hdr_size != QFILE_TUPLE_HDR_SIZE_BACKWARD)
+	{
+	  /* not a list id packed by this build (lockstep policy, ADR 0016 section 1.6): refuse rather than misread */
+	  assert (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
+	  goto error;
+	}
 
       /* own [domp | col] block; the descriptor is recomputed here from the unpacked domains (D-181-9) */
       if (qfile_type_list_alloc (&listid->type_list, count, hdr_size) != NO_ERROR)
