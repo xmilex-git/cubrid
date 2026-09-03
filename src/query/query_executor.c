@@ -523,8 +523,9 @@ static int qexec_analytic_value_lookup (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTI
 static int qexec_analytic_group_header_next (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state);
 static int qexec_analytic_update_group_result (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_state);
 static int qexec_collection_has_null (DB_VALUE * colval);
-static DB_VALUE_COMPARE_RESULT qexec_cmp_tpl_vals_merge (QFILE_TUPLE * left_tval, TP_DOMAIN ** left_dom,
-							 QFILE_TUPLE * rght_tval, TP_DOMAIN ** rght_dom, int tval_cnt);
+static DB_VALUE_COMPARE_RESULT qexec_cmp_tpl_vals_merge (char **left_tval, int *left_len, TP_DOMAIN ** left_dom,
+							  char **rght_tval, int *rght_len, TP_DOMAIN ** rght_dom,
+							  int tval_cnt);
 static long qexec_size_remaining (QFILE_TUPLE_RECORD * tplrec1, QFILE_TUPLE_RECORD * tplrec2,
 				  QFILE_LIST_MERGE_INFO * merge_info, int k);
 static int qexec_merge_tuple (QFILE_TUPLE_RECORD * tplrec1, QFILE_TUPLE_RECORD * tplrec2,
@@ -594,7 +595,7 @@ static int qexec_iterate_connect_by_results (THREAD_ENTRY * thread_p, XASL_NODE 
 					     QFILE_TUPLE_RECORD * tplrec);
 static int qexec_check_for_cycle (THREAD_ENTRY * thread_p, OUTPTR_LIST * outptr_list, QFILE_TUPLE tpl,
 				  QFILE_TUPLE_VALUE_TYPE_LIST * type_list, QFILE_LIST_ID * list_id_p, int *iscycle);
-static int qexec_compare_valptr_with_tuple (OUTPTR_LIST * outptr_list, QFILE_TUPLE tpl,
+static int qexec_compare_valptr_with_tuple (OUTPTR_LIST * outptr_list, QFILE_TUPLE_RECORD * tplrec,
 					    QFILE_TUPLE_VALUE_TYPE_LIST * type_list, int *are_equal);
 static int qexec_listfile_orderby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QFILE_LIST_ID * list_file,
 				   SORT_LIST * orderby_list, XASL_STATE * xasl_state, OUTPTR_LIST * outptr_list);
@@ -647,7 +648,8 @@ static int qexec_set_pseudocolumns_val_pointers (XASL_NODE * xasl, DB_VALUE ** l
 static void qexec_reset_pseudocolumns_val_pointers (DB_VALUE * level_valp, DB_VALUE * isleaf_valp,
 						    DB_VALUE * iscycle_valp, DB_VALUE * parent_pos_valp,
 						    DB_VALUE * index_valp);
-static int qexec_get_index_pseudocolumn_value_from_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QFILE_TUPLE tpl,
+static int qexec_get_index_pseudocolumn_value_from_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl,
+							  QFILE_TUPLE_RECORD * tplrec,
 							  DB_VALUE ** index_valp, char **index_value, int *index_len);
 static int qexec_recalc_tuples_parent_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p);
 static int qexec_remove_duplicates_for_replace (THREAD_ENTRY * thread_p, HEAP_SCANCACHE * scan_cache,
@@ -3788,8 +3790,7 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 {
   SORT_INFO *info;
   SORT_REC *key;
-  char *data, *tvalhp;
-  int tval_size;
+  char *data;
   ORDBYNUM_INFO *ordby_info;
   PAGE_PTR page;
   VPID ovfl_vpid;
@@ -3798,11 +3799,13 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
   int i;
   VPID vpid;
   QFILE_LIST_ID *list_idp;
-  QFILE_TUPLE_RECORD tplrec;
+  QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
+  QFILE_TUPLE_RECORD tplslot = { NULL, 0 };	/* slot over the tuple being emitted (in-place orderby_num, D-182-13) */
 
   error = NO_ERROR;
 
   info = (SORT_INFO *) arg;
+  qfile_slot_bind (&tplslot, &info->output_file->type_list);
   ordby_info = (ORDBYNUM_INFO *) info->extra_arg;
 
   /* Traverse next link */
@@ -3884,10 +3887,11 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 		  data = page + key->s.original.offset;
 
 		  /* update orderby_num() in the tuple */
+		  qfile_slot_set_tuple (&tplslot, data);
 		  for (i = 0; ordby_info && i < ordby_info->ordbynum_pos_cnt; i++)
 		    {
-		      QFILE_GET_TUPLE_VALUE_HEADER_POSITION (data, ordby_info->ordbynum_pos[i], tvalhp);
-		      (void) qdata_copy_db_value_to_tuple_value (ordby_info->ordbynum_val, tvalhp, &tval_size);
+		      (void) qfile_slot_overwrite_value (&tplslot, ordby_info->ordbynum_pos[i], &tp_Bigint_domain,
+							 ordby_info->ordbynum_val);
 		    }
 
 		  error = qfile_add_tuple_to_list (thread_p, info->output_file, data);
@@ -3906,10 +3910,11 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 		      qfile_get_tuple (thread_p, page, page + key->s.original.offset, &tplrec, list_idp);
 		      data = tplrec.tpl;
 		      /* update orderby_num() in the tuple */
+		      qfile_slot_set_tuple (&tplslot, data);
 		      for (i = 0; ordby_info && i < ordby_info->ordbynum_pos_cnt; i++)
 			{
-			  QFILE_GET_TUPLE_VALUE_HEADER_POSITION (data, ordby_info->ordbynum_pos[i], tvalhp);
-			  (void) qdata_copy_db_value_to_tuple_value (ordby_info->ordbynum_val, tvalhp, &tval_size);
+			  (void) qfile_slot_overwrite_value (&tplslot, ordby_info->ordbynum_pos[i], &tp_Bigint_domain,
+							     ordby_info->ordbynum_val);
 			}
 		      error = qfile_add_tuple_to_list (thread_p, info->output_file, data);
 		      db_private_free_and_init (thread_p, tplrec.tpl);
@@ -3937,10 +3942,11 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 		{
 		  data = info->output_recdes.data;
 		  /* update orderby_num() in the tuple */
+		  qfile_slot_set_tuple (&tplslot, data);
 		  for (i = 0; ordby_info && i < ordby_info->ordbynum_pos_cnt; i++)
 		    {
-		      QFILE_GET_TUPLE_VALUE_HEADER_POSITION (data, ordby_info->ordbynum_pos[i], tvalhp);
-		      (void) qdata_copy_db_value_to_tuple_value (ordby_info->ordbynum_val, tvalhp, &tval_size);
+		      (void) qfile_slot_overwrite_value (&tplslot, ordby_info->ordbynum_pos[i], &tp_Bigint_domain,
+							 ordby_info->ordbynum_val);
 		    }
 		  error = qfile_add_tuple_to_list (thread_p, info->output_file, data);
 		}
@@ -5894,8 +5900,8 @@ qexec_collection_has_null (DB_VALUE * colval)
  * then the next comparison will discard the other side.
  */
 static DB_VALUE_COMPARE_RESULT
-qexec_cmp_tpl_vals_merge (QFILE_TUPLE * left_tval, TP_DOMAIN ** left_dom, QFILE_TUPLE * rght_tval,
-			  TP_DOMAIN ** rght_dom, int tval_cnt)
+qexec_cmp_tpl_vals_merge (char **left_tval, int *left_len_arr, TP_DOMAIN ** left_dom, char **rght_tval,
+			  int *rght_len_arr, TP_DOMAIN ** rght_dom, int tval_cnt)
 {
   OR_BUF buf;
   DB_VALUE left_dbval, right_dbval;
@@ -5911,21 +5917,21 @@ qexec_cmp_tpl_vals_merge (QFILE_TUPLE * left_tval, TP_DOMAIN ** left_dom, QFILE_
 
       /* get tpl values into db_values for the comparison */
 
-      /* zero length means NULL */
-      left_len = QFILE_GET_TUPLE_VALUE_LENGTH (left_tval[i]);
+      /* zero length means NULL (the merge scan positions body pointers and lengths through the slot accessor) */
+      left_len = left_len_arr[i];
       if (left_len == 0)
 	{
 	  cmp = DB_LT;
 	  break;
 	}
-      right_len = QFILE_GET_TUPLE_VALUE_LENGTH (rght_tval[i]);
+      right_len = rght_len_arr[i];
       if (right_len == 0)
 	{
 	  cmp = DB_GT;
 	  break;
 	}
 
-      or_init (&buf, (char *) (left_tval[i] + QFILE_TUPLE_VALUE_HEADER_SIZE), left_len);
+      or_init (&buf, left_tval[i], left_len);
       /* Do not copy the string--just use the pointer.  The pr_ routines for strings and sets have different semantics
        * for length. */
       left_is_set = pr_is_set_type (TP_DOMAIN_TYPE (left_dom[i])) ? true : false;
@@ -5940,7 +5946,7 @@ qexec_cmp_tpl_vals_merge (QFILE_TUPLE * left_tval, TP_DOMAIN ** left_dom, QFILE_
 	  break;
 	}
 
-      or_init (&buf, (char *) (rght_tval[i] + QFILE_TUPLE_VALUE_HEADER_SIZE), right_len);
+      or_init (&buf, rght_tval[i], right_len);
       /* Do not copy the string--just use the pointer.  The pr_ routines for strings and sets have different semantics
        * for length. */
       right_is_set = pr_is_set_type (TP_DOMAIN_TYPE (rght_dom[i])) ? true : false;
@@ -6016,28 +6022,19 @@ static long
 qexec_size_remaining (QFILE_TUPLE_RECORD * tplrec1, QFILE_TUPLE_RECORD * tplrec2, QFILE_LIST_MERGE_INFO * merge_info,
 		      int k)
 {
-  int i, tpl_size;
-  char *t_valhp;
+  int i, tpl_size, len;
+  bool is_null;
+  QFILE_TUPLE_RECORD *src;
 
   tpl_size = 0;
   for (i = k; i < merge_info->ls_pos_cnt; i++)
     {
       tpl_size += QFILE_TUPLE_VALUE_HEADER_SIZE;
-      if (merge_info->ls_outer_inner_list[i] == QFILE_OUTER_LIST)
+      src = (merge_info->ls_outer_inner_list[i] == QFILE_OUTER_LIST) ? tplrec1 : tplrec2;
+      if (src)
 	{
-	  if (tplrec1)
-	    {
-	      QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tplrec1->tpl, merge_info->ls_pos_list[i], t_valhp);
-	      tpl_size += QFILE_GET_TUPLE_VALUE_LENGTH (t_valhp);
-	    }
-	}
-      else
-	{
-	  if (tplrec2)
-	    {
-	      QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tplrec2->tpl, merge_info->ls_pos_list[i], t_valhp);
-	      tpl_size += QFILE_GET_TUPLE_VALUE_LENGTH (t_valhp);
-	    }
+	  (void) qfile_slot_locate (src, merge_info->ls_pos_list[i], &len, &is_null);
+	  tpl_size += len;
 	}
     }
 
@@ -6061,11 +6058,13 @@ qexec_merge_tuple (QFILE_TUPLE_RECORD * tplrec1, QFILE_TUPLE_RECORD * tplrec2, Q
 		   QFILE_TUPLE_RECORD * tplrec)
 {
   QFILE_TUPLE tplp;
-  char *t_valhp;
+  QFILE_TUPLE_RECORD *src;
+  const char *t_body;
+  int t_len;
+  bool t_null;
   int t_val_size;
   int tpl_size, offset;
   int k;
-  INT32 ls_unbound[2] = { 0, 0 };
 
   /* merge two tuples, and form a new tuple */
   tplp = tplrec->tpl;
@@ -6074,37 +6073,22 @@ qexec_merge_tuple (QFILE_TUPLE_RECORD * tplrec1, QFILE_TUPLE_RECORD * tplrec2, Q
   tplp += QFILE_TUPLE_LENGTH_SIZE;
   offset += QFILE_TUPLE_LENGTH_SIZE;
 
-  QFILE_PUT_TUPLE_VALUE_FLAG ((char *) ls_unbound, V_UNBOUND);
-  QFILE_PUT_TUPLE_VALUE_LENGTH ((char *) ls_unbound, 0);
-
   /* copy tuple values from the first and second list file tuples */
   for (k = 0; k < merge_info->ls_pos_cnt; k++)
     {
-
-      if (merge_info->ls_outer_inner_list[k] == QFILE_OUTER_LIST)
+      src = (merge_info->ls_outer_inner_list[k] == QFILE_OUTER_LIST) ? tplrec1 : tplrec2;
+      if (src)
 	{
-	  if (tplrec1)
-	    {
-	      QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tplrec1->tpl, merge_info->ls_pos_list[k], t_valhp);
-	    }
-	  else
-	    {
-	      t_valhp = (char *) ls_unbound;
-	    }
+	  t_body = qfile_slot_locate (src, merge_info->ls_pos_list[k], &t_len, &t_null);
 	}
       else
-	{			/* copy from the second tuple */
-	  if (tplrec2)
-	    {
-	      QFILE_GET_TUPLE_VALUE_HEADER_POSITION (tplrec2->tpl, merge_info->ls_pos_list[k], t_valhp);
-	    }
-	  else
-	    {
-	      t_valhp = (char *) ls_unbound;
-	    }
+	{
+	  t_body = NULL;
+	  t_len = 0;
+	  t_null = true;
 	}
 
-      t_val_size = QFILE_TUPLE_VALUE_HEADER_SIZE + QFILE_GET_TUPLE_VALUE_LENGTH (t_valhp);
+      t_val_size = QFILE_TUPLE_VALUE_HEADER_SIZE + t_len;
       if ((tplrec->size - offset) < t_val_size)
 	{			/* no space left */
 	  tpl_size = offset + qexec_size_remaining (tplrec1, tplrec2, merge_info, k);
@@ -6115,7 +6099,8 @@ qexec_merge_tuple (QFILE_TUPLE_RECORD * tplrec1, QFILE_TUPLE_RECORD * tplrec2, Q
 	  tplp = (QFILE_TUPLE) tplrec->tpl + offset;
 	}
 
-      memcpy (tplp, t_valhp, t_val_size);
+      /* PR-1b assembler bridge: re-emit the legacy [flag][len][body] value (PR-2: tuple assembler, D-182-11) */
+      qfile_legacy_put_value (tplp, t_body, t_len, t_null);
       tplp += t_val_size;
       offset += t_val_size;
     }				/* for */
@@ -6212,15 +6197,16 @@ qexec_merge_tuple_add_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, QF
         }                                                                    \
     } while (0)
 
+/* position the merge columns of pre##_tplrec: body pointer + length (0 == NULL) through the slot accessor */
 #define QEXEC_MERGE_PVALS(pre)                                               \
     do {                                                                     \
         int _v;                                                              \
+        bool _null;                                                          \
         for (_v = 0; _v < nvals; _v++) {                                     \
-            do {                                                             \
-                QFILE_GET_TUPLE_VALUE_HEADER_POSITION((pre##_tplrec).tpl,    \
+            (pre##_valp)[_v] = (char *) qfile_slot_locate (&(pre##_tplrec),  \
                                         (pre##_indp)[_v],                    \
-                                        (pre##_valp)[_v]);                   \
-            } while (0);                                                     \
+                                        &(pre##_lenp)[_v], &_null);          \
+            if (_null) (pre##_lenp)[_v] = 0;                                 \
         }                                                                    \
     } while (0)
 
@@ -6321,6 +6307,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
   QFILE_TUPLE_RECORD inner_tplrec = { NULL, 0 };
   int *outer_indp, *inner_indp;
   char **outer_valp = NULL, **inner_valp = NULL;
+  int *outer_lenp = NULL, *inner_lenp = NULL;
   SCAN_CODE outer_scan = S_END, inner_scan = S_END;
   QFILE_LIST_SCAN_ID outer_sid, inner_sid;
 
@@ -6413,6 +6400,19 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
       goto exit_on_error;
     }
 
+  /* merge column value lengths (0 == NULL) */
+  outer_lenp = (int *) db_private_alloc (thread_p, nvals * sizeof (int));
+  if (outer_lenp == NULL)
+    {
+      goto exit_on_error;
+    }
+
+  inner_lenp = (int *) db_private_alloc (thread_p, nvals * sizeof (int));
+  if (inner_lenp == NULL)
+    {
+      goto exit_on_error;
+    }
+
   /* When a list file is sorted on a column, all the NULL values appear at the beginning of the list. So, we know that
    * all the following values in the inner/outer column are BOUND(not NULL) values. Depending on the join type, we must
    * skip or join with a NULL opposite row, when a NULL is encountered. */
@@ -6425,7 +6425,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 
       for (k = 0; k < nvals; k++)
 	{
-	  if (QFILE_GET_TUPLE_VALUE_FLAG (outer_valp[k]) == V_UNBOUND)
+	  if (outer_lenp[k] == 0)	/* NULL */
 	    {
 	      break;
 	    }
@@ -6444,7 +6444,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 
       for (k = 0; k < nvals; k++)
 	{
-	  if (QFILE_GET_TUPLE_VALUE_FLAG (inner_valp[k]) == V_UNBOUND)
+	  if (inner_lenp[k] == 0)	/* NULL */
 	    {
 	      break;
 	    }
@@ -6467,7 +6467,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
       /* compare two tuple values, if they have not been compared yet */
       if (!already_compared)
 	{
-	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -6526,7 +6526,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 		    }
 
 		  /* and compare */
-		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 		  if (val_cmp != DB_EQ)
 		    {
 		      if (val_cmp == DB_UNK)
@@ -6570,7 +6570,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 	      else
 		{
 		  /* and compare */
-		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 		  if (val_cmp == DB_UNK)
 		    {		/* is error */
 		      goto exit_on_error;
@@ -6582,7 +6582,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 		      QEXEC_MERGE_REV_SCAN_PVALS (thread_p, inner);
 
 		      /* and compare */
-		      val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+		      val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 		      if (val_cmp == DB_UNK)
 			{	/* is error */
 			  goto exit_on_error;
@@ -6647,7 +6647,7 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 	  QEXEC_MERGE_NEXT_SCAN_PVALS (thread_p, outer, true);
 
 	  /* and compare */
-	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -6709,6 +6709,14 @@ exit_on_end:
     {
       db_private_free_and_init (thread_p, inner_valp);
     }
+  if (outer_lenp)
+    {
+      db_private_free_and_init (thread_p, outer_lenp);
+    }
+  if (inner_lenp)
+    {
+      db_private_free_and_init (thread_p, inner_lenp);
+    }
 
   if (list_idp)
     {
@@ -6753,6 +6761,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
   QFILE_TUPLE_RECORD inner_tplrec = { NULL, 0 };
   int *outer_indp, *inner_indp;
   char **outer_valp = NULL, **inner_valp = NULL;
+  int *outer_lenp = NULL, *inner_lenp = NULL;
   SCAN_CODE outer_scan = S_END, inner_scan = S_END;
 
   TP_DOMAIN **outer_domp = NULL, **inner_domp = NULL;
@@ -6854,6 +6863,19 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
       goto exit_on_error;
     }
 
+  /* merge column value lengths (0 == NULL) */
+  outer_lenp = (int *) db_private_alloc (thread_p, nvals * sizeof (int));
+  if (outer_lenp == NULL)
+    {
+      goto exit_on_error;
+    }
+
+  inner_lenp = (int *) db_private_alloc (thread_p, nvals * sizeof (int));
+  if (inner_lenp == NULL)
+    {
+      goto exit_on_error;
+    }
+
   /* start scans */
   if (scan_start_scan (thread_p, outer_sid) != NO_ERROR || scan_start_scan (thread_p, inner_sid) != NO_ERROR)
     {
@@ -6879,7 +6901,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 	{
 	  for (k = 0; k < nvals; k++)
 	    {
-	      if (QFILE_GET_TUPLE_VALUE_FLAG (outer_valp[k]) == V_UNBOUND)
+	      if (outer_lenp[k] == 0)	/* NULL */
 		{
 		  break;
 		}
@@ -6908,7 +6930,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 	{
 	  for (k = 0; k < nvals; k++)
 	    {
-	      if (QFILE_GET_TUPLE_VALUE_FLAG (inner_valp[k]) == V_UNBOUND)
+	      if (inner_lenp[k] == 0)	/* NULL */
 		{
 		  break;
 		}
@@ -6937,7 +6959,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
       /* compare two tuple values, if they have not been compared yet */
       if (!already_compared)
 	{
-	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -7066,7 +7088,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 		    }
 
 		  /* and compare */
-		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 		  if (val_cmp != DB_EQ)
 		    {
 		      if (val_cmp == DB_UNK)
@@ -7131,7 +7153,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 	      else
 		{
 		  /* and compare */
-		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+		  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 		  if (val_cmp == DB_UNK)
 		    {		/* is error */
 		      goto exit_on_error;
@@ -7143,7 +7165,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 		      QEXEC_MERGE_OUTER_PREV_SCAN_PVALS (thread_p, inner);
 
 		      /* and compare */
-		      val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+		      val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 		      if (val_cmp == DB_UNK)
 			{	/* is error */
 			  goto exit_on_error;
@@ -7235,7 +7257,7 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 	  QEXEC_MERGE_OUTER_NEXT_SCAN_PVALS (thread_p, outer, true);
 
 	  /* and compare */
-	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_domp, inner_valp, inner_domp, nvals);
+	  val_cmp = qexec_cmp_tpl_vals_merge (outer_valp, outer_lenp, outer_domp, inner_valp, inner_lenp, inner_domp, nvals);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -7345,6 +7367,14 @@ exit_on_end:
   if (inner_valp)
     {
       db_private_free_and_init (thread_p, inner_valp);
+    }
+  if (outer_lenp)
+    {
+      db_private_free_and_init (thread_p, outer_lenp);
+    }
+  if (inner_lenp)
+    {
+      db_private_free_and_init (thread_p, inner_lenp);
     }
 
   if (list_idp)
@@ -10074,16 +10104,16 @@ qexec_setup_list_id (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
     }
 
   list_id->last_pgptr = NULL;	/* don't want qfile_close_list() to free this bogus listid */
-  list_id->type_list.type_cnt = 1;
-  list_id->type_list.domp = (TP_DOMAIN **) malloc (list_id->type_list.type_cnt * sizeof (TP_DOMAIN *));
-  if (list_id->type_list.domp == NULL)
+  /* hand-built one-column list: own [domp | col] block like qfile_open_list (D-181-1) */
+  if (qfile_type_list_alloc (&list_id->type_list, 1, QFILE_TL_HDR_SIZE_LEGACY) != NO_ERROR)
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1,
-	      list_id->type_list.type_cnt * sizeof (TP_DOMAIN *));
+	      sizeof (TP_DOMAIN *) + sizeof (QFILE_COL_LAYOUT));
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
   /* set up to return object domains in case we want to return the updated/inserted/deleted oid's */
   list_id->type_list.domp[0] = &tp_Object_domain;
+  qfile_type_list_finalize (&list_id->type_list);	/* mutator-owns-finalize (D-181-6) */
 
   if (xasl->type == INSERT_PROC && XASL_IS_FLAGED (xasl, XASL_RETURN_GENERATED_KEYS))
     {
@@ -17903,7 +17933,7 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 		  pr_clear_value (index_valp);
 		}
 
-	      if (qexec_get_index_pseudocolumn_value_from_tuple (thread_p, xasl, tuple_rec.tpl, &index_valp,
+	      if (qexec_get_index_pseudocolumn_value_from_tuple (thread_p, xasl, &tuple_rec, &index_valp,
 								 &father_index, &len_father_index) != NO_ERROR)
 		{
 		  GOTO_EXIT_ON_ERROR;
@@ -17980,7 +18010,7 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 
 		  /* preserve the parent position pseudocolumn value */
 		  if (qexec_get_tuple_column_value
-		      (tuple_rec.tpl, (xasl->outptr_list->valptr_cnt - PCOL_PARENTPOS_TUPLE_OFFSET), parent_pos_valp,
+		      (&tuple_rec, (xasl->outptr_list->valptr_cnt - PCOL_PARENTPOS_TUPLE_OFFSET), parent_pos_valp,
 		       &tp_Bit_domain) != NO_ERROR)
 		    {
 		      GOTO_EXIT_ON_ERROR;
@@ -18080,7 +18110,7 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 
 	      db_make_int (isleaf_valp, isleaf_value);
 
-	      if (qexec_get_tuple_column_value (tuple_rec.tpl,
+	      if (qexec_get_tuple_column_value (&tuple_rec,
 						(xasl->outptr_list->valptr_cnt - PCOL_PARENTPOS_TUPLE_OFFSET),
 						parent_pos_valp, &tp_Bit_domain) != NO_ERROR)
 		{
@@ -18170,19 +18200,19 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 		    }
 
 		  /* preserve iscycle, isleaf and parent_pos pseudocolumns */
-		  if (qexec_get_tuple_column_value (tpl_lst2tmp.tpl,
+		  if (qexec_get_tuple_column_value (&tpl_lst2tmp,
 						    (xasl->outptr_list->valptr_cnt - PCOL_ISCYCLE_TUPLE_OFFSET),
 						    iscycle_valp, &tp_Integer_domain) != NO_ERROR)
 		    {
 		      GOTO_EXIT_ON_ERROR;
 		    }
-		  if (qexec_get_tuple_column_value (tpl_lst2tmp.tpl,
+		  if (qexec_get_tuple_column_value (&tpl_lst2tmp,
 						    (xasl->outptr_list->valptr_cnt - PCOL_ISLEAF_TUPLE_OFFSET),
 						    isleaf_valp, &tp_Integer_domain) != NO_ERROR)
 		    {
 		      GOTO_EXIT_ON_ERROR;
 		    }
-		  if (qexec_get_tuple_column_value (tpl_lst2tmp.tpl,
+		  if (qexec_get_tuple_column_value (&tpl_lst2tmp,
 						    (xasl->outptr_list->valptr_cnt - PCOL_PARENTPOS_TUPLE_OFFSET),
 						    parent_pos_valp, &tp_Bit_domain) != NO_ERROR)
 		    {
@@ -18886,31 +18916,20 @@ qexec_insert_tuple_into_list (THREAD_ENTRY * thread_p, qfile_list_id * list_id, 
  *  domain(in):
  */
 int
-qexec_get_tuple_column_value (QFILE_TUPLE tpl, int index, DB_VALUE * valp, tp_domain * domain)
+qexec_get_tuple_column_value (QFILE_TUPLE_RECORD * tplrec, int index, DB_VALUE * valp, tp_domain * domain)
 {
-  QFILE_TUPLE_VALUE_FLAG flag;
-  char *ptr;
-  int length;
-  const PR_TYPE *pr_type;
-  OR_BUF buf;
+  bool is_null;
 
-  flag = (QFILE_TUPLE_VALUE_FLAG) qfile_locate_tuple_value (tpl, index, &ptr, &length);
-  if (flag == V_BOUND)
+  if (domain->type == NULL)
     {
-      pr_type = domain->type;
-      if (pr_type == NULL)
-	{
-	  return ER_FAILED;
-	}
-
-      or_init (&buf, ptr, length);
-
-      if (pr_type->data_readval (&buf, valp, domain, -1, false, NULL, 0) != NO_ERROR)
-	{
-	  return ER_FAILED;
-	}
+      return ER_FAILED;
     }
-  else
+
+  if (qfile_slot_read_value (tplrec, index, domain, valp, false, &is_null) != NO_ERROR)
+    {
+      return ER_FAILED;
+    }
+  if (is_null)
     {
       db_make_null (valp);
     }
@@ -18944,12 +18963,13 @@ qexec_check_for_cycle (THREAD_ENTRY * thread_p, OUTPTR_LIST * outptr_list, QFILE
       return ER_FAILED;
     }
 
-  /* we start with tpl itself */
-  qfile_slot_set_tuple (&tuple_rec, tpl);
+  /* we start with tpl itself; the raw tuple is wrapped in a slot bound to the list's finalized descriptor (the
+   * caller's type_list is the INPUT type list and only supplies the decoding domains) */
+  qfile_slot_fill (&tuple_rec, tpl, &s_id.list_id.type_list);
 
   do
     {
-      if (qexec_compare_valptr_with_tuple (outptr_list, tuple_rec.tpl, type_list, iscycle) != NO_ERROR)
+      if (qexec_compare_valptr_with_tuple (outptr_list, &tuple_rec, type_list, iscycle) != NO_ERROR)
 	{
 	  qfile_close_scan (thread_p, &s_id);
 	  return ER_FAILED;
@@ -18961,7 +18981,7 @@ qexec_check_for_cycle (THREAD_ENTRY * thread_p, OUTPTR_LIST * outptr_list, QFILE
 	}
 
       /* get the parent node */
-      if (qexec_get_tuple_column_value (tuple_rec.tpl,
+      if (qexec_get_tuple_column_value (&tuple_rec,
 					(outptr_list->valptr_cnt - PCOL_PARENTPOS_TUPLE_OFFSET), &p_pos_dbval,
 					&tp_Bit_domain) != NO_ERROR)
 	{
@@ -19012,23 +19032,24 @@ qexec_check_for_cycle (THREAD_ENTRY * thread_p, OUTPTR_LIST * outptr_list, QFILE
  *  weaken cycle detection.
  */
 static int
-qexec_compare_valptr_with_tuple (OUTPTR_LIST * outptr_list, QFILE_TUPLE tpl, QFILE_TUPLE_VALUE_TYPE_LIST * type_list,
+qexec_compare_valptr_with_tuple (OUTPTR_LIST * outptr_list, QFILE_TUPLE_RECORD * tplrec,
+				 QFILE_TUPLE_VALUE_TYPE_LIST * type_list,
 				 int *are_equal)
 {
   REGU_VARIABLE_LIST regulist;
-  QFILE_TUPLE tuple;
   OR_BUF buf;
   DB_VALUE dbval1, *dbvalp2;
   const PR_TYPE *pr_type_p;
   DB_TYPE type;
   TP_DOMAIN *domp;
   int length1, length2, equal, i;
+  const char *body;
+  bool is_null;
   bool copy = false;
   bool compare_this;
 
   *are_equal = 1;
 
-  tuple = tpl + QFILE_TUPLE_LENGTH_SIZE;
   regulist = outptr_list->valptrp;
   i = 0;
 
@@ -19043,7 +19064,11 @@ qexec_compare_valptr_with_tuple (OUTPTR_LIST * outptr_list, QFILE_TUPLE tpl, QFI
       copy = pr_is_set_type (type);
       pr_type_p = domp->type;
 
-      length1 = QFILE_GET_TUPLE_VALUE_LENGTH (tuple);
+      body = qfile_slot_locate (tplrec, i, &length1, &is_null);
+      if (is_null)
+	{
+	  length1 = 0;
+	}
 
       /* zero length means NULL */
       if (length1 == 0)
@@ -19052,7 +19077,7 @@ qexec_compare_valptr_with_tuple (OUTPTR_LIST * outptr_list, QFILE_TUPLE tpl, QFI
 	}
       else
 	{
-	  or_init (&buf, (char *) tuple + QFILE_TUPLE_VALUE_HEADER_SIZE, length1);
+	  or_init (&buf, (char *) body, length1);
 	  if (pr_type_p->data_readval (&buf, &dbval1, domp, -1, copy, NULL, 0) != NO_ERROR)
 	    {
 	      return ER_FAILED;
@@ -19098,7 +19123,6 @@ qexec_compare_valptr_with_tuple (OUTPTR_LIST * outptr_list, QFILE_TUPLE tpl, QFI
 	  break;
 	}
 
-      tuple += QFILE_TUPLE_VALUE_HEADER_SIZE + QFILE_GET_TUPLE_VALUE_LENGTH (tuple);
       regulist = regulist->next;
       i++;
     }
@@ -19432,10 +19456,10 @@ qexec_reset_pseudocolumns_val_pointers (DB_VALUE * level_valp, DB_VALUE * isleaf
  *  index_len(out):
  */
 static int
-qexec_get_index_pseudocolumn_value_from_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QFILE_TUPLE tpl,
+qexec_get_index_pseudocolumn_value_from_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QFILE_TUPLE_RECORD * tplrec,
 					       DB_VALUE ** index_valp, char **index_value, int *index_len)
 {
-  if (qexec_get_tuple_column_value (tpl, (xasl->outptr_list->valptr_cnt - PCOL_INDEX_STRING_TUPLE_OFFSET),
+  if (qexec_get_tuple_column_value (tplrec, (xasl->outptr_list->valptr_cnt - PCOL_INDEX_STRING_TUPLE_OFFSET),
 				    *index_valp, &tp_String_domain) != NO_ERROR)
     {
       return ER_FAILED;
@@ -19536,7 +19560,7 @@ qexec_recalc_tuples_parent_pos_in_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID *
 	  started = true;
 	}
 
-      if (qexec_get_tuple_column_value (tuple_rec.tpl, (list_id_p->type_list.type_cnt - PCOL_LEVEL_TUPLE_OFFSET),
+      if (qexec_get_tuple_column_value (&tuple_rec, (list_id_p->type_list.type_cnt - PCOL_LEVEL_TUPLE_OFFSET),
 					&level_dbval, &tp_Integer_domain) != NO_ERROR)
 	{
 	  goto exit_on_error;
@@ -21195,6 +21219,10 @@ qexec_resolve_domains_for_group_by (BUILDLIST_PROC_NODE * buildlist, OUTPTR_LIST
 	  context->sorted_part_list_id->type_list.domp[index + 1] = context->accumulator_domains[i]->value2_dom;
 	  context->sorted_part_list_id->type_list.domp[index + 2] = &tp_Integer_domain;
 	}
+
+      /* mutator-owns-finalize (D-181-6) */
+      qfile_type_list_finalize (&context->part_list_id->type_list);
+      qfile_type_list_finalize (&context->sorted_part_list_id->type_list);
     }
 }
 
@@ -21284,6 +21312,7 @@ qexec_resolve_domains_for_aggregation (THREAD_ENTRY * thread_p, AGGREGATE_TYPE *
 		       && TP_DOMAIN_TYPE (agg_p->list_id->type_list.domp[0]) == DB_TYPE_VARIABLE)
 		{
 		  agg_p->list_id->type_list.domp[0] = tp_domain_resolve_value (dbval, NULL);
+		  qfile_type_list_finalize (&agg_p->list_id->type_list);	/* mutator-owns-finalize (D-181-6) */
 		}
 	    }
 
@@ -21516,6 +21545,7 @@ qexec_resolve_domains_for_aggregation (THREAD_ENTRY * thread_p, AGGREGATE_TYPE *
 		{
 		  agg_p->list_id->type_list.domp[0] = tp_domain_resolve_value (dbval, NULL);
 		}
+	      qfile_type_list_finalize (&agg_p->list_id->type_list);	/* mutator-owns-finalize (D-181-6) */
 	    }
 
 	  /* initialize accumulators */
@@ -21707,7 +21737,7 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
 	      goto exit_on_error;
 	    }
 
-	  if (qexec_get_tuple_column_value (tuple_rec.tpl, i, &val, regu_list->value.domain) != NO_ERROR)
+	  if (qexec_get_tuple_column_value (&tuple_rec, i, &val, regu_list->value.domain) != NO_ERROR)
 	    {
 	      gbstate.state = ER_FAILED;
 	      goto exit_on_error;
@@ -23170,12 +23200,8 @@ static int
 qexec_analytic_finalize_group (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, ANALYTIC_FUNCTION_STATE * func_state,
 			       bool is_same_group)
 {
-  QFILE_TUPLE_RECORD tplrec;
+  QFILE_TUPLE_RECORD tplrec = { NULL, 0 };
   int rc = NO_ERROR;
-
-  /* initialize tuple record */
-  tplrec.tpl = NULL;
-  tplrec.size = 0;
 
   /* finalize function */
   if (qdata_finalize_analytic_func (thread_p, func_state->func_p, is_same_group) != NO_ERROR)
@@ -23859,28 +23885,27 @@ qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p, ANALYTI
 static int
 qexec_analytic_group_header_load (ANALYTIC_FUNCTION_STATE * func_state)
 {
-  QFILE_TUPLE tuple_p;
+  const char *body;
+  int len;
+  bool is_null;
 
   assert (func_state != NULL);
 
-  tuple_p = func_state->group_tplrec.tpl + QFILE_TUPLE_LENGTH_SIZE;
-
   /* deserialize tuple count */
-  if (QFILE_GET_TUPLE_VALUE_FLAG (tuple_p) != V_BOUND)
+  body = qfile_slot_locate (&func_state->group_tplrec, 0, &len, &is_null);
+  if (is_null)
     {
       return ER_FAILED;
     }
-  tuple_p += QFILE_TUPLE_VALUE_HEADER_SIZE;
-  func_state->curr_group_tuple_count = OR_GET_INT (tuple_p);
-  tuple_p += DB_ALIGN (tp_Integer.disksize, MAX_ALIGNMENT);
+  func_state->curr_group_tuple_count = OR_GET_INT (body);
 
   /* deserialize not-null tuple count */
-  if (QFILE_GET_TUPLE_VALUE_FLAG (tuple_p) != V_BOUND)
+  body = qfile_slot_locate (&func_state->group_tplrec, 1, &len, &is_null);
+  if (is_null)
     {
       return ER_FAILED;
     }
-  tuple_p += QFILE_TUPLE_VALUE_HEADER_SIZE;
-  func_state->curr_group_tuple_count_nn = OR_GET_INT (tuple_p);
+  func_state->curr_group_tuple_count_nn = OR_GET_INT (body);
 
   /* all ok */
   return NO_ERROR;
@@ -23899,22 +23924,20 @@ qexec_analytic_group_header_load (ANALYTIC_FUNCTION_STATE * func_state)
 static int
 qexec_analytic_sort_key_header_load (ANALYTIC_FUNCTION_STATE * func_state, bool load_value)
 {
-  QFILE_TUPLE tuple_p;
+  const char *body;
   OR_BUF buf;
   int length, rc = NO_ERROR;
+  bool is_null;
 
   assert (func_state != NULL);
 
-  tuple_p = func_state->value_tplrec.tpl + QFILE_TUPLE_LENGTH_SIZE;
-
   /* deserialize tuple count */
-  if (QFILE_GET_TUPLE_VALUE_FLAG (tuple_p) != V_BOUND)
+  body = qfile_slot_locate (&func_state->value_tplrec, 0, &length, &is_null);
+  if (is_null)
     {
       return ER_FAILED;
     }
-  tuple_p += QFILE_TUPLE_VALUE_HEADER_SIZE;
-  func_state->curr_sort_key_tuple_count = OR_GET_INT (tuple_p);
-  tuple_p += DB_ALIGN (tp_Integer.disksize, MAX_ALIGNMENT);
+  func_state->curr_sort_key_tuple_count = OR_GET_INT (body);
 
   if (!load_value && !func_state->func_p->ignore_nulls && !QPROC_IS_INTERPOLATION_FUNC (func_state->func_p))
     {
@@ -23926,11 +23949,10 @@ qexec_analytic_sort_key_header_load (ANALYTIC_FUNCTION_STATE * func_state, bool 
   pr_clear_value (func_state->func_p->value);
 
   /* deserialize value */
-  if (QFILE_GET_TUPLE_VALUE_FLAG (tuple_p) == V_BOUND)
+  body = qfile_slot_locate (&func_state->value_tplrec, 1, &length, &is_null);
+  if (!is_null)
     {
-      length = QFILE_GET_TUPLE_VALUE_LENGTH (tuple_p);
-      tuple_p += QFILE_TUPLE_VALUE_HEADER_SIZE;
-      or_init (&buf, tuple_p, length);
+      or_init (&buf, (char *) body, length);
 
       rc =
 	func_state->func_p->domain->type->data_readval (&buf, func_state->func_p->value, func_state->func_p->domain, -1,
