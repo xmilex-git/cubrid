@@ -118,6 +118,8 @@ cursor_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_l
     }
 
   dest_list_id_p->tpl_descr.f_valp = NULL;
+  dest_list_id_p->tpl_descr.col_src = NULL;
+  dest_list_id_p->tpl_descr.col_src_cap = 0;
   dest_list_id_p->sort_list = NULL;	/* never use sort_list in crs_ level */
 
   if (src_list_id_p->last_pgptr)
@@ -1580,6 +1582,8 @@ cursor_prev_tuple (CURSOR_ID * cursor_id_p)
 	{
 	  cursor_id_p->tuple_no--;
 	  cursor_id_p->current_tuple_no--;
+	  /* prev_len exists only in the 8-byte header of a backward capable list (D-181-8, D-182-9) */
+	  assert (QFILE_LIST_IS_BACKWARD (&cursor_id_p->list_id));
 	  cursor_id_p->current_tuple_offset -= QFILE_GET_PREV_TUPLE_LENGTH (cursor_id_p->current_tuple_p);
 	  cursor_id_p->current_tuple_p -= QFILE_GET_PREV_TUPLE_LENGTH (cursor_id_p->current_tuple_p);
 	  cursor_id_p->current_tuple_length = QFILE_GET_TUPLE_LENGTH (cursor_id_p->current_tuple_p);
