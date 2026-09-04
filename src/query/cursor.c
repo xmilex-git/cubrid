@@ -83,9 +83,7 @@ static void cursor_allocate_oid_buffer (CURSOR_ID * cursor_id_p);
  */
 
 /*
- * cursor_reset_current_slot () - forget the deform position of the current tuple.
- *   Called by every cursor move (mutator-owns-reset, D-182-5); the slot is re-pointed lazily by the first column
- *   read after the move (cursor_get_tuple_value_from_list), which is when current_tuple_p is final.
+ * cursor_reset_current_slot () - forget the deform position of the current tuple
  */
 static void
 cursor_reset_current_slot (CURSOR_ID * cursor_id_p)
@@ -111,13 +109,14 @@ cursor_copy_list_id (QFILE_LIST_ID * dest_list_id_p, const QFILE_LIST_ID * src_l
 {
   memcpy (dest_list_id_p, src_list_id_p, DB_SIZEOF (QFILE_LIST_ID));
 
-  /* the layout descriptor is inherited by block copy (D-181-6) */
+  /* deep-copy the type list's domain array (already block-copied above by reference) */
   if (qfile_type_list_copy (&dest_list_id_p->type_list, &src_list_id_p->type_list) != NO_ERROR)
     {
       return ER_FAILED;
     }
 
   dest_list_id_p->tpl_descr.f_valp = NULL;
+  dest_list_id_p->tpl_descr.f_len = NULL;
   dest_list_id_p->tpl_descr.col_src = NULL;
   dest_list_id_p->tpl_descr.col_src_cap = 0;
   dest_list_id_p->sort_list = NULL;	/* never use sort_list in crs_ level */
@@ -379,14 +378,12 @@ cursor_get_tuple_value_to_dbvalue (QFILE_TUPLE_RECORD * slot, int index, TP_DOMA
 
   type = pr_type->id;
 
-  /* VOBJs must be handled separately: a set column is VAR/SCRATCH, read it from a transient aligned copy */
+  /* VOBJs must be handled separately: a set column is VAR/SCRATCH, its body is 4-aligned in the tuple */
   if (type == DB_TYPE_VOBJ)
     {
       OR_BUF buffer;
       const char *body;
-      char stack_buf[QFILE_SCRATCH_STACK + MAX_ALIGNMENT];
-      char *aligned;
-      int length, rc;
+      int length;
 
       body = qfile_slot_locate (slot, index, &length, &is_null);
       if (is_null)
@@ -394,16 +391,8 @@ cursor_get_tuple_value_to_dbvalue (QFILE_TUPLE_RECORD * slot, int index, TP_DOMA
 	  db_value_domain_init (value_p, type, domain_p->precision, domain_p->scale);
 	  return NO_ERROR;
 	}
-      aligned = QFILE_SCRATCH_ACQUIRE (stack_buf, length);
-      if (aligned == NULL)
-	{
-	  return ER_FAILED;
-	}
-      memcpy (aligned, body, length);
-      or_init (&buffer, aligned, length);
-      rc = cursor_copy_vobj_to_dbvalue (&buffer, value_p);
-      QFILE_SCRATCH_RELEASE (aligned, stack_buf);
-      return rc;
+      or_init (&buffer, (char *) body, length);
+      return cursor_copy_vobj_to_dbvalue (&buffer, value_p);
     }
 
   /* for all other types, the shared accessor decodes with the prim routines */
@@ -450,8 +439,7 @@ cursor_get_tuple_value_from_list (CURSOR_ID * cursor_id_p, int index, DB_VALUE *
 
   assert (index >= 0 && index < type_list_p->type_cnt);
 
-  /* the slot is re-pointed by the first read after a cursor move; the shared accessor keeps the deform position
-   * (formerly current_tuple_value_index/_p) so successive reads of increasing columns stay O(1) */
+  /* the slot is re-pointed by the first read after a cursor move, so increasing-column reads stay O(1) */
   slot = &cursor_id_p->current_slot;
   if (slot->tpl == NULL)
     {
@@ -781,8 +769,6 @@ cursor_prefetch_first_hidden_oid (CURSOR_ID * cursor_id_p)
   QFILE_TUPLE_RECORD slot = { NULL, 0 };
   int length;
   bool is_null;
-  char stack_buf[QFILE_SCRATCH_STACK + MAX_ALIGNMENT];
-  char *aligned;
 
   if (cursor_id_p == NULL)
     {
@@ -814,21 +800,14 @@ cursor_prefetch_first_hidden_oid (CURSOR_ID * cursor_id_p)
 	  continue;
 	}
 
-      /* OBJECT/VOBJ columns are VAR/SCRATCH: read the OID from a transient aligned copy of the body */
-      aligned = QFILE_SCRATCH_ACQUIRE (stack_buf, length);
-      if (aligned == NULL)
-	{
-	  return ER_FAILED;
-	}
-      memcpy (aligned, tuple_p, length);
-      current_oid_p = cursor_get_oid_from_tuple (aligned, length, type);
+      /* OBJECT/VOBJ columns are VAR/SCRATCH: the body is 4-aligned in the tuple, read the OID where it lies */
+      current_oid_p = cursor_get_oid_from_tuple (tuple_p, length, type);
 
       if (current_oid_p && oid_index < cursor_id_p->oid_ent_count)
 	{
 	  COPY_OID (&cursor_id_p->oid_set[oid_index], current_oid_p);
 	  oid_index++;
 	}
-      QFILE_SCRATCH_RELEASE (aligned, stack_buf);
 
       /* move to next tuple */
       current_tuple = (char *) current_tuple + current_tuple_length;
@@ -851,8 +830,6 @@ cursor_prefetch_column_oids (CURSOR_ID * cursor_id_p)
   QFILE_TUPLE_RECORD slot = { NULL, 0 };
   int length;
   bool is_null;
-  char stack_buf[QFILE_SCRATCH_STACK + MAX_ALIGNMENT];
-  char *aligned;
 
   if (cursor_id_p == NULL)
     {
@@ -889,14 +866,8 @@ cursor_prefetch_column_oids (CURSOR_ID * cursor_id_p)
 	      continue;
 	    }
 
-	  /* OBJECT/VOBJ columns are VAR/SCRATCH: read the OID from a transient aligned copy of the body */
-	  aligned = QFILE_SCRATCH_ACQUIRE (stack_buf, length);
-	  if (aligned == NULL)
-	    {
-	      return ER_FAILED;
-	    }
-	  memcpy (aligned, tuple_p, length);
-	  current_oid_p = cursor_get_oid_from_tuple (aligned, length, type);
+	  /* OBJECT/VOBJ columns are VAR/SCRATCH: the body is 4-aligned in the tuple, read the OID where it lies */
+	  current_oid_p = cursor_get_oid_from_tuple (tuple_p, length, type);
 
 	  if (current_oid_p && oid_index < cursor_id_p->oid_ent_count)
 	    {
@@ -912,7 +883,6 @@ cursor_prefetch_column_oids (CURSOR_ID * cursor_id_p)
 
 	      oid_index++;
 	    }
-	  QFILE_SCRATCH_RELEASE (aligned, stack_buf);
 	}
 
       current_tuple = (char *) current_tuple + current_tuple_length;
@@ -1607,8 +1577,7 @@ cursor_prev_tuple (CURSOR_ID * cursor_id_p)
 	{
 	  cursor_id_p->tuple_no--;
 	  cursor_id_p->current_tuple_no--;
-	  /* prev_len exists only in the 8-byte header of a backward capable list (D-181-8, D-182-9): on a forward-only
-	   * list the word after the length is bitmap/value bytes, so refuse instead of stepping to a garbage offset */
+	  /* refuse instead of stepping to a garbage offset: prev_len only exists in a backward-capable list's header */
 	  if (!QFILE_LIST_IS_BACKWARD (&cursor_id_p->list_id))
 	    {
 	      assert (false);

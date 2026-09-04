@@ -17,10 +17,8 @@
  */
 
 /*
- * qfile_tuple_layout.c - temporary list file tuple slot & accessor API (CBRD-27365, ADR 0016)
- *
- * Cold paths: layout descriptor allocation / finalize / debug cross-check, in-place overwrite, slot teardown.
- * The hot accessors are inline in qfile_tuple_layout.h.
+ * qfile_tuple_layout.c - list file tuple slot & accessor API: layout alloc/finalize/debug-check, in-place overwrite,
+ *   slot teardown (hot accessors are inline in the header).
  */
 
 #ident "$Id$"
@@ -36,12 +34,12 @@
 #include "object_primitive.h"
 #include "error_manager.h"
 #include "dbtype.h"
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
 /*
- * qfile_type_list_compute () - pure layout computation (D-181-6 finalize algorithm, spec #180 v1).
- *   Fills col[type_cnt] and the list-level fields from (domp, type_cnt, hdr_size). Idempotent.
- *   An unresolved DB_TYPE_VARIABLE column is laid out as VAR (its tuples so far hold NULL there: the assembler resolves
- *   the column at its first bound value, D-199-13).
+ * qfile_type_list_compute () - pure layout computation: fills col[type_cnt] and the list-level fields from
+ *   (domp, type_cnt, hdr_size); idempotent.
  */
 static void
 qfile_type_list_compute (TP_DOMAIN ** domp, int type_cnt, int hdr_size, QFILE_COL_LAYOUT * col,
@@ -72,7 +70,7 @@ qfile_type_list_compute (TP_DOMAIN ** domp, int type_cnt, int hdr_size, QFILE_CO
       off = DB_ALIGN (off, col[i].alignby);
       if (off > INT16_MAX)
 	{
-	  /* D-181-4: give up the constant-offset cache from here on; correctness is unaffected */
+	  /* give up the constant-offset cache from here on; correctness is unaffected */
 	  *first_non_cached_col = i;
 	  continue;
 	}
@@ -83,9 +81,7 @@ qfile_type_list_compute (TP_DOMAIN ** domp, int type_cnt, int hdr_size, QFILE_CO
 
 /*
  * qfile_type_list_alloc () - allocate the [domp[type_cnt] | col[type_cnt]] block of a list's type list.
- *   return: NO_ERROR or ER_FAILED (out of memory; the caller reports it as before)
- *   The domp entries are left for the caller to fill; finalized is false until qfile_type_list_finalize ().
- *   type_cnt == 0 leaves domp/col NULL like the historical code.
+ *   return: NO_ERROR or ER_FAILED (out of memory)
  */
 int
 qfile_type_list_alloc (QFILE_TUPLE_VALUE_TYPE_LIST * tl, int type_cnt, int hdr_size)
@@ -117,9 +113,9 @@ qfile_type_list_alloc (QFILE_TUPLE_VALUE_TYPE_LIST * tl, int type_cnt, int hdr_s
 }
 
 /*
- * qfile_type_list_copy () - allocate dest and inherit src (block memcpy when src is finalized, D-181-6).
+ * qfile_type_list_copy () - allocate dest and inherit src (block memcpy when src is finalized; a non-finalized src
+ *   only contributes its domains).
  *   return: NO_ERROR or ER_FAILED
- *   A non-finalized src (an INPUT type list) only contributes its domains; the caller finalizes dest.
  */
 int
 qfile_type_list_copy (QFILE_TUPLE_VALUE_TYPE_LIST * dest, const QFILE_TUPLE_VALUE_TYPE_LIST * src)
@@ -128,9 +124,8 @@ qfile_type_list_copy (QFILE_TUPLE_VALUE_TYPE_LIST * dest, const QFILE_TUPLE_VALU
 
   if (hdr_size != QFILE_TUPLE_HDR_SIZE_FORWARD && hdr_size != QFILE_TUPLE_HDR_SIZE_BACKWARD)
     {
-      /* a list id that was never opened (QFILE_CLEAR_LIST_ID leaves hdr_size 0; e.g. xasl->list_id copied out by
-       * qexec_get_xasl_list_id after an error exit, CTP _003_manipulation/1020.sql) or an INPUT type list: it holds no
-       * tuples, so the header is immaterial; qfile_open_list () decides it when the list is actually created */
+      /* a list id never opened (hdr_size 0) or an INPUT type list holds no tuples, so the header is immaterial;
+       * qfile_open_list () decides it once the list actually exists */
       assert (!src->finalized);
       hdr_size = QFILE_TUPLE_HDR_SIZE_FORWARD;
     }
@@ -162,10 +157,9 @@ qfile_type_list_copy (QFILE_TUPLE_VALUE_TYPE_LIST * dest, const QFILE_TUPLE_VALU
 }
 
 /*
- * qfile_type_list_finalize () - (re)compute the layout descriptor from domp (mutator-owns-finalize, D-181-6).
- *   Must run after the last domp mutation of a list: qfile_open_list, qfile_modify_type_list,
- *   qfile_update_domains_on_type_list, qfile_unify_types, or_unpack_unbound_listid, the px domain resolver and
- *   the executor-side late domain fixes of DISTINCT aggregate/analytic and hash GROUP BY partial lists.
+ * qfile_type_list_finalize () - (re)compute the layout descriptor from domp; must run after the last domp mutation
+ *   of a list (qfile_open_list, qfile_modify_type_list, qfile_update_domains_on_type_list, and other domain-fixing
+ *   callers).
  */
 void
 qfile_type_list_finalize (QFILE_TUPLE_VALUE_TYPE_LIST * tl)
@@ -192,8 +186,8 @@ qfile_type_list_finalize (QFILE_TUPLE_VALUE_TYPE_LIST * tl)
 
 #if !defined(NDEBUG)
 /*
- * qfile_type_list_check () - debug cross-check: stored descriptor == recomputation from domp (D-181-7).
- *   return: true when consistent. A false return means a domp mutation without qfile_type_list_finalize ().
+ * qfile_type_list_check () - debug cross-check: stored descriptor == recomputation from domp.
+ *   return: true when consistent; false means a domp mutation without qfile_type_list_finalize ()
  */
 bool
 qfile_type_list_check (const QFILE_TUPLE_VALUE_TYPE_LIST * tl)
@@ -205,8 +199,7 @@ qfile_type_list_check (const QFILE_TUPLE_VALUE_TYPE_LIST * tl)
 
   if (tl->type_cnt <= 0)
     {
-      /* an empty list (e.g. an XASL list_id that never produced a tuple, or a cleared one) has nothing to lay out and
-       * may legitimately never have been finalized; no column can be read from it anyway */
+      /* an empty list has nothing to lay out and may never have been finalized; no column can be read from it anyway */
       return tl->domp == NULL && tl->col == NULL;
     }
   if (!tl->finalized
@@ -225,8 +218,7 @@ qfile_type_list_check (const QFILE_TUPLE_VALUE_TYPE_LIST * tl)
       return true;		/* cannot check; do not fail the caller for that */
     }
 
-  qfile_type_list_compute (tl->domp, tl->type_cnt, tl->hdr_size, col, &first_non_cached_col, data_off,
-			   &bitmap_size);
+  qfile_type_list_compute (tl->domp, tl->type_cnt, tl->hdr_size, col, &first_non_cached_col, data_off, &bitmap_size);
 
   ok = (memcmp (col, tl->col, tl->type_cnt * sizeof (QFILE_COL_LAYOUT)) == 0
 	&& first_non_cached_col == tl->first_non_cached_col && data_off[0] == tl->data_off[0]
@@ -238,8 +230,101 @@ qfile_type_list_check (const QFILE_TUPLE_VALUE_TYPE_LIST * tl)
 #endif /* !NDEBUG */
 
 /*
- * qfile_slot_clear () - unbind the descriptor. Called by the slot owner when the scan/cursor is closed.
- *   Does not touch rec->tpl / rec->size: the owned tuple buffer is still freed by the record owner as before.
+ * qfile_slot_locate_walk () - out-of-line half of qfile_slot_locate (): starts the cache if needed, then walks from
+ *   the cached position to column col.
+ */
+const char *
+qfile_slot_locate_walk (QFILE_TUPLE_RECORD * rec, int col, int *body_len, bool * is_null)
+{
+  const QFILE_TUPLE_VALUE_TYPE_LIST *tl = rec->tl;
+  const QFILE_COL_LAYOUT *c;
+  const unsigned char *bm;
+  const char *tpl = rec->tpl;
+  int i, off, hdr, len;
+
+  if (rec->nvalid < 0)
+    {
+      qfile_slot_start (rec);
+    }
+
+  if (col < rec->fast_limit)
+    {
+      c = &tl->col[col];
+      *body_len = c->size;
+      *is_null = false;
+      return tpl + rec->data_off + c->off;
+    }
+
+  if (col >= rec->nvalid)
+    {
+      i = rec->nvalid;
+      off = rec->off;
+    }
+  else
+    {
+      i = rec->fast_limit;
+      off = rec->data_off + qfile_prefix_end (tl, i);
+    }
+
+  bm = rec->has_null ? QFILE_TUPLE_BITMAP (tpl, tl->hdr_size) : NULL;
+
+  for (; i < col; i++)
+    {
+      if (bm != NULL && !QFILE_BITMAP_IS_BOUND (bm, i))
+	{
+	  continue;
+	}
+      c = &tl->col[i];
+      off = DB_ALIGN (off, c->alignby);
+      if (c->kind == QFILE_COL_FIXED)
+	{
+	  off += c->size;
+	}
+      else
+	{
+	  /* the format is not self-describing: a length header read out of the tuple is the only thing that keeps the
+	   * walk inside it, so check the invariant here as qfile_tuple_walk_next () does (debug only, SER-02) */
+	  assert (off < QFILE_GET_TUPLE_LENGTH (tpl));
+	  len = qfile_var_hdr_decode (tpl + off, &hdr);
+	  off += hdr + len;
+	}
+      assert (off <= QFILE_GET_TUPLE_LENGTH (tpl));
+    }
+
+  if (col <= INT16_MAX)
+    {
+      rec->nvalid = (int16_t) col;
+      rec->off = off;
+    }
+
+  if (bm != NULL && !QFILE_BITMAP_IS_BOUND (bm, col))
+    {
+      *body_len = 0;
+      *is_null = true;
+      return tpl + off;
+    }
+
+  c = &tl->col[col];
+  off = DB_ALIGN (off, c->alignby);
+  if (c->kind == QFILE_COL_FIXED)
+    {
+      assert (off + c->size <= QFILE_GET_TUPLE_LENGTH (tpl));
+      *body_len = c->size;
+      *is_null = false;
+      return tpl + off;
+    }
+
+  assert (off < QFILE_GET_TUPLE_LENGTH (tpl));
+  len = qfile_var_hdr_decode (tpl + off, &hdr);
+  assert (off + hdr + len <= QFILE_GET_TUPLE_LENGTH (tpl));
+  *body_len = len;
+  *is_null = false;
+  return tpl + off + hdr;
+}
+
+/*
+ * qfile_slot_clear () - unbind the descriptor when the scan/cursor closes; does not touch rec->tpl / rec->size
+ *   (still freed by the record owner).
  */
 void
 qfile_slot_clear (QFILE_TUPLE_RECORD * rec)
@@ -249,12 +334,8 @@ qfile_slot_clear (QFILE_TUPLE_RECORD * rec)
 }
 
 /*
- * qfile_slot_overwrite_value () - in-place rewrite of column col with value (D-182-13, #185).
+ * qfile_slot_overwrite_value () - in-place rewrite of column col with value.
  *   return: NO_ERROR or ER_FAILED
- *   Contract (asserted in debug, ER_FAILED in release): value is not NULL, the stored column is bound, the
- *   value's type is the column's decoding type, and the value's body size in the column's encoding equals the stored
- *   body length. The five in-place sites (orderby_num, inst_num, CONNECT BY ISLEAF/ISCYCLE/parent_pos) all satisfy
- *   it. Only the body is rewritten; the length header of a VAR column is untouched (same length by contract).
  */
 int
 qfile_slot_overwrite_value (QFILE_TUPLE_RECORD * rec, int col, const TP_DOMAIN * dom, const DB_VALUE * value)
@@ -303,27 +384,26 @@ qfile_slot_overwrite_value (QFILE_TUPLE_RECORD * rec, int col, const TP_DOMAIN *
       return NO_ERROR;
     }
 
-  /* VAR/SCRATCH: encode into a transient aligned copy, then overwrite the body */
-  {
-    char stack_buf[QFILE_SCRATCH_STACK + MAX_ALIGNMENT];
-    char *aligned = QFILE_SCRATCH_ACQUIRE (stack_buf, len);
-    int rc = NO_ERROR;
+  /* VAR/SCRATCH: the body is 4-aligned in the tuple, overwrite it in place */
+  assert (PTR_ALIGN (body, QFILE_TUPLE_ALIGNMENT) == body);
+  or_init (&buf, (char *) body, len);
+  if (t->data_writeval (&buf, value) != NO_ERROR || CAST_BUFLEN (buf.ptr - buf.buffer) != len)
+    {
+      assert (false);
+      return ER_FAILED;
+    }
+  return NO_ERROR;
+}
 
-    if (aligned == NULL)
-      {
-	return ER_FAILED;
-      }
-    or_init (&buf, aligned, len);
-    if (t->data_writeval (&buf, value) != NO_ERROR || CAST_BUFLEN (buf.ptr - buf.buffer) != len)
-      {
-	assert (false);
-	rc = ER_FAILED;
-      }
-    else
-      {
-	memcpy ((char *) body, aligned, len);
-      }
-    QFILE_SCRATCH_RELEASE (aligned, stack_buf);
-    return rc;
-  }
+/*
+ * qfile_col_cmpdisk_function () - disk comparator matching a column's stored encoding
+ */
+pr_type::data_cmpdisk_function_type
+qfile_col_cmpdisk_function (const QFILE_COL_LAYOUT * c, const TP_DOMAIN * dom)
+{
+  if (c->kind == QFILE_COL_VAR && c->var_access == QFILE_VAR_DIRECT && dom->type->has_index_readval ())
+    {
+      return dom->type->get_index_cmpdisk_function ();
+    }
+  return dom->type->get_data_cmpdisk_function ();
 }

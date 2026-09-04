@@ -68,6 +68,7 @@ static int fetch_peek_min_max_value_of_width_bucket_func (THREAD_ENTRY * thread_
 							  DB_VALUE ** min, DB_VALUE ** max);
 
 static bool is_argument_wrapped_with_cast_op (const REGU_VARIABLE * regu_var);
+static int fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * tplrec);
 static int get_hour_minute_or_second (const DB_VALUE * datetime, OPERATOR_TYPE op_type, DB_VALUE * db_value);
 static int get_year_month_or_day (const DB_VALUE * src_date, OPERATOR_TYPE op, DB_VALUE * result);
 static int get_date_weekday (const DB_VALUE * src_date, OPERATOR_TYPE op, DB_VALUE * result);
@@ -223,7 +224,8 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      if (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE
 		  || QSTR_IS_ANY_CHAR_OR_BIT (TP_DOMAIN_TYPE (regu_var->domain)))
 		{
-		  if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_right) != NO_ERROR)
+		  if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_right) !=
+		      NO_ERROR)
 		    {
 		      goto error;
 		    }
@@ -343,7 +345,8 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    {
 	      if (arithptr->rightptr != NULL)
 		{
-		  if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_right) != NO_ERROR)
+		  if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_right) !=
+		      NO_ERROR)
 		    {
 		      goto error;
 		    }
@@ -4083,8 +4086,7 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 
       *peek_dbval = regu_var->vfetch_to;
 
-      /* slot value accessor: layout from the bound descriptor, decoding domain from the regu (D-182-7, D-196-3);
-       * a NULL column leaves the cleared vfetch_to as is (same as before) */
+      /* slot accessor: layout from the bound descriptor, domain from the regu; NULL column leaves vfetch_to as is */
       if (regu_var->value.pos_descr.dom->type == NULL)
 	{
 	  goto exit_on_error;
@@ -4648,7 +4650,8 @@ exit_on_error:
  */
 static int
 fetch_peek_min_max_value_of_width_bucket_func (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr * vd,
-					       OID * obj_oid, QFILE_TUPLE_RECORD * tplrec, DB_VALUE ** min, DB_VALUE ** max)
+					       OID * obj_oid, QFILE_TUPLE_RECORD * tplrec, DB_VALUE ** min,
+					       DB_VALUE ** max)
 {
   int er_status = NO_ERROR;
   PRED_EXPR *pred_expr;
@@ -4830,8 +4833,11 @@ fetch_val_list (THREAD_ENTRY * thread_p, regu_variable_list_node * regu_list, va
 
   if (peek)
     {
-      /* D-182-8: the TYPE_POSITION-only fast path (fetch_peek_dbval_pos) is gone; the slot cache gives the generic
-       * loop the same sequential cost */
+      if (regu_list && regu_list->value.type == TYPE_POSITION)
+	{
+	  /* the list is all TYPE_POSITION (existing invariant): one sequential pass over the tuple */
+	  return fetch_peek_dbval_pos (regu_list, tplrec);
+	}
       for (regup = regu_list; regup != NULL; regup = regup->next)
 	{
 	  if (regup->value.vfetch_to && unlikely (pr_is_set_type (DB_VALUE_DOMAIN_TYPE (regup->value.vfetch_to))))
@@ -4870,6 +4876,55 @@ fetch_val_list (THREAD_ENTRY * thread_p, regu_variable_list_node * regu_list, va
 	    {
 	      return ER_FAILED;
 	    }
+	}
+    }
+  return NO_ERROR;
+}
+
+/*
+ * fetch_peek_dbval_pos () - fetch_val_list (peek) for an all-TYPE_POSITION regu list: reads columns in pos_no order
+ *   return: NO_ERROR or ER_code
+ */
+static int
+fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * tplrec)
+{
+  regu_variable_list_node *regup;
+  REGU_VARIABLE *regu_var;
+  QFILE_TUPLE_VALUE_POSITION *pos_descr;
+  bool is_null;
+#if !defined(NDEBUG)
+  int prev_pos = -1;
+#endif
+
+  for (regup = regu_list; regup != NULL; regup = regup->next)
+    {
+      regu_var = &regup->value;
+      pos_descr = &regu_var->value.pos_descr;
+      assert_release (regu_var->type == TYPE_POSITION);
+#if !defined(NDEBUG)
+      assert (pos_descr->pos_no >= prev_pos);
+      prev_pos = pos_descr->pos_no;
+#endif
+      if (pos_descr->dom->type == NULL)
+	{
+	  return ER_FAILED;
+	}
+
+      /* a need_clear-free FIXED column is just marked NULL; VAR columns always call pr_clear_value */
+      if (tplrec->tl->col[pos_descr->pos_no].kind != QFILE_COL_FIXED || regu_var->vfetch_to->need_clear
+	  || DB_NEED_CLEAR (regu_var->vfetch_to))
+	{
+	  pr_clear_value (regu_var->vfetch_to);
+	}
+      else
+	{
+	  PRIM_SET_NULL (regu_var->vfetch_to);
+	}
+      if (qfile_slot_read_value
+	  (tplrec, pos_descr->pos_no, pos_descr->dom, regu_var->vfetch_to, false /* Don't copy */ ,
+	   &is_null) != NO_ERROR)
+	{
+	  return ER_FAILED;
 	}
     }
   return NO_ERROR;

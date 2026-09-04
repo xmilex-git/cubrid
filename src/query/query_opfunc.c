@@ -230,9 +230,11 @@ static int qdata_regexp_function (THREAD_ENTRY * thread_p, FUNCTION_TYPE * funct
 				  OID * obj_oid_p, QFILE_TUPLE_RECORD * tplrec);
 
 static int qdata_convert_operands_to_value_and_call (THREAD_ENTRY * thread_p, FUNCTION_TYPE * function_p,
-						     VAL_DESCR * val_desc_p, OID * obj_oid_p, QFILE_TUPLE_RECORD * tplrec,
-						     int (*function_to_call) (DB_VALUE *, DB_VALUE * const *,
-									      int const));
+						     VAL_DESCR * val_desc_p, OID * obj_oid_p,
+						     QFILE_TUPLE_RECORD * tplrec, int (*function_to_call) (DB_VALUE *,
+													   DB_VALUE *
+													   const *,
+													   int const));
 
 static bool
 qdata_is_zero_value_date (DB_VALUE * dbval_p)
@@ -414,13 +416,24 @@ static int
 qdata_copy_values_to_tuple (THREAD_ENTRY * thread_p, DB_VALUE ** vals, int n, qfile_tuple_value_type_list * tl,
 			    qfile_tuple_record * tuple_record_p)
 {
-  int size;
+  int lens_buf[QDATA_TUPLE_VALS_STACK], *lens = lens_buf;
+  int size, error;
   bool has_null;
 
-  size = qfile_tuple_size_from_values (tl, vals, n, &has_null);
+  if (n > QDATA_TUPLE_VALS_STACK)
+    {
+      lens = (int *) db_private_alloc (thread_p, n * sizeof (int));
+      if (lens == NULL)
+	{
+	  return ER_FAILED;
+	}
+    }
+
+  size = qfile_tuple_size_from_values (tl, vals, lens, n, &has_null);
   if (size < 0)
     {
-      return ER_FAILED;
+      error = ER_FAILED;
+      goto end;
     }
 
   if (tuple_record_p->size < size)
@@ -438,12 +451,20 @@ qdata_copy_values_to_tuple (THREAD_ENTRY * thread_p, DB_VALUE ** vals, int n, qf
 	}
       if (tuple_record_p->tpl == NULL)
 	{
-	  return ER_FAILED;
+	  error = ER_FAILED;
+	  goto end;
 	}
       tuple_record_p->size = tpl_size;
     }
 
-  return qfile_tuple_fill_from_values (tl, vals, n, tuple_record_p->tpl, size);
+  error = qfile_tuple_fill_from_values (tl, vals, lens, n, tuple_record_p->tpl, size, has_null);
+
+end:
+  if (lens != lens_buf)
+    {
+      db_private_free (thread_p, lens);
+    }
+  return error;
 }
 
 int
@@ -490,7 +511,7 @@ qdata_tuple_to_val_list (THREAD_ENTRY * thread_p, qfile_tuple_value_type_list * 
   int len;
   bool is_null;
 
-  /* sequential column reads through the slot cache are O(n) overall (D-182-7 bulk accessor) */
+  /* sequential column reads through the slot cache are O(n) overall */
   for (val_list_iterator = val_list->valp, val_list_index = 0; val_list_iterator
        && val_list_index < val_list->val_cnt; val_list_iterator = val_list_iterator->next, val_list_index++)
     {
@@ -575,9 +596,7 @@ exit_with_status:
 }
 
 /*
- * qdata_size_tuple_desc () - assembler size pass over the values collected by
- *   qdata_generate_tuple_desc_for_valptr_list (). Call it AFTER the list's DB_TYPE_VARIABLE domains have been resolved
- *   from those values (qfile_update_domains_on_type_list) so size and fill see the same layout descriptor.
+ * qdata_size_tuple_desc () - size pass over the values from qdata_generate_tuple_desc_for_valptr_list ()
  *   return: QPROC_TPLDESCR_SUCCESS, QPROC_TPLDESCR_RETRY_BIG_REC or QPROC_TPLDESCR_FAILURE
  *   tl(in): finalized layout descriptor of the destination list
  */
@@ -586,7 +605,8 @@ qdata_size_tuple_desc (qfile_tuple_value_type_list * tl, qfile_tuple_descriptor 
 {
   /* the compressed string, if any, is deallocated later, after copying the db_value into the tuple */
   tuple_desc_p->tpl_size =
-    qfile_tuple_size_from_values (tl, tuple_desc_p->f_valp, tuple_desc_p->f_cnt, &tuple_desc_p->has_null);
+    qfile_tuple_size_from_values (tl, tuple_desc_p->f_valp, tuple_desc_p->f_len, tuple_desc_p->f_cnt,
+				  &tuple_desc_p->has_null);
   if (tuple_desc_p->tpl_size < 0)
     {
       return QPROC_TPLDESCR_FAILURE;
@@ -6982,7 +7002,8 @@ qdata_convert_table_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABL
 	      return ER_FAILED;
 	    }
 
-	  if (qfile_slot_read_value (&tuple_record, i, list_id_p->type_list.domp[i], &dbval, true, &is_null) != NO_ERROR)
+	  if (qfile_slot_read_value (&tuple_record, i, list_id_p->type_list.domp[i], &dbval, true, &is_null) !=
+	      NO_ERROR)
 	    {
 	      qfile_close_scan (thread_p, &scan_id);
 	      return ER_FAILED;
