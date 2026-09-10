@@ -12540,6 +12540,111 @@ sysprm_print_assign_values (SYSPRM_ASSIGN_VALUE * prm_values, char *buffer, int 
 
 /* was #if !SERVER_MODE — client half now compiled into server */
 /*
+ * sysprm_print_client_file_session_parameters () - print, one per line, the
+ *   session parameters this client process loaded from its own configuration
+ *   file, in the "name=value" shape ";set" accepts (string values quoted).
+ *
+ * return : number of entries printed, or -1 when buf is too small
+ * buf (out) : output buffer
+ * len (in)  : size of buf
+ *
+ * Note: the legacy fat client shipped ALL of its session parameter values to
+ *   the server in the boot handshake (cached_session_parameters), so a
+ *   session parameter set only in the client's cubrid.conf still governed
+ *   that session.  A thin (wire) client has no such handshake — its session
+ *   starts from the server's values — so it forwards, once per connection,
+ *   exactly the session parameters its file explicitly set (PRM_SET on a
+ *   PRM_FOR_CLIENT | PRM_FOR_SESSION parameter).  Parameters the wire client
+ *   already seeds by dedicated requests are excluded by the caller's list.
+ */
+int
+sysprm_print_client_file_session_parameters (char *buf, size_t len, const PARAM_ID * exclude, int num_exclude)
+{
+  int i, j, count = 0;
+  char *ptr = buf;
+  size_t remaining = len;
+
+  if (buf == NULL || len == 0)
+    {
+      return -1;
+    }
+  *ptr = '\0';
+
+  for (i = 0; i < MAX_SYSTEM_PARAMS; i++)
+    {
+      SYSPRM_PARAM *prm = GET_PRM (i);
+      bool excluded = false;
+
+      if (!PRM_IS_FOR_SESSION (prm) || !PRM_IS_FOR_CLIENT (prm) || !PRM_IS_SET (prm) || !PRM_USER_CAN_CHANGE (prm))
+	{
+	  continue;
+	}
+      for (j = 0; j < num_exclude; j++)
+	{
+	  if (exclude[j] == (PARAM_ID) i)
+	    {
+	      excluded = true;
+	      break;
+	    }
+	}
+      if (excluded)
+	{
+	  continue;
+	}
+
+      if (PRM_IS_STRING (prm))
+	{
+	  const char *value = PRM_GET_STRING (prm->value);
+	  size_t need;
+
+	  if (value == NULL)
+	    {
+	      continue;
+	    }
+	  /* name="value" with backslash escapes for '"' and '\\', then a newline */
+	  need = strlen (prm->name) + 2 + 2;
+	  for (const char *q = value; *q != '\0'; q++)
+	    {
+	      need += (*q == '"' || *q == '\\') ? 2 : 1;
+	    }
+	  if (need + 1 >= remaining)
+	    {
+	      return -1;
+	    }
+	  ptr += sprintf (ptr, "%s=\"", prm->name);
+	  for (const char *q = value; *q != '\0'; q++)
+	    {
+	      if (*q == '"' || *q == '\\')
+		{
+		  *ptr++ = '\\';
+		}
+	      *ptr++ = *q;
+	    }
+	  *ptr++ = '"';
+	  *ptr++ = '\n';
+	  *ptr = '\0';
+	  remaining = len - (size_t) (ptr - buf);
+	}
+      else
+	{
+	  int n = prm_print (prm, ptr, remaining, PRM_PRINT_NAME, PRM_PRINT_CURR_VAL);
+
+	  if (n <= 0 || (size_t) n + 2 >= remaining)
+	    {
+	      return -1;
+	    }
+	  ptr += n;
+	  *ptr++ = '\n';
+	  *ptr = '\0';
+	  remaining -= (size_t) n + 1;
+	}
+      count++;
+    }
+
+  return count;
+}
+
+/*
  * sysprm_print_parameters_for_qry_string () - print parameters for query
  *					       string
  *

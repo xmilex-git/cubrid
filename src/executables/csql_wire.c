@@ -86,6 +86,7 @@ static volatile sig_atomic_t wire_Cancel_thread_up = 0;
 static void wire_cancel_send (void);
 static int wire_apply_statement_blocks (void);
 static int wire_apply_locale_parameters (void);
+static int wire_apply_client_file_parameters (void);
 
 static void *
 wire_cancel_thread_run (void *arg)
@@ -589,7 +590,8 @@ csql_wire_connect (const char *db_name, const char *user_name, const char *passw
    * connection is its thin equivalent, and csql session commands gate on
    * this global (csql_session.c CMD_CHECK_CONNECT) */
   db_Connect_status = DB_CONNECTION_STATUS_CONNECTED;
-  if (wire_apply_statement_blocks () != NO_ERROR || wire_apply_locale_parameters () != NO_ERROR)
+  if (wire_apply_statement_blocks () != NO_ERROR || wire_apply_locale_parameters () != NO_ERROR
+      || wire_apply_client_file_parameters () != NO_ERROR)
     {
       csql_wire_disconnect ();
       return wire_Err_code;
@@ -1154,6 +1156,44 @@ wire_apply_locale_parameters (void)
 	      wire_set_error (ER_BO_CANT_LOAD_SYSPRM, er_msg ());
 	    }
 	  return wire_Err_code;
+	}
+    }
+  return NO_ERROR;
+}
+
+/* Every other session parameter this csql loaded from its own configuration
+ * file (cubrid.conf / CUBRID_CONF_FILE) reached the session through the fat
+ * client's boot handshake; forward those once so a file-only setting such as
+ * stored_procedure_dump_icode=yes governs this session the way it did (wf228,
+ * cbrd_25732 sub-case 4).  The parameters seeded above are excluded.  A
+ * rejected entry is logged and skipped rather than failing the connection:
+ * a server-side refusal of one file setting must not lock the user out. */
+static int
+wire_apply_client_file_parameters (void)
+{
+  const PARAM_ID seeded[] = { PRM_ID_BLOCK_DDL_STATEMENT, PRM_ID_BLOCK_NOWHERE_STATEMENT, PRM_ID_INTL_DATE_LANG,
+    PRM_ID_INTL_NUMBER_LANG, PRM_ID_INTL_COLLATION, PRM_ID_TIMEZONE
+  };
+  char entries[8192];
+  char *entry, *save = NULL;
+
+  if (sysprm_print_client_file_session_parameters (entries, sizeof (entries), seeded,
+						    (int) (sizeof (seeded) / sizeof (seeded[0]))) < 0)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_BO_CANT_LOAD_SYSPRM, 0);
+      wire_set_error (ER_BO_CANT_LOAD_SYSPRM, er_msg ());
+      return ER_BO_CANT_LOAD_SYSPRM;
+    }
+
+  for (entry = strtok_r (entries, "\n", &save); entry != NULL; entry = strtok_r (NULL, "\n", &save))
+    {
+      char line[4096 + 8];
+
+      snprintf (line, sizeof (line), ";set %s", entry);
+      if (wire_session_cmd (CAS_CSQL_FLAG_TRIGGER_ACTION, 0, "", line, false) != NO_ERROR)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_BO_CANT_LOAD_SYSPRM, 0);
+	  wire_set_error (NO_ERROR, NULL);
 	}
     }
   return NO_ERROR;

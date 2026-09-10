@@ -847,6 +847,8 @@ extern "C"
 #endif				/* CS_MODE */
 
   extern char *sysprm_print_parameters_for_qry_string (void);
+  extern int sysprm_print_client_file_session_parameters (char *buf, size_t len, const PARAM_ID * exclude,
+							   int num_exclude);
   extern char *sysprm_print_parameters_for_ha_repl (void);
   extern SYSPRM_ERR sysprm_validate_change_parameters (const char *data, bool check,
 						       SYSPRM_ASSIGN_VALUE ** assignments_ptr);
