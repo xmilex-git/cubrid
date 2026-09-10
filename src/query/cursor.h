@@ -83,12 +83,30 @@ struct cursor_id
 
 extern int cursor_copy_list_id (QFILE_LIST_ID * dest_list_id, const QFILE_LIST_ID * src_list_id);
 
+#if defined (SERVER_MODE)
+/* PoC T2/T3-b (workspace#254): in the fold the first-page copy attached by
+ * qmgr_attach_first_page_copy may be a session-owned slot rather than a heap
+ * block; the slot pool tells them apart by address.  cursor_copy_list_id's
+ * duplicates are always heap blocks and take the free branch. */
+extern char *csc_first_page_slot_acquire (void);	/* client_session_context.cpp */
+extern bool csc_first_page_slot_release (void *p);
+#define cursor_release_first_page(page) \
+        do { \
+          if (!csc_first_page_slot_release (page)) { \
+            free (page); \
+          } \
+          (page) = NULL; \
+        } while (0)
+#else /* !SERVER_MODE */
+#define cursor_release_first_page(page) free_and_init (page)
+#endif /* !SERVER_MODE */
+
 #define cursor_free_list_id(list_id) \
         do { \
           QFILE_LIST_ID *list_id_p = (QFILE_LIST_ID *) (list_id); \
           if (list_id_p != NULL) { \
             if (list_id_p->last_pgptr) { \
-              free_and_init (list_id_p->last_pgptr); \
+              cursor_release_first_page (list_id_p->last_pgptr); \
             } \
             if (list_id_p->tpl_descr.f_valp) { \
               free_and_init (list_id_p->tpl_descr.f_valp); \

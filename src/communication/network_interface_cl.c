@@ -215,6 +215,11 @@ exit_server (const THREAD_ENTRY & thread_ref)
 //   cursor_free_list_id frees.  Failure is benign: reads fall back to
 //   qfile_get_list_file_page while the query is still alive.
 //
+//   PoC T2/T3-b (workspace#254): the copy's buffer comes from the session's
+//   first-page slot pool (client_session_context.hpp) and only falls back to
+//   malloc when the pool is exhausted or no bracket is active;
+//   cursor_free_list_id returns a slot by address, frees a heap block.
+//
 static void
 qmgr_attach_first_page_copy (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id)
 {
@@ -227,16 +232,23 @@ qmgr_attach_first_page_copy (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id)
       return;
     }
 
-  page_copy = (char *) malloc (DB_PAGESIZE);
+  page_copy = csc_first_page_slot_acquire ();
   if (page_copy == NULL)
     {
-      return;
+      page_copy = (char *) malloc (DB_PAGESIZE);
+      if (page_copy == NULL)
+	{
+	  return;
+	}
     }
 
   page_ptr = qmgr_get_old_page (thread_p, &list_id->first_vpid, list_id->tfile_vfid);
   if (page_ptr == NULL)
     {
-      free (page_copy);
+      if (!csc_first_page_slot_release (page_copy))
+	{
+	  free (page_copy);
+	}
       return;
     }
 

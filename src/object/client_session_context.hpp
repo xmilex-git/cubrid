@@ -159,8 +159,23 @@ class client_session_context
      * teardown and frees it on exit instead */
     bool orphaned = false;
 
+    /* PoC T2/T3-b (workspace#254, ALLOC-01 / COH-12): session-owned reusable
+     * DB_PAGESIZE buffers for the result's first-page copy that
+     * qmgr_attach_first_page_copy hands the fold's result cursor.  In the #245
+     * perf leg that per-result malloc(DB_PAGESIZE) — a large-bin request — was
+     * 100 % of malloc_consolidate's callers; the copy itself is required by the
+     * autocommit generated-keys read-back contract, the per-result malloc is
+     * not.  Slots are allocated lazily, handed out by
+     * csc_first_page_slot_acquire, returned by cursor_free_list_id through
+     * csc_first_page_slot_release (address match), freed with the context.
+     * All slots busy -> acquire returns NULL and the caller mallocs as before. */
+    static constexpr int FIRST_PAGE_SLOTS = 4;
+    char *fp_slot[FIRST_PAGE_SLOTS] = {};
+    bool fp_slot_busy[FIRST_PAGE_SLOTS] = {};
+    unsigned fp_slot_overflow = 0;	/* acquires that fell back to malloc */
+
     client_session_context ();
-    ~client_session_context () = default;
+    ~client_session_context ();
 
     /* interpreter label table - owned here because labels are
      * session data; created lazily by pt_associate_label_with_value.
@@ -181,6 +196,13 @@ extern client_session_context *csc_current (void);
 /* does the calling thread hold an activation bracket? (no assert — memory
  * routing probes this on paths shared with pure server threads) */
 extern bool csc_bracket_is_active (void);
+
+/* PoC T2/T3-b (workspace#254): first-page slot pool of the bracketed session
+ * (see the fp_slot members) — csc_first_page_slot_acquire returns NULL off any
+ * bracket or when every slot is busy; csc_first_page_slot_release returns
+ * false when p is not one of the current bracket's slots, and the caller then
+ * owns a plain heap block and frees it.  Declared in cursor.h (SERVER_MODE),
+ * which every consumer already reaches through db.h. */
 
 /* has the bracketed session terminated a method/SP callback in-process?
  * (qexec's qlist balance check stands down only for such sessions) */

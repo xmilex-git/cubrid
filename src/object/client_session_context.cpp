@@ -29,6 +29,7 @@
 #include <cstring>
 
 #include "object_domain.h"	// tp_session_domains_final (B4-D9)
+#include "storage_common.h"	// DB_PAGESIZE (first-page slot pool, workspace#254)
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -47,6 +48,68 @@ client_session_context::client_session_context ()
   boot_server_credential.ha_server_state = HA_SERVER_STATE_NA;
   memset (boot_server_credential.server_session_key, 0xFF, SERVER_SESSION_KEY_SIZE);
   boot_server_credential.db_charset = INTL_CODESET_NONE;
+}
+
+client_session_context::~client_session_context ()
+{
+  for (int i = 0; i < FIRST_PAGE_SLOTS; i++)
+    {
+      /* a slot still busy here means a cursor outlived its session — a fault
+       * elsewhere (B4-D9 class); reclaim the page regardless */
+      free (fp_slot[i]);
+      fp_slot[i] = NULL;
+    }
+}
+
+/* PoC T2/T3-b (workspace#254): see client_session_context.hpp */
+char *
+csc_first_page_slot_acquire (void)
+{
+  client_session_context *ctx = tl_Csc_active;
+
+  if (ctx == NULL)
+    {
+      return NULL;
+    }
+  for (int i = 0; i < client_session_context::FIRST_PAGE_SLOTS; i++)
+    {
+      if (!ctx->fp_slot_busy[i])
+	{
+	  if (ctx->fp_slot[i] == NULL)
+	    {
+	      ctx->fp_slot[i] = (char *) malloc (DB_PAGESIZE);
+	      if (ctx->fp_slot[i] == NULL)
+		{
+		  return NULL;
+		}
+	    }
+	  ctx->fp_slot_busy[i] = true;
+	  return ctx->fp_slot[i];
+	}
+    }
+  ctx->fp_slot_overflow++;
+  return NULL;
+}
+
+bool
+csc_first_page_slot_release (void *p)
+{
+  client_session_context *ctx = tl_Csc_active;
+
+  if (ctx == NULL || p == NULL)
+    {
+      return false;
+    }
+  for (int i = 0; i < client_session_context::FIRST_PAGE_SLOTS; i++)
+    {
+      if (ctx->fp_slot[i] == p)
+	{
+	  assert (ctx->fp_slot_busy[i]);
+	  ctx->fp_slot_busy[i] = false;
+	  return true;
+	}
+    }
+  return false;
 }
 
 void
