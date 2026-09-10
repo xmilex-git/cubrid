@@ -170,8 +170,27 @@ enter_server_no_thread_entry (void)
 static THREAD_ENTRY *
 enter_server ()
 {
+  THREAD_ENTRY *thread_p;
+
   enter_server_no_thread_entry ();
-  return thread_get_thread_entry_info ();
+  thread_p = thread_get_thread_entry_info ();
+
+#if defined (SERVER_MODE)
+  /* The legacy CS client carried tm_Tran_invalidate_snapshot in every request
+   * header and net_server_request () consumed it (network_sr.c).  The merged
+   * in-process client half calls the x* functions directly, so consume the
+   * flag here, at the outermost server entry of a driver session — otherwise
+   * a READ COMMITTED session keeps its first snapshot for the whole
+   * transaction and never sees rows another session committed (wf228,
+   * isolation_commit_rollback test01: the second SELECT stayed at 1 row). */
+  if (db_on_server == 1 && csc_bracket_is_active () && tm_Tran_invalidate_snapshot)
+    {
+      logtb_invalidate_snapshot_data (thread_p);
+      tm_Tran_invalidate_snapshot = 0;
+    }
+#endif
+
+  return thread_p;
 }
 
 //
