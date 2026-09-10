@@ -226,9 +226,33 @@ method_dispatch (packing_unpacker &unpacker)
   int save_er_floor = csc->er_dispatch_floor;
   csc->er_dispatch_floor = er_stack_depth ();
 
+  /* A rights switch (executor::change_exec_rights, METHOD_CALLBACK_CHANGE_RIGHTS)
+   * is fire-and-forget bookkeeping around an SP frame, not a nested call, yet
+   * it is dispatched while the enclosing frame's query dispatch is still on
+   * this stack, so it reads one level deeper than the frame count.  Legacy CS
+   * never failed on it: the server did not wait for that callback's reply, so
+   * the client's depth error was dropped and only the next nested QUERY
+   * dispatch tripped the limit.  Keep that contract here — count the switch,
+   * but let only query/argument dispatches enforce the limit — otherwise a
+   * recursion of exactly METHOD_MAX_RECURSION_DEPTH + 1 frames (sp_sum(16),
+   * allowed on develop) fails one level early (wf228, case_caution_01 /
+   * cbrd_24121). */
+  bool rights_switch = false;
+  {
+    packing_unpacker peek (unpacker.get_buffer_start (),
+			   (size_t) (unpacker.get_buffer_end () - unpacker.get_buffer_start ()));
+    cubmethod::header peek_header (peek);
+    if (peek_header.command == METHOD_REQUEST_CALLBACK)
+      {
+	int code = 0;
+	peek.unpack_int (code);
+	rights_switch = (code == METHOD_CALLBACK_CHANGE_RIGHTS);
+      }
+  }
+
   tran_begin_libcas_function ();
   int depth = tran_get_libcas_depth ();
-  if (depth > METHOD_MAX_RECURSION_DEPTH)
+  if (depth > METHOD_MAX_RECURSION_DEPTH && !rights_switch)
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_SP_TOO_MANY_NESTED_CALL, 0);
       error = ER_SP_TOO_MANY_NESTED_CALL;
