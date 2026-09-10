@@ -1142,7 +1142,28 @@ pt_new_query_result_descriptor (PARSER_CONTEXT * parser, PT_NODE * query)
   r->type_cnt = degree;
   if (list_id)
     {
+      /* PoC T2/T3 (workspace#245, COH-12 transfer-over-copy): list_id->last_pgptr
+       * is a heap copy of the result's first page that only this descriptor's
+       * cursor will ever read, and list_id itself is freed right below.  Hand the
+       * page over instead of letting cursor_copy_list_id malloc+memcpy a second
+       * DB_PAGESIZE copy.  Ownership rule: after this block the page belongs to
+       * r->res.s.cursor_id.list_id (released by cursor_free_list_id); if the
+       * cursor could not be opened it is released here.  The autocommit
+       * generated-keys read-back (network_interface_cl.c, qmgr_attach_first_page_copy)
+       * is unaffected: the cursor still owns a private copy that outlives
+       * xqmgr_end_query. */
+      PAGE_PTR first_page = list_id->last_pgptr;
+
+      list_id->last_pgptr = NULL;
       failure = !cursor_open (&r->res.s.cursor_id, list_id, false, r->oid_included);
+      if (!failure)
+	{
+	  r->res.s.cursor_id.list_id.last_pgptr = first_page;
+	}
+      else if (first_page != NULL)
+	{
+	  free_and_init (first_page);
+	}
       /* free result, which was copied by open cursor operation! */
       cursor_free_self_list_id (list_id);
     }
