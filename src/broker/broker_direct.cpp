@@ -234,6 +234,12 @@ namespace brd
     /* handoff slots: ACK -1 is done by the dispatch thread, SESSION_END +1
      * by channel readers (#117 D3) */
     std::atomic<int> slots_used { 0 };
+    /* admission wait: the dispatch thread sleeps on this until a slot is
+     * released, instead of polling every 30 ms (wf228 bug_bts_10851: with
+     * MAX_NUM_APPL_SERVER=1 the poll period capped admission at ~33 sessions/s
+     * and 1,000 queued drivers timed out; legacy CAS reuse was immediate) */
+    std::mutex slots_mutex;
+    std::condition_variable slots_cv;
 
     /* channels + tokens.  Token counters are per-server, so two databases
      * behind one broker may issue equal token values — the table is a
@@ -331,6 +337,12 @@ namespace brd
     while (used > 0 && !m.slots_used.compare_exchange_weak (used, used - 1))
       ;
     m.shm->brd_slots_used = (used > 0) ? used - 1 : 0;
+    /* pair with the dispatch thread's predicate check under slots_mutex so a
+     * release between its check and its wait cannot be lost */
+    {
+      std::lock_guard<std::mutex> guard (m.slots_mutex);
+    }
+    m.slots_cv.notify_one ();
   }
 
   static void
@@ -1422,10 +1434,15 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
     {
       /* admission wait: the driver keeps waiting in the queue's stead, same
        * as the idle-CAS wait it replaces (#117 D3) */
-      while (m->slots_used.load () >= m->max_slots && !m->stopping.load ())
-	{
-	  std::this_thread::sleep_for (std::chrono::milliseconds (30));
-	}
+      {
+	/* event-driven, with the old 30 ms period kept only as a bounded
+	 * fallback for the stopping flag and the no-notify restart paths */
+	std::unique_lock<std::mutex> slots_guard (m->slots_mutex);
+	while (m->slots_used.load () >= m->max_slots && !m->stopping.load ())
+	  {
+	    m->slots_cv.wait_for (slots_guard, std::chrono::milliseconds (30));
+	  }
+      }
       if (m->stopping.load ())
 	{
 	  reject_client (*m, job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
