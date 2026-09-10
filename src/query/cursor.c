@@ -575,6 +575,17 @@ cursor_get_list_file_page (CURSOR_ID * cursor_id_p, VPID * vpid_p)
     {
       int ret_val;
 
+      if (cursor_id_p->buffer_area == NULL)
+	{
+	  /* PoC T2/T3 B-lite: deferred from cursor_open (see there) */
+	  cursor_id_p->buffer_area = (char *) malloc (CURSOR_BUFFER_AREA_SIZE);
+	  if (cursor_id_p->buffer_area == NULL)
+	    {
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) CURSOR_BUFFER_AREA_SIZE);
+	      return ER_OUT_OF_VIRTUAL_MEMORY;
+	    }
+	}
+
       ret_val = qfile_get_list_file_page (cursor_id_p->query_id, vpid_p->volid, vpid_p->pageid,
 					  cursor_id_p->buffer_area, &cursor_id_p->buffer_filled_size);
       if (ret_val != NO_ERROR)
@@ -1245,20 +1256,14 @@ cursor_open (CURSOR_ID * cursor_id_p, QFILE_LIST_ID * list_id_p, bool updatable,
 
   cursor_id_p->query_id = list_id_p->query_id;
 
-  if (cursor_id_p->list_id.type_list.type_cnt)
+  /* PoC T2/T3 B-lite (workspace#245, ALLOC-01): buffer_area is only needed when a
+   * page has to be fetched from the list file; a cursor that never leaves the
+   * first page (already owned as list_id.last_pgptr) never needs it.  Allocate it
+   * lazily in cursor_get_list_file_page instead of here: -1 malloc/free
+   * (IO_MAX_PAGE_SIZE) per single-page result. */
+  if (cursor_id_p->list_id.type_list.type_cnt && is_oid_included)
     {
-      cursor_id_p->buffer_area = (char *) malloc (CURSOR_BUFFER_AREA_SIZE);
-      cursor_id_p->buffer = cursor_id_p->buffer_area;
-
-      if (cursor_id_p->buffer == NULL)
-	{
-	  return false;
-	}
-
-      if (is_oid_included)
-	{
-	  cursor_allocate_oid_buffer (cursor_id_p);
-	}
+      cursor_allocate_oid_buffer (cursor_id_p);
     }
 
   return true;
