@@ -57,6 +57,7 @@
 #include "perf_monitor.h"
 #include "porting.h"
 #include "porting_inline.hpp"
+#include <atomic>
 #if defined(ENABLE_SYSTEMTAP)
 #include "probes.h"
 #endif /* ENABLE_SYSTEMTAP */
@@ -378,6 +379,7 @@ struct lk_tran_lock
   int lk_entry_pool_count;	/* Current count of lock entries in local pool. */
   int inst_hold_count;		/* # of entries in inst_hold_list */
   int class_hold_count;		/* # of entries in class_hold_list */
+  int fp_count;			/* U1 PoC: fastpath class entries currently linked in root_class_hold/class_hold_list */
 
   LK_ENTRY *waiting;		/* waiting lock entry */
 
@@ -474,6 +476,90 @@ struct lk_global_data
 };
 
 LK_GLOBAL_DATA lk_Gl;
+
+#if defined(SERVER_MODE)
+/*
+ * U1 PoC (workspace#246) — PostgreSQL-style fastpath for weak class locks.
+ *
+ * Weak class lock modes (IS, IX, SCH_S) are mutually compatible, so a transaction that only needs one of them on a
+ * class does not have to appear in the class resource's shared holder list at all: the entry is kept in the owner's
+ * hold list only (is_fastpath, res_head == NULL). Every statement of an autocommit OLTP workload otherwise takes
+ * the same LK_RES res_mutex twice (acquire + lock_unlock_all) and walks a holder list ~#connections long.
+ *
+ * Correctness hinges on the strong-lock counter (PG FastPathStrongRelationLocks): a requester of any non-weak class
+ * lock mode (S, SIX, X, SCH_M, BU) increments lk_Fp_strong_count[hash (class_oid)] BEFORE touching the shared
+ * table, then walks every transaction's hold list under that transaction's hold_mutex and transfers the matching
+ * fastpath entries into the resource's holder list (lock_fp_transfer_all); from then on the normal compatibility
+ * rules see them. A weak requester reads the counter while holding its own hold_mutex: either it saw 0 and its
+ * entry was linked before the strong requester's scan takes that mutex, or the scan finished first and the mutex
+ * hand-off makes the increment visible (acquire/release — COH-10: free on x86 TSO, real barrier on ARM64). The count
+ * is released in lock_free_entry when the strong entry dies. Counters are read-mostly (PAR-10): written only by
+ * DDL-class requesters, so the array is not padded per shard (GLOB-09 not needed; a contended hot write path is
+ * absent by construction).
+ *
+ * Lock order: res_mutex -> hold_mutex (same as lock_insert_into_tran_hold_list). The fastpath itself never nests
+ * a resource mutex inside hold_mutex.
+ */
+#define LK_FP_SLOTS_PER_TRAN 16	/* PG FP_LOCK_SLOTS_PER_BACKEND */
+#define LK_FP_STRONG_PARTITIONS 1024	/* PG FAST_PATH_STRONG_LOCK_HASH_PARTITIONS */
+
+// *INDENT-OFF*
+static std::atomic<int> lk_Fp_strong_count[LK_FP_STRONG_PARTITIONS];
+// *INDENT-ON*
+
+typedef enum
+{
+  LK_FP_GRANTED,		/* re-granted on the fastpath entry */
+  LK_FP_NOT_FASTPATH,		/* the entry was transferred to the shared table meanwhile; *res_out set */
+  LK_FP_BLOCKED_BY_STRONG	/* a strong requester is present: go through the shared table */
+} LK_FP_REGRANT;
+
+static inline bool
+lock_fp_is_weak_mode (LOCK lock)
+{
+  return lock == IS_LOCK || lock == IX_LOCK || lock == SCH_S_LOCK;
+}
+
+static inline unsigned
+lock_fp_hash (const OID * oid)
+{
+  unsigned h = (unsigned) oid->pageid * 2654435761u;
+  h ^= (unsigned) oid->slotid * 40503u;
+  h ^= (unsigned) oid->volid;
+  return h & (LK_FP_STRONG_PARTITIONS - 1);
+}
+
+static inline void
+lock_fp_entry_copy_key (LK_ENTRY * entry_ptr, const LK_RES * res)
+{
+  if (res != NULL)
+    {
+      entry_ptr->key_type = res->key.type;
+      entry_ptr->key_oid = res->key.oid;	/* for TRANSACTION keys these bytes are the mvccid; never read as OID */
+    }
+  else
+    {
+      entry_ptr->key_type = LOCK_RESOURCE_INSTANCE;
+      OID_SET_NULL (&entry_ptr->key_oid);
+    }
+  entry_ptr->is_fastpath = false;
+  entry_ptr->holds_strong_count = false;
+}
+
+static LK_ENTRY *lock_fp_find_class_entry (int tran_index, const OID * class_oid, bool * is_fastpath_out,
+					   LK_RES ** res_out);
+static bool lock_fp_try_grant_new (THREAD_ENTRY * thread_p, int tran_index, LF_TRAN_ENTRY * t_entry, const OID * oid,
+				   LOCK lock, LK_ENTRY * class_entry, bool is_instant_duration, LK_ENTRY ** entry_out);
+static LK_FP_REGRANT lock_fp_try_regrant (THREAD_ENTRY * thread_p, int tran_index, LK_ENTRY * entry_ptr, LOCK lock,
+					  bool is_instant_duration, LK_RES ** res_out);
+static void lock_fp_transfer_one_locked (LK_RES * res_ptr, LK_ENTRY * entry_ptr, LK_TRAN_LOCK * tran_lock);
+static void lock_fp_transfer_own (LK_RES * res_ptr, LK_ENTRY * entry_ptr, int tran_index);
+static void lock_fp_transfer_all (LK_RES * res_ptr, const OID * class_oid);
+static void lock_fp_self_transfer_slow (THREAD_ENTRY * thread_p, LK_ENTRY * entry_ptr, int tran_index);
+static bool lock_fp_release_entry (THREAD_ENTRY * thread_p, LF_TRAN_ENTRY * t_entry, LK_ENTRY * entry_ptr,
+				   int tran_index);
+static LK_RES_KEY lock_fp_entry_key (const LK_ENTRY * entry_ptr);
+#endif /* SERVER_MODE */
 
 /* size of each data structure */
 static const int SIZEOF_LK_LOCKINFO = sizeof (LK_LOCKINFO);
@@ -986,6 +1072,7 @@ lock_initialize_entry (LK_ENTRY * entry_ptr)
   entry_ptr->instant_lock_count = 0;
   entry_ptr->bind_index_in_tran = -1;
   XASL_ID_SET_NULL (&entry_ptr->xasl_id);
+  lock_fp_entry_copy_key (entry_ptr, NULL);
 }
 
 /* initialize lock entry as granted state */
@@ -1004,6 +1091,7 @@ lock_initialize_entry_as_granted (LK_ENTRY * entry_ptr, int tran_index, LK_RES *
   entry_ptr->class_entry = NULL;
   entry_ptr->ngranules = 0;
   entry_ptr->instant_lock_count = 0;
+  lock_fp_entry_copy_key (entry_ptr, res);
 
   lock_event_set_xasl_id_to_entry (tran_index, entry_ptr);
 }
@@ -1025,6 +1113,7 @@ lock_initialize_entry_as_blocked (LK_ENTRY * entry_ptr, THREAD_ENTRY * thread_p,
   entry_ptr->class_entry = NULL;
   entry_ptr->ngranules = 0;
   entry_ptr->instant_lock_count = 0;
+  lock_fp_entry_copy_key (entry_ptr, res);
 
   lock_event_set_xasl_id_to_entry (tran_index, entry_ptr);
 }
@@ -1045,6 +1134,7 @@ lock_initialize_entry_as_non2pl (LK_ENTRY * entry_ptr, int tran_index, LK_RES * 
   entry_ptr->class_entry = NULL;
   entry_ptr->ngranules = 0;
   entry_ptr->instant_lock_count = 0;
+  lock_fp_entry_copy_key (entry_ptr, res);
 }
 
 /* initialize lock resource as allocated state */
@@ -1429,7 +1519,7 @@ lock_insert_into_tran_hold_list (LK_ENTRY * entry_ptr, int owner_tran_index)
   tran_lock = &lk_Gl.tran_lock_table[entry_ptr->tran_index];
   rv = pthread_mutex_lock (&tran_lock->hold_mutex);
 
-  switch (entry_ptr->res_head->key.type)
+  switch (entry_ptr->key_type)
     {
     case LOCK_RESOURCE_ROOT_CLASS:
 #if defined(CUBRID_DEBUG)
@@ -1539,14 +1629,14 @@ lock_delete_from_tran_hold_list (LK_ENTRY * entry_ptr, int owner_tran_index)
   tran_lock = &lk_Gl.tran_lock_table[entry_ptr->tran_index];
   rv = pthread_mutex_lock (&tran_lock->hold_mutex);
 
-  switch (entry_ptr->res_head->key.type)
+  switch (entry_ptr->key_type)
     {
     case LOCK_RESOURCE_ROOT_CLASS:
       if (entry_ptr != tran_lock->root_class_hold)
 	{			/* does not exist */
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_LK_NOTFOUND_IN_TRAN_HOLD_LIST, 7,
-		  lock_to_lockmode_string (entry_ptr->granted_mode), "ROOT CLASS", entry_ptr->res_head->key.oid.volid,
-		  entry_ptr->res_head->key.oid.pageid, entry_ptr->res_head->key.oid.slotid, entry_ptr->tran_index,
+		  lock_to_lockmode_string (entry_ptr->granted_mode), "ROOT CLASS", entry_ptr->key_oid.volid,
+		  entry_ptr->key_oid.pageid, entry_ptr->key_oid.slotid, entry_ptr->tran_index,
 		  (tran_lock->root_class_hold == NULL ? 0 : 1));
 	  error_code = ER_LK_NOTFOUND_IN_TRAN_HOLD_LIST;
 	}
@@ -1604,9 +1694,8 @@ lock_delete_from_tran_hold_list (LK_ENTRY * entry_ptr, int owner_tran_index)
       break;
 
     default:
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_LK_INVALID_OBJECT_TYPE, 4, entry_ptr->res_head->key.type,
-	      entry_ptr->res_head->key.oid.volid, entry_ptr->res_head->key.oid.pageid,
-	      entry_ptr->res_head->key.oid.slotid);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_LK_INVALID_OBJECT_TYPE, 4, entry_ptr->key_type,
+	      entry_ptr->key_oid.volid, entry_ptr->key_oid.pageid, entry_ptr->key_oid.slotid);
       error_code = ER_LK_INVALID_OBJECT_TYPE;
       break;
     }
@@ -1750,37 +1839,11 @@ lock_delete_from_tran_non2pl_list (LK_ENTRY * non2pl, int owner_tran_index)
 static LK_ENTRY *
 lock_find_class_entry (int tran_index, const OID * class_oid)
 {
-  LK_TRAN_LOCK *tran_lock;
-  LK_ENTRY *entry_ptr;
-  int rv;
+  bool is_fastpath;
+  LK_RES *res_ptr;
 
   /* The caller is not holding any mutex */
-
-  tran_lock = &lk_Gl.tran_lock_table[tran_index];
-  rv = pthread_mutex_lock (&tran_lock->hold_mutex);
-
-  if (OID_IS_ROOTOID (class_oid))
-    {
-      entry_ptr = tran_lock->root_class_hold;
-    }
-  else
-    {
-      entry_ptr = tran_lock->class_hold_list;
-      while (entry_ptr != NULL)
-	{
-	  assert (tran_index == entry_ptr->tran_index);
-
-	  if (OID_EQ (&entry_ptr->res_head->key.oid, class_oid))
-	    {
-	      break;
-	    }
-	  entry_ptr = entry_ptr->tran_next;
-	}
-    }
-
-  pthread_mutex_unlock (&tran_lock->hold_mutex);
-
-  return entry_ptr;		/* it might be NULL */
+  return lock_fp_find_class_entry (tran_index, class_oid, &is_fastpath, &res_ptr);	/* it might be NULL */
 }
 #endif /* SERVER_MODE */
 
@@ -3107,7 +3170,7 @@ lock_check_escalate (THREAD_ENTRY * thread_p, LK_ENTRY * class_entry, LK_TRAN_LO
   superclass_entry = class_entry->class_entry;
 
   /* check if the lock escalation is needed. */
-  if (superclass_entry != NULL && !OID_IS_ROOTOID (&superclass_entry->res_head->key.oid))
+  if (superclass_entry != NULL && !OID_IS_ROOTOID (&superclass_entry->key_oid))
     {
       /* Superclass_entry points to a root class in a class hierarchy. Escalate locks only if the criteria for the
        * superclass is met. Superclass keeps a counter for all locks set in the hierarchy. */
@@ -3210,7 +3273,7 @@ lock_escalate_if_needed (THREAD_ENTRY * thread_p, LK_ENTRY * class_entry, int tr
       wait_msecs = LK_FORCE_ZERO_WAIT;	/* Conditional Locking */
       granted =
 	lock_internal_perform_lock_object (thread_p, tran_index,
-					   lock_create_search_key (&class_entry->res_head->key.oid, NULL),
+					   lock_create_search_key (&class_entry->key_oid, NULL),
 					   max_class_lock, wait_msecs, &class_entry, NULL);
       if (granted != LK_GRANTED)
 	{
@@ -3233,6 +3296,369 @@ lock_escalate_if_needed (THREAD_ENTRY * thread_p, LK_ENTRY * class_entry, int tr
   pthread_mutex_unlock (&tran_lock->hold_mutex);
 
   return LK_GRANTED;
+}
+#endif /* SERVER_MODE */
+
+#if defined(SERVER_MODE)
+/*
+ *  U1 PoC (workspace#246): class-lock fastpath helpers. See the block comment next to lk_Fp_strong_count.
+ */
+
+/*
+ * lock_fp_find_class_entry - lock_find_class_entry that also reports, under hold_mutex, whether the entry is a
+ *   fastpath entry and which resource it belongs to (both may change under a concurrent transfer, so the caller
+ *   must not read them racily).
+ */
+static LK_ENTRY *
+lock_fp_find_class_entry (int tran_index, const OID * class_oid, bool * is_fastpath_out, LK_RES ** res_out)
+{
+  LK_TRAN_LOCK *tran_lock = &lk_Gl.tran_lock_table[tran_index];
+  LK_ENTRY *entry_ptr;
+  int rv;
+
+  *is_fastpath_out = false;
+  *res_out = NULL;
+
+  rv = pthread_mutex_lock (&tran_lock->hold_mutex);
+
+  if (OID_IS_ROOTOID (class_oid))
+    {
+      entry_ptr = tran_lock->root_class_hold;
+    }
+  else
+    {
+      entry_ptr = tran_lock->class_hold_list;
+      while (entry_ptr != NULL)
+	{
+	  assert (tran_index == entry_ptr->tran_index);
+
+	  if (OID_EQ (&entry_ptr->key_oid, class_oid))
+	    {
+	      break;
+	    }
+	  entry_ptr = entry_ptr->tran_next;
+	}
+    }
+
+  if (entry_ptr != NULL)
+    {
+      *is_fastpath_out = entry_ptr->is_fastpath;
+      *res_out = entry_ptr->res_head;
+    }
+
+  pthread_mutex_unlock (&tran_lock->hold_mutex);
+
+  return entry_ptr;
+}
+
+/*
+ * lock_fp_try_grant_new - Grant a weak class lock the transaction does not hold yet, on the fastpath.
+ *   return: true if granted (*entry_out set); false -> caller takes the shared-table path.
+ */
+static bool
+lock_fp_try_grant_new (THREAD_ENTRY * thread_p, int tran_index, LF_TRAN_ENTRY * t_entry, const OID * oid, LOCK lock,
+		       LK_ENTRY * class_entry, bool is_instant_duration, LK_ENTRY ** entry_out)
+{
+  LK_TRAN_LOCK *tran_lock = &lk_Gl.tran_lock_table[tran_index];
+  LK_ENTRY *entry_ptr;
+  int rv;
+
+  assert (lock_fp_is_weak_mode (lock));
+
+  if (tran_lock->fp_count >= LK_FP_SLOTS_PER_TRAN)
+    {
+      return false;
+    }
+
+  entry_ptr = lock_get_new_entry (tran_index, t_entry, &lk_Gl.obj_free_entry_list);
+  if (entry_ptr == NULL)
+    {
+      return false;		/* the shared-table path reports the allocation failure */
+    }
+
+  rv = pthread_mutex_lock (&tran_lock->hold_mutex);
+
+  /* The strong-count read must stay inside hold_mutex (see the protocol comment). */
+  if (lk_Fp_strong_count[lock_fp_hash (oid)].load (std::memory_order_acquire) != 0)
+    {
+      pthread_mutex_unlock (&tran_lock->hold_mutex);
+      lock_initialize_entry (entry_ptr);	/* a fresh lf entry is uninitialized; lock_free_entry reads the fp flags */
+      lock_free_entry (tran_index, t_entry, &lk_Gl.obj_free_entry_list, entry_ptr);
+      return false;
+    }
+
+  lock_initialize_entry_as_granted (entry_ptr, tran_index, NULL, lock);
+  entry_ptr->key_oid = *oid;
+  entry_ptr->key_type = OID_IS_ROOTOID (oid) ? LOCK_RESOURCE_ROOT_CLASS : LOCK_RESOURCE_CLASS;
+  entry_ptr->is_fastpath = true;
+  if (is_instant_duration)
+    {
+      entry_ptr->instant_lock_count++;
+    }
+
+  /* to manage granules (same as the shared-table grant) */
+  entry_ptr->class_entry = class_entry;
+  lock_increment_class_granules (class_entry);
+
+  /* link into the transaction hold list — lock_insert_into_tran_hold_list minus its own mutex acquisition */
+  if (entry_ptr->key_type == LOCK_RESOURCE_ROOT_CLASS)
+    {
+      assert (tran_lock->root_class_hold == NULL);
+      entry_ptr->tran_next = tran_lock->root_class_hold;
+      tran_lock->root_class_hold = entry_ptr;
+    }
+  else
+    {
+      if (tran_lock->class_hold_list != NULL)
+	{
+	  tran_lock->class_hold_list->tran_prev = entry_ptr;
+	}
+      entry_ptr->tran_next = tran_lock->class_hold_list;
+      tran_lock->class_hold_list = entry_ptr;
+      tran_lock->class_hold_count++;
+    }
+  tran_lock->fp_count++;
+
+  pthread_mutex_unlock (&tran_lock->hold_mutex);
+
+  perfmon_inc_stat (thread_p, PSTAT_LK_NUM_ACQUIRED_ON_OBJECTS);
+#if defined(LK_TRACE_OBJECT)
+  LK_MSG_LOCK_ACQUIRED (entry_ptr);
+#endif /* LK_TRACE_OBJECT */
+
+  *entry_out = entry_ptr;
+  return true;
+}
+
+/*
+ * lock_fp_try_regrant - Re-request (same mode) or weak->weak conversion on my own fastpath entry.
+ */
+static LK_FP_REGRANT
+lock_fp_try_regrant (THREAD_ENTRY * thread_p, int tran_index, LK_ENTRY * entry_ptr, LOCK lock,
+		     bool is_instant_duration, LK_RES ** res_out)
+{
+  LK_TRAN_LOCK *tran_lock = &lk_Gl.tran_lock_table[tran_index];
+  LOCK new_mode;
+  int rv;
+
+  assert (lock_fp_is_weak_mode (lock));
+
+  rv = pthread_mutex_lock (&tran_lock->hold_mutex);
+
+  if (!entry_ptr->is_fastpath)
+    {
+      /* a strong requester transferred it into the shared table meanwhile */
+      *res_out = entry_ptr->res_head;
+      pthread_mutex_unlock (&tran_lock->hold_mutex);
+      return LK_FP_NOT_FASTPATH;
+    }
+
+  new_mode = lock_conv (lock, entry_ptr->granted_mode);
+  assert (lock_fp_is_weak_mode (new_mode));
+
+  if (new_mode != entry_ptr->granted_mode
+      && lk_Fp_strong_count[lock_fp_hash (&entry_ptr->key_oid)].load (std::memory_order_acquire) != 0)
+    {
+      /* IS -> IX while a strong requester is around: it may hold S; decide in the shared table */
+      pthread_mutex_unlock (&tran_lock->hold_mutex);
+      return LK_FP_BLOCKED_BY_STRONG;
+    }
+
+  /* count == 0 means no S/SIX/X/SCH_M/BU holder or waiter exists on this class: every holder is weak, and weak
+   * modes are mutually compatible, so the conversion is grantable without looking at the shared table. */
+  entry_ptr->granted_mode = new_mode;
+  entry_ptr->count += 1;
+  if (is_instant_duration)
+    {
+      entry_ptr->instant_lock_count++;
+      assert (entry_ptr->instant_lock_count > 0);
+    }
+
+  pthread_mutex_unlock (&tran_lock->hold_mutex);
+
+  perfmon_inc_stat (thread_p, PSTAT_LK_NUM_RE_REQUESTED_ON_OBJECTS);
+  return LK_FP_GRANTED;
+}
+
+/*
+ * lock_fp_transfer_one_locked - Move one fastpath entry into res_ptr's holder list.
+ *   Caller holds res_ptr->res_mutex and the owner's hold_mutex. The LK_ENTRY object itself is kept (pointers held
+ *   by the owner — class_entry links of its instance locks, lock_object locals — stay valid).
+ */
+static void
+lock_fp_transfer_one_locked (LK_RES * res_ptr, LK_ENTRY * entry_ptr, LK_TRAN_LOCK * tran_lock)
+{
+  assert (entry_ptr->is_fastpath && entry_ptr->res_head == NULL && entry_ptr->blocked_mode == NULL_LOCK);
+  assert (res_ptr->key.type == entry_ptr->key_type && OID_EQ (&res_ptr->key.oid, &entry_ptr->key_oid));
+
+  entry_ptr->res_head = res_ptr;
+  entry_ptr->next = NULL;
+  lock_position_holder_entry (res_ptr, entry_ptr);
+  res_ptr->total_holders_mode = lock_conv (entry_ptr->granted_mode, res_ptr->total_holders_mode);
+  assert (res_ptr->total_holders_mode != NA_LOCK);
+
+  tran_lock->fp_count--;
+  assert (tran_lock->fp_count >= 0);
+
+  /* PoC simplification: lock_update_non2pl_list is not replayed for the transferred weak lock. */
+  /* release store: lock_internal_perform_unlock_object reads is_fastpath without hold_mutex and must then see
+   * res_head (COH-10: no instruction on x86, dmb on ARM64) */
+  __atomic_store_n (&entry_ptr->is_fastpath, false, __ATOMIC_RELEASE);
+}
+
+/* Caller holds res_ptr->res_mutex. Moves my own fastpath entry if it is still one. */
+static void
+lock_fp_transfer_own (LK_RES * res_ptr, LK_ENTRY * entry_ptr, int tran_index)
+{
+  LK_TRAN_LOCK *tran_lock = &lk_Gl.tran_lock_table[tran_index];
+  int rv;
+
+  rv = pthread_mutex_lock (&tran_lock->hold_mutex);
+  if (entry_ptr->is_fastpath)
+    {
+      lock_fp_transfer_one_locked (res_ptr, entry_ptr, tran_lock);
+    }
+  pthread_mutex_unlock (&tran_lock->hold_mutex);
+}
+
+/*
+ * lock_fp_transfer_all - Strong requester: pull every transaction's fastpath entry on class_oid into res_ptr.
+ *   Caller holds res_ptr->res_mutex and has already incremented the strong counter, so no new fastpath entry on
+ *   this class can appear while (or after) we scan. Cost O(num_trans) mutex pairs — DDL-class requests only.
+ */
+static void
+lock_fp_transfer_all (LK_RES * res_ptr, const OID * class_oid)
+{
+  const bool is_root = OID_IS_ROOTOID (class_oid);
+  LK_TRAN_LOCK *tran_lock;
+  LK_ENTRY *entry_ptr;
+  int i, rv;
+
+  for (i = 0; i < lk_Gl.config.num_trans; i++)
+    {
+      tran_lock = &lk_Gl.tran_lock_table[i];
+
+      /* fp_count must be read under hold_mutex: a weak requester that read count == 0 may be linking right now */
+      rv = pthread_mutex_lock (&tran_lock->hold_mutex);
+      if (tran_lock->fp_count > 0)
+	{
+	  if (is_root)
+	    {
+	      entry_ptr = tran_lock->root_class_hold;
+	      if (entry_ptr != NULL && entry_ptr->is_fastpath)
+		{
+		  lock_fp_transfer_one_locked (res_ptr, entry_ptr, tran_lock);
+		}
+	    }
+	  else
+	    {
+	      for (entry_ptr = tran_lock->class_hold_list; entry_ptr != NULL; entry_ptr = entry_ptr->tran_next)
+		{
+		  if (entry_ptr->is_fastpath && OID_EQ (&entry_ptr->key_oid, class_oid))
+		    {
+		      lock_fp_transfer_one_locked (res_ptr, entry_ptr, tran_lock);
+		      break;	/* one entry per class per transaction */
+		    }
+		}
+	    }
+	}
+      pthread_mutex_unlock (&tran_lock->hold_mutex);
+    }
+}
+
+/*
+ * lock_fp_self_transfer_slow - Move my fastpath entry into the shared table so that a caller which needs the
+ *   resource (non2pl bookkeeping) can proceed on the normal path. No mutex held on entry or exit.
+ */
+static void
+lock_fp_self_transfer_slow (THREAD_ENTRY * thread_p, LK_ENTRY * entry_ptr, int tran_index)
+{
+  LK_RES_KEY search_key = lock_create_search_key (&entry_ptr->key_oid, NULL);
+  LK_RES *res_ptr = NULL;
+
+  (void) lk_Gl.m_obj_hash_table.find_or_insert (thread_p, search_key, res_ptr);
+  if (res_ptr == NULL)
+    {
+      assert (false);
+      return;
+    }
+  /* find_or_insert leaves res_mutex locked */
+  if (res_ptr->holder == NULL && res_ptr->waiter == NULL && res_ptr->non2pl == NULL)
+    {
+      lock_initialize_resource_as_allocated (res_ptr, NULL_LOCK);
+    }
+  lock_fp_transfer_own (res_ptr, entry_ptr, tran_index);
+  assert (entry_ptr->res_head == res_ptr);
+  pthread_mutex_unlock (&res_ptr->res_mutex);
+}
+
+/*
+ * lock_fp_release_entry - Full release of a fastpath entry: O(1) on the owner's hold list, no shared table.
+ *   return: true if released here; false if the entry was transferred meanwhile (caller continues normally).
+ */
+static bool
+lock_fp_release_entry (THREAD_ENTRY * thread_p, LF_TRAN_ENTRY * t_entry, LK_ENTRY * entry_ptr, int tran_index)
+{
+  LK_TRAN_LOCK *tran_lock = &lk_Gl.tran_lock_table[tran_index];
+  int rv;
+
+  rv = pthread_mutex_lock (&tran_lock->hold_mutex);
+  if (!entry_ptr->is_fastpath)
+    {
+      pthread_mutex_unlock (&tran_lock->hold_mutex);
+      return false;
+    }
+
+  /* unlink — lock_delete_from_tran_hold_list minus its own mutex acquisition */
+  if (entry_ptr->key_type == LOCK_RESOURCE_ROOT_CLASS)
+    {
+      assert (tran_lock->root_class_hold == entry_ptr);
+      tran_lock->root_class_hold = NULL;
+    }
+  else
+    {
+      if (tran_lock->class_hold_list == entry_ptr)
+	{
+	  tran_lock->class_hold_list = entry_ptr->tran_next;
+	  if (entry_ptr->tran_next)
+	    {
+	      entry_ptr->tran_next->tran_prev = NULL;
+	    }
+	}
+      else
+	{
+	  if (entry_ptr->tran_prev)
+	    {
+	      entry_ptr->tran_prev->tran_next = entry_ptr->tran_next;
+	    }
+	  if (entry_ptr->tran_next)
+	    {
+	      entry_ptr->tran_next->tran_prev = entry_ptr->tran_prev;
+	    }
+	}
+      tran_lock->class_hold_count--;
+    }
+  tran_lock->fp_count--;
+  assert (tran_lock->fp_count >= 0);
+  entry_ptr->is_fastpath = false;
+  pthread_mutex_unlock (&tran_lock->hold_mutex);
+
+  /* to manage granules */
+  lock_decrement_class_granules (entry_ptr->class_entry);
+
+  lock_free_entry (tran_index, t_entry, &lk_Gl.obj_free_entry_list, entry_ptr);
+  return true;
+}
+
+/* Resource key of a class entry whether or not it currently has a resource. */
+static LK_RES_KEY
+lock_fp_entry_key (const LK_ENTRY * entry_ptr)
+{
+  if (entry_ptr->res_head != NULL)
+    {
+      return entry_ptr->res_head->key;
+    }
+  return lock_create_search_key (&entry_ptr->key_oid, NULL);
 }
 #endif /* SERVER_MODE */
 
@@ -3519,6 +3945,11 @@ lock_internal_perform_lock_object (THREAD_ENTRY * thread_p, int tran_index, LK_R
   TSCTIMEVAL tv_diff;
   UINT64 lock_wait_time;
   LK_PERFORM_STATE state = LK_S_FIND_RESOURCE;
+  /* U1 PoC fastpath state (class-lock requests only) */
+  bool fp_is_class_request = false;
+  bool fp_strong_counted = false;
+  LK_ENTRY *my_class_entry = NULL;
+  unsigned fp_hash = 0;
 
 #if defined(ENABLE_SYSTEMTAP)
   const OID *class_oid_for_marker_p;
@@ -3636,15 +4067,65 @@ lock_internal_perform_lock_object (THREAD_ENTRY * thread_p, int tran_index, LK_R
 	    }
 	  else
 	    {
-	      /* Class lock request. */
-	      /* Try to find class lock entry if it already exists to avoid using the expensive resource mutex. */
-	      entry_ptr = lock_find_class_entry (tran_index, oid);
-	      if (entry_ptr != NULL)
+	      /* Class lock request (CLASS or ROOT_CLASS resource). U1 PoC: weak modes go through the fastpath. */
+	      const bool fp_weak = lock_fp_is_weak_mode (lock);
+	      bool my_is_fastpath = false;
+	      LK_RES *my_res = NULL;
+
+	      fp_is_class_request = true;
+	      fp_hash = lock_fp_hash (oid);
+	      my_class_entry = lock_fp_find_class_entry (tran_index, oid, &my_is_fastpath, &my_res);
+
+	      if (my_class_entry == NULL)
 		{
-		  res_ptr = entry_ptr->res_head;
+		  if (fp_weak
+		      && lock_fp_try_grant_new (thread_p, tran_index, t_entry_ent, oid, lock, class_entry,
+						is_instant_duration, &entry_ptr))
+		    {
+		      *entry_addr_ptr = entry_ptr;
+		      ret_val = LK_GRANTED;
+		      state = LK_S_DONE;
+		      break;
+		    }
+		}
+	      else if (my_is_fastpath && fp_weak)
+		{
+		  LK_FP_REGRANT r = lock_fp_try_regrant (thread_p, tran_index, my_class_entry, lock,
+							 is_instant_duration, &my_res);
+		  if (r == LK_FP_GRANTED)
+		    {
+		      entry_ptr = my_class_entry;
+		      *entry_addr_ptr = entry_ptr;
+		      ret_val = LK_GRANTED;
+		      state = LK_S_DONE;
+		      break;
+		    }
+		  if (r == LK_FP_NOT_FASTPATH)
+		    {
+		      my_is_fastpath = false;	/* transferred meanwhile; my_res is its resource */
+		    }
+		  /* LK_FP_BLOCKED_BY_STRONG: decide in the shared table (self-transfer below) */
+		}
+
+	      if (!fp_weak && (my_class_entry == NULL || !my_class_entry->holds_strong_count))
+		{
+		  /* Strong requester: publish before touching the shared table so no fastpath grant on this class
+		   * hash can race past the transfer below (PG FastPathStrongRelationLocks). Balanced at the end of
+		   * this function (set holds_strong_count on the granted entry, or undo). */
+		  lk_Fp_strong_count[fp_hash].fetch_add (1, std::memory_order_seq_cst);
+		  fp_strong_counted = true;
+		}
+
+	      if (my_class_entry != NULL && !my_is_fastpath)
+		{
+		  /* already a holder in the shared table: the pre-existing shortcut */
+		  entry_ptr = my_class_entry;
+		  res_ptr = my_res;
 		  state = LK_S_EXISTING_HOLDER;
 		  break;
 		}
+	      /* my_class_entry == NULL, or it is my fastpath entry that must first move into the shared table:
+	       * fall through to find_or_insert. */
 	    }
 
 	  /* find or add the lockable object in the lock table */
@@ -3656,6 +4137,31 @@ lock_internal_perform_lock_object (THREAD_ENTRY * thread_p, int tran_index, LK_R
 	    }
 	  /* Find or insert also locks the resource mutex. */
 	  is_res_mutex_locked = true;
+
+	  if (fp_is_class_request)
+	    {
+	      if (res_ptr->holder == NULL && res_ptr->waiter == NULL && res_ptr->non2pl == NULL)
+		{
+		  lock_initialize_resource_as_allocated (res_ptr, NULL_LOCK);
+		}
+	      if (fp_strong_counted)
+		{
+		  /* pull every fastpath holder of this class (mine included) into the shared holder list */
+		  lock_fp_transfer_all (res_ptr, oid);
+		}
+	      else if (my_class_entry != NULL)
+		{
+		  /* weak request forced onto the slow path while I hold a fastpath entry: move only mine */
+		  lock_fp_transfer_own (res_ptr, my_class_entry, tran_index);
+		}
+	      if (my_class_entry != NULL)
+		{
+		  assert (my_class_entry->res_head == res_ptr && !my_class_entry->is_fastpath);
+		  entry_ptr = my_class_entry;
+		  state = LK_S_EXISTING_HOLDER;
+		  break;
+		}
+	    }
 
 	  if (res_ptr->holder == NULL && res_ptr->waiter == NULL && res_ptr->non2pl == NULL)
 	    {
@@ -4186,6 +4692,18 @@ lock_internal_perform_lock_object (THREAD_ENTRY * thread_p, int tran_index, LK_R
   CUBRID_LOCK_ACQUIRE_END (oid_for_marker_p, class_oid_for_marker_p, lock, ret_val != LK_GRANTED);
 #endif /* ENABLE_SYSTEMTAP */
 
+  if (fp_strong_counted)
+    {
+      if (ret_val == LK_GRANTED && entry_ptr != NULL && !entry_ptr->holds_strong_count)
+	{
+	  entry_ptr->holds_strong_count = true;	/* released by lock_free_entry */
+	}
+      else
+	{
+	  lk_Fp_strong_count[fp_hash].fetch_sub (1, std::memory_order_seq_cst);
+	}
+    }
+
   if (entry_ptr != NULL && ret_val == LK_GRANTED)
     {
       lock_event_set_xasl_id_to_entry (tran_index, entry_ptr);
@@ -4264,6 +4782,21 @@ lock_internal_perform_unlock_object (THREAD_ENTRY * thread_p, LK_ENTRY * entry_p
 	{
 	  return;
 	}
+    }
+
+  if (__atomic_load_n (&entry_ptr->is_fastpath, __ATOMIC_ACQUIRE))
+    {
+      /* U1 PoC fastpath entry: it is in no shared holder list (racy read; the helpers re-check under hold_mutex). */
+      if (release_flag == false && move_to_non2pl == true)
+	{
+	  /* keep the non2pl semantics exactly: move the entry into the shared table, then take the normal path */
+	  lock_fp_self_transfer_slow (thread_p, entry_ptr, tran_index);
+	}
+      else if (lock_fp_release_entry (thread_p, t_entry, entry_ptr, tran_index))
+	{
+	  return;
+	}
+      /* else: transferred meanwhile — res_head is set, continue normally */
     }
 
   /* hold resource mutex */
@@ -6393,7 +6926,7 @@ lock_object (THREAD_ENTRY * thread_p, const OID * oid, const OID * class_oid, LO
       if (old_class_lock < new_class_lock)
 	{
 	  if (class_entry != NULL && class_entry->class_entry != NULL
-	      && !OID_IS_ROOTOID (&class_entry->class_entry->res_head->key.oid))
+	      && !OID_IS_ROOTOID (&class_entry->class_entry->key_oid))
 	    {
 	      /* preserve class hierarchy */
 	      superclass_entry = class_entry->class_entry;
@@ -8854,6 +9387,7 @@ lock_unlock_all_shared_get_all_exclusive (THREAD_ENTRY * thread_p, LK_ACQUIRED_L
   LK_TRAN_LOCK *tran_lock;
   int idx;
   LK_ENTRY *entry_ptr;
+  LK_RES_KEY fp_key;
   int rv;
 
   /* some preparation */
@@ -8909,7 +9443,8 @@ lock_unlock_all_shared_get_all_exclusive (THREAD_ENTRY * thread_p, LK_ACQUIRED_L
 	{
 	  assert (tran_index == entry_ptr->tran_index);
 
-	  lock_copy_key_for_log (&acqlocks->locks[idx].key, &entry_ptr->res_head->key);
+	  fp_key = lock_fp_entry_key (entry_ptr);
+	  lock_copy_key_for_log (&acqlocks->locks[idx].key, &fp_key);
 	  acqlocks->locks[idx].lock = entry_ptr->granted_mode;
 	  idx += 1;
 	}
@@ -8919,7 +9454,8 @@ lock_unlock_all_shared_get_all_exclusive (THREAD_ENTRY * thread_p, LK_ACQUIRED_L
 	{
 	  assert (tran_index == entry_ptr->tran_index);
 
-	  lock_copy_key_for_log (&acqlocks->locks[idx].key, &entry_ptr->res_head->key);
+	  fp_key = lock_fp_entry_key (entry_ptr);
+	  lock_copy_key_for_log (&acqlocks->locks[idx].key, &fp_key);
 	  acqlocks->locks[idx].lock = entry_ptr->granted_mode;
 	  idx += 1;
 	}
@@ -8930,7 +9466,8 @@ lock_unlock_all_shared_get_all_exclusive (THREAD_ENTRY * thread_p, LK_ACQUIRED_L
 	{
 	  assert (tran_index == entry_ptr->tran_index);
 
-	  lock_copy_key_for_log (&acqlocks->locks[idx].key, &entry_ptr->res_head->key);
+	  fp_key = lock_fp_entry_key (entry_ptr);
+	  lock_copy_key_for_log (&acqlocks->locks[idx].key, &fp_key);
 	  acqlocks->locks[idx].lock = entry_ptr->granted_mode;
 	  idx += 1;
 	}
@@ -9610,13 +10147,13 @@ lock_is_instant_lock_mode (int tran_index)
 static void
 lock_increment_class_granules (LK_ENTRY * class_entry)
 {
-  if (class_entry == NULL || class_entry->res_head->key.type != LOCK_RESOURCE_CLASS)
+  if (class_entry == NULL || class_entry->key_type != LOCK_RESOURCE_CLASS)
     {
       return;
     }
 
   class_entry->ngranules++;
-  if (class_entry->class_entry != NULL && !OID_IS_ROOTOID (&class_entry->class_entry->res_head->key.oid))
+  if (class_entry->class_entry != NULL && !OID_IS_ROOTOID (&class_entry->class_entry->key_oid))
     {
       /* This is a class in a class hierarchy so increment the number of granules for the superclass */
       class_entry->class_entry->ngranules++;
@@ -9632,13 +10169,13 @@ lock_increment_class_granules (LK_ENTRY * class_entry)
 static void
 lock_decrement_class_granules (LK_ENTRY * class_entry)
 {
-  if (class_entry == NULL || class_entry->res_head->key.type != LOCK_RESOURCE_CLASS)
+  if (class_entry == NULL || class_entry->key_type != LOCK_RESOURCE_CLASS)
     {
       return;
     }
 
   class_entry->ngranules--;
-  if (class_entry->class_entry != NULL && !OID_IS_ROOTOID (&class_entry->class_entry->res_head->key.oid))
+  if (class_entry->class_entry != NULL && !OID_IS_ROOTOID (&class_entry->class_entry->key_oid))
     {
       /* This is a class in a class hierarchy so decrement the number of granules for the superclass */
       class_entry->class_entry->ngranules--;
@@ -10129,6 +10666,14 @@ lock_event_log_lock_info (THREAD_ENTRY * thread_p, FILE * log_fp, LK_ENTRY * ent
 
   res_ptr = entry->res_head;
 
+  if (res_ptr == NULL)
+    {
+      /* U1 PoC fastpath class lock: no resource */
+      fprintf (log_fp, " (fastpath class lock oid=%d|%d|%d)\n", entry->key_oid.volid, entry->key_oid.pageid,
+	       entry->key_oid.slotid);
+      return;
+    }
+
   if (res_ptr->key.type == LOCK_RESOURCE_TRANSACTION)
     {
       /* transaction self-lock: no OID, print MVCCID only */
@@ -10383,6 +10928,14 @@ static void
 lock_free_entry (int tran_index, LF_TRAN_ENTRY * tran_entry, LF_FREELIST * freelist, LK_ENTRY * lock_entry)
 {
   LK_TRAN_LOCK *tran_lock = &lk_Gl.tran_lock_table[tran_index];
+
+  if (lock_entry->holds_strong_count)
+    {
+      /* U1 PoC: the strong class lock dies with its entry; re-open the fastpath for this class hash */
+      lk_Fp_strong_count[lock_fp_hash (&lock_entry->key_oid)].fetch_sub (1, std::memory_order_seq_cst);
+      lock_entry->holds_strong_count = false;
+    }
+  assert (!lock_entry->is_fastpath);
 
   assert (tran_lock->lk_entry_pool_count >= 0
 	  && tran_lock->lk_entry_pool_count <= lk_Gl.config.tran_local_pool_max_size);

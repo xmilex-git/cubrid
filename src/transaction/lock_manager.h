@@ -72,6 +72,15 @@ typedef enum
   KEY_LOCK_ESCALATED = 2
 } KEY_LOCK_ESCALATION;
 
+/* type of locking resource */
+typedef enum
+{
+  LOCK_RESOURCE_INSTANCE,	/* An instance resource */
+  LOCK_RESOURCE_CLASS,		/* A class resource */
+  LOCK_RESOURCE_ROOT_CLASS,	/* A root class resource */
+  LOCK_RESOURCE_TRANSACTION	/* A transaction self-lock keyed by the inserter's MVCCID */
+} LOCK_RESOURCE_TYPE;
+
 /*****************************/
 /* Lock Heap Entry Structure */
 /*****************************/
@@ -95,6 +104,13 @@ struct lk_entry
   int instant_lock_count;	/* number of instant lock requests */
   int bind_index_in_tran;
   XASL_ID xasl_id;
+  /* U1 PoC (workspace#246) — class-lock fastpath bookkeeping. key_oid/key_type mirror res_head->key so a class
+   * entry is identifiable without a resource: a fastpath entry has res_head == NULL until it is transferred into
+   * the shared lock table by a strong requester. */
+  OID key_oid;			/* copy of the resource key oid (class / root class entries) */
+  LOCK_RESOURCE_TYPE key_type;	/* copy of the resource key type */
+  bool is_fastpath;		/* weak class lock held only in the owner's hold list, in no LK_RES holder list */
+  bool holds_strong_count;	/* this entry contributed +1 to lk_Fp_strong_count[hash (key_oid)] */
 #else				/* not SERVER_MODE */
   int dummy;
 #endif				/* not SERVER_MODE */
@@ -132,15 +148,6 @@ struct lk_composite_lock
 {
   LK_LOCKCOMP lockcomp;
 };
-
-/* type of locking resource */
-typedef enum
-{
-  LOCK_RESOURCE_INSTANCE,	/* An instance resource */
-  LOCK_RESOURCE_CLASS,		/* A class resource */
-  LOCK_RESOURCE_ROOT_CLASS,	/* A root class resource */
-  LOCK_RESOURCE_TRANSACTION	/* A transaction self-lock keyed by the inserter's MVCCID */
-} LOCK_RESOURCE_TYPE;
 
 /*
  * Lock Resource key structure
