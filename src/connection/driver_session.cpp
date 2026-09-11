@@ -531,6 +531,7 @@ namespace cubconn
 	}
       cas_log_error_handler_end ();
       net_buf_destroy (&net_buf);
+      cas_request_scratch_release_thread ();	/* PoC R7 (workspace#249): per-thread request-body scratch */
     }
 
     /* ------------------------------------------------------------------ */

@@ -74,6 +74,74 @@
  * cub_server's address space. */
 #define CAS_DISPATCH_REQUEST_BODY_MAX (1024 * 1024 * 1024)
 
+/* PoC R7 (workspace#249, ALLOC-02/ALLOC-05): the request body used to be one
+ * MALLOC + FREE per request and the argument vector one REALLOC per argument.
+ * The body now lives in a per-thread scratch buffer (the CAS speaker is one
+ * dedicated thread per adopted connection, so "thread" == "session" here) that
+ * is bounded and reused across requests; the argv lives in an inline array on
+ * the dispatcher's stack.  Contract: everything that points into the body
+ * (argv, borrowed bind values — PoC T1) is consumed before cas_process_request
+ * returns, exactly as with the old malloc'd body, which was freed at the same
+ * point.  Bodies above the bound, or a nested request while the scratch is in
+ * use, take the legacy heap path. */
+#define CAS_REQ_BODY_SCRATCH_MAX (64 * 1024)
+#define CAS_REQ_ARGV_INLINE 16
+
+static CAS_TLS char *cas_req_body_scratch = NULL;
+static CAS_TLS int cas_req_body_scratch_cap = 0;
+static CAS_TLS bool cas_req_body_scratch_busy = false;
+
+static char *
+cas_req_body_acquire (int size)
+{
+  char *buf;
+
+  if (size <= CAS_REQ_BODY_SCRATCH_MAX && !cas_req_body_scratch_busy)
+    {
+      if (size > cas_req_body_scratch_cap)
+	{
+	  int cap = (cas_req_body_scratch_cap > 0) ? cas_req_body_scratch_cap : 1024;
+
+	  while (cap < size)
+	    {
+	      cap *= 2;
+	    }
+	  buf = (char *) REALLOC (cas_req_body_scratch, cap);
+	  if (buf == NULL)
+	    {
+	      return NULL;
+	    }
+	  cas_req_body_scratch = buf;
+	  cas_req_body_scratch_cap = cap;
+	}
+      cas_req_body_scratch_busy = true;
+      return cas_req_body_scratch;
+    }
+
+  return (char *) MALLOC (size);
+}
+
+static void
+cas_req_body_release (char *buf)
+{
+  if (buf != NULL && buf == cas_req_body_scratch)
+    {
+      cas_req_body_scratch_busy = false;
+      return;
+    }
+  FREE_MEM (buf);
+}
+
+/* called once when the speaker thread leaves its request loop */
+void
+cas_request_scratch_release_thread (void)
+{
+  FREE_MEM (cas_req_body_scratch);
+  cas_req_body_scratch = NULL;
+  cas_req_body_scratch_cap = 0;
+  cas_req_body_scratch_busy = false;
+}
+
 static void set_db_parameter (void);
 
 static T_SERVER_FUNC server_fn_table[] = {
@@ -380,6 +448,7 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
   char func_code;
   int argc;
   void **argv = NULL;
+  void *argv_inline[CAS_REQ_ARGV_INLINE];
   int err_code;
 
   int con_status_to_restore, old_con_status;
@@ -559,7 +628,7 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
       return FN_CLOSE_CONN;
     }
 
-  read_msg = (char *) MALLOC (*(client_msg_header.msg_body_size_ptr));
+  read_msg = cas_req_body_acquire (*(client_msg_header.msg_body_size_ptr));
   if (read_msg == NULL)
     {
       net_write_error (sock_fd, req_info->client_version, req_info->driver_info, cas_msg_header.info_ptr, cas_info_size,
@@ -568,7 +637,7 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
     }
   if (net_read_stream (sock_fd, read_msg, *(client_msg_header.msg_body_size_ptr)) < 0)
     {
-      FREE_MEM (read_msg);
+      cas_req_body_release (read_msg);
       net_write_error (sock_fd, req_info->client_version, req_info->driver_info, cas_msg_header.info_ptr, cas_info_size,
 		       CAS_ERROR_INDICATOR, CAS_ER_COMMUNICATION, NULL);
       cas_log_write_and_end (0, true, "COMMUNICATION ERROR net_read_stream()");
@@ -579,10 +648,11 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
   cas_server_apply_pending_config (true);
 #endif
 
-  argc = net_decode_str (read_msg, *(client_msg_header.msg_body_size_ptr), &func_code, &argv);
+  argc = net_decode_str_into (read_msg, *(client_msg_header.msg_body_size_ptr), &func_code, &argv, argv_inline,
+			      CAS_REQ_ARGV_INLINE);
   if (argc < 0)
     {
-      FREE_MEM (read_msg);
+      cas_req_body_release (read_msg);
       net_write_error (sock_fd, req_info->client_version, req_info->driver_info, cas_msg_header.info_ptr, cas_info_size,
 		       CAS_ERROR_INDICATOR, CAS_ER_COMMUNICATION, NULL);
       return FN_CLOSE_CONN;
@@ -590,8 +660,11 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
 
   if (func_code <= 0 || func_code >= CAS_FC_MAX)
     {
-      FREE_MEM (argv);
-      FREE_MEM (read_msg);
+      if (argv != argv_inline)
+	{
+	  FREE_MEM (argv);
+	}
+      cas_req_body_release (read_msg);
       net_write_error (sock_fd, req_info->client_version, req_info->driver_info, cas_msg_header.info_ptr, cas_info_size,
 		       CAS_ERROR_INDICATOR, CAS_ER_COMMUNICATION, NULL);
       return FN_CLOSE_CONN;
@@ -899,8 +972,11 @@ exit_on_end:
 
   net_buf_clear (net_buf);
 
-  FREE_MEM (read_msg);
-  FREE_MEM (argv);
+  cas_req_body_release (read_msg);
+  if (argv != argv_inline)
+    {
+      FREE_MEM (argv);
+    }
 
   return fn_ret;
 }

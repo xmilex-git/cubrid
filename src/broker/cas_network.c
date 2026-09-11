@@ -395,12 +395,28 @@ net_read_int (SOCKET sock_fd, int *value)
 int
 net_decode_str (char *msg, int msg_size, char *func_code, void ***ret_argv)
 {
+  return net_decode_str_into (msg, msg_size, func_code, ret_argv, NULL, 0);
+}
+
+/*
+ * net_decode_str_into () - PoC R7 (workspace#249, ALLOC-02/ALLOC-05): same
+ *   wire decode as net_decode_str, but the argument vector is written into the
+ *   caller's inline array while it fits (inline_cap slots); only an overflow
+ *   falls back to the heap (one MALLOC, then doubling REALLOC instead of one
+ *   REALLOC per argument).  The caller frees *ret_argv only when it differs
+ *   from inline_argv.  inline_argv == NULL / inline_cap == 0 reproduces the
+ *   legacy behaviour exactly (heap from the first argument).
+ */
+int
+net_decode_str_into (char *msg, int msg_size, char *func_code, void ***ret_argv, void **inline_argv, int inline_cap)
+{
   int remain_size = msg_size;
   char *cur_p = msg;
   char *argp;
   int i_val;
-  void **argv = NULL;
+  void **argv = inline_argv;
   int argc = 0;
+  int cap = (inline_argv != NULL) ? inline_cap : 0;
 
   *ret_argv = (void **) NULL;
 
@@ -415,7 +431,10 @@ net_decode_str (char *msg, int msg_size, char *func_code, void ***ret_argv)
     {
       if (remain_size < 4)
 	{
-	  FREE_MEM (argv);
+	  if (argv != inline_argv)
+	    {
+	      FREE_MEM (argv);
+	    }
 	  return CAS_ER_COMMUNICATION;
 	}
       argp = cur_p;
@@ -426,16 +445,44 @@ net_decode_str (char *msg, int msg_size, char *func_code, void ***ret_argv)
 
       if (remain_size < i_val)
 	{
-	  FREE_MEM (argv);
+	  if (argv != inline_argv)
+	    {
+	      FREE_MEM (argv);
+	    }
 	  return CAS_ER_COMMUNICATION;
 	}
 
-      argc++;
-      argv = (void **) REALLOC (argv, sizeof (void *) * argc);
-      if (argv == NULL)
-	return CAS_ER_NO_MORE_MEMORY;
+      if (argc >= cap)
+	{
+	  /* overflow (or no inline array): grow on the heap, geometric */
+	  int new_cap = (cap > 0) ? cap * 2 : 8;
+	  void **grown;
 
-      argv[argc - 1] = argp;
+	  if (argv == inline_argv)
+	    {
+	      grown = (void **) MALLOC (sizeof (void *) * new_cap);
+	      if (grown != NULL && argc > 0)
+		{
+		  memcpy (grown, argv, sizeof (void *) * argc);
+		}
+	    }
+	  else
+	    {
+	      grown = (void **) REALLOC (argv, sizeof (void *) * new_cap);
+	    }
+	  if (grown == NULL)
+	    {
+	      if (argv != inline_argv)
+		{
+		  FREE_MEM (argv);
+		}
+	      return CAS_ER_NO_MORE_MEMORY;
+	    }
+	  argv = grown;
+	  cap = new_cap;
+	}
+
+      argv[argc++] = argp;
 
       cur_p += i_val;
       remain_size -= i_val;

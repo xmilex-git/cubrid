@@ -49,6 +49,7 @@ extern "C"
   extern void set_db_connection_info (void);
   extern void clear_db_connection_info (void);
   extern bool need_database_reconnect (void);
+  extern void cas_request_scratch_release_thread (void);	/* PoC R7 (workspace#249) */
 
 #ifdef __cplusplus
 }

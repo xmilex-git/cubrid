@@ -179,6 +179,13 @@ struct t_attr_table
 extern void set_query_timeout (T_SRV_HANDLE * srv_handle, int query_timeout);
 
 static int netval_to_dbval (void *type, void *value, DB_VALUE * db_val, T_NET_BUF * net_buf, char desired_type);
+static int make_bind_value_into (int num_bind, int argc, void **argv, DB_VALUE * inline_buf, int inline_cap,
+				 DB_VALUE ** ret_val, T_NET_BUF * net_buf, char desired_type);
+
+/* PoC T1 (workspace#249, ALLOC-01/ALLOC-02): bind values for one execute live
+ * in an inline array on ux_execute's stack while they fit; the heap MALLOC of
+ * value_list is the overflow path only. */
+#define CAS_BIND_INLINE 8
 static int cur_tuple (T_QUERY_RESULT * q_result, int max_col_size, char sensitive_flag, DB_OBJECT * obj,
 		      T_NET_BUF * net_buf);
 static int dbval_to_net_buf (DB_VALUE * val, T_NET_BUF * net_buf, char fetch_flag, int max_col_size,
@@ -1087,6 +1094,7 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
 {
   int err_code;
   DB_VALUE *value_list = NULL;
+  DB_VALUE bind_inline[CAS_BIND_INLINE];	/* PoC T1 (workspace#249) */
   int num_bind = 0;
   int i, n, stmt_id;
   DB_QUERY_RESULT *result = NULL;
@@ -1133,7 +1141,8 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
 
   if (num_bind > 0)
     {
-      err_code = make_bind_value (num_bind, argc, argv, &value_list, net_buf, DB_TYPE_NULL);
+      err_code = make_bind_value_into (num_bind, argc, argv, bind_inline, CAS_BIND_INLINE, &value_list, net_buf,
+				       DB_TYPE_NULL);
       if (err_code < 0)
 	{
 	  goto execute_error;
@@ -1327,7 +1336,10 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
 	{
 	  db_value_clear (&(value_list[i]));
 	}
-      FREE_MEM (value_list);
+      if (value_list != bind_inline)
+	{
+	  FREE_MEM (value_list);
+	}
     }
 
   if (*clt_cache_reusable == TRUE)
@@ -1408,7 +1420,10 @@ execute_error:
 	{
 	  db_value_clear (&(value_list[i]));
 	}
-      FREE_MEM (value_list);
+      if (value_list != bind_inline)
+	{
+	  FREE_MEM (value_list);
+	}
     }
   return err_code;
 }
@@ -3348,6 +3363,19 @@ get_set_domain (DB_DOMAIN * set_domain, int *precision, short *scale, char *db_t
 int
 make_bind_value (int num_bind, int argc, void **argv, DB_VALUE ** ret_val, T_NET_BUF * net_buf, char desired_type)
 {
+  return make_bind_value_into (num_bind, argc, argv, NULL, 0, ret_val, net_buf, desired_type);
+}
+
+/*
+ * make_bind_value_into () - PoC T1 (workspace#249): make_bind_value whose
+ *   value array is the caller's inline_buf while num_bind <= inline_cap; the
+ *   heap MALLOC is the overflow path.  The caller frees *ret_val only when it
+ *   differs from inline_buf.  inline_buf == NULL reproduces make_bind_value.
+ */
+static int
+make_bind_value_into (int num_bind, int argc, void **argv, DB_VALUE * inline_buf, int inline_cap, DB_VALUE ** ret_val,
+		      T_NET_BUF * net_buf, char desired_type)
+{
   DB_VALUE *value_list = NULL;
   int i, type_idx, val_idx;
   int err_code;
@@ -3359,10 +3387,17 @@ make_bind_value (int num_bind, int argc, void **argv, DB_VALUE ** ret_val, T_NET
       return ERROR_INFO_SET (CAS_ER_NUM_BIND, CAS_ERROR_INDICATOR);
     }
 
-  value_list = (DB_VALUE *) MALLOC (sizeof (DB_VALUE) * num_bind);
-  if (value_list == NULL)
+  if (inline_buf != NULL && num_bind <= inline_cap)
     {
-      return ERROR_INFO_SET (CAS_ER_NO_MORE_MEMORY, CAS_ERROR_INDICATOR);
+      value_list = inline_buf;
+    }
+  else
+    {
+      value_list = (DB_VALUE *) MALLOC (sizeof (DB_VALUE) * num_bind);
+      if (value_list == NULL)
+	{
+	  return ERROR_INFO_SET (CAS_ER_NO_MORE_MEMORY, CAS_ERROR_INDICATOR);
+	}
     }
 
   memset (value_list, 0, sizeof (DB_VALUE) * num_bind);
@@ -3378,7 +3413,10 @@ make_bind_value (int num_bind, int argc, void **argv, DB_VALUE ** ret_val, T_NET
 	    {
 	      db_value_clear (&(value_list[i]));
 	    }
-	  FREE_MEM (value_list);
+	  if (value_list != inline_buf)
+	    {
+	      FREE_MEM (value_list);
+	    }
 	  return err_code;
 	}
     }
@@ -4401,6 +4439,19 @@ netval_to_dbval (void *net_type, void *net_value, DB_VALUE * out_val, T_NET_BUF 
 
   if (desired_type == DB_TYPE_NULL || coercion_flag == FALSE)
     {
+      /* PoC T1 (workspace#249, ALLOC-01): a char-family bind whose payload
+       * still points into the request body (need_clear == false, i.e. not
+       * unicode-composed) is handed over as an alias instead of a deep
+       * clone.  The body outlives the whole execute (released at the end of
+       * cas_process_request), and set_host_variables -> pt_set_host_variables
+       * clones into the parser's own host_variables anyway, so the CAS-side
+       * copy was a second, purely transient copy of the same bytes.  Owned
+       * payloads (composed strings, JSON, sets, ...) keep the clone. */
+      if (!db_val.need_clear && TP_IS_CHAR_TYPE (DB_VALUE_DOMAIN_TYPE (&db_val)))
+	{
+	  *out_val = db_val;
+	  return data_size;
+	}
       db_value_clone (&db_val, out_val);
     }
   else

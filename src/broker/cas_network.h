@@ -260,6 +260,8 @@ extern int net_write_stream (SOCKET sock_fd, const char *buf, int size);
 extern int net_write_int (SOCKET sock_fd, int value);
 extern int net_read_int (SOCKET sock_fd, int *value);
 extern int net_decode_str (char *msg, int msg_size, char *func_code, void ***ret_argv);
+extern int net_decode_str_into (char *msg, int msg_size, char *func_code, void ***ret_argv, void **inline_argv,
+				 int inline_cap);
 
 extern int net_read_to_file (SOCKET sock_fd, int file_size, char *filename);
 extern int net_write_from_file (SOCKET sock_fd, int file_size, char *filename);
