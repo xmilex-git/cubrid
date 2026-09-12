@@ -209,7 +209,11 @@ namespace cubscan
 	      db_value_clear (&result);
 	    }
 
-	  m_method_group->reset (false);
+	  error = m_method_group->reset (false);
+	  if (error != NO_ERROR)
+	    {
+	      scan_code = S_ERROR;
+	    }
 	}
 
       if (scan_code == S_ERROR)
@@ -264,7 +268,7 @@ namespace cubscan
     SCAN_CODE
     scanner::get_single_tuple ()
     {
-      QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+      QFILE_TUPLE_RECORD tuple_record = QFILE_TUPLE_RECORD_INITIALIZER;
       SCAN_CODE scan_code = qfile_scan_list_next (m_thread_p, &m_scan_id, &tuple_record, PEEK);
       if (scan_code == S_SUCCESS)
 	{
@@ -276,7 +280,7 @@ namespace cubscan
 	      const PR_TYPE *pr_type = domain->type;
 
 	      db_make_null (value);
-	      if (qfile_slot_read_value (&tuple_record, i, domain, value, true, &is_null) != NO_ERROR)
+	      if (qfile_slot_read_column_value (&tuple_record, i, domain, value, true, &is_null) != NO_ERROR)
 		{
 		  scan_code = S_ERROR;
 		  break;

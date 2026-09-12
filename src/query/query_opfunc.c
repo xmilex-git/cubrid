@@ -36,7 +36,7 @@
 /* value pointer staging for the private-buffer tuple writers: stack for the usual column counts */
 #define QDATA_TUPLE_VALS_STACK 64
 static int qdata_copy_values_to_tuple (THREAD_ENTRY * thread_p, DB_VALUE ** vals, int n,
-				       qfile_tuple_value_type_list * tl, qfile_tuple_record * tuple_record_p);
+				       qfile_tuple_value_type_list * type_list, qfile_tuple_record * tuple_record_p);
 
 #include "system_parameter.h"
 #include "error_manager.h"
@@ -230,9 +230,11 @@ static int qdata_regexp_function (THREAD_ENTRY * thread_p, FUNCTION_TYPE * funct
 				  OID * obj_oid_p, QFILE_TUPLE_RECORD * tplrec);
 
 static int qdata_convert_operands_to_value_and_call (THREAD_ENTRY * thread_p, FUNCTION_TYPE * function_p,
-						     VAL_DESCR * val_desc_p, OID * obj_oid_p, QFILE_TUPLE_RECORD * tplrec,
-						     int (*function_to_call) (DB_VALUE *, DB_VALUE * const *,
-									      int const));
+						     VAL_DESCR * val_desc_p, OID * obj_oid_p,
+						     QFILE_TUPLE_RECORD * tplrec, int (*function_to_call) (DB_VALUE *,
+													   DB_VALUE *
+													   const *,
+													   int const));
 
 static bool
 qdata_is_zero_value_date (DB_VALUE * dbval_p)
@@ -353,7 +355,7 @@ qdata_copy_db_value (DB_VALUE * dest_p, const DB_VALUE * src_p)
  *   return: NO_ERROR, or ER_code
  *   valptr_list(in)    : Value pointer list
  *   vd(in)     : Value descriptor
- *   tl(in)     : layout descriptor of the list the tuple is written into
+ *   type_list(in)     : layout descriptor of the list the tuple is written into
  *   tplrec(in) : Tuple descriptor
  *
  * Note: Copy valptr_list values to tuple descriptor.  Regu variables
@@ -363,7 +365,7 @@ qdata_copy_db_value (DB_VALUE * dest_p, const DB_VALUE * src_p)
  */
 int
 qdata_copy_valptr_list_to_tuple (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list_p, val_descr * val_desc_p,
-				 qfile_tuple_value_type_list * tl, qfile_tuple_record * tuple_record_p)
+				 qfile_tuple_value_type_list * type_list, qfile_tuple_record * tuple_record_p)
 {
   REGU_VARIABLE_LIST reg_var_p;
   DB_VALUE *vals_buf[QDATA_TUPLE_VALS_STACK], **vals = vals_buf;
@@ -396,7 +398,7 @@ qdata_copy_valptr_list_to_tuple (THREAD_ENTRY * thread_p, valptr_list_node * val
       n++;
     }
 
-  error = qdata_copy_values_to_tuple (thread_p, vals, n, tl, tuple_record_p);
+  error = qdata_copy_values_to_tuple (thread_p, vals, n, type_list, tuple_record_p);
 
 end:
   if (vals != vals_buf)
@@ -411,16 +413,27 @@ end:
  *   return: NO_ERROR, or ER_code
  */
 static int
-qdata_copy_values_to_tuple (THREAD_ENTRY * thread_p, DB_VALUE ** vals, int n, qfile_tuple_value_type_list * tl,
+qdata_copy_values_to_tuple (THREAD_ENTRY * thread_p, DB_VALUE ** vals, int n, qfile_tuple_value_type_list * type_list,
 			    qfile_tuple_record * tuple_record_p)
 {
-  int size;
+  int lens_buf[QDATA_TUPLE_VALS_STACK], *lens = lens_buf;
+  int size, error;
   bool has_null;
 
-  size = qfile_tuple_size_from_values (tl, vals, n, &has_null);
+  if (n > QDATA_TUPLE_VALS_STACK)
+    {
+      lens = (int *) db_private_alloc (thread_p, n * sizeof (int));
+      if (lens == NULL)
+	{
+	  return ER_FAILED;
+	}
+    }
+
+  size = qfile_tuple_size_from_values (type_list, vals, lens, n, &has_null);
   if (size < 0)
     {
-      return ER_FAILED;
+      error = ER_FAILED;
+      goto end;
     }
 
   if (tuple_record_p->size < size)
@@ -438,16 +451,24 @@ qdata_copy_values_to_tuple (THREAD_ENTRY * thread_p, DB_VALUE ** vals, int n, qf
 	}
       if (tuple_record_p->tpl == NULL)
 	{
-	  return ER_FAILED;
+	  error = ER_FAILED;
+	  goto end;
 	}
       tuple_record_p->size = tpl_size;
     }
 
-  return qfile_tuple_fill_from_values (tl, vals, n, tuple_record_p->tpl, size);
+  error = qfile_tuple_fill_from_values (type_list, vals, lens, n, tuple_record_p->tpl, size, has_null);
+
+end:
+  if (lens != lens_buf)
+    {
+      db_private_free (thread_p, lens);
+    }
+  return error;
 }
 
 int
-qdata_copy_val_list_to_tuple (THREAD_ENTRY * thread_p, VAL_LIST * val_list, qfile_tuple_value_type_list * tl,
+qdata_copy_val_list_to_tuple (THREAD_ENTRY * thread_p, VAL_LIST * val_list, qfile_tuple_value_type_list * type_list,
 			      qfile_tuple_record * tuple_record_p)
 {
   QPROC_DB_VALUE_LIST val_list_iterator;
@@ -469,7 +490,7 @@ qdata_copy_val_list_to_tuple (THREAD_ENTRY * thread_p, VAL_LIST * val_list, qfil
       vals[n] = val_list_iterator->val;
     }
 
-  error = qdata_copy_values_to_tuple (thread_p, vals, n, tl, tuple_record_p);
+  error = qdata_copy_values_to_tuple (thread_p, vals, n, type_list, tuple_record_p);
 
   if (vals != vals_buf)
     {
@@ -490,14 +511,15 @@ qdata_tuple_to_val_list (THREAD_ENTRY * thread_p, qfile_tuple_value_type_list * 
   int len;
   bool is_null;
 
-  /* sequential column reads through the slot cache are O(n) overall (D-182-7 bulk accessor) */
+  /* sequential column reads through the slot cache are O(n) overall */
   for (val_list_iterator = val_list->valp, val_list_index = 0; val_list_iterator
        && val_list_index < val_list->val_cnt; val_list_iterator = val_list_iterator->next, val_list_index++)
     {
       pr_clear_value (val_list_iterator->val);
 
-      err_code = qfile_slot_read_value (tplrec, val_list_index, type_list->domp[val_list_index], val_list_iterator->val,
-					false /* Don't copy */ , &is_null);
+      err_code =
+	qfile_slot_read_column_value (tplrec, val_list_index, type_list->domp[val_list_index], val_list_iterator->val,
+				      false /* Don't copy */ , &is_null);
       if (err_code != NO_ERROR)
 	{
 	  return err_code;
@@ -575,18 +597,17 @@ exit_with_status:
 }
 
 /*
- * qdata_size_tuple_desc () - assembler size pass over the values collected by
- *   qdata_generate_tuple_desc_for_valptr_list (). Call it AFTER the list's DB_TYPE_VARIABLE domains have been resolved
- *   from those values (qfile_update_domains_on_type_list) so size and fill see the same layout descriptor.
+ * qdata_size_tuple_desc () - size pass over the values from qdata_generate_tuple_desc_for_valptr_list ()
  *   return: QPROC_TPLDESCR_SUCCESS, QPROC_TPLDESCR_RETRY_BIG_REC or QPROC_TPLDESCR_FAILURE
- *   tl(in): finalized layout descriptor of the destination list
+ *   type_list(in): layout-ready descriptor of the destination list
  */
 QPROC_TPLDESCR_STATUS
-qdata_size_tuple_desc (qfile_tuple_value_type_list * tl, qfile_tuple_descriptor * tuple_desc_p)
+qdata_size_tuple_desc (qfile_tuple_value_type_list * type_list, qfile_tuple_descriptor * tuple_desc_p)
 {
   /* the compressed string, if any, is deallocated later, after copying the db_value into the tuple */
   tuple_desc_p->tpl_size =
-    qfile_tuple_size_from_values (tl, tuple_desc_p->f_valp, tuple_desc_p->f_cnt, &tuple_desc_p->has_null);
+    qfile_tuple_size_from_values (type_list, tuple_desc_p->f_valp, tuple_desc_p->f_len, tuple_desc_p->f_cnt,
+				  &tuple_desc_p->has_null);
   if (tuple_desc_p->tpl_size < 0)
     {
       return QPROC_TPLDESCR_FAILURE;
@@ -2639,6 +2660,300 @@ qdata_add_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, 
     }
 
   return qdata_coerce_result_to_domain (result_p, domain_p);
+}
+
+/*
+ * qdata_sum_acc_start () - open the accumulator on the first value of a group
+ *   return: NO_ERROR, or ER_FAILED on a type the accumulator does not take
+ *   acc(in/out) : accumulator; becomes active in the value's mode
+ *   dbv(in)     : first NUMERIC/SHORT/INTEGER/BIGINT/DOUBLE/FLOAT value; not NULL-valued
+ */
+static int
+qdata_sum_acc_start (SUM_ACC * acc, const DB_VALUE * dbv)
+{
+  DB_TYPE vtype = DB_VALUE_DOMAIN_TYPE (dbv);
+
+  switch (vtype)
+    {
+    case DB_TYPE_NUMERIC:
+      numeric_sum_acc_load_dbv (acc, dbv);
+      return NO_ERROR;
+    case DB_TYPE_SHORT:
+      acc->v.int_sum = (int64_t) db_get_short (dbv);
+      break;
+    case DB_TYPE_INTEGER:
+      acc->v.int_sum = (int64_t) db_get_int (dbv);
+      break;
+    case DB_TYPE_BIGINT:
+      acc->v.int_sum = (int64_t) db_get_bigint (dbv);
+      break;
+    case DB_TYPE_DOUBLE:
+      acc->v.dbl_sum = db_get_double (dbv);
+      break;
+    case DB_TYPE_FLOAT:
+      acc->v.dbl_sum = (double) db_get_float (dbv);
+      break;
+    default:
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_FAILED;
+    }
+
+  acc->sum_type = sum_acc_sum_type_for (vtype);
+  acc->is_active = true;
+  return NO_ERROR;
+}
+
+/*
+ * qdata_sum_acc_add_dbv () - add one value to an active accumulator
+ *   return: NO_ERROR, or ER_QPROC_OVERFLOW_ADDITION with the same overflow
+ *           semantics as the per-row addition
+ *   acc(in/out) : active accumulator; sum_type matches the value's type
+ *   dbv(in)     : the value; not NULL-valued
+ */
+int
+qdata_sum_acc_add_dbv (SUM_ACC * acc, const DB_VALUE * dbv)
+{
+  DB_TYPE vtype;
+
+  assert (acc != NULL && acc->is_active && dbv != NULL);
+
+  vtype = DB_VALUE_DOMAIN_TYPE (dbv);
+  if (acc->sum_type != sum_acc_sum_type_for (vtype))
+    {
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_FAILED;
+    }
+
+  switch (vtype)
+    {
+    case DB_TYPE_NUMERIC:
+      return numeric_sum_acc_add_dbv (acc, dbv);
+    case DB_TYPE_SHORT:
+      acc->v.int_sum += (int64_t) db_get_short (dbv);
+      if (OR_CHECK_SHORT_OVERFLOW (acc->v.int_sum))
+	{
+	  goto overflow;
+	}
+      break;
+    case DB_TYPE_INTEGER:
+      acc->v.int_sum += (int64_t) db_get_int (dbv);
+      if (OR_CHECK_INT_OVERFLOW (acc->v.int_sum))
+	{
+	  goto overflow;
+	}
+      break;
+    case DB_TYPE_BIGINT:
+      if (__builtin_add_overflow (acc->v.int_sum, (int64_t) db_get_bigint (dbv), &acc->v.int_sum))
+	{
+	  goto overflow;
+	}
+      break;
+    case DB_TYPE_DOUBLE:
+      acc->v.dbl_sum += db_get_double (dbv);
+      if (OR_CHECK_DOUBLE_OVERFLOW (acc->v.dbl_sum))
+	{
+	  goto overflow;
+	}
+      break;
+    case DB_TYPE_FLOAT:
+      acc->v.dbl_sum += (double) db_get_float (dbv);
+      if (OR_CHECK_DOUBLE_OVERFLOW (acc->v.dbl_sum))
+	{
+	  goto overflow;
+	}
+      break;
+    default:
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_FAILED;
+    }
+
+  return NO_ERROR;
+
+overflow:
+  acc->is_active = false;
+  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OVERFLOW_ADDITION, 0);
+  return ER_QPROC_OVERFLOW_ADDITION;
+}
+
+/*
+ * qdata_sum_acc_accumulate () - accumulate one value, dispatching on its type
+ *   return: NO_ERROR, or an error code
+ *   acc(in/out)   : accumulator
+ *   is_first(in)  : true for the first value of the group; seed_from is ignored
+ *   seed_from(in) : caller's running value, or NULL; used to restore a partial
+ *                   sum when the accumulator is empty
+ *   value(in)     : value to accumulate; not NULL-valued
+ *
+ * Note: The first value is always accumulated here rather than kept in the
+ *       caller's DB_VALUE. The analytic path may finalize that value mid-partition,
+ *       and AVG can overwrite it with a DOUBLE.
+ */
+int
+qdata_sum_acc_accumulate (SUM_ACC * acc, bool is_first, const DB_VALUE * seed_from, const DB_VALUE * value)
+{
+  assert (acc != NULL && value != NULL);
+
+  if (is_first)
+    {
+      /* new group: discard whatever state the previous one left behind */
+      acc->is_active = false;
+    }
+  else if (!acc->is_active && !DB_IS_NULL (seed_from)
+	   && sum_acc_sum_type_for (DB_VALUE_DOMAIN_TYPE (seed_from)) != DB_TYPE_NULL)
+    {
+      /* an empty accumulator under a running value: a spilled partial sum came
+       * back as a plain DB_VALUE. Fold it in first or it is lost. */
+      if (qdata_sum_acc_start (acc, seed_from) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
+
+  return acc->is_active ? qdata_sum_acc_add_dbv (acc, value) : qdata_sum_acc_start (acc, value);
+}
+
+/*
+ * qdata_sum_acc_merge () - merge one partial accumulator into another
+ *   return: NO_ERROR, or an error code
+ *   acc(in/out) : active destination accumulator
+ *   other(in)   : active source accumulator; left untouched
+ *
+ * Note: Partial accumulators for the same aggregate have the same sum_type.
+ *       Typed merges re-check the input type's range; NUMERIC accumulators
+ *       merge directly in the word domain.
+ */
+int
+qdata_sum_acc_merge (SUM_ACC * acc, const SUM_ACC * other)
+{
+  assert (acc != NULL && acc->is_active);
+  assert (other != NULL && other->is_active);
+
+  if (acc->sum_type != other->sum_type)
+    {
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_FAILED;
+    }
+
+  switch ((DB_TYPE) acc->sum_type)
+    {
+    case DB_TYPE_SHORT:
+      acc->v.int_sum += other->v.int_sum;
+      if (OR_CHECK_SHORT_OVERFLOW (acc->v.int_sum))
+	{
+	  goto overflow;
+	}
+      return NO_ERROR;
+    case DB_TYPE_INTEGER:
+      acc->v.int_sum += other->v.int_sum;
+      if (OR_CHECK_INT_OVERFLOW (acc->v.int_sum))
+	{
+	  goto overflow;
+	}
+      return NO_ERROR;
+    case DB_TYPE_BIGINT:
+      if (__builtin_add_overflow (acc->v.int_sum, other->v.int_sum, &acc->v.int_sum))
+	{
+	  goto overflow;
+	}
+      return NO_ERROR;
+    case DB_TYPE_DOUBLE:
+      acc->v.dbl_sum += other->v.dbl_sum;
+      if (OR_CHECK_DOUBLE_OVERFLOW (acc->v.dbl_sum))
+	{
+	  goto overflow;
+	}
+      return NO_ERROR;
+    case DB_TYPE_NUMERIC:
+      return numeric_sum_acc_merge (acc, other);
+    default:
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_FAILED;
+    }
+
+overflow:
+  acc->is_active = false;
+  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_OVERFLOW_ADDITION, 0);
+  return ER_QPROC_OVERFLOW_ADDITION;
+}
+
+/*
+ * qdata_sum_acc_snapshot () - write the accumulator's running sum into a DB_VALUE,
+ *                             keeping the accumulator active
+ *   return: NO_ERROR, or an error code
+ *   acc(in)     : active accumulator; NOT deactivated
+ *   result(out) : the running sum as a DB_VALUE
+ *
+ * Note: Used by cumulative analytic functions, which emit a running value per
+ *       sort key group and continue accumulating. Typed sums convert losslessly;
+ *       NUMERIC mode rounds a copy, leaving the live accumulator unchanged.
+ */
+int
+qdata_sum_acc_snapshot (const SUM_ACC * acc, DB_VALUE * result)
+{
+  assert (acc != NULL && acc->is_active && result != NULL);
+
+  switch ((DB_TYPE) acc->sum_type)
+    {
+    case DB_TYPE_SHORT:
+      db_make_short (result, (short) acc->v.int_sum);
+      return NO_ERROR;
+    case DB_TYPE_INTEGER:
+      db_make_int (result, (int) acc->v.int_sum);
+      return NO_ERROR;
+    case DB_TYPE_BIGINT:
+      db_make_bigint (result, (DB_BIGINT) acc->v.int_sum);
+      return NO_ERROR;
+    case DB_TYPE_DOUBLE:
+      db_make_double (result, acc->v.dbl_sum);
+      return NO_ERROR;
+    case DB_TYPE_NUMERIC:
+      return numeric_sum_acc_snapshot (acc, result);
+    default:
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_FAILED;
+    }
+}
+
+/*
+ * qdata_sum_acc_finalize () - finalize the accumulator into the running-sum DB_VALUE
+ *   return: NO_ERROR, or an error code
+ *   acc(in/out) : active accumulator; deactivated on the way out
+ *   result(out) : the running sum as a DB_VALUE
+ *
+ * Note: Typed sums need no rounding or packing; their range is re-checked on
+ *       every add, so the final narrowing casts are lossless. NUMERIC mode
+ *       performs the single per-group rounding here.
+ */
+int
+qdata_sum_acc_finalize (SUM_ACC * acc, DB_VALUE * result)
+{
+  int ret = qdata_sum_acc_snapshot (acc, result);
+
+  acc->is_active = false;
+  return ret;
+}
+
+/*
+ * qdata_sum_acc_flatten_for_spill () - flatten the accumulator into its running
+ *                                      DB_VALUE before writing it to a spill file
+ *   return: NO_ERROR, or an error code
+ *
+ * Note: Uses the same conversion as qdata_sum_acc_finalize (). The separate name
+ *       marks the one call site where it happens mid-group. NUMERIC accumulators
+ *       cannot be stored in list file columns, so the partial sum is stored as
+ *       a DB_VALUE and restored by the accumulate seed path when reloaded.
+ *       Typed sums convert losslessly.
+ */
+int
+qdata_sum_acc_flatten_for_spill (SUM_ACC * acc, DB_VALUE * result)
+{
+  return qdata_sum_acc_finalize (acc, result);
 }
 
 /*
@@ -6246,7 +6561,7 @@ qdata_strcat_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_
 int
 qdata_get_single_tuple_from_list_id (THREAD_ENTRY * thread_p, qfile_list_id * list_id_p, val_list_node * single_tuple_p)
 {
-  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  QFILE_TUPLE_RECORD tuple_record = QFILE_TUPLE_RECORD_INITIALIZER;
   QFILE_LIST_SCAN_ID scan_id;
   const PR_TYPE *pr_type_p;
   bool is_null;
@@ -6306,7 +6621,7 @@ qdata_get_single_tuple_from_list_id (THREAD_ENTRY * thread_p, qfile_list_id * li
 	      return ER_FAILED;
 	    }
 
-	  if (qfile_slot_read_value (&tuple_record, i, domain_p, value_list->val, true, &is_null) != NO_ERROR)
+	  if (qfile_slot_read_column_value (&tuple_record, i, domain_p, value_list->val, true, &is_null) != NO_ERROR)
 	    {
 	      qfile_close_scan (thread_p, &scan_id);
 	      return ER_FAILED;
@@ -6894,9 +7209,7 @@ static int
 qdata_convert_table_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABLE * function_p, VAL_DESCR * val_desc_p)
 {
   QFILE_LIST_SCAN_ID scan_id;
-  QFILE_TUPLE_RECORD tuple_record = {
-    NULL, 0
-  };
+  QFILE_TUPLE_RECORD tuple_record = QFILE_TUPLE_RECORD_INITIALIZER;
   SCAN_CODE scan_code;
   QFILE_LIST_ID *list_id_p;
   int i, seq_pos;
@@ -6982,7 +7295,8 @@ qdata_convert_table_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABL
 	      return ER_FAILED;
 	    }
 
-	  if (qfile_slot_read_value (&tuple_record, i, list_id_p->type_list.domp[i], &dbval, true, &is_null) != NO_ERROR)
+	  if (qfile_slot_read_column_value (&tuple_record, i, list_id_p->type_list.domp[i], &dbval, true, &is_null) !=
+	      NO_ERROR)
 	    {
 	      qfile_close_scan (thread_p, &scan_id);
 	      return ER_FAILED;
@@ -7035,7 +7349,7 @@ qdata_evaluate_connect_by_root (THREAD_ENTRY * thread_p, void *xasl_p, regu_vari
   QFILE_TUPLE tpl;
   QFILE_LIST_ID *list_id_p;
   QFILE_LIST_SCAN_ID s_id;
-  QFILE_TUPLE_RECORD tuple_rec = { (QFILE_TUPLE) NULL, 0 };
+  QFILE_TUPLE_RECORD tuple_rec = QFILE_TUPLE_RECORD_INITIALIZER;
   const QFILE_TUPLE_POSITION *bitval = NULL;
   QFILE_TUPLE_POSITION p_pos;
   QPROC_DB_VALUE_LIST valp;
@@ -7078,7 +7392,7 @@ qdata_evaluate_connect_by_root (THREAD_ENTRY * thread_p, void *xasl_p, regu_vari
     }
 
   /* we start with tpl itself */
-  qfile_slot_fill (&tuple_rec, tpl, &s_id.list_id.type_list);	/* raw CONNECT BY tuple: bind to the list's descriptor */
+  qfile_slot_set_tuple_ptr_and_layout (&tuple_rec, tpl, &s_id.list_id.type_list);	/* raw CONNECT BY tuple: bind to the list's descriptor */
 
   do
     {
@@ -7166,7 +7480,7 @@ qdata_evaluate_qprior (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node
   QFILE_TUPLE tpl;
   QFILE_LIST_ID *list_id_p;
   QFILE_LIST_SCAN_ID s_id;
-  QFILE_TUPLE_RECORD tuple_rec = { (QFILE_TUPLE) NULL, 0 };
+  QFILE_TUPLE_RECORD tuple_rec = QFILE_TUPLE_RECORD_INITIALIZER;
   const QFILE_TUPLE_POSITION *bitval = NULL;
   QFILE_TUPLE_POSITION p_pos;
   DB_VALUE p_pos_dbval;
@@ -7201,7 +7515,7 @@ qdata_evaluate_qprior (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node
       return false;
     }
 
-  qfile_slot_fill (&tuple_rec, tpl, &s_id.list_id.type_list);	/* raw CONNECT BY tuple: bind to the list's descriptor */
+  qfile_slot_set_tuple_ptr_and_layout (&tuple_rec, tpl, &s_id.list_id.type_list);	/* raw CONNECT BY tuple: bind to the list's descriptor */
 
   /* get the parent node */
   if (qexec_get_tuple_column_value (&tuple_rec, xptr->outptr_list->valptr_cnt - PCOL_PARENTPOS_TUPLE_OFFSET,
@@ -7286,7 +7600,7 @@ qdata_evaluate_sys_connect_by_path (THREAD_ENTRY * thread_p, void *xasl_p, regu_
   QFILE_TUPLE tpl;
   QFILE_LIST_ID *list_id_p;
   QFILE_LIST_SCAN_ID s_id;
-  QFILE_TUPLE_RECORD tuple_rec = { (QFILE_TUPLE) NULL, 0 };
+  QFILE_TUPLE_RECORD tuple_rec = QFILE_TUPLE_RECORD_INITIALIZER;
   const QFILE_TUPLE_POSITION *bitval = NULL;
   QFILE_TUPLE_POSITION p_pos;
   QPROC_DB_VALUE_LIST valp;
@@ -7422,7 +7736,7 @@ qdata_evaluate_sys_connect_by_path (THREAD_ENTRY * thread_p, void *xasl_p, regu_
     }
 
   /* we start with tpl itself */
-  qfile_slot_fill (&tuple_rec, tpl, &s_id.list_id.type_list);	/* raw CONNECT BY tuple: bind to the list's descriptor */
+  qfile_slot_set_tuple_ptr_and_layout (&tuple_rec, tpl, &s_id.list_id.type_list);	/* raw CONNECT BY tuple: bind to the list's descriptor */
 
   len_result_path = SYS_CONNECT_BY_PATH_MEM_STEP;
   result_path = (char *) db_private_alloc (thread_p, sizeof (char) * len_result_path);
@@ -9307,7 +9621,7 @@ qdata_get_interpolation_function_result (THREAD_ENTRY * thread_p, QFILE_LIST_SCA
 					 DB_VALUE * result, tp_domain ** result_dom, FUNC_CODE function)
 {
   int error = NO_ERROR;
-  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  QFILE_TUPLE_RECORD tuple_record = QFILE_TUPLE_RECORD_INITIALIZER;
   DB_VALUE *f_value, *c_value;
   DB_VALUE f_fetch_value, c_fetch_value;
   REGU_VARIABLE regu_var;

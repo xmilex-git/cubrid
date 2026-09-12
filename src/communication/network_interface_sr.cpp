@@ -5551,7 +5551,7 @@ stran_can_end_after_query_execution (THREAD_ENTRY *thread_p, int query_flag, QFI
 				     bool *can_end_transaction)
 {
   QFILE_LIST_SCAN_ID scan_id;
-  QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+  QFILE_TUPLE_RECORD tuple_record = QFILE_TUPLE_RECORD_INITIALIZER;
   SCAN_CODE qp_scan;
   OR_BUF buf;
   TP_DOMAIN **domains;
@@ -5629,9 +5629,8 @@ stran_can_end_after_query_execution (THREAD_ENTRY *thread_p, int query_flag, QFI
 	      continue;
 	    }
 
-	  /* a string column is VAR/DIRECT: the body is the index encoding, whose compression prefix is the same one
-	   * or_get_varchar_compression_lengths () reads from the data encoding */
-	  tuple_p = (char *) qfile_slot_locate (&tuple_record, i, &val_length, &is_null);
+	  /* the body carries the same compression prefix that or_get_varchar_compression_lengths () expects */
+	  tuple_p = (char *) qfile_slot_get_column_data (&tuple_record, i, &val_length, &is_null);
 	  if (!is_null)
 	    {
 	      or_init (&buf, tuple_p, val_length);
@@ -11600,6 +11599,12 @@ scdc_find_lsa (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reql
 
       cdc_set_extraction_lsa (&start_lsa);
 
+      /* The client is about to be told to resume from here, so the volume holding that position has to be
+       * kept from now on. Waiting for the first bundle leaves a window: extraction can come back as
+       * ER_CDC_EXTRACTION_TIMEOUT before the volume is ever recorded, and archive removal is free to run
+       * in between. */
+      cdc_update_arv_num_to_keep (thread_p, &start_lsa);
+
       cdc_reinitialize_queue (&start_lsa);
 
       cdc_wakeup_producer ();
@@ -11663,6 +11668,9 @@ scdc_get_loginfo_metadata (THREAD_ENTRY *thread_p, unsigned int rid, char *reque
 	}
 
       cdc_set_extraction_lsa (&start_lsa);
+
+      /* Same window as in scdc_find_lsa(): record the volume before the first bundle is attempted. */
+      cdc_update_arv_num_to_keep (thread_p, &start_lsa);
 
       cdc_reinitialize_queue (&start_lsa);
 
@@ -11740,7 +11748,7 @@ scdc_end_session (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int r
   char *reply = OR_ALIGNED_BUF_START (a_reply);
   int error_code;
 
-  error_code = cdc_cleanup ();
+  error_code = cdc_cleanup (thread_p);
 
   cdc_log ("%s : clean up for cdc thread has done.", __func__);
 
