@@ -526,7 +526,7 @@ namespace cubconn
           registry_auto_ready (wake_fd >= 0 && as_info->con_status == CON_STATUS_OUT_TRAN
                                && as_info->num_holdable_results == 0 && !is_xa_prepared ()
                                && as_info->cas_change_mode == CAS_CHANGE_MODE_AUTO
-                               && !csc_has_method_callback_state ());
+                               && csc_prepare_detach ());
 	  /* the SIGUSR1 (re)arming of the CAS loop is retired: cancel arrives
 	   * as a tran interrupt via the control channel (#117 D4) */
 	  fn_ret = cas_process_request (fd, &net_buf, &req_info, wake_fd);
