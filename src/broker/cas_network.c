@@ -424,16 +424,26 @@ net_decode_str (char *msg, int msg_size, char *func_code, void ***ret_argv)
       remain_size -= 4;
       cur_p += 4;
 
-      if (remain_size < i_val)
+      /* a negative length passed the remain_size check, walked cur_p
+       * backwards and grew argv without bound — in the CAS that killed one
+       * process, here it is cub_server's address space (workspace#259 axis 1,
+       * audit 1-4) */
+      if (i_val < 0 || remain_size < i_val)
 	{
 	  FREE_MEM (argv);
 	  return CAS_ER_COMMUNICATION;
 	}
 
       argc++;
-      argv = (void **) REALLOC (argv, sizeof (void *) * argc);
-      if (argv == NULL)
-	return CAS_ER_NO_MORE_MEMORY;
+      {
+	void **new_argv = (void **) REALLOC (argv, sizeof (void *) * argc);
+	if (new_argv == NULL)
+	  {
+	    FREE_MEM (argv);	/* realloc failure keeps the old block: do not lose it */
+	    return CAS_ER_NO_MORE_MEMORY;
+	  }
+	argv = new_argv;
+      }
 
       argv[argc - 1] = argp;
 

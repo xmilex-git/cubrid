@@ -41,6 +41,9 @@
 #include "boot_sr.h"		/* boot_db_name */
 #endif
 #include "porting.h"
+#if defined(SERVER_MODE)
+#include <pthread.h>		/* pthread_once: install_static_methods */
+#endif
 #include "system_parameter.h"
 #include "storage_common.h"
 #include "environment_variable.h"
@@ -985,6 +988,19 @@ db_restart (const char *program, int print_version, const char *volume)
 	{
 	  db_Connect_status = DB_CONNECTION_STATUS_CONNECTED;
 	  strncpy (db_Database_name, volume, DB_MAX_IDENTIFIER_LENGTH);
+#if defined(SERVER_MODE)
+	  /* the static-method table is a process registry of the built-in au_*
+	   * methods, identical for every session: install it once instead of
+	   * letting every adopted connection push onto the shared list outside
+	   * boot_Restart_mutex.  And the folded client must not replace
+	   * cub_server's own SIGFPE handler — from the second connection on,
+	   * prev == sigfpe_handler and a real SIGFPE recursed forever
+	   * (workspace#259 axis 2, audit 0-7). */
+	  {
+	    static pthread_once_t install_static_methods_once = PTHREAD_ONCE_INIT;
+	    (void) pthread_once (&install_static_methods_once, install_static_methods);
+	  }
+#else /* SERVER_MODE */
 	  install_static_methods ();
 #if !defined(WINDOWS)
 #if defined(SA_MODE) && (defined(LINUX) || defined(x86_SOLARIS))
@@ -993,6 +1009,7 @@ db_restart (const char *program, int print_version, const char *volume)
 	  prev_sigfpe_handler = os_set_signal_handler (SIGFPE, sigfpe_handler);
 #endif /* SA_MODE && (LINUX||X86_SOLARIS) */
 #endif /* !WINDOWS */
+#endif /* SERVER_MODE */
 	}
     }
 
@@ -1053,7 +1070,8 @@ db_shutdown (void)
   db_Database_name[0] = '\0';
   db_Connect_status = DB_CONNECTION_STATUS_NOT_CONNECTED;
   db_Program_name[0] = '\0';
-#if !defined(WINDOWS)
+#if !defined(WINDOWS) && !defined(SERVER_MODE)
+  /* SERVER_MODE never installed it (see db_restart_ex) */
   (void) os_set_signal_handler (SIGFPE, prev_sigfpe_handler);
 #endif
 #if !defined (SERVER_MODE)

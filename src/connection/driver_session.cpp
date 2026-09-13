@@ -595,6 +595,12 @@ namespace cubconn
       cubthread::entry *entry_p = cubthread::get_manager ()->claim_entry ();
       if (entry_p == NULL)
 	{
+	  if (ssl_client)
+	    {
+	      /* the TLS object is the one session resource taken so far (workspace#259 audit 1-12) */
+	      cas_ssl_close (params.client_fd);
+	      ssl_client = false;
+	    }
 	  css_decrement_num_conn ((BOOT_CLIENT_TYPE) params.client_type);	/* same refund as above */
 	  registry_session_finished (params.token);
 	  close (params.client_fd);
@@ -854,11 +860,20 @@ namespace cubconn
 	{
 	  (void) ux_end_tran (CCI_TRAN_ROLLBACK, false, true);
 	}
+      /* the CAS answered RESET / CHANGE CLIENT / restart with FN_KEEP_SESS and
+       * db_set_keep_session (true) so the driver could reattach to the kept
+       * server session.  Nothing reattaches here (above), yet the flag still
+       * reached csession_end_session, which parks the session past every GC
+       * pass (session.c keep skip): one session state + client context leaked
+       * per HA reset (workspace#259 axis 3, audit 1-1).  The driver already
+       * reconnects through the broker on the EOF, as it did with the CAS. */
+      db_set_keep_session (false);
       (void) ux_end_session ();
 
 retire:
       registry_begin_session_cleanup (params.token);
       qr_final ();
+      hm_srv_handle_table_final ();	/* needs as_info: before cas_server_session_slot_end */
       if (as_info != NULL)
 	{
 	  /* the CAS process closed its logs at exit; a session closes its own

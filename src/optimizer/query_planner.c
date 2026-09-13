@@ -456,6 +456,39 @@ QO_PLAN_VTBL *all_vtbls[] = {
   &qo_worst_plan_vtbl
 };
 
+#if defined (SERVER_MODE)
+/* SET OPTIMIZATION COST / csql ;cost used to rewrite all_vtbls[i]->cost_fn in
+ * place — per process in the CAS, but one process now hosts every session, so
+ * one session's ;cost changed every other session's plan choice (workspace#259
+ * axis 2, audit 0-5).  The vtables stay immutable; the override lives on the
+ * session thread (one dedicated thread per adopted connection).  The hot path
+ * pays one thread-local bool; the per-vtable lookup runs only on a thread
+ * that actually set an override. */
+typedef void (*QO_PLAN_COST_FUNC) (QO_PLAN *);
+static thread_local QO_PLAN_COST_FUNC qo_Cost_fn_override[DIM (all_vtbls)] = { NULL };
+static thread_local bool qo_Cost_fn_override_active = false;
+
+static QO_PLAN_COST_FUNC
+qo_plan_cost_fn (const QO_PLAN_VTBL * vtbl)
+{
+  if (qo_Cost_fn_override_active)
+    {
+      for (int i = 0; i < DIM (all_vtbls); i++)
+	{
+	  if (all_vtbls[i] == vtbl)
+	    {
+	      return (qo_Cost_fn_override[i] != NULL) ? qo_Cost_fn_override[i] : vtbl->cost_fn;
+	    }
+	}
+    }
+  return vtbl->cost_fn;
+}
+
+#define QO_PLAN_COST_FN(vtbl) (qo_plan_cost_fn (vtbl))
+#else /* SERVER_MODE */
+#define QO_PLAN_COST_FN(vtbl) ((vtbl)->cost_fn)
+#endif /* SERVER_MODE */
+
 static double qo_or_selectivity (QO_ENV * env, double lhs_sel, double rhs_sel);
 
 static double qo_and_selectivity (QO_ENV * env, double lhs_sel, double rhs_sel);
@@ -791,7 +824,7 @@ qo_plan_compute_cost (QO_PLAN * plan)
     }
 
   /* This computes the specific cost characteristics for each plan. */
-  (*(plan->vtbl)->cost_fn) (plan);
+  (*QO_PLAN_COST_FN (plan->vtbl)) (plan);
 
   /* Now add in the subquery costs; this cost is incurred for each row produced by this plan, so multiply it by the
    * estimated scan_rows and add it to the access cost.
@@ -2875,7 +2908,7 @@ qo_sort_cost (QO_PLAN * planp)
 	{
 	  double save_ncard = QO_NODE_NCARD (subplanp->plan_un.scan.node);
 	  QO_NODE_NCARD (subplanp->plan_un.scan.node) = (double) db_get_bigint (&QO_ENV_LIMIT_VALUE (planp->info->env));
-	  (*(subplanp->vtbl)->cost_fn) (subplanp);
+	  (*QO_PLAN_COST_FN (subplanp->vtbl)) (subplanp);
 	  QO_NODE_NCARD (subplanp->plan_un.scan.node) = save_ncard;
 	}
 
@@ -5461,11 +5494,11 @@ qo_plan_get_cost_fn (const char *plan_name)
     {
       if (intl_mbs_ncasecmp (plan_name, all_vtbls[i]->plan_string, strlen (all_vtbls[i]->plan_string)) == 0)
 	{
-	  if (all_vtbls[i]->cost_fn == &qo_zero_cost)
+	  if (QO_PLAN_COST_FN (all_vtbls[i]) == &qo_zero_cost)
 	    {
 	      cost = '0';
 	    }
-	  else if (all_vtbls[i]->cost_fn == &qo_worst_cost)
+	  else if (QO_PLAN_COST_FN (all_vtbls[i]) == &qo_worst_cost)
 	    {
 	      cost = 'i';
 	    }
@@ -5500,6 +5533,8 @@ qo_plan_set_cost_fn (const char *plan_name, int fn)
     {
       if (intl_mbs_ncasecmp (plan_name, all_vtbls[i]->plan_string, strlen (all_vtbls[i]->plan_string)) == 0)
 	{
+	  void (*new_cost_fn) (QO_PLAN *) = NULL;	/* NULL: the plan's default cost */
+
 	  switch (fn)
 	    {
 	    case 0:
@@ -5508,7 +5543,7 @@ qo_plan_set_cost_fn (const char *plan_name, int fn)
 	    case 'B':		/* BEST */
 	    case 'z':		/* zero */
 	    case 'Z':		/* ZERO */
-	      all_vtbls[i]->cost_fn = &qo_zero_cost;
+	      new_cost_fn = &qo_zero_cost;
 	      break;
 
 	    case 1:
@@ -5517,13 +5552,27 @@ qo_plan_set_cost_fn (const char *plan_name, int fn)
 	    case 'I':		/* INFINITE */
 	    case 'w':		/* worst */
 	    case 'W':		/* WORST */
-	      all_vtbls[i]->cost_fn = &qo_worst_cost;
+	      new_cost_fn = &qo_worst_cost;
 	      break;
 
 	    default:
-	      all_vtbls[i]->cost_fn = all_vtbls[i]->default_cost;
 	      break;
 	    }
+#if defined (SERVER_MODE)
+	  /* session-local override; the shared vtable is never written */
+	  qo_Cost_fn_override[i] = new_cost_fn;
+	  qo_Cost_fn_override_active = false;
+	  for (int j = 0; j < n; j++)
+	    {
+	      if (qo_Cost_fn_override[j] != NULL)
+		{
+		  qo_Cost_fn_override_active = true;
+		  break;
+		}
+	    }
+#else /* SERVER_MODE */
+	  all_vtbls[i]->cost_fn = (new_cost_fn != NULL) ? new_cost_fn : all_vtbls[i]->default_cost;
+#endif /* SERVER_MODE */
 	  return all_vtbls[i]->plan_string;
 	}
     }
