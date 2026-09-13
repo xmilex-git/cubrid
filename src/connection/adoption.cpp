@@ -29,6 +29,7 @@
 
 #include "adoption.hpp"
 #include "driver_session.hpp"
+#include "auto_trace.hpp"
 
 #include <netinet/in.h>		/* htonl/INADDR_LOOPBACK (DIRECT_CONNECT, wf122/B5) */
 #include <sys/socket.h>
@@ -419,6 +420,7 @@ namespace cubconn
     static void
     yield_idle (manager &m, const channel &ch, bool wanted)
     {
+      wf259_auto_trace ("yield group=%s wanted=%d", ch.broker_name, (int) wanted);
       std::shared_ptr<session_binding> binding;
       {
         std::lock_guard<std::mutex> guard (m.registry_mutex);
@@ -434,6 +436,9 @@ namespace cubconn
           }
         for (const auto &pair : m.registry)
           {
+            wf259_auto_trace ("candidate token=%u group=%s ready=%d wake=%d",
+                              pair.first, pair.second.broker_name,
+                              (int) pair.second.binding->auto_ready.load (), pair.second.binding->wake_fd);
             if (std::strcmp (pair.second.broker_name, ch.broker_name) == 0
                 && pair.second.binding->auto_ready.exchange (false, std::memory_order_acq_rel))
               {
@@ -450,7 +455,8 @@ namespace cubconn
       if (pin.wake_fd >= 0)
         {
           const std::uint64_t one = 1;
-          (void) write (pin.wake_fd, &one, sizeof (one));
+          auto sent = write (pin.wake_fd, &one, sizeof (one));
+          wf259_auto_trace ("yield write fd=%d bytes=%d errno=%d", pin.wake_fd, (int) sent, errno);
         }
     }
 

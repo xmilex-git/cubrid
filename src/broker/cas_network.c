@@ -56,6 +56,7 @@
 #include "cas_ssl.h"
 #if defined (SERVER_MODE)
 #include "adoption.hpp"
+#include "auto_trace.hpp"
 #endif
 
 #if defined(WINDOWS)
@@ -567,6 +568,11 @@ retry_poll:
     {
       n = poll (po, po_size, timeout);
     }
+#if defined (SERVER_MODE)
+  wf259_auto_trace ("poll fd=%d wake=%d count=%d rc=%d revents=%d/%d con=%d",
+                    (int) sock_fd, (int) new_req_sock_fd, po_size, n, po[0].revents,
+                    po[1].revents, as_info->con_status);
+#endif
   if (n < 0)
     {
       if (errno == EINTR)

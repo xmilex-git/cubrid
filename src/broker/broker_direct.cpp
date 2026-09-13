@@ -65,6 +65,7 @@
 #include <vector>
 
 #include "adoption.hpp"
+#include "auto_trace.hpp"
 #include "cas_common.h"		/* FN_STATUS_* */
 #include "cas_error.h"
 #include "cas_protocol.h"
@@ -1533,6 +1534,8 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
        * as the idle-CAS wait it replaces (#117 D3) */
       while (m->slots_used.load () >= m->max_slots && !m->stopping.load ())
 	{
+          wf259_auto_trace ("broker pressure db=%s keep=%d slots=%d/%d",
+                            db_name, (int) m->shm->keep_connection, m->slots_used.load (), m->max_slots);
           std::shared_ptr<channel> yield_channel = channel_get_or_dial (*m, db_name);
           if (yield_channel != nullptr && m->shm->keep_connection == KEEP_CON_AUTO)
             {

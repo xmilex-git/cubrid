@@ -33,6 +33,7 @@
 #if defined (SERVER_MODE)
 
 #include "driver_session.hpp"
+#include "auto_trace.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -518,6 +519,10 @@ namespace cubconn
       FN_RETURN fn_ret = FN_KEEP_CONN;
       while (fn_ret == FN_KEEP_CONN)
 	{
+          wf259_auto_trace ("loop S=%u wake=%d con=%d hold=%d xa=%d change=%d callback=%d",
+                            (unsigned) db_get_session_id (), wake_fd, as_info->con_status,
+                            as_info->num_holdable_results, (int) is_xa_prepared (),
+                            (int) as_info->cas_change_mode, (int) csc_has_method_callback_state ());
           registry_auto_ready (wake_fd >= 0 && as_info->con_status == CON_STATUS_OUT_TRAN
                                && as_info->num_holdable_results == 0 && !is_xa_prepared ()
                                && as_info->cas_change_mode == CAS_CHANGE_MODE_AUTO
