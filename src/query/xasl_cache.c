@@ -84,8 +84,14 @@ struct xcache_stats
   INT64 found_at_insert;
   INT64 rt_checks;
   INT64 rt_true;
+  /* workspace #266 P7: clone accounting — a clone hit reuses a pooled unpacked XASL, a clone miss unpacks
+   * the stream again (one per concurrent executor beyond the pool), a decache frees one. live = built - decached. */
+  INT64 clone_hits;
+  INT64 clone_misses;
+  INT64 clone_built;
+  INT64 clone_decached;
 };
-#define XCACHE_STATS_INITIALIZER { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+#define XCACHE_STATS_INITIALIZER { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
 
 
 
@@ -1111,6 +1117,7 @@ xcache_find_xasl_id_for_execute (THREAD_ENTRY * thread_p, const XASL_ID * xid, X
 	      (void) pthread_mutex_unlock (&(*xcache_entry)->cache_clones_mutex);
 
 	      assert (xclone->xasl != NULL && xclone->xasl_buf != NULL);
+	      XCACHE_STAT_INC (clone_hits);
 
 	      xcache_log ("found cached clone: \n"
 			  XCACHE_LOG_ENTRY_TEXT ("entry")
@@ -1125,6 +1132,7 @@ xcache_find_xasl_id_for_execute (THREAD_ENTRY * thread_p, const XASL_ID * xid, X
 	  (void) pthread_mutex_unlock (&(*xcache_entry)->cache_clones_mutex);
 	}
       /* Clone not found. */
+      XCACHE_STAT_INC (clone_misses);
       /* When clones are activated, we use global heap to generate the XASL's; this way, other threads can use the
        * clone. */
       save_heapid = db_change_private_heap (thread_p, 0);
@@ -1136,6 +1144,7 @@ xcache_find_xasl_id_for_execute (THREAD_ENTRY * thread_p, const XASL_ID * xid, X
     {
       /* only a successfully built clone holds memory. */
       ATOMIC_INC_32 (&xcache_Memory_usage_clone, xcache_entry_get_one_clonesize (*xcache_entry));
+      XCACHE_STAT_INC (clone_built);
     }
 
   if (save_heapid != 0)
@@ -2201,6 +2210,12 @@ xcache_dump (THREAD_ENTRY * thread_p, FILE * fp)
   fprintf (fp, "Unfix:                      %lld\n", (long long) XCACHE_STAT_GET (unfix));
   fprintf (fp, "Cache cleanups:             %lld\n", (long long) XCACHE_STAT_GET (cleanups));
   fprintf (fp, "Deletes at cleanup:	    %lld\n", (long long) XCACHE_STAT_GET (deletes_at_cleanup));
+  fprintf (fp, "Clone hits:                 %lld\n", (long long) XCACHE_STAT_GET (clone_hits));
+  fprintf (fp, "Clone misses:               %lld\n", (long long) XCACHE_STAT_GET (clone_misses));
+  fprintf (fp, "Clones built:               %lld\n", (long long) XCACHE_STAT_GET (clone_built));
+  fprintf (fp, "Clones decached:            %lld\n", (long long) XCACHE_STAT_GET (clone_decached));
+  fprintf (fp, "Clones live:                %lld\n",
+	   (long long) (XCACHE_STAT_GET (clone_built) - XCACHE_STAT_GET (clone_decached)));
   /* add overflow, RT checks. */
 
   /* Memory info */
@@ -2309,6 +2324,7 @@ xcache_clone_decache (THREAD_ENTRY * thread_p, XASL_CLONE * xclone, XASL_CACHE_E
 {
 
   ATOMIC_INC_32 (&xcache_Memory_usage_clone, -xcache_entry_get_one_clonesize (xcache_entry));
+  XCACHE_STAT_INC (clone_decached);
 
   HL_HEAPID save_heapid = db_change_private_heap (thread_p, 0);
   XASL_SET_FLAG (xclone->xasl, XASL_DECACHE_CLONE);
