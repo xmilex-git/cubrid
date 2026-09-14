@@ -172,6 +172,8 @@ extern void xcache_dump (THREAD_ENTRY * thread_p, FILE * fp);
 extern bool xcache_can_entry_cache_list (XASL_CACHE_ENTRY * xcache_entry);
 
 extern void xcache_retire_clone (THREAD_ENTRY * thread_p, XASL_CACHE_ENTRY * xcache_entry, XASL_CLONE * xclone);
+/* workspace #266 D-EVICT: shared prepared-statement descriptors (db_shared_stmt.cpp) charge the plan cache budget */
+extern void xcache_shared_stmt_account (INT32 bytes_delta, int entries_delta);
 extern int xcache_get_entry_count (void);
 extern bool xcache_uses_clones (void);
 

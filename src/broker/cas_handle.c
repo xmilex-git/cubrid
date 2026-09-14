@@ -39,6 +39,7 @@
 #include "cas_common_vars.h"
 #include "dbtype.h"
 #include "cas_common_execute.h"
+#include "db_shared_stmt.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -394,6 +395,17 @@ hm_session_free (T_SRV_HANDLE * srv_handle)
   srv_handle->session = NULL;
 }
 
+/* drop the handle's reference to its shared prepared-statement descriptor (workspace #266) */
+void
+hm_shared_stmt_detach (T_SRV_HANDLE * srv_handle)
+{
+  if (srv_handle->shared_stmt != NULL)
+    {
+      db_shared_stmt_release ((DB_SHARED_STMT *) srv_handle->shared_stmt);
+      srv_handle->shared_stmt = NULL;
+    }
+}
+
 void
 hm_col_update_info_clear (T_COL_UPDATE_INFO * col_update_info)
 {
@@ -458,6 +470,7 @@ srv_handle_content_free (T_SRV_HANDLE * srv_handle)
 	    {
 	      hm_qresult_end (srv_handle, TRUE);
 	      hm_session_free (srv_handle);
+	      hm_shared_stmt_detach (srv_handle);
 	    }
 	  break;
 	}

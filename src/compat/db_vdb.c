@@ -50,6 +50,7 @@
 #include "locator_cl.h"
 #include "server_interface.h"
 #include "db_session.h"
+#include "db_shared_stmt.hpp"
 #include "network_interface_cl.h"
 #include "transaction_cl.h"
 #include "dbtype.h"
@@ -5154,6 +5155,21 @@ db_set_statement_auto_commit (DB_SESSION * session, bool auto_commit)
     }
 
   return NO_ERROR;
+}
+
+/*
+ * db_statement_can_execute_with_autocommit () - the tree path's autocommit eligibility of a compiled statement,
+ *   exported for the shared prepared-statement descriptor (workspace #266, db_shared_stmt.cpp)
+ */
+bool
+db_statement_can_execute_with_autocommit (DB_SESSION * session, int stmt_ndx)
+{
+  if (session == NULL || session->parser == NULL || session->statements == NULL || stmt_ndx < 1
+      || stmt_ndx > session->dimension || session->statements[stmt_ndx - 1] == NULL)
+    {
+      return false;
+    }
+  return db_can_execute_statement_with_autocommit (session->parser, session->statements[stmt_ndx - 1]);
 }
 
 /*

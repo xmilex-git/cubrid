@@ -640,6 +640,7 @@ set(CLIENT_HALF_SOURCES
   ${COMPAT_DIR}/db_old.c
   ${COMPAT_DIR}/db_query.c
   ${COMPAT_DIR}/db_temp.c
+  ${COMPAT_DIR}/db_shared_stmt.cpp
   ${COMPAT_DIR}/db_vdb.c
   ${COMPAT_DIR}/db_virt.c
   ${COMPAT_DIR}/dbtype_function.c

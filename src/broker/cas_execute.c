@@ -85,6 +85,7 @@
 #include "cas_db_inc.h"
 #include "cas_common_vars.h"
 #include "query_replace.h"
+#include "db_shared_stmt.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -282,6 +283,11 @@ static void prepare_call_info_dbval_clear (T_PREPARE_CALL_INFO * call_info);
 static int fetch_call (T_SRV_HANDLE * srv_handle, T_NET_BUF * net_buf, T_REQ_INFO * req_info);
 #define check_class_chn(s) 0
 static int get_client_result_cache_lifetime (DB_SESSION * session, int stmt_id);
+static int get_client_result_cache_lifetime_shared (DB_SHARED_STMT * shared);
+static int prepare_column_list_info_set_columns (DB_QUERY_TYPE * column_info, bool free_column_info, int oids_included,
+						 char prepare_flag, T_QUERY_RESULT * q_result, T_NET_BUF * net_buf,
+						 T_BROKER_VERSION client_version);
+static int ux_shared_key_flags (int prepare_flag);
 static const char *convert_db_value_to_string (DB_VALUE * value, DB_VALUE * value_string);
 static void serialize_collection_as_string (DB_VALUE * col, char **out);
 static void add_fk_info_before (T_FK_INFO_RESULT * pivot, T_FK_INFO_RESULT * pnew);
@@ -709,6 +715,7 @@ ux_prepare (char *sql_stmt, int flag, char auto_commit_mode, T_NET_BUF * net_buf
   char *tmp;
   int result_cache_lifetime;
   PT_NODE *statement = NULL;
+  DB_SHARED_STMT *shared = NULL;
 
   if ((flag & CCI_PREPARE_UPDATABLE) && (flag & CCI_PREPARE_HOLDABLE))
     {
@@ -826,6 +833,22 @@ ux_prepare (char *sql_stmt, int flag, char auto_commit_mode, T_NET_BUF * net_buf
       goto prepare_result_set;
     }
 
+  /* workspace #266: a descriptor published by an earlier execution of the same text under this DB user
+   * serves the PREPARE reply without parsing or compiling; plan-dump and pinned prepares keep their tree. */
+  if (replace_rule_idx < 0 && !(flag & (CCI_PREPARE_QUERY_INFO | CCI_PREPARE_XASL_CACHE_PINNED)))
+    {
+      shared = db_shared_stmt_lookup (sql_stmt, ux_shared_key_flags (flag));
+      if (shared != NULL)
+	{
+	  srv_handle->shared_stmt = shared;
+	  srv_handle->is_prepared = TRUE;
+	  num_markers = get_num_markers (sql_stmt);
+	  stmt_type = db_shared_stmt_stmt_type (shared);
+	  stmt_id = 1;
+	  goto prepare_result_set;
+	}
+    }
+
   db_init_lexer_lineno ();
   session = db_open_buffer (sql_stmt);
   if (!session)
@@ -915,7 +938,8 @@ prepare_result_set:
 
   net_buf_cp_int (net_buf, srv_h_id, NULL);
 
-  result_cache_lifetime = get_client_result_cache_lifetime (session, stmt_id);
+  result_cache_lifetime = (shared != NULL) ? get_client_result_cache_lifetime_shared (shared)
+    : get_client_result_cache_lifetime (session, stmt_id);
   net_buf_cp_int (net_buf, result_cache_lifetime, NULL);
 
   net_buf_cp_byte (net_buf, stmt_type);
@@ -932,7 +956,17 @@ prepare_result_set:
   q_result->stmt_type = stmt_type;
   q_result->stmt_id = stmt_id;
 
-  err_code = prepare_column_list_info_set (session, flag, q_result, net_buf, client_version);
+  if (shared != NULL)
+    {
+      err_code =
+	prepare_column_list_info_set_columns ((DB_QUERY_TYPE *) db_shared_stmt_columns (shared), false,
+					      db_shared_stmt_oids_included (shared) ? 1 : 0, flag, q_result, net_buf,
+					      client_version);
+    }
+  else
+    {
+      err_code = prepare_column_list_info_set (session, flag, q_result, net_buf, client_version);
+    }
   if (err_code < 0)
     {
       FREE_MEM (q_result);
@@ -950,7 +984,14 @@ prepare_result_set:
       srv_handle->is_holdable = true;
     }
 
-  db_get_cacheinfo (session, stmt_id, &srv_handle->use_plan_cache, &srv_handle->use_query_cache);
+  if (shared != NULL)
+    {
+      db_shared_stmt_cacheinfo (shared, &srv_handle->use_plan_cache, &srv_handle->use_query_cache);
+    }
+  else
+    {
+      db_get_cacheinfo (session, stmt_id, &srv_handle->use_plan_cache, &srv_handle->use_query_cache);
+    }
 
   return srv_h_id;
 
@@ -1106,6 +1147,7 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
   DB_SESSION *session;
   T_BROKER_VERSION client_version = req_info->client_version;
   bool recompile = false;
+  DB_SHARED_STMT *shared = NULL;
 
   char stmt_type;
 
@@ -1124,6 +1166,69 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
       logddl_reset_query_text ();
     }
 
+  /* workspace #266: a handle bound to a shared descriptor executes XASL-only; anything the descriptor path
+   * does not serve (plan dump, generated keys, a handle whose prepare flag was reset) drops back to the tree */
+  if (srv_handle->shared_stmt != NULL)
+    {
+      if (srv_handle->is_prepared == TRUE && !(flag & (CCI_EXEC_QUERY_INFO | CCI_EXEC_RETURN_GENERATED_KEYS)))
+	{
+	  shared = (DB_SHARED_STMT *) srv_handle->shared_stmt;
+	}
+      else
+	{
+	  hm_shared_stmt_detach (srv_handle);
+	  srv_handle->is_prepared = FALSE;
+	}
+    }
+
+  num_bind = srv_handle->num_markers;
+
+  if (num_bind > 0)
+    {
+      err_code = make_bind_value (num_bind, argc, argv, &value_list, net_buf, DB_TYPE_NULL);
+      if (err_code < 0)
+	{
+	  goto execute_error;
+	}
+    }
+
+  if (shared != NULL)
+    {
+      DB_SHARED_EXEC_OPTS opts;
+      bool needs_tree = false;
+      bool reusable = false;
+
+      opts.auto_commit = srv_handle->auto_commit_mode ? true : false;
+      opts.holdable = srv_handle->is_holdable;
+      opts.pinned_reference = (srv_handle->prepare_flag & CCI_PREPARE_XASL_CACHE_PINNED) != 0;
+      session = NULL;
+      stmt_id = 1;
+      srv_handle->is_from_current_transaction = true;
+      if (!(flag & CCI_EXEC_QUERY_INFO))
+	{
+	  SQL_LOG2_EXEC_BEGIN (as_info->cur_sql_log2, stmt_id);
+	}
+      hm_set_current_srv_handle (srv_handle->id);
+      n = db_shared_stmt_execute (shared, num_bind, value_list, &opts, &result, clt_cache_time, &reusable, &needs_tree);
+      hm_set_current_srv_handle (-1);
+      if (needs_tree)
+	{
+	  /* stale plan, unsupported bind, ...: compile privately (and republish) — no side effect happened */
+	  hm_shared_stmt_detach (srv_handle);
+	  srv_handle->is_prepared = FALSE;
+	  shared = NULL;
+	  goto tree_path;
+	}
+      if (srv_handle->session != NULL)
+	{
+	  /* the tree kept from before this handle's descriptor was published is no longer needed */
+	  hm_session_free (srv_handle);
+	}
+      stmt_type = db_shared_stmt_stmt_type (shared);
+      goto executed;
+    }
+
+tree_path:
   if (srv_handle->is_prepared == FALSE)
     {
       hm_session_free (srv_handle);
@@ -1142,16 +1247,8 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
       session = (DB_SESSION *) srv_handle->session;
     }
 
-  num_bind = srv_handle->num_markers;
-
   if (num_bind > 0)
     {
-      err_code = make_bind_value (num_bind, argc, argv, &value_list, net_buf, DB_TYPE_NULL);
-      if (err_code < 0)
-	{
-	  goto execute_error;
-	}
-
       err_code = set_host_variables (session, num_bind, value_list);
       if (err_code != NO_ERROR)
 	{
@@ -1230,6 +1327,8 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
   hm_set_current_srv_handle (-1);
 
   stmt_type = db_get_statement_type (session, stmt_id);
+
+executed:
   update_query_execution_count (as_info, stmt_type);
 
   if (n < 0)
@@ -1267,7 +1366,7 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
       goto execute_error;
     }
 
-  if (max_row > 0 && db_get_statement_type (session, stmt_id) == CUBRID_STMT_SELECT && *clt_cache_reusable == FALSE)
+  if (max_row > 0 && stmt_type == CUBRID_STMT_SELECT && *clt_cache_reusable == FALSE)
     {
       err_code = db_query_seek_tuple (result, max_row, 1);
       if (err_code < 0)
@@ -1290,7 +1389,10 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
 
   if (srv_handle->prepare_flag & CCI_PREPARE_XASL_CACHE_PINNED)
     {
-      db_session_set_xasl_cache_pinned (session, false, false);
+      if (session != NULL)
+	{
+	  db_session_set_xasl_cache_pinned (session, false, false);
+	}
       srv_handle->prepare_flag &= ~CCI_PREPARE_XASL_CACHE_PINNED;
     }
   srv_handle->max_col_size = max_col_size;
@@ -1327,7 +1429,36 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
 	}
     }
 
-  db_get_cacheinfo (session, stmt_id, &srv_handle->use_plan_cache, &srv_handle->use_query_cache);
+  if (shared != NULL)
+    {
+      db_shared_stmt_cacheinfo (shared, &srv_handle->use_plan_cache, &srv_handle->use_query_cache);
+    }
+  else
+    {
+      db_get_cacheinfo (session, stmt_id, &srv_handle->use_plan_cache, &srv_handle->use_query_cache);
+
+      /* workspace #266: the first execution fixed the plan for this text; publish it so that later handles
+       * of this DB user (this session's or any other's) prepare and execute without a tree.  Refusals and
+       * allocation failures are not this execution's errors. */
+      if (srv_handle->shared_stmt == NULL && srv_handle->is_prepared == TRUE && srv_handle->replace_rule_idx < 0
+	  && srv_handle->query_info_flag == FALSE && !(flag & (CCI_EXEC_QUERY_INFO | CCI_EXEC_RETURN_GENERATED_KEYS))
+	  && !(srv_handle->prepare_flag & (CCI_PREPARE_QUERY_INFO | CCI_PREPARE_XASL_CACHE_PINNED | CCI_PREPARE_CALL))
+	  && db_shared_stmt_enabled ())
+	{
+	  DB_SHARED_STMT *published = NULL;
+
+	  if (db_shared_stmt_publish (session, stmt_id, srv_handle->sql_stmt,
+				      ux_shared_key_flags (srv_handle->prepare_flag), &published) == NO_ERROR
+	      && published != NULL)
+	    {
+	      srv_handle->shared_stmt = published;
+	    }
+	  else
+	    {
+	      er_clear ();
+	    }
+	}
+    }
 
   if (do_commit_after_execute (*srv_handle))
     {
@@ -1364,7 +1495,7 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
       int result_cache_lifetime;
       char include_column_info;
 
-      if (db_check_single_query (session) == NO_ERROR)
+      if (session == NULL || db_check_single_query (session) == NO_ERROR)
 	{
 	  include_column_info = 0;
 	}
@@ -1405,7 +1536,10 @@ execute_error:
 
   if (srv_handle->prepare_flag & CCI_PREPARE_XASL_CACHE_PINNED)
     {
-      db_session_set_xasl_cache_pinned (session, false, false);
+      if (session != NULL)
+	{
+	  db_session_set_xasl_cache_pinned (session, false, false);
+	}
       srv_handle->prepare_flag &= ~CCI_PREPARE_XASL_CACHE_PINNED;
     }
   if (srv_handle->auto_commit_mode)
@@ -6880,7 +7014,36 @@ static int
 prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_RESULT * q_result, T_NET_BUF * net_buf,
 			      T_BROKER_VERSION client_version)
 {
-  DB_QUERY_TYPE *column_info = NULL, *col;
+  DB_QUERY_TYPE *column_info = NULL;
+  int oids_included = 0;
+
+  if (q_result->stmt_type == CUBRID_STMT_SELECT)
+    {
+      if (prepare_flag)
+	{
+	  oids_included = db_query_produce_updatable_result (session, q_result->stmt_id);
+	}
+      column_info = db_get_query_type_list (session, q_result->stmt_id);
+      if (column_info == NULL)
+	{
+	  return ERROR_INFO_SET (db_error_code (), DBMS_ERROR_INDICATOR);
+	}
+    }
+  return prepare_column_list_info_set_columns (column_info, true, oids_included, prepare_flag, q_result, net_buf,
+					       client_version);
+}
+
+/*
+ * prepare_column_list_info_set_columns () - the column-metadata half of the PREPARE reply, fed either from a
+ *   private DB_SESSION (above) or from a shared descriptor (workspace #266) whose columns are read-only.
+ *   oids_included: db_query_produce_updatable_result () verdict when prepare_flag is set (ignored otherwise).
+ */
+static int
+prepare_column_list_info_set_columns (DB_QUERY_TYPE * column_info, bool free_column_info, int oids_included,
+				      char prepare_flag, T_QUERY_RESULT * q_result, T_NET_BUF * net_buf,
+				      T_BROKER_VERSION client_version)
+{
+  DB_QUERY_TYPE *col;
   DB_DOMAIN *domain;
   int num_cols;
   DB_TYPE db_type;
@@ -6888,7 +7051,6 @@ prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_R
   char *col_name, *attr_name, *class_name;
   T_COL_UPDATE_INFO *col_update_info = NULL;
   char stmt_type = q_result->stmt_type;
-  int stmt_id = q_result->stmt_id;
   char updatable_flag = prepare_flag & CCI_PREPARE_UPDATABLE;
   char *null_type_column = NULL;
 
@@ -6906,7 +7068,7 @@ prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_R
 
       if (prepare_flag)
 	{
-	  if (db_query_produce_updatable_result (session, stmt_id) <= 0)
+	  if (oids_included <= 0)
 	    {
 	      updatable_flag = FALSE;
 	    }
@@ -6914,12 +7076,6 @@ prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_R
 	    {
 	      q_result->include_oid = TRUE;
 	    }
-	}
-
-      column_info = db_get_query_type_list (session, stmt_id);
-      if (column_info == NULL)
-	{
-	  return ERROR_INFO_SET (db_error_code (), DBMS_ERROR_INDICATOR);
 	}
 
       net_buf_cp_byte (net_buf, updatable_flag);
@@ -7040,7 +7196,7 @@ prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_R
 
       q_result->null_type_column = null_type_column;
       net_buf_overwrite_int (net_buf, num_col_offset, num_cols);
-      if (column_info)
+      if (column_info && free_column_info)
 	{
 	  db_query_format_free (column_info);
 	}
@@ -9951,6 +10107,35 @@ get_client_result_cache_lifetime (DB_SESSION * session, int stmt_id)
     }
 
   return jdbc_cache_life_time;
+}
+
+/* get_client_result_cache_lifetime () over a shared descriptor (workspace #266) */
+static int
+get_client_result_cache_lifetime_shared (DB_SHARED_STMT * shared)
+{
+  bool jdbc_cache_is_hint;
+  int jdbc_cache_life_time = CAS_SHM_CFG (jdbc_cache_life_time);
+
+  if (CAS_SHM_CFG (jdbc_cache) == 0 || db_shared_stmt_stmt_type (shared) != CUBRID_STMT_SELECT
+      || cas_default_isolation_level == TRAN_REPEATABLE_READ || cas_default_isolation_level == TRAN_SERIALIZABLE)
+    {
+      return -1;
+    }
+
+  jdbc_cache_is_hint = db_shared_stmt_jdbc_cache_hint (shared, &jdbc_cache_life_time);
+  if (CAS_SHM_CFG (jdbc_cache_only_hint) && !jdbc_cache_is_hint)
+    {
+      return -1;
+    }
+
+  return jdbc_cache_life_time;
+}
+
+/* the prepare flags that change the compiled result and therefore the descriptor key (workspace #266 D-KEY) */
+static int
+ux_shared_key_flags (int prepare_flag)
+{
+  return (prepare_flag & (CCI_PREPARE_UPDATABLE | CCI_PREPARE_INCLUDE_OID)) ? DB_SHARED_STMT_KEY_INCLUDE_OID : 0;
 }
 
 int

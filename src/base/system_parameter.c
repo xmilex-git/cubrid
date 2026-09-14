@@ -843,6 +843,7 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 #define PRM_NAME_CAS_ACCESS_CONTROL_DEFAULT_ALLOW "cas_access_control_default_allow"
 #define PRM_NAME_CAS_STRIPPED_COLUMN_NAME "cas_stripped_column_name"
 #define PRM_NAME_DRIVER_REQUEST_MAX_SIZE "driver_request_max_size"
+#define PRM_NAME_SHARED_PREPARED_STATEMENT "shared_prepared_statement"
 
 // #endregion 
 
@@ -5823,6 +5824,21 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.bi = 1024LL * 1024 * 1024}},
    {false, {.bi = 1024LL * 1024 * 1024}},
    {false, {.bi = 16LL * 1024 * 1024}},
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  /* workspace#266 S3: CAS statement handles of the same DB user share one immutable prepared-statement
+   * descriptor (SQL, column metadata, host-variable domains, XASL id) and execute without a per-handle
+   * DB_SESSION/parse tree.  Off restores the per-handle compile of the legacy CAS. */
+  {PRM_ID_SHARED_PREPARED_STATEMENT,
+   PRM_NAME_SHARED_PREPARED_STATEMENT,
+   (PRM_FOR_SERVER | PRM_FOR_CLIENT | PRM_USER_CHANGE),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = true}},
+   {false, {.b = true}},
+   NULL_SYSPRM_PARAM_VALUE,
+   NULL_SYSPRM_PARAM_VALUE,
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},

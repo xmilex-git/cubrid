@@ -44,6 +44,8 @@
 #include <algorithm>
 #include <assert.h>
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "db_shared_stmt.hpp"
+
 #include "memory_wrapper.hpp"
 
 #define XCACHE_ENTRY_MARK_DELETED	    ((INT32) 0x80000000)
@@ -163,6 +165,9 @@ XCACHE xcache_Global;
 #define xcache_Max_plan_size xcache_Global.max_plan_size
 #define xcache_Memory_usage_cache xcache_Global.memory_usage_cache
 #define xcache_Memory_usage_clone xcache_Global.memory_usage_clone
+/* workspace #266: bytes/entries of shared prepared-statement descriptors, charged to the same budget (D-EVICT) */
+static INT32 xcache_Memory_usage_shared = 0;
+static INT32 xcache_Shared_entries = 0;
 #define xcache_Time_threshold xcache_Global.time_threshold
 #define xcache_Last_cleaned_time xcache_Global.last_cleaned_time
 #define xcache_Hashmap xcache_Global.hashmap
@@ -1441,7 +1446,7 @@ static XCACHE_CLEANUP_REASON
 xcache_need_cleanup (void)
 {
   struct timeval current_time;
-  if (xcache_Soft_limit < xcache_Memory_usage_cache + xcache_Memory_usage_clone)
+  if (xcache_Soft_limit < xcache_Memory_usage_cache + xcache_Memory_usage_clone + xcache_Memory_usage_shared)
     {
       return XCACHE_CLEANUP_FULL_MEMORY;
     }
@@ -2230,7 +2235,11 @@ xcache_dump (THREAD_ENTRY * thread_p, FILE * fp)
   fprintf (fp, "  Memory Hard Limit:           %.2f MB\n", max_mem_mb);
   fprintf (fp, "  Current Memory (cache):      %.2f KB\n", curr_mem_kb);
   fprintf (fp, "  Current Memory (clone):      %.2f KB\n", curr_mem_clone_kb);
-  fprintf (fp, "  Total Memory:                %.2f KB\n", curr_mem_kb + curr_mem_clone_kb);
+  fprintf (fp, "  Current Memory (shared stmt): %.2f KB (%d descriptors)\n", xcache_Memory_usage_shared / 1024.0,
+	   xcache_Shared_entries);
+  fprintf (fp, "  Total Memory:                %.2f KB\n",
+	   curr_mem_kb + curr_mem_clone_kb + xcache_Memory_usage_shared / 1024.0);
+  db_shared_stmt_dump (fp);
   fprintf (fp, "  Max Plan Size:               %.2f MB\n", max_plan_mb);
   fprintf (fp, "  Usage Percent:               %.2f%%\n", usage_percent);
   fprintf (fp, "\n");
@@ -2310,6 +2319,16 @@ xcache_can_entry_cache_list (XASL_CACHE_ENTRY * xcache_entry)
       return false;
     }
   return (xcache_entry != NULL && (xcache_entry->xasl_id.cache_flag & XCACHE_ENTRY_FLAGS_MASK) == 0);
+}
+
+/*
+ * xcache_shared_stmt_account () - charge/refund shared prepared-statement descriptor bytes (workspace #266).
+ */
+void
+xcache_shared_stmt_account (INT32 bytes_delta, int entries_delta)
+{
+  ATOMIC_INC_32 (&xcache_Memory_usage_shared, bytes_delta);
+  ATOMIC_INC_32 (&xcache_Shared_entries, entries_delta);
 }
 
 /*
@@ -2452,6 +2471,11 @@ xcache_cleanup (THREAD_ENTRY * thread_p)
       return;
     }
 
+  /* workspace #266 D-EVICT: descriptors share the budget, so they give back first (only unreferenced ones go) */
+  if (need_cleanup == XCACHE_CLEANUP_FULL_MEMORY && xcache_Shared_entries > 0)
+    {
+      db_shared_stmt_trim_to (xcache_Shared_entries - xcache_Shared_entries / 10);
+    }
   xcache_log ("cleanup start: entries = %d \n" XCACHE_LOG_TRAN_TEXT,
 	      xcache_Entry_count, XCACHE_LOG_TRAN_ARGS (thread_p));
 
