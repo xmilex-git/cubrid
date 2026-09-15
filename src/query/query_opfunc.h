@@ -29,6 +29,7 @@
 #include "dbtype_def.h"
 #include "db_function.hpp"
 #include "query_list.h"
+#include "query_sum_accumulator.h"
 #include "storage_common.h"
 #include "string_opfunc.h"
 #include "thread_compat.hpp"
@@ -57,11 +58,11 @@ extern void qdata_set_value_list_to_null (val_list_node * val_list);
 extern bool qdata_copy_db_value (DB_VALUE * dbval1, const DB_VALUE * dbval2);
 
 extern int qdata_copy_valptr_list_to_tuple (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list, val_descr * vd,
-					    qfile_tuple_value_type_list * tl, qfile_tuple_record * tplrec);
+					    qfile_tuple_value_type_list * type_list, qfile_tuple_record * tplrec);
 extern QPROC_TPLDESCR_STATUS qdata_generate_tuple_desc_for_valptr_list (THREAD_ENTRY * thread_p,
 									valptr_list_node * valptr_list, val_descr * vd,
 									qfile_tuple_descriptor * tdp);
-extern QPROC_TPLDESCR_STATUS qdata_size_tuple_desc (qfile_tuple_value_type_list * tl,
+extern QPROC_TPLDESCR_STATUS qdata_size_tuple_desc (qfile_tuple_value_type_list * type_list,
 						    qfile_tuple_descriptor * tdp);
 extern int qdata_set_valptr_list_unbound (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list, val_descr * vd);
 
@@ -85,7 +86,7 @@ extern int qdata_evaluate_function (THREAD_ENTRY * thread_p, regu_variable_node 
 extern int qdata_get_val_list_type_list (THREAD_ENTRY * thread_p, VAL_LIST * val_list,
 					 qfile_tuple_value_type_list * type_list);
 extern int qdata_copy_val_list_to_tuple (THREAD_ENTRY * thread_p, VAL_LIST * val_list,
-					 qfile_tuple_value_type_list * tl, qfile_tuple_record * tplrec);
+					 qfile_tuple_value_type_list * type_list, qfile_tuple_record * tplrec);
 extern int qdata_tuple_to_val_list (THREAD_ENTRY * thread_p, qfile_tuple_value_type_list * type_list,
 				    qfile_tuple_record * tplrec, VAL_LIST * val_list);
 
@@ -128,5 +129,23 @@ extern int qdata_get_interpolation_function_result (THREAD_ENTRY * thread_p, qfi
 						    FUNC_CODE function);
 extern int qdata_update_interpolation_func_value_and_domain (DB_VALUE * src_val, DB_VALUE * dest_val,
 							     tp_domain ** domain);
+
+/*
+ * The qdata_sum_acc_* family is the SUM/AVG accumulator's type-dispatch point.
+ *
+ * NUMERIC uses the word accumulator in numeric_opfunc.c. SHORT/INTEGER/BIGINT,
+ * DOUBLE, and FLOAT use the typed accumulator in query_opfunc.c. Typed modes
+ * reproduce qdata_add_dbval () without per-row DB_VALUE dispatch.
+ *
+ * Integer modes preserve the input type's overflow semantics (for example,
+ * SUM(SHORT) overflows past 32767). DOUBLE uses the same IEEE operations, and
+ * FLOAT accumulates as DOUBLE before the final demotion.
+ */
+extern int qdata_sum_acc_accumulate (SUM_ACC * acc, bool is_first, const DB_VALUE * seed_from, const DB_VALUE * value);
+extern int qdata_sum_acc_add_dbv (SUM_ACC * acc, const DB_VALUE * dbv);
+extern int qdata_sum_acc_merge (SUM_ACC * acc, const SUM_ACC * other);
+extern int qdata_sum_acc_snapshot (const SUM_ACC * acc, DB_VALUE * result);
+extern int qdata_sum_acc_finalize (SUM_ACC * acc, DB_VALUE * result);
+extern int qdata_sum_acc_flatten_for_spill (SUM_ACC * acc, DB_VALUE * result);
 
 #endif /* _QUERY_OPFUNC_H_ */
