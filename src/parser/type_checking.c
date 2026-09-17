@@ -208,9 +208,11 @@ static bool pt_is_range_expression (const PT_OP_TYPE op);
 static bool pt_are_unmatchable_types (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM op_type);
 static bool pt_is_hv_arithmetic_op (PT_OP_TYPE op);
 static bool pt_hv_is_open_slot (PARSER_CONTEXT * parser, const PT_NODE * node);
+static bool pt_hv_is_marker_only_collection (PARSER_CONTEXT * parser, const PT_NODE * node);
 static void pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NODE * source);
 static void pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node);
-static void pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index);
+static void pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index,
+				    SEMANTIC_CHK_INFO * sc_info);
 static PT_NODE *pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
 					       int *continue_walk);
 static PT_TYPE_ENUM pt_get_equivalent_type_with_op (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM arg_type,
@@ -4660,7 +4662,24 @@ pt_coerce_expression_argument (PARSER_CONTEXT * parser, PT_NODE * expr, PT_NODE 
       break;
     }
 
-  if (node->type_enum == PT_TYPE_MAYBE)
+  if (node->node_type == PT_HOST_VAR && node->info.host_var.index < parser->host_var_count
+      && (node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE) && !pt_hv_is_open_slot (parser, node)
+      && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_VARIABLE
+      && pt_db_to_type_enum (TP_DOMAIN_TYPE (node->expected_domain)) != def_type)
+    {
+      /* The marker's slot contract was decided by another consumer (a LIMIT count reused in the offset + count
+       * predicate, a seeded partner type): a contract is decided once, so this use site casts the slot's value to
+       * the type it needs instead of re-typing the slot (which would strand the other use and the bind). */
+      new_node = pt_wrap_with_cast_op (parser, node, def_type, precision, scale, new_dt);
+      if (new_node == NULL)
+	{
+	  return ER_FAILED;
+	}
+      *arg = new_node;
+      return NO_ERROR;
+    }
+
+  if (node->type_enum == PT_TYPE_MAYBE || (node->type_enum == PT_TYPE_NONE && node->node_type == PT_HOST_VAR))
     {
       if ((node->node_type == PT_EXPR && pt_is_op_hv_late_bind (node->info.expr.op))
 	  || (node->node_type == PT_SELECT && node->info.query.is_subquery == PT_IS_SUBQUERY))
@@ -7307,7 +7326,7 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
     case PT_UNION:
     case PT_DIFFERENCE:
     case PT_INTERSECTION:
-      pt_hv_seed_limit_slots (parser, node->info.query.limit, NULL);
+      pt_hv_seed_limit_slots (parser, node->info.query.limit, NULL, (SEMANTIC_CHK_INFO *) arg);
       /* propagate to children */
       arg1 = node->info.query.q.union_.arg1;
       arg2 = node->info.query.q.union_.arg2;
@@ -7336,6 +7355,12 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
 	      limit = pt_limit_to_numbering_expr (parser, node->info.query.limit, PT_ORDERBY_NUM, false);
 	      if (limit != NULL)
 		{
+		  /* built after the statement was typed: type the numbering predicates (the offset + row count PLUS
+		   * of two markers, the comparisons with the numbering functions) like every other expression */
+		  limit = pt_semantic_type (parser, limit, sc_info);
+		}
+	      if (limit != NULL)
+		{
 		  t_node = *expr_pred;
 		  while (t_node != NULL && t_node->next != NULL)
 		    {
@@ -7362,6 +7387,9 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
       break;
 
     case PT_SELECT:
+      /* the LIMIT / KEYLIMIT markers are BIGINT slots, seeded before the rewrite below copies them */
+      pt_hv_seed_limit_slots (parser, node->info.query.limit, node->info.query.q.select.using_index,
+			      (SEMANTIC_CHK_INFO *) arg);
       /* rewrite limit clause as numbering expression and add it to the corresponding predicate */
       if (node->info.query.limit && node->info.query.flag.rewrite_limit)
 	{
@@ -7372,22 +7400,46 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
 	    {
 	      expr_pred = &node->info.query.orderby_for;
 	      limit = pt_limit_to_numbering_expr (parser, node->info.query.limit, PT_ORDERBY_NUM, false);
+	      if (limit != NULL)
+		{
+		  /* built after the statement was typed: type the numbering predicates (the offset + row count PLUS
+		   * of two markers, the comparisons with the numbering functions) like every other expression */
+		  limit = pt_semantic_type (parser, limit, sc_info);
+		}
 	    }
 	  else if (node->info.query.q.select.group_by)
 	    {
 	      expr_pred = &node->info.query.q.select.having;
 	      limit = pt_limit_to_numbering_expr (parser, node->info.query.limit, PT_LAST_OPCODE, true);
+	      if (limit != NULL)
+		{
+		  /* built after the statement was typed: type the numbering predicates (the offset + row count PLUS
+		   * of two markers, the comparisons with the numbering functions) like every other expression */
+		  limit = pt_semantic_type (parser, limit, sc_info);
+		}
 	    }
 	  else if (node->info.query.all_distinct == PT_DISTINCT)
 	    {
 	      /* When a distinct query has neither orderby nor groupby clause, limit must be orderby_num predicate. */
 	      expr_pred = &node->info.query.orderby_for;
 	      limit = pt_limit_to_numbering_expr (parser, node->info.query.limit, PT_ORDERBY_NUM, false);
+	      if (limit != NULL)
+		{
+		  /* built after the statement was typed: type the numbering predicates (the offset + row count PLUS
+		   * of two markers, the comparisons with the numbering functions) like every other expression */
+		  limit = pt_semantic_type (parser, limit, sc_info);
+		}
 	    }
 	  else
 	    {
 	      expr_pred = &node->info.query.q.select.where;
 	      limit = pt_limit_to_numbering_expr (parser, node->info.query.limit, PT_INST_NUM, false);
+	      if (limit != NULL)
+		{
+		  /* built after the statement was typed: type the numbering predicates (the offset + row count PLUS
+		   * of two markers, the comparisons with the numbering functions) like every other expression */
+		  limit = pt_semantic_type (parser, limit, sc_info);
+		}
 	    }
 
 	  if (limit != NULL)
@@ -7425,11 +7477,18 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
       break;
 
     case PT_DELETE:
+      pt_hv_seed_limit_slots (parser, node->info.delete_.limit, node->info.delete_.using_index,
+			      (SEMANTIC_CHK_INFO *) arg);
       /* rewrite limit clause as numbering expression and add it to search condition */
       if (node->info.delete_.limit && node->info.delete_.rewrite_limit)
 	{
 	  PT_NODE *t_node = node->info.delete_.search_cond;
 	  PT_NODE *limit = pt_limit_to_numbering_expr (parser, node->info.delete_.limit, PT_INST_NUM, false);
+
+	  if (limit != NULL)
+	    {
+	      limit = pt_semantic_type (parser, limit, sc_info);
+	    }
 
 	  if (limit != NULL)
 	    {
@@ -7457,6 +7516,8 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
       break;
 
     case PT_UPDATE:
+      pt_hv_seed_limit_slots (parser, node->info.update.limit, node->info.update.using_index,
+			      (SEMANTIC_CHK_INFO *) arg);
       /* rewrite limit clause as numbering expression and add it to search condition */
       if (node->info.update.limit && node->info.update.rewrite_limit)
 	{
@@ -7467,11 +7528,23 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
 	    {
 	      expr_pred = &node->info.update.orderby_for;
 	      limit = pt_limit_to_numbering_expr (parser, node->info.update.limit, PT_ORDERBY_NUM, false);
+	      if (limit != NULL)
+		{
+		  /* built after the statement was typed: type the numbering predicates (the offset + row count PLUS
+		   * of two markers, the comparisons with the numbering functions) like every other expression */
+		  limit = pt_semantic_type (parser, limit, sc_info);
+		}
 	    }
 	  else
 	    {
 	      expr_pred = &node->info.update.search_cond;
 	      limit = pt_limit_to_numbering_expr (parser, node->info.update.limit, PT_INST_NUM, false);
+	      if (limit != NULL)
+		{
+		  /* built after the statement was typed: type the numbering predicates (the offset + row count PLUS
+		   * of two markers, the comparisons with the numbering functions) like every other expression */
+		  limit = pt_semantic_type (parser, limit, sc_info);
+		}
 	    }
 
 	  if (limit != NULL)
@@ -7971,12 +8044,12 @@ pt_eval_type (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_
       break;
 
     case PT_DELETE:
-      pt_hv_seed_limit_slots (parser, node->info.delete_.limit, node->info.delete_.using_index);
+      pt_hv_seed_limit_slots (parser, node->info.delete_.limit, node->info.delete_.using_index, sc_info);
       node->info.delete_.search_cond = pt_where_type (parser, node->info.delete_.search_cond);
       break;
 
     case PT_UPDATE:
-      pt_hv_seed_limit_slots (parser, node->info.update.limit, node->info.update.using_index);
+      pt_hv_seed_limit_slots (parser, node->info.update.limit, node->info.update.using_index, sc_info);
       node->info.update.search_cond = pt_where_type (parser, node->info.update.search_cond);
       break;
 
@@ -8012,7 +8085,7 @@ pt_eval_type (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_
       break;
 
     case PT_SELECT:
-      pt_hv_seed_limit_slots (parser, node->info.query.limit, node->info.query.q.select.using_index);
+      pt_hv_seed_limit_slots (parser, node->info.query.limit, node->info.query.q.select.using_index, sc_info);
       if (node->info.query.q.select.list)
 	{
 	  /* for value query, compatibility check for rows */
@@ -8710,8 +8783,8 @@ pt_hv_effective_type (const PT_NODE * node)
     {
       return PT_TYPE_NONE;
     }
-  if (node->type_enum == PT_TYPE_MAYBE && node->node_type == PT_HOST_VAR && node->expected_domain != NULL
-      && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_UNKNOWN
+  if ((node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE) && node->node_type == PT_HOST_VAR
+      && node->expected_domain != NULL && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_UNKNOWN
       && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_VARIABLE)
     {
       return pt_db_to_type_enum (TP_DOMAIN_TYPE (node->expected_domain));
@@ -8750,9 +8823,35 @@ pt_is_hv_arithmetic_op (PT_OP_TYPE op)
 static bool
 pt_hv_is_open_slot (PARSER_CONTEXT * parser, const PT_NODE * node)
 {
-  return (node != NULL && node->node_type == PT_HOST_VAR && node->type_enum == PT_TYPE_MAYBE
+  return (node != NULL && node->node_type == PT_HOST_VAR
+	  && (node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE)
 	  && node->info.host_var.index < parser->host_var_count
 	  && (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN));
+}
+
+/*
+ * pt_hv_is_marker_only_collection () - a value list ('IN (?, ?)', 'ANY {?, ?}') made of user markers only: its
+ *				       collation is whatever the consumer decides (the slots convert at bind time)
+ */
+static bool
+pt_hv_is_marker_only_collection (PARSER_CONTEXT * parser, const PT_NODE * node)
+{
+  const PT_NODE *elem;
+
+  if (node == NULL || node->node_type != PT_FUNCTION || !PT_IS_COLLECTION_TYPE (node->type_enum)
+      || (node->info.function.function_type != F_SET && node->info.function.function_type != F_MULTISET
+	  && node->info.function.function_type != F_SEQUENCE) || node->info.function.arg_list == NULL)
+    {
+      return false;
+    }
+  for (elem = node->info.function.arg_list; elem != NULL; elem = elem->next)
+    {
+      if (elem->node_type != PT_HOST_VAR || elem->info.host_var.index >= parser->host_var_count)
+	{
+	  return false;
+	}
+    }
+  return true;
 }
 
 /*
@@ -8819,9 +8918,9 @@ pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NO
  *   using_index(in): the USING INDEX name list, may be NULL
  */
 static void
-pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index)
+pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index, SEMANTIC_CHK_INFO * sc_info)
 {
-  PT_NODE *l, *idx;
+  PT_NODE *l, *idx, *save_next;
 
   if (parser->host_var_count <= 0)
     {
@@ -8829,7 +8928,19 @@ pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * usin
     }
   for (l = limit; l != NULL; l = l->next)
     {
-      pt_hv_seed_slot (parser, l, PT_TYPE_BIGINT, NULL);
+      if (l->node_type == PT_EXPR && l->type_enum == PT_TYPE_NONE)
+	{
+	  /* 'LIMIT ? - ?, ? * ?': the clause is not part of the typed tree walk; type it here so its markers hold
+	   * their contracts before the rewrite copies the expression into the numbering predicates */
+	  save_next = l->next;
+	  l->next = NULL;
+	  (void) pt_semantic_type (parser, l, sc_info);
+	  l->next = save_next;
+	}
+      else
+	{
+	  pt_hv_seed_slot (parser, l, PT_TYPE_BIGINT, NULL);
+	}
     }
   for (idx = using_index; idx != NULL; idx = idx->next)
     {
@@ -8837,7 +8948,17 @@ pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * usin
 	{
 	  for (l = idx->info.name.indx_key_limit; l != NULL; l = l->next)
 	    {
-	      pt_hv_seed_slot (parser, l, PT_TYPE_BIGINT, NULL);
+	      if (l->node_type == PT_EXPR && l->type_enum == PT_TYPE_NONE)
+		{
+		  save_next = l->next;
+		  l->next = NULL;
+		  (void) pt_semantic_type (parser, l, sc_info);
+		  l->next = save_next;
+		}
+	      else
+		{
+		  pt_hv_seed_slot (parser, l, PT_TYPE_BIGINT, NULL);
+		}
 	    }
 	}
     }
@@ -8886,6 +9007,27 @@ pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
     }
 
   if ((op == PT_IS_IN || op == PT_IS_NOT_IN) && pt_hv_is_open_slot (parser, left) && right != NULL
+      && right->node_type != PT_FUNCTION && PT_IS_COLLECTION_TYPE (right->type_enum) && right->data_type != NULL)
+    {
+      /* '? IN d.groups': the marker is an element of the column's collection; a single declared element type is
+       * the contract (an OBJECT element keeps its class), a multi-type collection leaves the statement default */
+      PT_NODE *elem = right->data_type;
+
+      if (elem != NULL && elem->next == NULL && elem->type_enum != PT_TYPE_MAYBE && elem->type_enum != PT_TYPE_NONE)
+	{
+	  TP_DOMAIN *d = pt_data_type_to_db_domain (parser, elem, NULL);
+
+	  if (d != NULL)
+	    {
+	      d = tp_domain_cache (d);
+	      SET_EXPECTED_DOMAIN (left, d);
+	      pt_preset_hostvar (parser, left);
+	    }
+	}
+      return;
+    }
+
+  if ((op == PT_IS_IN || op == PT_IS_NOT_IN) && pt_hv_is_open_slot (parser, left) && right != NULL
       && right->node_type == PT_FUNCTION && PT_IS_COLLECTION_TYPE (right->type_enum))
     {
       /* '? IN (1, 2)': the list's common element type, when it has one */
@@ -8923,6 +9065,30 @@ pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
   if (known != NULL)
     {
       known_type = pt_hv_effective_type (known);
+      if ((PT_IS_COLLECTION_TYPE (known_type) || known_type == PT_TYPE_OBJECT) && known->data_type != NULL
+	  && known->node_type != PT_HOST_VAR)
+	{
+	  /* a collection or object partner ('d.groups - ?', '? = d.owner'): the marker is bound to a value of the
+	   * partner's declared domain; the contract is that domain (its element domains / class), so the bound set or
+	   * object converts at bind time and the operator sees two operands of one domain */
+	  TP_DOMAIN *d = pt_node_to_db_domain (parser, known, NULL);
+
+	  if (d != NULL)
+	    {
+	      d = tp_domain_cache (d);
+	      if (pt_hv_is_open_slot (parser, left))
+		{
+		  SET_EXPECTED_DOMAIN (left, d);
+		  pt_preset_hostvar (parser, left);
+		}
+	      if (pt_hv_is_open_slot (parser, right))
+		{
+		  SET_EXPECTED_DOMAIN (right, d);
+		  pt_preset_hostvar (parser, right);
+		}
+	    }
+	  return;
+	}
       if (PT_IS_COLLECTION_TYPE (known_type) || known_type == PT_TYPE_OBJECT || known_type == PT_TYPE_LOGICAL
 	  || known_type == PT_TYPE_JSON || PT_IS_LOB_TYPE (known_type) || known_type == PT_TYPE_MAYBE)
 	{
@@ -8979,13 +9145,31 @@ pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
 {
   TP_DOMAIN *d;
 
-  if (node == NULL || node->node_type != PT_HOST_VAR || node->info.host_var.index >= parser->host_var_count
+  if (node == NULL)
+    {
+      return node;
+    }
+
+  if ((node->node_type == PT_EXPR || node->node_type == PT_FUNCTION) && node->data_type != NULL
+      && node->data_type->next == NULL && PT_HAS_COLLATION (node->type_enum)
+      && node->data_type->info.data_type.collation_flag == TP_DOMAIN_COLL_LEAVE)
+    {
+      /* a string result built from host variable slots / session variables that no consumer coerced at a use
+       * site (D-277-05): the compile environment's collation is its collation. Nothing at execution has to
+       * resolve a collation from the values any more. */
+      node->data_type->info.data_type.units = (int) LANG_SYS_CODESET;
+      node->data_type->info.data_type.collation_id = LANG_SYS_COLLATION;
+      node->data_type->info.data_type.collation_flag = TP_DOMAIN_COLL_NORMAL;
+      return node;
+    }
+
+  if (node->node_type != PT_HOST_VAR || node->info.host_var.index >= parser->host_var_count
       || node->info.host_var.var_type != PT_HOST_IN)
     {
       return node;
     }
 
-  if (node->type_enum == PT_TYPE_MAYBE
+  if ((node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE)
       && (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN
 	  || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_VARIABLE))
     {
@@ -8997,8 +9181,22 @@ pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
       return node;
     }
 
-  if (node->expected_domain == NULL)
+  if (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN
+      || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_VARIABLE)
     {
+      /* a consumer typed the marker (pt_coerce_value sets type_enum and data_type: an OBJECT or collection
+       * operand, a CAST target) without deciding a contract: the contract is that compiled type */
+      if (node->type_enum != PT_TYPE_MAYBE && node->type_enum != PT_TYPE_NONE && node->type_enum != PT_TYPE_NULL
+	  && node->type_enum != PT_TYPE_NA && node->type_enum != PT_TYPE_STAR)
+	{
+	  d = pt_node_to_db_domain (parser, node, NULL);
+	  if (d != NULL)
+	    {
+	      d = tp_domain_cache (d);
+	      SET_EXPECTED_DOMAIN (node, d);
+	      pt_preset_hostvar (parser, node);
+	    }
+	}
       return node;
     }
 
@@ -9047,7 +9245,7 @@ pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
 void
 pt_hv_finalize_contracts (PARSER_CONTEXT * parser, PT_NODE * tree)
 {
-  if (parser == NULL || tree == NULL || parser->host_var_count <= 0)
+  if (parser == NULL || tree == NULL)
     {
       return;
     }
@@ -10112,8 +10310,12 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
     {
       if (!PT_DOES_FUNCTION_HAVE_DIFFERENT_ARGS (op))
 	{
-	  if (arg2 && arg2->type_enum == PT_TYPE_MAYBE)
+	  if (arg2 && arg2->type_enum == PT_TYPE_MAYBE
+	      && (arg2->node_type != PT_HOST_VAR || pt_hv_is_open_slot (parser, arg2)))
 	    {
+	      /* a default for a still-open slot only: the semantic pass runs more than once over the same tree (view
+	       * translation re-types it) and a contract a consumer already decided (the BIGINT interval count of
+	       * DATE_ADD, for one) must not be replaced by the partner's type on the next pass */
 	      if (PT_IS_NUMERIC_TYPE (arg1_type) || PT_IS_STRING_TYPE (arg1_type))
 		{
 		  d = pt_node_to_db_domain (parser, arg1, NULL);
@@ -10584,7 +10786,7 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
 
     case PT_DATE_ADD:
     case PT_DATE_SUB:
-      if (arg1_hv && arg1_type == PT_TYPE_MAYBE)
+      if (arg1_hv && arg1_type == PT_TYPE_MAYBE && pt_hv_is_open_slot (parser, arg1_hv))
 	{
 	  /* Though arg1 can be date/timestamp/datetime/string, assume it is a string which is the most general. */
 	  d = tp_domain_resolve_default (DB_TYPE_STRING);
@@ -10592,11 +10794,28 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
 	  pt_preset_hostvar (parser, arg1);
 	  common_type = node->type_enum = PT_TYPE_VARCHAR;
 	}
-      if (arg2_hv && arg2_type == PT_TYPE_MAYBE)
+      if (arg2_hv && arg2_type == PT_TYPE_MAYBE && pt_hv_is_open_slot (parser, arg2_hv) && arg3 != NULL)
 	{
-	  d = tp_domain_resolve_default (DB_TYPE_STRING);
-	  SET_EXPECTED_DOMAIN (arg2, d);
-	  pt_preset_hostvar (parser, arg2);
+	  switch (arg3->info.expr.qualifier)
+	    {
+	    case PT_MILLISECOND:
+	    case PT_SECOND:
+	    case PT_MINUTE:
+	    case PT_HOUR:
+	    case PT_DAY:
+	    case PT_WEEK:
+	    case PT_MONTH:
+	    case PT_QUARTER:
+	    case PT_YEAR:
+	      /* the count of a simple unit is an integer: the BIGINT coercion below decides the slot */
+	      break;
+	    default:
+	      /* a composite unit ('DAYS HOURS:MINUTES:SECONDS') is written as a string */
+	      d = tp_domain_resolve_default (DB_TYPE_STRING);
+	      SET_EXPECTED_DOMAIN (arg2, d);
+	      pt_preset_hostvar (parser, arg2);
+	      break;
+	    }
 	}
 
       /* arg1 -> date or string, arg2 -> integer or string acc to unit */
@@ -12610,13 +12829,14 @@ pt_upd_domain_info (PARSER_CONTEXT * parser, PT_NODE * arg1, PT_NODE * arg2, PT_
 	    {
 	      dt->info.data_type.units = (int) LANG_SYS_CODESET;
 	      dt->info.data_type.collation_id = LANG_SYS_COLLATION;
-	      if ((arg1 == NULL || arg1->type_enum != PT_TYPE_MAYBE || arg1->node_type == PT_HOST_VAR)
-		  && (arg2 == NULL || arg2->type_enum != PT_TYPE_MAYBE || arg2->node_type == PT_HOST_VAR))
+	      if ((arg1 == NULL || arg1->type_enum != PT_TYPE_MAYBE)
+		  && (arg2 == NULL || arg2->type_enum != PT_TYPE_MAYBE)
+		  && (!((PT_NODE_IS_SESSION_VARIABLE (arg1)) && (PT_NODE_IS_SESSION_VARIABLE (arg2)))))
 		{
-		  /* operator without arguments or with arguments has result with system collation. A host variable
-		   * slot is a system-collation contract and a session variable read is VARCHAR with the system
-		   * collation, so neither leaves the result collation to the execution. Only a residual MAYBE
-		   * expression (STR_TO_DATE with a bound format) still does. */
+		  /* operator without arguments or with arguments has result with system collation. A result built from
+		   * host variable slots or session variables alone stays coercible (TP_DOMAIN_COLL_LEAVE) so that the
+		   * consumer decides its collation at the use site (D-277-05); what no consumer decided is fixed to the
+		   * compile environment's collation when the statement's contracts are finalized. */
 		  collation_flag = TP_DOMAIN_COLL_NORMAL;
 		}
 	    }
@@ -22059,7 +22279,7 @@ pt_coerce_node_collation (PARSER_CONTEXT * parser, PT_NODE * node, const int col
 	}
       break;
     case PT_HOST_VAR:
-      if (node->type_enum == PT_TYPE_MAYBE && node->expected_domain == NULL)
+      if ((node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE) && node->expected_domain == NULL)
 	{
 	  TP_DOMAIN *dom_hv;
 	  DB_TYPE exp_db_type;
@@ -22363,6 +22583,11 @@ pt_coerce_node_collation (PARSER_CONTEXT * parser, PT_NODE * node, const int col
 		  node->expected_domain->collation_flag = TP_DOMAIN_COLL_ENFORCE;
 		}
 	    }
+	}
+      if (node->node_type == PT_HOST_VAR)
+	{
+	  /* the use-site collation is part of the slot contract the bind converts the value to (D-277-05) */
+	  pt_preset_hostvar (parser, node);
 	}
     }
   else if (node->expected_domain != NULL && TP_IS_SET_TYPE (TP_DOMAIN_TYPE (node->expected_domain)))
@@ -22955,6 +23180,18 @@ pt_check_expr_collation (PARSER_CONTEXT * parser, PT_NODE ** node)
     {
       int status = pt_get_collation_info_for_collection_type (parser, arg2,
 							      &arg2_coll_inf);
+
+      if (pt_hv_is_marker_only_collection (parser, arg2) && status != ERROR_COLLATION)
+	{
+	  /* D-277-05: 's1 IN (?, ?)' -- the list's own collation (the session default of its slots) is not evidence;
+	   * the markers take the collation the other operand decides (pt_coerce_node_collation sets their slot
+	   * contracts, so the bound values are converted at bind time) */
+	  arg2_coll_inf.coll_id = LANG_SYS_COLLATION;
+	  arg2_coll_inf.codeset = LANG_SYS_CODESET;
+	  arg2_coll_inf.can_force_cs = true;
+	  arg2_coll_inf.coerc_level = PT_COLLATION_FULLY_COERC;
+	  status = HAS_COLLATION;
+	}
 
       if (status == ERROR_COLLATION)
 	{

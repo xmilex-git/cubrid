@@ -1279,10 +1279,8 @@ namespace func_type
 		return false;
 	      }
 
-	    if (arg_node->type_enum != PT_TYPE_MAYBE || arg_node->node_type == PT_HOST_VAR)
+	    if (arg_node->type_enum != PT_TYPE_MAYBE)
 	      {
-		/* a host variable slot is a system-collation, fully coercible contract: it does not leave the
-		 * result collation to the execution (D-277-05) */
 		compat.m_collation_action = TP_DOMAIN_COLL_NORMAL;
 	      }
 	  }

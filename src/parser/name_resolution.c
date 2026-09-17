@@ -11616,10 +11616,17 @@ pt_set_attr_list_types (PARSER_CONTEXT * parser, PT_NODE * as_attr_list, PT_MISC
 	  /* derived columns assume the type of their matching attributes */
 	  for (col = as_attr_list, att = select_list; col && att; col = col->next, att = att->next)
 	    {
-	      col->type_enum = att->type_enum;
+	      col->type_enum = pt_hv_effective_type (att);
 	      if (att->data_type)
 		{
 		  col->data_type = parser_copy_tree_list (parser, att->data_type);
+		}
+	      else if (att->node_type == PT_HOST_VAR && col->type_enum != PT_TYPE_MAYBE && att->expected_domain != NULL)
+		{
+		  /* a host variable select-list item: the derived column has the marker's compiled slot contract
+		   * (a recursive CTE's anchor 'select ?, ?' types the recursive references from it) */
+		  parser_free_tree (parser, col->data_type);
+		  col->data_type = pt_domain_to_data_type (parser, att->expected_domain);
 		}
 	      else
 		{
