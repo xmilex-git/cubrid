@@ -206,6 +206,13 @@ static PT_NODE *pt_coerce_range_expr_arguments (PARSER_CONTEXT * parser, PT_NODE
 static bool pt_is_range_comp_op (const PT_OP_TYPE op);
 static bool pt_is_range_expression (const PT_OP_TYPE op);
 static bool pt_are_unmatchable_types (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM op_type);
+static bool pt_is_hv_arithmetic_op (PT_OP_TYPE op);
+static bool pt_hv_is_open_slot (PARSER_CONTEXT * parser, const PT_NODE * node);
+static void pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NODE * source);
+static void pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node);
+static void pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index);
+static PT_NODE *pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
+					       int *continue_walk);
 static PT_TYPE_ENUM pt_get_equivalent_type_with_op (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM arg_type,
 						    PT_OP_TYPE op);
 static PT_NODE *pt_evaluate_new_data_type (const PT_TYPE_ENUM old_type, const PT_TYPE_ENUM new_type,
@@ -3950,8 +3957,11 @@ pt_get_expression_definition (const PT_OP_TYPE op, EXPRESSION_DEFINITION * def)
       sig.arg1_type.type = pt_arg_type::NORMAL;
       sig.arg1_type.val.type = PT_TYPE_CHAR;
 
+      /* a session variable read is a VARCHAR typed slot (D-276-04): the stored value, whatever its type, is
+       * converted to VARCHAR when it is read (fetch T_EVALUATE_VARIABLE); '@a + 1' therefore follows the VARCHAR +
+       * INTEGER rules. Re-assignment (PT_DEFINE_VARIABLE) keeps the type of the assigned expression. */
       sig.return_type.type = pt_arg_type::NORMAL;
-      sig.return_type.val.type = PT_TYPE_MAYBE;
+      sig.return_type.val.type = PT_TYPE_VARCHAR;
 
       def->overloads[num++] = sig;
 
@@ -4827,16 +4837,29 @@ pt_infer_common_type (const PT_OP_TYPE op, PT_TYPE_ENUM * arg1, PT_TYPE_ENUM * a
 	      /* "mirror" the known argument type to the other argument if the later is PT_TYPE_MAYBE */
 	      if (!pt_is_op_hv_late_bind (op))
 		{
+		  PT_TYPE_ENUM known = PT_TYPE_MAYBE;
+
 		  if (arg1_eq_type != PT_TYPE_MAYBE)
 		    {
 		      /* then arg2_eq_type is PT_TYPE_MAYBE */
-		      arg2_eq_type = arg1_eq_type;
-		      common_type = arg1_eq_type;
+		      known = arg1_eq_type;
 		    }
 		  else if (arg2_eq_type != PT_TYPE_MAYBE)
 		    {
-		      arg1_eq_type = arg2_eq_type;
-		      common_type = arg2_eq_type;
+		      known = arg2_eq_type;
+		    }
+
+		  if (known == PT_TYPE_ENUMERATION && pt_is_hv_arithmetic_op (op))
+		    {
+		      /* D-277-03: an ENUM in arithmetic is promoted to its ordinal; the unresolved operand takes the
+		       * ordinal's type, never the ENUM definition (the ENUM contract is a comparison/assignment
+		       * matter) */
+		      known = PT_TYPE_INTEGER;
+		    }
+
+		  if (known != PT_TYPE_MAYBE)
+		    {
+		      arg1_eq_type = arg2_eq_type = common_type = known;
 		    }
 		}
 	    }
@@ -4871,6 +4894,14 @@ pt_infer_common_type (const PT_OP_TYPE op, PT_TYPE_ENUM * arg1, PT_TYPE_ENUM * a
       /* if expected type if not PT_TYPE_NONE then a expression higher up in the parser tree has set an expected domain
        * for this node and we can use it to set the expected domain of the arguments */
       common_type = expected_type;
+    }
+
+  if (common_type == PT_TYPE_MAYBE && !pt_is_op_hv_late_bind (op))
+    {
+      /* D-271-02 (4): every operand is unresolved and nothing above constrains the result. Arithmetic takes the
+       * floating NUMERIC contract, every other symmetric operator (comparison, common-value selection) the VARCHAR
+       * contract. The bound values are cast to that contract; a caller who wants another meaning writes a CAST. */
+      common_type = pt_is_hv_arithmetic_op (op) ? PT_TYPE_NUMERIC : PT_TYPE_VARCHAR;
     }
 
   /* final check : common_type should be PT_TYPE_MAYBE at this stage only for a small number of operators (PLUS,
@@ -5410,13 +5441,13 @@ pt_coerce_expr_arguments (PARSER_CONTEXT * parser, PT_NODE * expr, PT_NODE * arg
   arg1 = expr->info.expr.arg1;
   if (arg1)
     {
-      arg1_type = arg1->type_enum;
+      arg1_type = pt_hv_effective_type (arg1);
     }
 
   arg2 = expr->info.expr.arg2;
   if (arg2)
     {
-      arg2_type = arg2->type_enum;
+      arg2_type = pt_hv_effective_type (arg2);
 
       if (op == PT_WIDTH_BUCKET)
 	{
@@ -5427,7 +5458,7 @@ pt_coerce_expr_arguments (PARSER_CONTEXT * parser, PT_NODE * expr, PT_NODE * arg
   arg3 = expr->info.expr.arg3;
   if (arg3)
     {
-      arg3_type = arg3->type_enum;
+      arg3_type = pt_hv_effective_type (arg3);
     }
 
   arg1_eq_type = pt_get_equivalent_type_with_op (sig.arg1_type, arg1_type, op);
@@ -5890,13 +5921,13 @@ pt_apply_expressions_definition (PARSER_CONTEXT * parser, PT_NODE ** node)
       arg1 = expr->info.expr.arg1;
       if (arg1)
 	{
-	  arg1_type = arg1->type_enum;
+	  arg1_type = pt_hv_effective_type (arg1);
 	}
 
       arg2 = expr->info.expr.arg2;
       if (arg2)
 	{
-	  arg2_type = arg2->type_enum;
+	  arg2_type = pt_hv_effective_type (arg2);
 
 	  if (op == PT_WIDTH_BUCKET)
 	    {
@@ -5908,7 +5939,7 @@ pt_apply_expressions_definition (PARSER_CONTEXT * parser, PT_NODE ** node)
   arg3 = expr->info.expr.arg3;
   if (arg3)
     {
-      arg3_type = arg3->type_enum;
+      arg3_type = pt_hv_effective_type (arg3);
     }
 
   /* check the expression contains NULL argument. If the op does not specially treat NULL args, for instance, NVL,
@@ -6000,6 +6031,28 @@ pt_apply_expressions_definition (PARSER_CONTEXT * parser, PT_NODE ** node)
       && (arg1_type == PT_TYPE_MAYBE || arg2_type == PT_TYPE_MAYBE || arg3_type == PT_TYPE_MAYBE))
     {
       expr->type_enum = PT_TYPE_MAYBE;
+    }
+  else if (op == PT_DEFINE_VARIABLE && expr->info.expr.arg2 != NULL)
+    {
+      /* '@a := expr' returns the assigned expression as it is: its compile-time type (an unresolved host variable
+       * argument has already received its VARCHAR contract from the signature) */
+      expr->type_enum = pt_hv_effective_type (expr->info.expr.arg2);
+      if (expr->type_enum == PT_TYPE_MAYBE || expr->type_enum == PT_TYPE_NONE)
+	{
+	  expr->type_enum = PT_TYPE_VARCHAR;
+	}
+      if (expr->data_type == NULL)
+	{
+	  if (expr->info.expr.arg2->data_type != NULL
+	      && expr->info.expr.arg2->data_type->type_enum == expr->type_enum)
+	    {
+	      expr->data_type = parser_copy_tree_list (parser, expr->info.expr.arg2->data_type);
+	    }
+	  else
+	    {
+	      expr->data_type = pt_make_prim_data_type (parser, expr->type_enum);
+	    }
+	}
     }
   else
     {
@@ -7254,6 +7307,7 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
     case PT_UNION:
     case PT_DIFFERENCE:
     case PT_INTERSECTION:
+      pt_hv_seed_limit_slots (parser, node->info.query.limit, NULL);
       /* propagate to children */
       arg1 = node->info.query.q.union_.arg1;
       arg2 = node->info.query.q.union_.arg2;
@@ -7861,6 +7915,7 @@ pt_eval_type (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_
     case PT_EXPR:
       if (sc_info->has_dblink == false)
 	{
+	  pt_hv_seed_from_context (parser, node);
 	  node = pt_eval_expr_type (parser, node);
 	}
 #if 1				//original code but it doesn't check for errors
@@ -7916,10 +7971,12 @@ pt_eval_type (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_
       break;
 
     case PT_DELETE:
+      pt_hv_seed_limit_slots (parser, node->info.delete_.limit, node->info.delete_.using_index);
       node->info.delete_.search_cond = pt_where_type (parser, node->info.delete_.search_cond);
       break;
 
     case PT_UPDATE:
+      pt_hv_seed_limit_slots (parser, node->info.update.limit, node->info.update.using_index);
       node->info.update.search_cond = pt_where_type (parser, node->info.update.search_cond);
       break;
 
@@ -7955,6 +8012,7 @@ pt_eval_type (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_
       break;
 
     case PT_SELECT:
+      pt_hv_seed_limit_slots (parser, node->info.query.limit, node->info.query.q.select.using_index);
       if (node->info.query.q.select.list)
 	{
 	  /* for value query, compatibility check for rows */
@@ -7972,8 +8030,23 @@ pt_eval_type (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_
 	    }
 	  else
 	    {
-	      node->type_enum = node->info.query.q.select.list->type_enum;
-	      dt = node->info.query.q.select.list->data_type;
+	      PT_NODE *first = node->info.query.q.select.list;
+
+	      /* D-271-02 (4): a user marker that is a select-list item of this query block has no other context than
+	       * the statement default, so it takes the VARCHAR contract here, before an enclosing expression, UNION or
+	       * INSERT ... SELECT reads this block's type. The block's type is the marker's contract, not MAYBE. */
+	      for (list = first; list != NULL; list = list->next)
+		{
+		  pt_hv_seed_slot (parser, list, PT_TYPE_VARCHAR, NULL);
+		}
+
+	      node->type_enum = pt_hv_effective_type (first);
+	      dt = first->data_type;
+	      if (dt == NULL && first->node_type == PT_HOST_VAR && node->type_enum != PT_TYPE_MAYBE
+		  && first->expected_domain != NULL)
+		{
+		  dt = pt_domain_to_data_type (parser, first->expected_domain);
+		}
 	    }
 
 	  if (dt)
@@ -8614,7 +8687,371 @@ pt_preset_hostvar (PARSER_CONTEXT * parser, PT_NODE * hv_node)
       return;
     }
 
+  /* the expected-domain array has exactly one entry per user marker of the compiled text (D-276-08) */
+  assert (hv_node->info.host_var.index < parser->host_var_expected_domains_size);
+  if (hv_node->info.host_var.index >= parser->host_var_expected_domains_size)
+    {
+      return;
+    }
+
   parser->host_var_expected_domains[hv_node->info.host_var.index] = hv_node->expected_domain;
+}
+
+/*
+ * pt_hv_effective_type () - the type an expression sees for its operand: a host variable marker that already holds a
+ *			     slot contract counts as that contract's type, not as PT_TYPE_MAYBE
+ *   return: the type to use for signature matching and common-type inference
+ *   node(in): an operand, may be NULL
+ */
+PT_TYPE_ENUM
+pt_hv_effective_type (const PT_NODE * node)
+{
+  if (node == NULL)
+    {
+      return PT_TYPE_NONE;
+    }
+  if (node->type_enum == PT_TYPE_MAYBE && node->node_type == PT_HOST_VAR && node->expected_domain != NULL
+      && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_UNKNOWN
+      && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_VARIABLE)
+    {
+      return pt_db_to_type_enum (TP_DOMAIN_TYPE (node->expected_domain));
+    }
+  return node->type_enum;
+}
+
+/*
+ * pt_is_hv_arithmetic_op () - the operators whose unresolved host variable operands take the numeric contract
+ */
+static bool
+pt_is_hv_arithmetic_op (PT_OP_TYPE op)
+{
+  switch (op)
+    {
+    case PT_PLUS:
+    case PT_MINUS:
+    case PT_TIMES:
+    case PT_DIVIDE:
+    case PT_MODULUS:
+    case PT_UNARY_MINUS:
+    case PT_ABS:
+    case PT_CEIL:
+    case PT_FLOOR:
+    case PT_ROUND:
+    case PT_TRUNC:
+      return true;
+    default:
+      return false;
+    }
+}
+
+/*
+ * pt_hv_is_open_slot () - a user host variable marker that has no slot contract yet
+ */
+static bool
+pt_hv_is_open_slot (PARSER_CONTEXT * parser, const PT_NODE * node)
+{
+  return (node != NULL && node->node_type == PT_HOST_VAR && node->type_enum == PT_TYPE_MAYBE
+	  && node->info.host_var.index < parser->host_var_count
+	  && (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN));
+}
+
+/*
+ * pt_hv_seed_slot () - give an open host variable slot its contract
+ *   parser(in): the parser context
+ *   hv(in/out): the marker; ignored when it is not an open user slot
+ *   type(in): the contract's type
+ *   source(in): the operand the type comes from, needed for an ENUM (its definition), NULL otherwise
+ *
+ * Note: the contract is the type-level default, not the partner's typmod (D-271-03/04/05): NUMERIC is the floating
+ *	 NUMERIC (the value keeps its own precision and scale), strings have no length limit and no collation of their
+ *	 own (TP_DOMAIN_COLL_LEAVE: the consumer decides the collation, pt_check_expr_collation), an ENUM is the
+ *	 partner's definition (labels are converted at bind time).
+ */
+static void
+pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NODE * source)
+{
+  TP_DOMAIN *d = NULL;
+  DB_TYPE db_type;
+
+  if (!pt_hv_is_open_slot (parser, hv))
+    {
+      return;
+    }
+
+  db_type = pt_type_enum_to_db (type);
+  if (db_type == DB_TYPE_UNKNOWN || db_type == DB_TYPE_VARIABLE)
+    {
+      return;
+    }
+
+  if (db_type == DB_TYPE_ENUMERATION)
+    {
+      if (source == NULL || source->data_type == NULL)
+	{
+	  return;
+	}
+      d = pt_node_to_db_domain (parser, source, NULL);
+    }
+  else if (TP_IS_CHAR_TYPE (db_type) || TP_IS_BIT_TYPE (db_type))
+    {
+      d = tp_domain_resolve_default_w_coll (db_type, LANG_SYS_COLLATION, TP_DOMAIN_COLL_LEAVE);
+    }
+  else
+    {
+      d = tp_domain_resolve_default (db_type);
+    }
+  if (d == NULL)
+    {
+      return;
+    }
+
+  d = tp_domain_cache (d);
+  SET_EXPECTED_DOMAIN (hv, d);
+  pt_preset_hostvar (parser, hv);
+}
+
+/*
+ * pt_hv_seed_limit_slots () - the markers of a LIMIT clause and of the KEYLIMIT of a USING INDEX list are BIGINT slots
+ *			       (the row counts the numbering predicates and the key limit consume); seeded before the
+ *			       LIMIT rewrite copies them into inst_num () / orderby_num () / groupby_num () predicates
+ *   parser(in): the parser context
+ *   limit(in): the LIMIT clause list (offset, row count), may be NULL
+ *   using_index(in): the USING INDEX name list, may be NULL
+ */
+static void
+pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index)
+{
+  PT_NODE *l, *idx;
+
+  if (parser->host_var_count <= 0)
+    {
+      return;
+    }
+  for (l = limit; l != NULL; l = l->next)
+    {
+      pt_hv_seed_slot (parser, l, PT_TYPE_BIGINT, NULL);
+    }
+  for (idx = using_index; idx != NULL; idx = idx->next)
+    {
+      if (idx->node_type == PT_NAME)
+	{
+	  for (l = idx->info.name.indx_key_limit; l != NULL; l = l->next)
+	    {
+	      pt_hv_seed_slot (parser, l, PT_TYPE_BIGINT, NULL);
+	    }
+	}
+    }
+}
+
+/*
+ * pt_hv_seed_from_context () - D-271-02 (2)-(5): before an expression's signature is applied, give its open host
+ *				variable operands the contract the expression itself implies
+ *   parser(in): the parser context
+ *   node(in/out): a PT_EXPR whose operands are already typed
+ *
+ * Note: for arithmetic and for the common-value / comparison operators the known operand's type is mirrored onto
+ *	 the unresolved one (scalar primitives only: an ENUM in arithmetic means its ordinal (INTEGER), a date/time
+ *	 partner of '+' / 'date - ?' means the BIGINT offset role, a collection/object partner is left to the
+ *	 existing rules); when no operand is known, arithmetic gets the floating NUMERIC contract and everything
+ *	 else VARCHAR. This makes '? + 1' INTEGER, 'nvl(?, 0)' INTEGER, '? + ?' NUMERIC, '? = ?' VARCHAR,
+ *	 'd + ?' a date offset, regardless of the bound values.
+ */
+static void
+pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
+{
+  PT_NODE *left, *right, *known = NULL;
+  PT_OP_TYPE op;
+  PT_TYPE_ENUM type, known_type;
+  bool numeric, common;
+
+  if (node == NULL || node->node_type != PT_EXPR || parser->host_var_count <= 0)
+    {
+      return;
+    }
+
+  op = node->info.expr.op;
+  left = node->info.expr.arg1;
+  right = node->info.expr.arg2;
+
+  numeric = pt_is_hv_arithmetic_op (op);
+  common = (op == PT_NVL || op == PT_IFNULL || op == PT_NULLIF || op == PT_COALESCE || op == PT_LEAST
+	    || op == PT_GREATEST || pt_is_range_or_comp (op));
+  if (!numeric && !common)
+    {
+      return;
+    }
+  if (!pt_hv_is_open_slot (parser, left) && !pt_hv_is_open_slot (parser, right))
+    {
+      return;
+    }
+
+  if ((op == PT_IS_IN || op == PT_IS_NOT_IN) && pt_hv_is_open_slot (parser, left) && right != NULL
+      && right->node_type == PT_FUNCTION && PT_IS_COLLECTION_TYPE (right->type_enum))
+    {
+      /* '? IN (1, 2)': the list's common element type, when it has one */
+      bool is_multitype = false;
+      PT_TYPE_ENUM elem_type = pt_get_common_collection_type (right, &is_multitype);
+
+      if (!is_multitype && elem_type != PT_TYPE_MAYBE && elem_type != PT_TYPE_NONE && elem_type != PT_TYPE_NULL
+	  && elem_type != PT_TYPE_ENUMERATION && !PT_IS_COLLECTION_TYPE (elem_type))
+	{
+	  pt_hv_seed_slot (parser, left, elem_type, NULL);
+	}
+      return;
+    }
+
+  if (left != NULL && left->type_enum != PT_TYPE_MAYBE && left->type_enum != PT_TYPE_NONE
+      && left->type_enum != PT_TYPE_NULL && left->type_enum != PT_TYPE_NA)
+    {
+      known = left;
+    }
+  else if (right != NULL && right->type_enum != PT_TYPE_MAYBE && right->type_enum != PT_TYPE_NONE
+	   && right->type_enum != PT_TYPE_NULL && right->type_enum != PT_TYPE_NA)
+    {
+      known = right;
+    }
+  else if (pt_hv_effective_type (left) != PT_TYPE_MAYBE && left != NULL && left->node_type == PT_HOST_VAR)
+    {
+      /* the partner is a marker whose slot is already decided */
+      known = left;
+    }
+  else if (pt_hv_effective_type (right) != PT_TYPE_MAYBE && right != NULL && right->node_type == PT_HOST_VAR)
+    {
+      known = right;
+    }
+
+  if (known != NULL)
+    {
+      known_type = pt_hv_effective_type (known);
+      if (PT_IS_COLLECTION_TYPE (known_type) || known_type == PT_TYPE_OBJECT || known_type == PT_TYPE_LOGICAL
+	  || known_type == PT_TYPE_JSON || PT_IS_LOB_TYPE (known_type) || known_type == PT_TYPE_MAYBE)
+	{
+	  /* not a scalar primitive partner: the existing rules (declared collection domain, error) decide */
+	  return;
+	}
+      type = known_type;
+      if (known_type == PT_TYPE_ENUMERATION)
+	{
+	  if (numeric)
+	    {
+	      type = PT_TYPE_INTEGER;
+	      known = NULL;
+	    }
+	  else if (!pt_is_range_or_comp (op))
+	    {
+	      /* D-277-03: a common-value selection between an ENUM and a marker follows the signatures (string) */
+	      return;
+	    }
+	  /* D-271-07 / D-277-03: a comparison with an ENUM gives the marker the ENUM definition as its contract; a
+	   * bound label or ordinal is converted before the scan (tp_value_cast to the ENUM), no pass-through */
+	}
+      else if (numeric && PT_IS_DATE_TIME_TYPE (known_type))
+	{
+	  if (op == PT_PLUS || (op == PT_MINUS && known == left))
+	    {
+	      /* the marker is the offset of a date/time arithmetic, never a date */
+	      type = PT_TYPE_BIGINT;
+	      known = NULL;
+	    }
+	  else
+	    {
+	      return;
+	    }
+	}
+    }
+  else
+    {
+      type = numeric ? PT_TYPE_NUMERIC : PT_TYPE_VARCHAR;
+    }
+
+  pt_hv_seed_slot (parser, left, type, known);
+  if (op != PT_ROUND && op != PT_TRUNC)
+    {
+      pt_hv_seed_slot (parser, right, type, known);
+    }
+}
+
+/*
+ * pt_hv_finalize_contracts_post () - statement-level defaults and normalization of the host variable slot contracts
+ */
+static PT_NODE *
+pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  TP_DOMAIN *d;
+
+  if (node == NULL || node->node_type != PT_HOST_VAR || node->info.host_var.index >= parser->host_var_count
+      || node->info.host_var.var_type != PT_HOST_IN)
+    {
+      return node;
+    }
+
+  if (node->type_enum == PT_TYPE_MAYBE
+      && (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN
+	  || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_VARIABLE))
+    {
+      /* D-271-02 (4): a marker no context constrained (SELECT ?, ? IS NULL, ...) is a VARCHAR slot */
+      d = tp_domain_resolve_default_w_coll (DB_TYPE_VARCHAR, LANG_SYS_COLLATION, TP_DOMAIN_COLL_NORMAL);
+      d = tp_domain_cache (d);
+      SET_EXPECTED_DOMAIN (node, d);
+      pt_preset_hostvar (parser, node);
+      return node;
+    }
+
+  if (node->expected_domain == NULL)
+    {
+      return node;
+    }
+
+  if (TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (node->expected_domain))
+      && TP_DOMAIN_COLLATION_FLAG (node->expected_domain) == TP_DOMAIN_COLL_LEAVE)
+    {
+      /* no consumer required a collation for this slot: the compile environment's default collation is the
+       * contract (D-271-05). The value is converted to it at bind time, so nothing at execution has to decide a
+       * collation from the value. */
+      d = tp_domain_copy (node->expected_domain, false);
+      if (d != NULL)
+	{
+	  d->collation_flag = TP_DOMAIN_COLL_NORMAL;
+	  d->codeset = LANG_SYS_CODESET;
+	  d->collation_id = LANG_SYS_COLLATION;
+	  d = tp_domain_cache (d);
+	  SET_EXPECTED_DOMAIN (node, d);
+	  pt_preset_hostvar (parser, node);
+	}
+    }
+  else if (TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_NUMERIC
+	   && (node->expected_domain->precision != DB_DEFAULT_NUMERIC_PRECISION
+	       || node->expected_domain->scale != DB_DEFAULT_NUMERIC_SCALE))
+    {
+      /* D-271-03: a NUMERIC slot is the floating NUMERIC; the value keeps its own precision and scale, a fixed
+       * (p,s) constraint is applied by the consumer that requires it (assignment target, CAST) */
+      d = tp_domain_resolve_default (DB_TYPE_NUMERIC);
+      SET_EXPECTED_DOMAIN (node, d);
+      pt_preset_hostvar (parser, node);
+    }
+
+  return node;
+}
+
+/*
+ * pt_hv_finalize_contracts () - close the host variable slot contracts of a statement once its semantic typing is
+ *				 done: apply the statement-level defaults to the markers no context constrained and
+ *				 normalize the compiled contracts (D-271-02 (4), D-271-03, D-271-05)
+ *   parser(in): the parser context
+ *   tree(in/out): the typed statement
+ *
+ * Note: after this pass every user marker of the statement has a concrete slot contract; XASL generation consumes
+ *	 the contract (never a bound value) and the bind converts the values to it. Running it again on an already
+ *	 finalized tree changes nothing.
+ */
+void
+pt_hv_finalize_contracts (PARSER_CONTEXT * parser, PT_NODE * tree)
+{
+  if (parser == NULL || tree == NULL || parser->host_var_count <= 0)
+    {
+      return;
+    }
+  (void) parser_walk_tree (parser, tree, NULL, NULL, pt_hv_finalize_contracts_post, NULL);
 }
 
 /* pt_set_expected_domain - set the expected tomain of a PT_NODE
@@ -8912,7 +9349,7 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
   arg1 = node->info.expr.arg1;
   if (arg1)
     {
-      arg1_type = arg1->type_enum;
+      arg1_type = pt_hv_effective_type (arg1);
 
       if (arg1->node_type == PT_HOST_VAR && arg1->type_enum == PT_TYPE_MAYBE)
 	{
@@ -8936,7 +9373,7 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
     {
       if (arg2->or_next == NULL)
 	{
-	  arg2_type = arg2->type_enum;
+	  arg2_type = pt_hv_effective_type (arg2);
 	}
       else
 	{
@@ -8976,7 +9413,7 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
   arg3 = node->info.expr.arg3;
   if (arg3)
     {
-      arg3_type = arg3->type_enum;
+      arg3_type = pt_hv_effective_type (arg3);
       if (arg3->node_type == PT_HOST_VAR && arg3->type_enum == PT_TYPE_MAYBE)
 	{
 	  arg3_hv = arg3;
@@ -10136,8 +10573,10 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
 	    /* if other value, the db_str_to_date will return NULL */
 	    node->type_enum = PT_TYPE_NULL;
 	  }
-	else if (arg1_type == PT_TYPE_MAYBE || arg2_type == PT_TYPE_MAYBE)
+	else if (type_specifier == PT_TYPE_MAYBE || arg1_type == PT_TYPE_MAYBE)
 	  {
+	    /* the format is not a literal (host variable, session variable): the result type depends on the
+	     * format's contents and stays the execution-time residual (the only remaining late-bound result) */
 	    node->type_enum = PT_TYPE_MAYBE;
 	  }
 	break;
@@ -11832,6 +12271,17 @@ pt_upd_domain_info (PARSER_CONTEXT * parser, PT_NODE * arg1, PT_NODE * arg2, PT_
 	  return ER_OUT_OF_VIRTUAL_MEMORY;
 	}
       break;
+    case PT_EVALUATE_VARIABLE:
+      /* D-276-04: a session variable read is a VARCHAR slot with the compile environment's collation (fully
+       * coercible, pt_get_collation_info); the value is converted to it when read. A concrete data type here is
+       * what the consumers of a VARCHAR operand expect (UNION compatibility casts, COERCIBILITY / COLLATION). */
+      assert (dt == NULL);
+      dt = pt_make_prim_data_type (parser, PT_TYPE_VARCHAR);
+      dt->info.data_type.units = (int) LANG_SYS_CODESET;
+      dt->info.data_type.collation_id = LANG_SYS_COLLATION;
+      do_detect_collation = false;
+      break;
+
     case PT_LIST_DBS:
     case PT_TO_CHAR:
     case PT_USER:
@@ -12160,11 +12610,13 @@ pt_upd_domain_info (PARSER_CONTEXT * parser, PT_NODE * arg1, PT_NODE * arg2, PT_
 	    {
 	      dt->info.data_type.units = (int) LANG_SYS_CODESET;
 	      dt->info.data_type.collation_id = LANG_SYS_COLLATION;
-	      if ((arg1 == NULL || arg1->type_enum != PT_TYPE_MAYBE)
-		  && (arg2 == NULL || arg2->type_enum != PT_TYPE_MAYBE)
-		  && (!((PT_NODE_IS_SESSION_VARIABLE (arg1)) && (PT_NODE_IS_SESSION_VARIABLE (arg2)))))
+	      if ((arg1 == NULL || arg1->type_enum != PT_TYPE_MAYBE || arg1->node_type == PT_HOST_VAR)
+		  && (arg2 == NULL || arg2->type_enum != PT_TYPE_MAYBE || arg2->node_type == PT_HOST_VAR))
 		{
-		  /* operator without arguments or with arguments has result with system collation */
+		  /* operator without arguments or with arguments has result with system collation. A host variable
+		   * slot is a system-collation contract and a session variable read is VARCHAR with the system
+		   * collation, so neither leaves the result collation to the execution. Only a residual MAYBE
+		   * expression (STR_TO_DATE with a bound format) still does. */
 		  collation_flag = TP_DOMAIN_COLL_NORMAL;
 		}
 	    }
@@ -19381,6 +19833,13 @@ pt_semantic_type (PARSER_CONTEXT * parser, PT_NODE * tree, SEMANTIC_CHK_INFO * s
       return tree;
     }
 
+  if (sc_info_ptr != NULL && sc_info_ptr->top_node == tree)
+    {
+      /* the whole statement is typed: close the host variable slot contracts before constant folding and the
+       * optimizer consume them */
+      pt_hv_finalize_contracts (parser, tree);
+    }
+
   /* Parsing static sql is only for semantic check. Any kind of execution should be avoided */
   if (!parser->flag.is_parsing_static_sql)
     {
@@ -19651,10 +20110,10 @@ pt_coerce_value_internal (PARSER_CONTEXT * parser, PT_NODE * src, PT_NODE * dest
   switch (src->node_type)
     {
     case PT_HOST_VAR:
-      /* binding of host variables may be delayed in the case of an esql PREPARE statement until an OPEN cursor or an
-       * EXECUTE statement. in this case we seem to have no choice but to assume each host variable is typeless and can
-       * be coerced into any desired type. */
-      if (parser->flag.set_host_var == 0)
+      /* A host variable marker is typed by its SQL context alone, whether or not a driver has already bound a value
+       * (the value is cast to the compiled contract afterwards). Assume it is typeless and coercible into the desired
+       * type; never consult the value, so the compile-then-bind and bind-then-compile flows type it the same way. */
+      if (src->info.host_var.index < parser->host_var_count || parser->flag.set_host_var == 0)
 	{
 	  dest->type_enum = desired_type;
 	  dest->data_type = parser_copy_tree_list (parser, data_type);
@@ -20497,10 +20956,20 @@ pt_between_to_comp_op (PT_OP_TYPE between, PT_OP_TYPE * left, PT_OP_TYPE * right
 static PT_TYPE_ENUM
 pt_get_equivalent_type_with_op (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM arg_type, PT_OP_TYPE op)
 {
-  if (pt_is_op_hv_late_bind (op) && (def_type.type == pt_arg_type::GENERIC && arg_type == PT_TYPE_MAYBE))
+  if (def_type.type == pt_arg_type::GENERIC && arg_type == PT_TYPE_MAYBE)
     {
-      /* leave undetermined type */
-      return PT_TYPE_MAYBE;
+      if (pt_is_op_hv_late_bind (op))
+	{
+	  /* leave undetermined type */
+	  return PT_TYPE_MAYBE;
+	}
+      if (pt_is_symmetric_op (op))
+	{
+	  /* a symmetric operator mirrors the type of its known operand onto the unresolved one in
+	   * pt_infer_common_type (); the generic default of pt_get_equivalent_type () applies only when no operand is
+	   * known, which pt_infer_common_type () decides */
+	  return PT_TYPE_MAYBE;
+	}
     }
   return pt_get_equivalent_type (def_type, arg_type);
 }
@@ -20523,47 +20992,14 @@ pt_get_equivalent_type_with_op (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM a
 bool
 pt_is_op_hv_late_bind (PT_OP_TYPE op)
 {
+  /* Host variable operands are typed at compile time from their SQL context (pt_hv_seed_from_context, the
+   * expression signatures and the statement-level defaults of pt_hv_finalize_contracts); an expression no longer
+   * leaves its result type to the bound values. The one remaining value-dependent result is STR_TO_DATE with a
+   * non-literal format: its result type depends on the format's contents, which only the execution-time residual
+   * resolution can decide, so it is the only operator still marked here. */
   switch (op)
     {
-    case PT_ABS:
-    case PT_CEIL:
-    case PT_FLOOR:
-    case PT_PLUS:
-    case PT_DIVIDE:
-    case PT_MODULUS:
-    case PT_TIMES:
-    case PT_MINUS:
-    case PT_ROUND:
-    case PT_TRUNC:
-    case PT_UNARY_MINUS:
-    case PT_EVALUATE_VARIABLE:
-    case PT_DEFINE_VARIABLE:
-    case PT_ADDTIME:
-    case PT_TO_CHAR:
-    case PT_HEX:
-    case PT_CONV:
-    case PT_ASCII:
-    case PT_IFNULL:
-    case PT_NVL:
-    case PT_NVL2:
-    case PT_COALESCE:
-    case PT_NULLIF:
-    case PT_LEAST:
-    case PT_GREATEST:
-    case PT_FROM_TZ:
-    case PT_NEW_TIME:
     case PT_STR_TO_DATE:
-    case PT_HOURF:
-    case PT_MINUTEF:
-    case PT_SECONDF:
-    case PT_BIT_LENGTH:
-    case PT_OCTET_LENGTH:
-    case PT_TO_DATE:
-    case PT_TO_DATETIME:
-    case PT_TO_DATETIME_TZ:
-    case PT_TO_TIME:
-    case PT_TO_TIMESTAMP:
-    case PT_TO_TIMESTAMP_TZ:
       return true;
 
     default:
@@ -23332,6 +23768,13 @@ pt_fix_enumeration_comparison (PARSER_CONTEXT * parser, PT_NODE * expr)
 	}
       if (pt_is_same_enum_data_type (arg1->data_type, arg2->data_type))
 	{
+	  return expr;
+	}
+      if (arg2->node_type == PT_HOST_VAR && arg2->expected_domain != NULL
+	  && TP_DOMAIN_TYPE (arg2->expected_domain) == DB_TYPE_ENUMERATION)
+	{
+	  /* the marker's slot contract is already this ENUM (pt_hv_seed_from_context): the bound value is converted
+	   * at bind time, no TO_ENUMERATION_VALUE wrapper is needed */
 	  return expr;
 	}
 

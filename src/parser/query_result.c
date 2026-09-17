@@ -984,7 +984,9 @@ pt_fillin_type_size (PARSER_CONTEXT * parser, PT_NODE * query, DB_QUERY_TYPE * l
   for (t = list; s && t; s = s->next, t = t->next)
     {
       t->col_type = pt_get_col_type (parser, s);
-      t->db_type = pt_type_enum_to_db (s->type_enum);
+      /* D-271-09: a host variable output column reports its compiled slot contract at prepare time (a bound value
+       * never changes it); pt_hv_effective_type / pt_node_to_db_domain read the contract of a user marker */
+      t->db_type = pt_type_enum_to_db (pt_hv_effective_type (s));
       t->size = pt_find_size_from_dbtype (t->db_type);
       t->domain = pt_xasl_node_to_domain (parser, s);
       t->src_domain = pt_get_src_domain (parser, s, from_list);

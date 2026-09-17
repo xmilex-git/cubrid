@@ -4028,6 +4028,19 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  goto error;
 	}
+      /* D-276-04: a session variable read is a VARCHAR typed slot; the stored value is converted to the compiled
+       * contract (the plan's domain) here, so the value the consumers see matches the list schema whatever type
+       * the variable was assigned. This is a value conversion, not a domain decision. */
+      if (regu_var->domain != NULL && TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (regu_var->domain))
+	  && !DB_IS_NULL (arithptr->value) && !TP_IS_CHAR_TYPE (DB_VALUE_DOMAIN_TYPE (arithptr->value)))
+	{
+	  dom_status = tp_value_cast (arithptr->value, arithptr->value, regu_var->domain, false);
+	  if (dom_status != DOMAIN_COMPATIBLE)
+	    {
+	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, arithptr->value, regu_var->domain);
+	      goto error;
+	    }
+	}
       break;
 
     case T_DEFINE_VARIABLE:

@@ -168,6 +168,9 @@ extern "C"
   extern void pt_end_query (PARSER_CONTEXT * parser, QUERY_ID query_id_self);
 
   extern void pt_set_host_variables (PARSER_CONTEXT * parser, int count, DB_VALUE * values);
+  extern int pt_bind_host_variable_to_domain (PARSER_CONTEXT * parser, const DB_VALUE * val, DB_VALUE * hv,
+					      TP_DOMAIN * hv_dom);
+  extern int pt_bind_host_variables_to_expected_domains (PARSER_CONTEXT * parser);
   extern DB_VALUE *pt_host_var_db_value (PARSER_CONTEXT * parser, PT_NODE * hv);
   extern PT_NODE *pt_bind_values_to_hostvars (PARSER_CONTEXT * parser, PT_NODE * node);
   extern int pt_resolve_default_value (PARSER_CONTEXT * parser, PT_NODE * name);
@@ -573,6 +576,8 @@ extern "C"
   extern PT_NODE *pt_is_path_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
 
   extern void pt_preset_hostvar (PARSER_CONTEXT * parser, PT_NODE * hv_node);
+  extern PT_TYPE_ENUM pt_hv_effective_type (const PT_NODE * node);
+  extern void pt_hv_finalize_contracts (PARSER_CONTEXT * parser, PT_NODE * tree);
   extern void pt_set_expected_domain (PT_NODE * node, TP_DOMAIN * domain);
   extern int pt_host_var_index (const PT_NODE * hv);
   extern PT_NODE *pt_get_input_host_vars (const PT_HOST_VARS * hv);

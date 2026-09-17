@@ -22,6 +22,11 @@
 
 #include "dbtype.h"
 #include "func_type.hpp"
+#include "language_support.h"
+#include "object_domain.h"
+
+static void pt_hv_set_default_slot (PARSER_CONTEXT *parser, PT_NODE *arg, PT_TYPE_ENUM slot_type);
+static PT_TYPE_ENUM pt_hv_aggregate_slot_type (FUNC_CODE fcode);
 #include "message_catalog.h"
 #include "object_primitive.h"
 #include "parse_tree.h"
@@ -65,28 +70,20 @@ func_all_signatures sig_ret_bigint =
   {PT_TYPE_BIGINT, {}, {}},
 };
 
+/* D-276-03: the interpolation functions take a numeric or a date/time argument. The result type is fixed at compile
+ * time: DOUBLE for a numeric PERCENTILE_CONT / MEDIAN, the argument's own type otherwise. A string argument is a
+ * compile-time error (pt_hv_check_interpolation_arg): the caller writes the CAST that says which type the text is,
+ * instead of the execution guessing it from the first row's contents. */
 func_all_signatures sig_of_percentile_cont =
 {
-#if 1
-  {PT_TYPE_MAYBE, {PT_GENERIC_TYPE_NUMBER}, {}},
-  {0, {PT_GENERIC_TYPE_DATETIME}, {}},
-  {PT_TYPE_MAYBE, {PT_GENERIC_TYPE_STRING}, {}},
-  {0, {PT_TYPE_MAYBE}, {}},
-#else //use double as return type (as documentation says)... but tests are failing (adjust doc or tests)
   {PT_TYPE_DOUBLE, {PT_GENERIC_TYPE_NUMBER}, {}},
-  {0, {PT_GENERIC_TYPE_STRING}, {}},
-  {PT_TYPE_DOUBLE, {PT_GENERIC_TYPE_DATETIME}, {}},
-  {0, {PT_TYPE_MAYBE}, {}},
-  {0, {PT_TYPE_NA}, {}},
-#endif
+  {0, {PT_GENERIC_TYPE_DATETIME}, {}},
 };
 
 func_all_signatures sig_of_percentile_disc =
 {
-  {PT_TYPE_MAYBE, {PT_GENERIC_TYPE_NUMBER}, {}},
+  {0, {PT_GENERIC_TYPE_NUMBER}, {}},
   {0, {PT_GENERIC_TYPE_DATETIME}, {}},
-  {PT_TYPE_MAYBE, {PT_GENERIC_TYPE_STRING}, {}},
-  {0, {PT_TYPE_MAYBE}, {}},
 };
 
 func_all_signatures sig_ret_bigint_arg_discrete =
@@ -118,7 +115,6 @@ func_all_signatures sig_of_count =
 func_all_signatures sig_of_sum =
 {
   {0, {PT_GENERIC_TYPE_NUMBER}, {}},
-  {0, {PT_TYPE_MAYBE}, {}},
   {0, {PT_TYPE_SET}, {}},
   {0, {PT_TYPE_MULTISET}, {}},
   {0, {PT_TYPE_SEQUENCE}, {}},
@@ -135,15 +131,11 @@ func_all_signatures sig_of_ntile =
   {PT_TYPE_INTEGER, {PT_GENERIC_TYPE_NUMBER}, {}}, //argument value will be truncated at execution
 };
 
-/*cannot define a clear signature because casting depends on actual value
-  MEDIAN('123456')     <=> MEDIAN(double) -> double
-  MEDIAN('2018-03-14') <=> MEDIAN(date)   -> date  */
+/* D-276-03: see sig_of_percentile_cont; MEDIAN of a string requires an explicit CAST */
 func_all_signatures sig_of_median =
 {
-  {PT_TYPE_MAYBE, {PT_GENERIC_TYPE_NUMBER}, {}}, //if ret type is double => tests with median(int) will fail
+  {PT_TYPE_DOUBLE, {PT_GENERIC_TYPE_NUMBER}, {}},
   {0, {PT_GENERIC_TYPE_DATETIME}, {}},
-  {PT_TYPE_MAYBE, {PT_GENERIC_TYPE_STRING}, {}},
-  {0, {PT_TYPE_MAYBE}, {}}, //DISCUSSION: can we get rid of MAYBE here??? prepare median(?)...execute with date'2018-06-13'
 };
 
 func_all_signatures sig_ret_type0_arg_scalar =
@@ -738,7 +730,21 @@ namespace func_type
   {
     parser_node *save_next = arg->next;
 
-    if (arg_res.m_type != arg->type_enum)
+    if (arg->node_type == PT_HOST_VAR && arg->type_enum == PT_TYPE_MAYBE
+	&& arg->info.host_var.index < m_parser->host_var_count)
+      {
+	/* an unresolved host variable argument receives the signature's type as its slot contract instead of a
+	 * CAST around a typeless marker: the bound value is converted at bind time (D-271-01/02). A generic
+	 * signature that fixes nothing (ANY, SCALAR) leaves the slot to the statement-level VARCHAR default. */
+	PT_TYPE_ENUM slot_type = arg_res.m_type;
+
+	if (slot_type == PT_TYPE_MAYBE || slot_type == PT_TYPE_NONE)
+	  {
+	    slot_type = PT_TYPE_VARCHAR;
+	  }
+	pt_hv_set_default_slot (m_parser, arg, slot_type);
+      }
+    else if (arg_res.m_type != arg->type_enum)
       {
 	arg = pt_wrap_with_cast_op (m_parser, arg, arg_res.m_type, TP_FLOATING_PRECISION_VALUE, 0, NULL);
 	if (arg == NULL)
@@ -1273,8 +1279,10 @@ namespace func_type
 		return false;
 	      }
 
-	    if (arg_node->type_enum != PT_TYPE_MAYBE)
+	    if (arg_node->type_enum != PT_TYPE_MAYBE || arg_node->node_type == PT_HOST_VAR)
 	      {
+		/* a host variable slot is a system-collation, fully coercible contract: it does not leave the
+		 * result collation to the execution (D-277-05) */
 		compat.m_collation_action = TP_DOMAIN_COLL_NORMAL;
 	      }
 	  }
@@ -1447,6 +1455,94 @@ pt_are_equivalent_types (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM op_type)
   return false;
 }
 
+/*
+ * pt_hv_set_default_slot () - give an open host variable argument its slot contract from the function that consumes
+ *			       it (D-271-01/02): the bound value is converted to it at bind time, no CAST is wrapped
+ *			       around a typeless marker
+ *   parser(in): the parser context
+ *   arg(in/out): the argument; ignored unless it is a user marker without a contract
+ *   slot_type(in): the contract's type; strings get no length limit and no collation of their own (the consumer
+ *		    decides the collation), NUMERIC is the floating NUMERIC
+ */
+static void
+pt_hv_set_default_slot (PARSER_CONTEXT *parser, PT_NODE *arg, PT_TYPE_ENUM slot_type)
+{
+  DB_TYPE db_type;
+  TP_DOMAIN *d;
+
+  if (arg == NULL || arg->node_type != PT_HOST_VAR || arg->type_enum != PT_TYPE_MAYBE
+      || arg->info.host_var.index >= parser->host_var_count
+      || (arg->expected_domain != NULL && TP_DOMAIN_TYPE (arg->expected_domain) != DB_TYPE_UNKNOWN))
+    {
+      return;
+    }
+
+  db_type = pt_type_enum_to_db (slot_type);
+  if (db_type == DB_TYPE_UNKNOWN || db_type == DB_TYPE_VARIABLE)
+    {
+      return;
+    }
+  if (TP_IS_CHAR_TYPE (db_type) || TP_IS_BIT_TYPE (db_type))
+    {
+      d = tp_domain_resolve_default_w_coll (db_type, LANG_SYS_COLLATION, TP_DOMAIN_COLL_LEAVE);
+    }
+  else
+    {
+      d = tp_domain_resolve_default (db_type);
+    }
+  if (d != NULL)
+    {
+      d = tp_domain_cache (d);
+      pt_set_expected_domain (arg, d);
+      pt_preset_hostvar (parser, arg);
+    }
+}
+
+/*
+ * pt_hv_aggregate_slot_type () - the slot contract of an open host variable argument of an aggregate / analytic
+ *				  function typed by pt_eval_function_type_aggregate (): the floating NUMERIC for the
+ *				  numeric aggregates, VARCHAR for the value-preserving ones (D-271-02)
+ */
+static PT_TYPE_ENUM
+pt_hv_aggregate_slot_type (FUNC_CODE fcode)
+{
+  switch (fcode)
+    {
+    case PT_SUM:
+    case PT_AVG:
+    case PT_STDDEV:
+    case PT_STDDEV_POP:
+    case PT_STDDEV_SAMP:
+    case PT_VARIANCE:
+    case PT_VAR_POP:
+    case PT_VAR_SAMP:
+    case PT_MEDIAN:
+    case PT_PERCENTILE_CONT:
+    case PT_PERCENTILE_DISC:
+      return PT_TYPE_NUMERIC;
+    case PT_NTILE:
+      /* the signature says GENERIC NUMBER and the execution truncates the value (ntile(4.5) is ntile(4)); a BIGINT
+       * slot would round the bound value at bind time and differ from the literal form */
+      return PT_TYPE_NUMERIC;
+    case PT_AGG_BIT_AND:
+    case PT_AGG_BIT_OR:
+    case PT_AGG_BIT_XOR:
+      return PT_TYPE_BIGINT;
+    case PT_MIN:
+    case PT_MAX:
+    case PT_FIRST_VALUE:
+    case PT_LAST_VALUE:
+    case PT_NTH_VALUE:
+    case PT_LEAD:
+    case PT_LAG:
+    case PT_COUNT:
+    case PT_GROUP_CONCAT:
+      return PT_TYPE_VARCHAR;
+    default:
+      return PT_TYPE_NONE;
+    }
+}
+
 // TODO: remove me
 #define PT_COLL_WRAP_TYPE_FOR_MAYBE(type) \
   ((PT_IS_CHAR_STRING_TYPE (type)) ? (type) : PT_TYPE_VARCHAR)
@@ -1488,7 +1584,12 @@ pt_eval_function_type_aggregate (PARSER_CONTEXT *parser, PT_NODE *node)
    * accepts more than one.
    */
   check_agg_single_arg = true;
-  arg_type = (arg_list) ? arg_list->type_enum : PT_TYPE_NONE;
+  if (arg_list != NULL && arg_list->node_type == PT_HOST_VAR && arg_list->type_enum == PT_TYPE_MAYBE)
+    {
+      /* an open host variable argument takes the function's slot contract before the checks below read its type */
+      pt_hv_set_default_slot (parser, arg_list, pt_hv_aggregate_slot_type (fcode));
+    }
+  arg_type = (arg_list) ? pt_hv_effective_type (arg_list) : PT_TYPE_NONE;
 
   switch (fcode)
     {
@@ -1848,8 +1949,11 @@ pt_eval_function_type_aggregate (PARSER_CONTEXT *parser, PT_NODE *node)
     case PT_MEDIAN:
     case PT_PERCENTILE_CONT:
     case PT_PERCENTILE_DISC:
+      /* D-276-03: a numeric or a date/time argument only. A string argument is refused at compile time: the
+       * execution used to pick DOUBLE, DATETIME or TIME from the first row's contents; the caller now states the
+       * type with an explicit CAST. */
       if (arg_type != PT_TYPE_NULL && arg_type != PT_TYPE_NA && !PT_IS_NUMERIC_TYPE (arg_type)
-	  && !PT_IS_STRING_TYPE (arg_type) && !PT_IS_DATE_TIME_TYPE (arg_type) && arg_type != PT_TYPE_MAYBE)
+	  && !PT_IS_DATE_TIME_TYPE (arg_type) && arg_type != PT_TYPE_MAYBE)
 	{
 	  PT_ERRORmf2 (parser, node, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_INCOMPATIBLE_OPDS,
 		       fcode_get_lowercase_name (fcode), pt_show_type_enum (arg_type));
@@ -1955,10 +2059,17 @@ pt_eval_function_type_aggregate (PARSER_CONTEXT *parser, PT_NODE *node)
 
 	case PT_MEDIAN:
 	case PT_PERCENTILE_CONT:
+	  /* D-276-03: DOUBLE for a numeric argument (what the execution computes), the argument's own type for a
+	   * date/time argument; the argument type is known at compile time (a string is refused above) */
+	  node->type_enum = (PT_IS_DATE_TIME_TYPE (arg_type) ? arg_type : PT_TYPE_DOUBLE);
+	  node->data_type = (PT_IS_DATE_TIME_TYPE (arg_type) ? parser_copy_tree_list (parser, arg_list->data_type)
+			     : NULL);
+	  break;
+
 	case PT_PERCENTILE_DISC:
-	  /* let calculation decide the type */
-	  node->type_enum = PT_TYPE_MAYBE;
-	  node->data_type = NULL;
+	  /* the argument's own type: the function returns one of its input values */
+	  node->type_enum = arg_type;
+	  node->data_type = parser_copy_tree_list (parser, arg_list->data_type);
 	  break;
 
 	case PT_GROUP_CONCAT:
@@ -2803,6 +2914,12 @@ pt_get_equivalent_type (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM arg_type)
       if (arg_type == PT_TYPE_ENUMERATION)
 	{
 	  return PT_TYPE_SMALLINT;
+	}
+      if (arg_type == PT_TYPE_MAYBE)
+	{
+	  /* D-271-02 / D-276-02: an unresolved host variable in a numeric argument position is the floating
+	   * NUMERIC contract (not DOUBLE: no precision loss for exact inputs) */
+	  return PT_TYPE_NUMERIC;
 	}
       return PT_TYPE_DOUBLE;
 

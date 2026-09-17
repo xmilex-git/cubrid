@@ -91,7 +91,7 @@ static int do_process_prepare_statement (DB_SESSION * session, PT_NODE * stateme
 static int do_get_prepared_statement_info (DB_SESSION * session, int stmt_idx, int *subquery_num,
 					   DB_PREPARE_SUBQUERY_INFO ** subquery_info);
 static int do_set_user_host_variables (DB_SESSION * session, PT_NODE * using_list);
-static int do_cast_host_variables_to_expected_domain (DB_SESSION * session);
+static int do_bind_host_variables_after_compile (DB_SESSION * session, PT_NODE * statement);
 static int do_recompile_and_execute_prepared_statement (DB_SESSION * session, PT_NODE * statement,
 							DB_QUERY_RESULT ** result);
 static int do_replan_statement_with_bind_peek (PARSER_CONTEXT * parser, PT_NODE * statement);
@@ -826,6 +826,7 @@ db_compile_statement_local (DB_SESSION * session)
   DB_QUERY_TYPE *qtype, *q;
   CUBRID_STMT_TYPE cmd_type;
   int err;
+  int save_set_host_var;
   static long seed = 0;
 
   /* obvious error checking - invalid parameter */
@@ -970,11 +971,20 @@ db_compile_statement_local (DB_SESSION * session)
       srand48 (seed = (long) time (NULL));
     }
 
+  /* The semantic pass, the view translation and the result-type filling are value-blind in every client flow: a
+   * user marker ('?') is typed from its SQL context alone, whether or not the driver pushed its values before this
+   * compilation (CAS recompile, EXECUTE PREPARE of DML, db_push_values before db_compile_statement). Hiding the
+   * values here makes those flows compile exactly like PREPARE does, so no compile branch can type or skip a slot
+   * contract from a wire-typed value; the values are bound to the compiled contracts right after (below). */
+  save_set_host_var = parser->flag.set_host_var;
+  parser->flag.set_host_var = 0;
+
   /* do semantic check for the statement */
   statement_result = pt_compile (parser, statement);
 
   if (statement_result == NULL || pt_has_error (parser))
     {
+      parser->flag.set_host_var = save_set_host_var;
       pt_report_to_ersys_with_statement (parser, PT_SEMANTIC, statement);
       return er_errid ();
     }
@@ -1031,6 +1041,7 @@ db_compile_statement_local (DB_SESSION * session)
       statement_result = mq_translate (parser, statement);
       if (!statement_result || pt_has_error (parser))
 	{
+	  parser->flag.set_host_var = save_set_host_var;
 	  pt_report_to_ersys_with_statement (parser, PT_SEMANTIC, statement);
 	  return er_errid ();
 	}
@@ -1040,6 +1051,7 @@ db_compile_statement_local (DB_SESSION * session)
       (void) pt_class_pre_fetch (parser, statement);
       if (pt_has_error (parser))
 	{
+	  parser->flag.set_host_var = save_set_host_var;
 	  pt_report_to_ersys_with_statement (parser, PT_SYNTAX, statement);
 	  return er_errid ();
 	}
@@ -1062,9 +1074,29 @@ db_compile_statement_local (DB_SESSION * session)
 	}
     }
 
-  /* so now, the statement is compiled */
+    /* the statement is compiled: the values a client pushed before compilation are visible again and are bound to
+   * the compiled slot contracts below */
+  parser->flag.set_host_var = save_set_host_var;
+
+/* so now, the statement is compiled */
   session->statements[stmt_ndx] = statement;
   session->stage[stmt_ndx] = StatementCompiledStage;
+
+  /* Single bind order for every client flow: compile first, then bind the values to the compiled slot
+   * contracts. A flow that pushed its values before this compilation (CAS recompile / is_prepared == FALSE,
+   * EXECUTE PREPARE of DML, db_push_values before db_compile_statement) had them kept raw because the expected
+   * domains were still unknown; cast them now, before plan selection and XASL generation consume them. A flow
+   * that binds after compilation (PREPARE/EXECUTE, db_compile_statement then db_push_values) finds nothing to do
+   * here and casts inside pt_set_host_variables (). This is the only place a value is cast to its slot; XASL
+   * generation never re-types a user marker from its value. */
+  if (parser->flag.set_host_var == 1 && parser->host_var_count > 0)
+    {
+      err = do_bind_host_variables_after_compile (session, statement);
+      if (err < 0)
+	{
+	  return err;
+	}
+    }
 
 
   /*
@@ -1080,22 +1112,6 @@ db_compile_statement_local (DB_SESSION * session)
   if (!parser->flag.is_parsing_static_sql && prm_get_integer_value (PRM_ID_XASL_CACHE_MAX_ENTRIES) > 0
       && statement->flag.cannot_prepare == 0)
     {
-      if (session->is_subsession_for_prepared)
-	{
-	  /* cast host variables to their expected domain, before XASL generation. */
-	  session->parser->flag.set_host_var = 0;
-	  err = do_cast_host_variables_to_expected_domain (session);
-	  if (err < 0)
-	    {
-	      if (pt_has_error (parser))
-		{
-		  pt_report_to_ersys_with_statement (parser, PT_SEMANTIC, statement);
-		  return er_errid ();
-		}
-	      return err;
-	    }
-	}
-
       /* now, prepare the statement by calling do_prepare_statement() */
       err = do_prepare_statement (parser, statement);
 #if 0
@@ -3115,6 +3131,9 @@ do_get_prepared_statement_info (DB_SESSION * session, int stmt_idx, int *subquer
   parser->host_variables = prepare_info.host_variables.vals;
   parser->host_var_expected_domains = prepare_info.host_var_expected_domains;
   parser->host_var_count = prepare_info.host_variables.size - prepare_info.auto_param_count;
+  /* db_unpack_prepare_info () unpacks exactly one expected domain per user marker; the auto-parameter slots that
+   * are folded into host_var_count below have none (they are constants), so bound consumers by this size. */
+  parser->host_var_expected_domains_size = parser->host_var_count;
 
   err = do_set_user_host_variables (session, statement->info.execute.using_list);
   if (err != NO_ERROR)
@@ -3194,58 +3213,29 @@ cleanup:
 }
 
 /*
- * do_cast_host_variables_to_expected_domain () - After compilation phase,
- *						  cast all host variables to
- *						  their expected domains
+ * do_bind_host_variables_after_compile () - cast the values a client pushed before compilation to the slot
+ *					     contracts the semantic pass has just compiled
  *
- * return	: error code
- * session (in) : db_session
+ * return	   : error code
+ * session (in)	   : db_session
+ * statement (in)  : the statement just compiled (for the error report)
+ *
+ * Note: with this the bind order is the same in every flow: compile, then bind. The values of a bind-then-compile
+ *	 flow were kept raw by pt_set_host_variables () (unknown contracts); casting them here, before plan selection
+ *	 and XASL generation, is their one and only bind. Slots already bound after compilation are unaffected.
  */
 static int
-do_cast_host_variables_to_expected_domain (DB_SESSION * session)
+do_bind_host_variables_after_compile (DB_SESSION * session, PT_NODE * statement)
 {
-  int hv_count = session->parser->host_var_count;
-  DB_VALUE *host_vars = session->parser->host_variables;
-  TP_DOMAIN **expected_domains = session->parser->host_var_expected_domains;
-  DB_VALUE *hv = NULL;
-  TP_DOMAIN *hv_dom = NULL, *d = NULL;
-  int i = 0;
+  PARSER_CONTEXT *parser = session->parser;
 
-  for (i = 0; i < hv_count; i++)
+  if (pt_bind_host_variables_to_expected_domains (parser) != NO_ERROR || pt_has_error (parser))
     {
-      int prec;
-      DB_TYPE typ;
-
-      hv = &host_vars[i];
-      typ = db_value_type (hv);
-      prec = db_value_precision (hv);
-      hv_dom = expected_domains[i];
-      if (TP_DOMAIN_TYPE (hv_dom) == DB_TYPE_UNKNOWN || hv_dom->type->id == DB_TYPE_ENUMERATION)
-	{
-	  /* skip casting enum and unknown type values */
-	  continue;
-	}
-      if (tp_value_cast_preserve_domain (hv, hv, hv_dom, false, true) != DOMAIN_COMPATIBLE)
-	{
-	  d = pt_type_enum_to_db_domain (pt_db_to_type_enum (TP_DOMAIN_TYPE (hv_dom)));
-	  PT_ERRORmf2 (session->parser, NULL, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_CANT_COERCE_TO, "host var",
-		       d);
-	  tp_domain_free (d);
-	  pt_report_to_ersys (session->parser, PT_EXECUTION);
-	  pt_reset_error (session->parser);
-	  return ER_PT_EXECUTE;
-	}
-
-      if (TP_IS_CHAR_TYPE (hv_dom->type->id))
-	{
-	  if (hv_dom->type->id != typ && (typ == DB_TYPE_VARCHAR))
-	    {
-	      db_value_domain_init (hv, typ, prec, 0);
-	    }
-	}
+      pt_report_to_ersys_with_statement (parser, PT_EXECUTION, statement);
+      pt_reset_error (parser);
+      assert (er_errid () != NO_ERROR);
+      return er_errid ();
     }
-
-  session->parser->flag.set_host_var = 1;
 
   return NO_ERROR;
 }
@@ -3309,7 +3299,7 @@ db_check_where_need_recompile (PARSER_CONTEXT * parent_parser, PT_NODE * stateme
   bool do_recompile = false;
   DB_VALUE *save_host_variables = NULL;
   TP_DOMAIN **save_host_var_expected_domains = NULL;
-  int save_host_var_count, save_auto_param_count;
+  int save_host_var_count, save_auto_param_count, save_host_var_expected_domains_size;
 
   if (statement->node_type != PT_EXECUTE_PREPARE)
     {
@@ -3345,9 +3335,11 @@ db_check_where_need_recompile (PARSER_CONTEXT * parent_parser, PT_NODE * stateme
   save_host_var_count = session->parser->host_var_count;
   save_host_variables = session->parser->host_variables;
   save_host_var_expected_domains = session->parser->host_var_expected_domains;
+  save_host_var_expected_domains_size = session->parser->host_var_expected_domains_size;
 
   session->parser->host_variables = parent_parser->host_variables;
   session->parser->host_var_expected_domains = parent_parser->host_var_expected_domains;
+  session->parser->host_var_expected_domains_size = parent_parser->host_var_expected_domains_size;
   session->parser->host_var_count = parent_parser->host_var_count;
   session->parser->auto_param_count = parent_parser->auto_param_count;
   session->parser->flag.set_host_var = 1;
@@ -3360,6 +3352,7 @@ db_check_where_need_recompile (PARSER_CONTEXT * parent_parser, PT_NODE * stateme
   /* restore host variable info */
   session->parser->host_variables = save_host_variables;
   session->parser->host_var_expected_domains = save_host_var_expected_domains;
+  session->parser->host_var_expected_domains_size = save_host_var_expected_domains_size;
   session->parser->auto_param_count = save_auto_param_count;
   session->parser->host_var_count = save_host_var_count;
   session->parser->flag.set_host_var = 0;
@@ -3395,7 +3388,7 @@ db_check_limit_need_recompile (PARSER_CONTEXT * parent_parser, PT_NODE * stateme
   bool do_recompile = false;
   DB_VALUE *save_host_variables = NULL;
   TP_DOMAIN **save_host_var_expected_domains = NULL;
-  int save_host_var_count, save_auto_param_count;
+  int save_host_var_count, save_auto_param_count, save_host_var_expected_domains_size;
 
   if (statement->node_type != PT_EXECUTE_PREPARE)
     {
@@ -3431,9 +3424,11 @@ db_check_limit_need_recompile (PARSER_CONTEXT * parent_parser, PT_NODE * stateme
   save_host_var_count = session->parser->host_var_count;
   save_host_variables = session->parser->host_variables;
   save_host_var_expected_domains = session->parser->host_var_expected_domains;
+  save_host_var_expected_domains_size = session->parser->host_var_expected_domains_size;
 
   session->parser->host_variables = parent_parser->host_variables;
   session->parser->host_var_expected_domains = parent_parser->host_var_expected_domains;
+  session->parser->host_var_expected_domains_size = parent_parser->host_var_expected_domains_size;
   session->parser->host_var_count = parent_parser->host_var_count;
   session->parser->auto_param_count = parent_parser->auto_param_count;
   session->parser->flag.set_host_var = 1;
@@ -3447,6 +3442,7 @@ db_check_limit_need_recompile (PARSER_CONTEXT * parent_parser, PT_NODE * stateme
   /* restore host variable info */
   session->parser->host_variables = save_host_variables;
   session->parser->host_var_expected_domains = save_host_var_expected_domains;
+  session->parser->host_var_expected_domains_size = save_host_var_expected_domains_size;
   session->parser->auto_param_count = save_auto_param_count;
   session->parser->host_var_count = save_host_var_count;
   session->parser->flag.set_host_var = 0;
@@ -3582,14 +3578,8 @@ do_reexecute_prepared_statement_from_kept_tree (DB_SESSION * session, DB_SESSION
   assert (statement->node_type == PT_EXECUTE_PREPARE);
   assert (kept != NULL && kept->statements != NULL && kept->statements[0] != NULL);
 
+  /* the kept subsession is compiled: pt_set_host_variables () casts the USING values to the slot contracts */
   err = do_set_user_host_variables (kept, statement->info.execute.using_list);
-  if (err != NO_ERROR)
-    {
-      return err;
-    }
-
-  kept->parser->flag.set_host_var = 0;
-  err = do_cast_host_variables_to_expected_domain (kept);
   if (err != NO_ERROR)
     {
       return err;
@@ -3705,13 +3695,14 @@ do_recompile_and_execute_prepared_statement (DB_SESSION * session, PT_NODE * sta
        * host-variable peeking shape the replacement plan (and dump it for SET TRACE).
        * Compile-first is kept only for the unpeeked first execution, whose value-typed
        * replan runs separately below. */
+      /* the values are pushed raw (the slot contracts are not compiled yet); db_compile_statement () casts
+       * them to the contracts right after the semantic pass, before plan selection consumes them */
       assert (session->parser->flag.set_host_var == 1);
       err = do_set_user_host_variables (new_session, statement->info.execute.using_list);
       if (err != NO_ERROR)
 	{
 	  return err;
 	}
-      new_session->parser->flag.set_host_var = 0;
 
       idx = db_compile_statement (new_session);
       if (idx < 0)
@@ -3722,36 +3713,20 @@ do_recompile_and_execute_prepared_statement (DB_SESSION * session, PT_NODE * sta
     }
   else
     {
-      /* compile exactly like PREPARE does: the host variables are still unbound, so the
-       * in-compile expected-domain cast (db_compile_statement's subsession block) must not
-       * run -- besides having nothing to cast, it flips set_host_var on, and XASL
-       * generation would then derive the select-list host variables' domains from the
-       * unbound (NULL) values, baking a NULL-domain coercion into the plan: whatever the
-       * user binds afterwards would be fetched as NULL. The values are bound and cast to
-       * their expected domains right below, like the db_compile/db_push_values flow. */
-      new_session->is_subsession_for_prepared = false;
+      /* compile exactly like PREPARE does, with the host variables unbound: the semantic pass types them from
+       * their SQL context and XASL generation takes the compiled contract (never a value). The values are bound
+       * and cast to those contracts right below, like the db_compile/db_push_values flow. */
       idx = db_compile_statement (new_session);
-      new_session->is_subsession_for_prepared = true;
       if (idx < 0)
 	{
 	  assert (er_errid () != NO_ERROR);
 	  return er_errid ();
 	}
 
-      /* set host variable values in new session */
+      /* set host variable values in new session: the statement is compiled, so pt_set_host_variables ()
+       * casts them to the slot contracts */
       assert (session->parser->flag.set_host_var == 1);
       err = do_set_user_host_variables (new_session, statement->info.execute.using_list);
-      if (err != NO_ERROR)
-	{
-	  return err;
-	}
-      new_session->parser->flag.set_host_var = 0;
-    }
-
-  if (new_session->parser->flag.set_host_var == 0)
-    {
-      /* Cast host variable to expected domain, if not already casted in db_compile_statement. */
-      err = do_cast_host_variables_to_expected_domain (new_session);
       if (err != NO_ERROR)
 	{
 	  return err;
@@ -4327,6 +4302,7 @@ db_close_session_local (DB_SESSION * session)
     }
 
   parser->host_var_count = parser->auto_param_count = 0;
+  parser->host_var_expected_domains_size = 0;
 
   pt_free_orphans (session->parser);
   parser_free_parser (session->parser);

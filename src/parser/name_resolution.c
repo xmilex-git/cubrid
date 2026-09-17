@@ -1060,6 +1060,17 @@ pt_bind_type_of_host_var (PARSER_CONTEXT * parser, PT_NODE * hv)
 {
   DB_VALUE *val = NULL;
 
+  if (hv->info.host_var.index < parser->host_var_count)
+    {
+      /* A user marker ('?') is typed from its SQL context by the semantic pass, never from the value a driver
+       * happens to have bound before compilation (bind-then-compile flows: CAS recompile, EXECUTE PREPARE of DML).
+       * Typing it from the value would make the compiled contract depend on the driver's wire type, so the same
+       * statement would compile differently in the compile-then-bind flow. The bound value is cast to the
+       * contract after compilation (pt_bind_host_variables_to_expected_domains). Auto-parameterized literals
+       * (index >= host_var_count) are constants and keep their value's type. */
+      return;
+    }
+
   val = pt_host_var_db_value (parser, hv);
   if (val)
     {
@@ -11908,6 +11919,8 @@ pt_parameterize_for_static_sql (PARSER_CONTEXT * parser, PT_NODE * name_node)
   parser->host_var_expected_domains[parser->host_var_count] = pt_type_enum_to_db_domain (PT_TYPE_NONE);
 
   ++parser->host_var_count;
+  /* the expected-domain array always has exactly one valid entry per user marker */
+  parser->host_var_expected_domains_size = parser->host_var_count;
   larger_host_variables = NULL;
   larger_host_var_expected_domains = NULL;
 

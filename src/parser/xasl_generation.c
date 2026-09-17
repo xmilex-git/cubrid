@@ -6409,6 +6409,64 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
       /* determine the domain of this host var */
       regu->domain = NULL;
 
+      if (node->info.host_var.index < parser->host_var_count)
+	{
+	  /* A user marker carries the slot contract the semantic pass compiled (pt_hv_finalize_contracts): that
+	   * contract is the plan's domain. The bound value is never consulted: the same statement compiles to the
+	   * same plan whether the driver bound before or after compilation, and the value is converted to the
+	   * contract at bind time (pt_bind_host_variable_to_domain). A string slot without a consumer-decided
+	   * collation uses the compile environment's default; the plan never resolves a collation from a value. */
+	  TP_DOMAIN *slot = node->expected_domain;
+
+	  if (slot == NULL || TP_DOMAIN_TYPE (slot) == DB_TYPE_UNKNOWN || TP_DOMAIN_TYPE (slot) == DB_TYPE_VARIABLE)
+	    {
+	      /* every marker of a compiled statement has a contract; this is a compiler defect, not a bind issue */
+	      PT_INTERNAL_ERROR (parser, "unresolved slot contract of host var");
+	      return NULL;
+	    }
+	  if (TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (slot)) && TP_DOMAIN_COLLATION_FLAG (slot) != TP_DOMAIN_COLL_NORMAL)
+	    {
+	      TP_DOMAIN *d = tp_domain_copy (slot, false);
+
+	      if (d == NULL)
+		{
+		  goto error_exit;
+		}
+	      if (TP_DOMAIN_COLLATION_FLAG (slot) == TP_DOMAIN_COLL_LEAVE)
+		{
+		  d->codeset = LANG_SYS_CODESET;
+		  d->collation_id = LANG_SYS_COLLATION;
+		}
+	      d->collation_flag = TP_DOMAIN_COLL_NORMAL;
+	      slot = tp_domain_cache (d);
+	    }
+	  regu->domain = slot;
+
+	  if (parser->flag.set_host_var == 0 && typ == DB_TYPE_NULL)
+	    {
+	      /* not bound yet: preset the place holder to the contract, the bind converts the value to it */
+	      (void) db_value_domain_init (val, TP_DOMAIN_TYPE (regu->domain), regu->domain->precision,
+					   regu->domain->scale);
+	      if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (regu->domain)))
+		{
+		  db_string_put_cs_and_collation (val, TP_DOMAIN_CODESET (regu->domain),
+						  TP_DOMAIN_COLLATION (regu->domain));
+		}
+	    }
+	  else if (parser->flag.set_host_var == 1 && !DB_IS_NULL (val)
+		   && DB_VALUE_DOMAIN_TYPE (val) != TP_DOMAIN_TYPE (regu->domain))
+	    {
+	      /* the bind converts every value to its contract before XASL generation (db_compile_statement,
+	       * pt_set_host_variables); a mismatch here is a missed bind, not something to repair from the value */
+	      assert (false);
+	      PT_INTERNAL_ERROR (parser, "host var value not bound to its slot contract");
+	      return NULL;
+	    }
+
+	  return regu;
+	}
+
+      /* an auto-parameterized literal (index >= host_var_count): a constant whose value decides its domain */
       if (node->data_type)
 	{
 	  /* try to get domain info from its data_type */
@@ -11573,8 +11631,10 @@ pt_to_key_limit (PARSER_CONTEXT * parser, PT_NODE * key_limit, QO_LIMIT_INFO * l
       /* user explicitly specifies keylimit */
       key_infop->is_user_given_keylimit = true;
 
-      if (limit_u->type_enum == PT_TYPE_MAYBE)
+      if (limit_u->type_enum == PT_TYPE_MAYBE && limit_u->expected_domain == NULL)
 	{
+	  /* a user marker already carries its compiled BIGINT contract (pt_hv_seed_limit_slots); the scan coerces
+	   * the fetched value to BIGINT, so a contract is never overridden here */
 	  limit_u->expected_domain = dom_bigint;
 	}
       regu_var_u = pt_to_regu_variable (parser, limit_u, UNBOX_AS_VALUE);
@@ -11586,7 +11646,7 @@ pt_to_key_limit (PARSER_CONTEXT * parser, PT_NODE * key_limit, QO_LIMIT_INFO * l
       limit_l = limit_u->next;
       if (limit_l != NULL)
 	{
-	  if (limit_l->type_enum == PT_TYPE_MAYBE)
+	  if (limit_l->type_enum == PT_TYPE_MAYBE && limit_l->expected_domain == NULL)
 	    {
 	      limit_l->expected_domain = dom_bigint;
 	    }

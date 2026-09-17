@@ -23990,6 +23990,8 @@ parser_main (PARSER_CONTEXT * parser)
 		  parser->host_var_expected_domains[i] =
 		      tp_domain_resolve_default (DB_TYPE_UNKNOWN);
 		}
+	      /* one contract entry per user marker of this text (D-276-08) */
+	      parser->host_var_expected_domains_size = parser->host_var_count;
 	    }
 	  else
 	    {

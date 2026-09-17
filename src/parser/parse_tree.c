@@ -1203,6 +1203,7 @@ parser_create_parser (void)
   parser->flag.is_xasl_pinned_reference = 0;
   parser->flag.recompile_xasl_pinned = 0;
   parser->auto_param_count = 0;
+  parser->host_var_expected_domains_size = 0;
   parser->flag.return_generated_keys = 0;
   parser->flag.is_system_generated_stmt = 0;
   parser->flag.has_internal_error = 0;

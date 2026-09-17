@@ -563,6 +563,7 @@ struct trace_json_t;
                  CLEAR_HOST_VARIABLES(parser_); } \
              parser_->host_variables = parent_parser->host_variables; \
 	     parser_->host_var_expected_domains = parent_parser->host_var_expected_domains; \
+	     parser_->host_var_expected_domains_size = parent_parser->host_var_expected_domains_size; \
              parser_->host_var_count = parent_parser->host_var_count; \
              parser_->auto_param_count = parent_parser->auto_param_count; \
              parser_->flag.set_host_var = 1; } } while (0)
@@ -571,6 +572,7 @@ struct trace_json_t;
     do { if (parent_parser) { \
              parser_->host_variables = NULL; parser_->host_var_count = 0; \
 	     parser_->host_var_expected_domains = NULL; \
+	     parser_->host_var_expected_domains_size = 0; \
              parser_->auto_param_count = 0; parser_->flag.set_host_var = 0; } } while (0)
 
 #endif /* !SERVER_MODE */
@@ -3913,6 +3915,11 @@ struct parser_context
   QUERY_ID query_id;		/* id assigned to current query */
   DB_VALUE *host_variables;	/* host variables place holder; DB_VALUE array */
   TP_DOMAIN **host_var_expected_domains;	/* expected domains for host variables */
+  int host_var_expected_domains_size;	/* number of valid entries in host_var_expected_domains: exactly the
+					 * user markers ('?') of the compiled text. host_var_count may exceed it
+					 * once EXECUTE PREPARE folds the auto-parameters into the user count
+					 * (do_get_prepared_statement_info); every consumer of the expected
+					 * domains bounds itself by this size, never by host_var_count. */
   EXECUTION_STATE_VALUES execution_values;	/* values kept across the execution of statements during a client
 						 * session. */
   int host_var_count;		/* number of input host variables */

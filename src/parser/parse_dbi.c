@@ -2292,6 +2292,25 @@ pt_node_to_db_domain (PARSER_CONTEXT * parser, PT_NODE * node, const char *class
 	  break;
 	}
     }
+  else if (node->node_type == PT_HOST_VAR && node->type_enum == PT_TYPE_MAYBE
+	   && node->info.host_var.index < parser->host_var_count && node->expected_domain != NULL
+	   && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_UNKNOWN
+	   && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_VARIABLE)
+    {
+      /* a user marker's domain is its compiled slot contract; a string slot no consumer constrained has the compile
+       * environment's collation (the same normalization XASL generation applies) */
+      retval = tp_domain_copy (node->expected_domain, false);
+      if (retval != NULL && TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (retval))
+	  && retval->collation_flag != TP_DOMAIN_COLL_NORMAL)
+	{
+	  if (retval->collation_flag == TP_DOMAIN_COLL_LEAVE)
+	    {
+	      retval->codeset = LANG_SYS_CODESET;
+	      retval->collation_id = LANG_SYS_COLLATION;
+	    }
+	  retval->collation_flag = TP_DOMAIN_COLL_NORMAL;
+	}
+    }
   else
     {
       retval = pt_type_enum_to_db_domain (node->type_enum);
@@ -3072,7 +3091,6 @@ void
 pt_set_host_variables (PARSER_CONTEXT * parser, int count, DB_VALUE * values)
 {
   DB_VALUE *val, *hv;
-  DB_TYPE typ;
   TP_DOMAIN *hv_dom;
   int i, is_ref = 0;
 
@@ -3107,33 +3125,110 @@ pt_set_host_variables (PARSER_CONTEXT * parser, int count, DB_VALUE * values)
 	}
 
       pr_clear_value (hv);
-      hv_dom = parser->host_var_expected_domains[i];
-      if (TP_DOMAIN_TYPE (hv_dom) == DB_TYPE_UNKNOWN || hv_dom->type->id == DB_TYPE_ENUMERATION)
+      if (i < parser->host_var_expected_domains_size)
 	{
-	  pr_clone_value (val, hv);
+	  hv_dom = parser->host_var_expected_domains[i];
 	}
       else
 	{
-	  DB_TYPE val_type = db_value_type (val);
+	  /* a marker of a statement whose text was not compiled by this parser (EXECUTE PREPARE folds the
+	   * auto-parameters into host_var_count); it has no contract here and is bound when it is compiled */
+	  assert (parser->host_var_expected_domains_size == 0 || i >= parser->host_var_expected_domains_size);
+	  hv_dom = NULL;
+	}
 
-	  if (tp_value_cast_preserve_domain (val, hv, hv_dom, false, true) != DOMAIN_COMPATIBLE)
-	    {
-	      typ = TP_DOMAIN_TYPE (hv_dom);
-	      PT_ERRORmf2 (parser, NULL, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_CANT_COERCE_TO, "host var",
-			   pt_type_enum_to_db_domain_name (pt_db_to_type_enum (typ)));
-	      return;
-	    }
-	  if (TP_IS_CHAR_TYPE (hv_dom->type->id))
-	    {
-	      if (hv_dom->type->id != val_type && (val_type == DB_TYPE_VARCHAR))
-		{
-		  pr_clone_value (val, hv);
-		}
-	    }
+      if (pt_bind_host_variable_to_domain (parser, val, hv, hv_dom) != NO_ERROR)
+	{
+	  return;
 	}
     }
 
   parser->flag.set_host_var = 1;	/* OK */
+}
+
+/*
+ * pt_bind_host_variable_to_domain () - the single place a bound value is converted to its slot contract
+ *   return: NO_ERROR, or ER_FAILED with the parser error set
+ *   parser(in): the parser context
+ *   val(in): the value the client bound (may alias hv)
+ *   hv(out): the slot in parser->host_variables
+ *   hv_dom(in): the slot contract the semantic pass compiled, or NULL / an unknown-type domain when the
+ *		 statement holding the marker is not compiled yet (the value is kept raw until it is)
+ *
+ * Note: the contract is applied exactly as compiled: a known ENUM converts the label or ordinal now (no
+ *	 pass-through to the scan), a CHAR contract stays CHAR whatever the wire type of the value was, a NUMERIC
+ *	 contract changes the type only and keeps the value's precision/scale, string contracts convert the
+ *	 charset and tag the collation the consumer decided. A NULL value becomes the typed NULL of the contract.
+ */
+int
+pt_bind_host_variable_to_domain (PARSER_CONTEXT * parser, const DB_VALUE * val, DB_VALUE * hv, TP_DOMAIN * hv_dom)
+{
+  TP_DOMAIN_STATUS status;
+
+  if (hv_dom == NULL || TP_DOMAIN_TYPE (hv_dom) == DB_TYPE_UNKNOWN)
+    {
+      if (val != hv)
+	{
+	  pr_clone_value (val, hv);
+	}
+      return NO_ERROR;
+    }
+
+  if (TP_DOMAIN_TYPE (hv_dom) == DB_TYPE_NUMERIC)
+    {
+      /* D-271-03 / D-277-02: a NUMERIC slot is the floating NUMERIC. Casting into the default NUMERIC domain
+       * (precision DB_DEFAULT_NUMERIC_PRECISION marks it floating) changes the type only: the value's own precision
+       * and scale are kept in the value header (numeric_db_value_coerce_to_num), whatever (p,s) a partner column
+       * had. A fixed (p,s) is applied by the consumer that requires it (assignment target, explicit CAST). */
+      hv_dom = tp_domain_resolve_default (DB_TYPE_NUMERIC);
+    }
+
+  status = tp_value_cast_preserve_domain (val, hv, hv_dom, false, true);
+
+  if (status != DOMAIN_COMPATIBLE)
+    {
+      PT_ERRORmf2 (parser, NULL, MSGCAT_SET_PARSER_SEMANTIC, MSGCAT_SEMANTIC_CANT_COERCE_TO, "host var",
+		   pt_type_enum_to_db_domain_name (pt_db_to_type_enum (TP_DOMAIN_TYPE (hv_dom))));
+      return ER_FAILED;
+    }
+
+  return NO_ERROR;
+}
+
+/*
+ * pt_bind_host_variables_to_expected_domains () - cast the values already pushed into parser->host_variables to
+ *						   the slot contracts the semantic pass has just compiled
+ *   return: NO_ERROR, or ER_FAILED with the parser error set
+ *   parser(in): the parser context, values present (flag.set_host_var == 1)
+ *
+ * Note: called by db_compile_statement () right after compilation for the flows that push their values before
+ *	 compiling (CAS recompile, EXECUTE PREPARE of DML, db_push_values before db_compile_statement): those values
+ *	 were kept raw by pt_set_host_variables () because their contracts were unknown. Slots the semantic pass did
+ *	 not type (a marker of another, not yet compiled statement of the same session) stay raw. Applying a
+ *	 contract to an already converted value is a no-op, so a flow that bound after compilation is unaffected.
+ */
+int
+pt_bind_host_variables_to_expected_domains (PARSER_CONTEXT * parser)
+{
+  int i, n;
+
+  if (parser == NULL || parser->host_variables == NULL || parser->host_var_expected_domains == NULL)
+    {
+      return NO_ERROR;
+    }
+
+  /* host_var_count may include the folded auto-parameters of an EXECUTE PREPARE (no contract entries) */
+  n = MIN (parser->host_var_count, parser->host_var_expected_domains_size);
+  for (i = 0; i < n; i++)
+    {
+      if (pt_bind_host_variable_to_domain (parser, &parser->host_variables[i], &parser->host_variables[i],
+					   parser->host_var_expected_domains[i]) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
+
+  return NO_ERROR;
 }
 
 /*
