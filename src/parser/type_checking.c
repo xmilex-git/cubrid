@@ -9621,6 +9621,24 @@ pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
 	      return;
 	    }
 	}
+      else if ((op == PT_PLUS || op == PT_MINUS) && PT_IS_DISCRETE_NUMBER_TYPE (known_type)
+		&& known->node_type == PT_NAME)
+	{
+	  /* R6 (D-271-03/D-277-02): a discrete-integer *column* ('i1 - ?') mirrors its exact declared type onto
+	   * the marker just like the D-271-02(5) literal case ('? + 1'), but a column, unlike a literal, still
+	   * needs to accept whatever numeric value the caller actually has -- baseline let i1(3) - ?:0.12313e1
+	   * (a DOUBLE bind) keep its fractional part (1.7687), and a plain INTEGER contract silently truncates it
+	   * to 1 first (giving 2). Widen the contract to the floating NUMERIC (the value keeps its own precision
+	   * and scale, D-277-02) so an INTEGER bind (no fraction to lose) and a DOUBLE/NUMERIC bind (fraction
+	   * preserved) both come out right; the arithmetic result's own scale is still driven by the wider of the
+	   * two operands, same as any other NUMERIC-vs-INTEGER expression.
+	   * Scoped to +/- only: '? / i1' and '? MOD i1' against an INTEGER column have their own baseline
+	   * semantics (integer-truncating division/modulus when both sides are integral) that a NUMERIC-typed
+	   * divisor changes outright (confirmed regression: sum(?/i1) over i1 IN (3,30) USING 20 went from the
+	   * baseline's truncating-integer-division sum 6 to the NUMERIC-division sum 7.333...), not merely a
+	   * precision-loss fix -- those operators need their own, more careful pass, not this one. */
+	  type = PT_TYPE_NUMERIC;
+	}
     }
   else
     {
