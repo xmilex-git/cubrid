@@ -9321,7 +9321,7 @@ pt_hv_prefer_string_overload (PARSER_CONTEXT * parser, const EXPRESSION_DEFINITI
 static void
 pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index, SEMANTIC_CHK_INFO * sc_info)
 {
-  PT_NODE *l, *idx, *save_next;
+  PT_NODE *l, *idx, *save_next, *prev;
 
   if (parser->host_var_count <= 0)
     {
@@ -9349,19 +9349,38 @@ pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * usin
     {
       if (idx->node_type == PT_NAME)
 	{
-	  for (l = idx->info.name.indx_key_limit; l != NULL; l = l->next)
+	  prev = NULL;
+	  for (l = idx->info.name.indx_key_limit; l != NULL; l = save_next)
 	    {
+	      save_next = l->next;
 	      if (l->node_type == PT_EXPR && l->type_enum == PT_TYPE_NONE)
 		{
-		  save_next = l->next;
 		  l->next = NULL;
 		  (void) parser_walk_tree (parser, l, pt_hv_seed_bigint_pre, NULL, NULL, NULL);
-		  (void) pt_semantic_type (parser, l, sc_info);
-		  l->next = save_next;
+		  /* pt_semantic_type () may constant-fold 'l' into a different node (e.g. '9-9' -> 0); the result
+		   * has to be spliced back into the list explicitly, or indx_key_limit / the previous node's
+		   * ->next keeps pointing at the stale pre-fold node and the paired key limit value is lost */
+		  l = pt_semantic_type (parser, l, sc_info);
+		  if (l != NULL)
+		    {
+		      l->next = save_next;
+		    }
+		  if (prev != NULL)
+		    {
+		      prev->next = l;
+		    }
+		  else
+		    {
+		      idx->info.name.indx_key_limit = l;
+		    }
 		}
 	      else
 		{
 		  pt_hv_seed_slot (parser, l, PT_TYPE_BIGINT, NULL);
+		}
+	      if (l != NULL)
+		{
+		  prev = l;
 		}
 	    }
 	}
