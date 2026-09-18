@@ -9688,7 +9688,14 @@ pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
 	{
 	  if (numeric)
 	    {
-	      type = PT_TYPE_INTEGER;
+	      /* The ENUM is promoted to its ordinal, so the marker is a number. Which number follows the same rule as
+	       * the discrete-integer column below (R6): '+'/'-' must still accept whatever numeric value the caller
+	       * actually has -- an INTEGER contract silently rounds a DOUBLE bind ('e1 + ?:1.1' came out 2 instead of
+	       * the baseline's 2.1, and a BIGINT bind was rejected outright), and a silently changed value is exactly
+	       * what this map forbids (D-276-01, no escape hatch). The floating NUMERIC keeps the bound value's own
+	       * precision and scale (D-277-02). Scoped to '+'/'-' for the same reason as the column case: '/' and MOD
+	       * over two integral operands truncate by their own semantics, which a NUMERIC divisor would change. */
+	      type = (op == PT_PLUS || op == PT_MINUS) ? PT_TYPE_NUMERIC : PT_TYPE_INTEGER;
 	      known = NULL;
 	    }
 	  else if (!pt_is_range_or_comp (op))
