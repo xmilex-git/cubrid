@@ -1291,12 +1291,15 @@ ux_execute (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_row,
       int result_cache_lifetime;
       char include_column_info;
 
-      if (db_check_single_query (session) == NO_ERROR)
+      if (db_check_single_query (session) == NO_ERROR
+	  && (srv_handle->q_result == NULL || !srv_handle->q_result->has_variable_column))
 	{
 	  include_column_info = 0;
 	}
       else
 	{
+	  /* a batch re-sends the column list of the statement that just ran; so does a statement that carries a
+	   * value dependent column, whose type this execution alone determined (D-272-06) */
 	  include_column_info = 1;
 	}
 
@@ -1636,12 +1639,15 @@ ux_execute_all (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max_
       int result_cache_lifetime;
       char include_column_info;
 
-      if (db_check_single_query (session) == NO_ERROR)
+      if (db_check_single_query (session) == NO_ERROR
+	  && (srv_handle->q_result == NULL || !srv_handle->q_result->has_variable_column))
 	{
 	  include_column_info = 0;
 	}
       else
 	{
+	  /* a batch re-sends the column list of the statement that just ran; so does a statement that carries a
+	   * value dependent column, whose type this execution alone determined (D-272-06) */
 	  include_column_info = 1;
 	}
 
@@ -1833,12 +1839,15 @@ ux_execute_call (T_SRV_HANDLE * srv_handle, char flag, int max_col_size, int max
       int result_cache_lifetime;
       char include_column_info;
 
-      if (db_check_single_query (session) == NO_ERROR)
+      if (db_check_single_query (session) == NO_ERROR
+	  && (srv_handle->q_result == NULL || !srv_handle->q_result->has_variable_column))
 	{
 	  include_column_info = 0;
 	}
       else
 	{
+	  /* a batch re-sends the column list of the statement that just ran; so does a statement that carries a
+	   * value dependent column, whose type this execution alone determined (D-272-06) */
 	  include_column_info = 1;
 	}
 
@@ -6853,6 +6862,20 @@ prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_R
 	  return ERROR_INFO_SET (db_error_code (), DBMS_ERROR_INDICATOR);
 	}
 
+      /* At prepare time a value dependent column is still undetermined and is reported as such; once the statement
+       * has run, this execution's result carries the type that was pinned before the scan started, and that is
+       * what this response must report (D-272-06).  column_info is a private copy, so the prepared statement keeps
+       * its undetermined column for the next execution. */
+      if (q_result->result != NULL)
+	{
+	  (void) db_query_pin_variable_column_types ((DB_QUERY_RESULT *) q_result->result, column_info);
+	}
+      else
+	{
+	  /* prepare time: the loop below re-reads which columns are still undetermined */
+	  q_result->has_variable_column = FALSE;
+	}
+
       net_buf_cp_byte (net_buf, updatable_flag);
 
       num_cols = 0;
@@ -6926,6 +6949,12 @@ prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_R
 
 	  domain = db_query_format_domain (col);
 	  db_type = TP_DOMAIN_TYPE (domain);
+
+	  if (db_type == DB_TYPE_VARIABLE)
+	    {
+	      /* still undetermined here: only an execution can tell this column's type */
+	      q_result->has_variable_column = TRUE;
+	    }
 
 
 	  if (TP_IS_SET_TYPE (db_type))

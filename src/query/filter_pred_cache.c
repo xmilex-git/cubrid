@@ -407,11 +407,16 @@ fpcache_claim (THREAD_ENTRY * thread_p, BTID * btid, or_predicate * or_pred, pre
       HL_HEAPID old_private_heap = db_change_private_heap (thread_p, 0);
       error_code =
 	stx_map_stream_to_filter_pred (thread_p, filter_pred, or_pred->pred_stream, or_pred->pred_stream_size);
+      (void) db_change_private_heap (thread_p, old_private_heap);
       if (error_code != NO_ERROR)
 	{
+	  /* The caller expects a usable predicate expression on NO_ERROR (it asserts *filter_pred != NULL and then
+	   * evaluates it).  Returning NO_ERROR here left it with NULL, so a predicate that could not be loaded was
+	   * silently treated as "no filter" - the load boundary must report its failures instead. */
 	  ASSERT_ERROR ();
+	  assert (*filter_pred == NULL);
+	  return error_code;
 	}
-      (void) db_change_private_heap (thread_p, old_private_heap);
     }
   return NO_ERROR;
 }

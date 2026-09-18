@@ -90,6 +90,12 @@ struct xasl_state
   VAL_DESCR vd;			/* Value Descriptor */
   QUERY_ID query_id;		/* Query associated with XASL */
   int qp_xasl_line;		/* Error line */
+
+  /* Answers of this execution's domain pin gate (see DOMAIN_PIN_PLAN in xasl.h), indexed by pin_id; NULL when the
+   * plan has no residual type.  The entries are interned built-in domains, not owned copies, so a parallel worker
+   * installs them into its own clone by copying pointers - nothing here is freed twice or across threads. */
+  TP_DOMAIN **pinned_domains;
+  int pinned_cnt;
 };
 
 extern qfile_list_id *qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt,
@@ -114,6 +120,8 @@ extern int qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, xasl_nod
 extern qfile_list_id *qexec_get_xasl_list_id (xasl_node * xasl);
 extern xasl_state *qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state);
 extern void qexec_free_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state);
+extern int qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root,
+					xasl_state * worker_state, const xasl_state * root_state);
 #if defined(CUBRID_DEBUG)
 extern void get_xasl_dumper_linked_in ();
 #endif

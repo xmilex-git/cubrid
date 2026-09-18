@@ -79,6 +79,42 @@ struct xasl_node_header
 
 #define XASL_NODE_HEADER_SIZE OR_INT_SIZE + OR_INT_SIZE	/* xasl_flag + id */
 
+/*
+ * Execution-time domain pin plan.
+ *
+ * Compilation types every expression it can (pt_hv_seed_from_context () and the statement defaults of
+ * pt_hv_finalize_contracts ()).  Exactly one result type is still value dependent: STR_TO_DATE () whose format
+ * argument is not a literal.  The type checker restricts that argument to a literal, an input host variable or a
+ * session variable (pt_eval_type (), PT_STR_TO_DATE), so the format's value is always available *before* the query
+ * starts - never only from a row.  The plan below carries the recipe (which value to classify) and the uses (which
+ * consumer domains to install the answer into); the answer itself is execution state (XASL_STATE::pinned_domains),
+ * never a field of the shared plan.  A statement with no residual has a NULL plan: no array, no traversal.
+ */
+typedef struct domain_pin_recipe DOMAIN_PIN_RECIPE;
+struct domain_pin_recipe
+{
+  /* The value to classify: an input host variable slot (bound before the gate runs), a session variable, or a
+   * constant of the plan.  Any other shape is rejected when the plan is loaded, so the gate reads this one value
+   * without evaluating a row, a sub-query or anything with a side effect. */
+  REGU_VARIABLE *format_regu;
+};
+
+typedef struct domain_pin_use DOMAIN_PIN_USE;
+struct domain_pin_use
+{
+  REGU_VARIABLE *owner_regu;	/* the T_STR_TO_DATE regu whose domain the pinned answer completes */
+  int pin_id;			/* index into DOMAIN_PIN_PLAN::recipes */
+};
+
+typedef struct domain_pin_plan DOMAIN_PIN_PLAN;
+struct domain_pin_plan
+{
+  DOMAIN_PIN_RECIPE *recipes;
+  DOMAIN_PIN_USE *uses;
+  int n_recipes;
+  int n_uses;
+};
+
 #define OR_PACK_XASL_NODE_HEADER(PTR, X) \
   do \
     { \
@@ -1214,6 +1250,8 @@ struct xasl_node
   int *tcard_list;		/* list of #pages of the class OIDs */
   const char *query_alias;
   int dbval_cnt;		/* number of host variables in this XASL */
+  DOMAIN_PIN_PLAN *domain_pin_plan;	/* residual domains of the whole statement, resolved before the mainblock
+					 * starts; only the root node of an execution carries one (NULL otherwise) */
   bool iscan_oid_order;
 
   SQ_CACHE *sq_cache;

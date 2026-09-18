@@ -618,6 +618,8 @@ static SCAN_CODE qexec_init_next_partition (THREAD_ENTRY * thread_p, ACCESS_SPEC
 
 static int qexec_check_limit_clause (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 				     bool * empty_result);
+static int qexec_pin_domain_of_format (THREAD_ENTRY * thread_p, const DB_VALUE * format, TP_DOMAIN ** domain);
+static int qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
 static int qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 					     UPDDEL_CLASS_INSTANCE_LOCK_INFO * p_class_instance_lock_info);
 static DEL_LOB_INFO *qexec_create_delete_lob_info (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state,
@@ -3688,6 +3690,22 @@ qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state_p)
     }
   new_xasl_state->qp_xasl_line = xasl_state_p->qp_xasl_line;
   new_xasl_state->query_id = xasl_state_p->query_id;
+  new_xasl_state->pinned_domains = NULL;
+  new_xasl_state->pinned_cnt = 0;
+  if (xasl_state_p->pinned_cnt > 0)
+    {
+      /* the answers of the root's gate; the entries are interned domains, so this copies pointers only */
+      new_xasl_state->pinned_domains =
+	(TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *) * xasl_state_p->pinned_cnt);
+      if (new_xasl_state->pinned_domains == NULL)
+	{
+	  db_private_free (thread_p, new_xasl_state);
+	  return NULL;
+	}
+      memcpy (new_xasl_state->pinned_domains, xasl_state_p->pinned_domains,
+	      sizeof (TP_DOMAIN *) * xasl_state_p->pinned_cnt);
+      new_xasl_state->pinned_cnt = xasl_state_p->pinned_cnt;
+    }
   new_xasl_state->vd.xasl_state = new_xasl_state;
   new_xasl_state->vd.dbval_cnt = xasl_state_p->vd.dbval_cnt;
   new_xasl_state->vd.drand = xasl_state_p->vd.drand;
@@ -3730,6 +3748,10 @@ qexec_free_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state)
   if (xasl_state->vd.dbval_ptr)
     {
       db_private_free (thread_p, xasl_state->vd.dbval_ptr);
+    }
+  if (xasl_state->pinned_domains)
+    {
+      db_private_free (thread_p, xasl_state->pinned_domains);
     }
   db_private_free (thread_p, xasl_state);
 }
@@ -16173,6 +16195,12 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
   bool mvcc_select_lock_needed;
   bool old_no_logging;
 
+#if !defined (NDEBUG)
+  /* execution boundary: no mainblock starts while a residual result type is still open.  Only the root of an
+   * execution carries a plan, so this is a no-op for every sub-node. */
+  assert (xasl->domain_pin_plan == NULL || xasl_state->pinned_cnt == xasl->domain_pin_plan->n_recipes);
+#endif
+
   /*
    * Pre_processing
    */
@@ -17433,6 +17461,211 @@ qexec_clear_a_eval_values (THREAD_ENTRY * thread_p, ANALYTIC_EVAL_TYPE * a_eval_
 }
 
 /*
+ * qexec_pin_domain_of_format () - the result domain of a STR_TO_DATE () with this format
+ *   return: NO_ERROR, or an error code
+ *   format(in): the format value, already fetched
+ *   domain(out): the built-in domain the result takes
+ *
+ * Note: same classification, in the same order, as the literal format takes at compile time
+ *       (pt_eval_type (), PT_STR_TO_DATE): a format the classifier does not recognize means DATE, and a NULL
+ *       format means the NULL type, exactly as a literal of either shape compiles today.  Whitespace does not
+ *       change the outcome - db_check_time_date_format () only reads the letter after a '%', and db_str_to_date ()
+ *       rejects a '%' followed by whitespace.
+ */
+static int
+qexec_pin_domain_of_format (THREAD_ENTRY * thread_p, const DB_VALUE * format, TP_DOMAIN ** domain)
+{
+  char stack_buf[64];
+  char *format_str = stack_buf;
+  const char *str;
+  int str_len, specifier;
+
+  if (format == NULL || DB_IS_NULL (format))
+    {
+      *domain = tp_domain_resolve_default (DB_TYPE_NULL);
+      return NO_ERROR;
+    }
+
+  if (!TP_IS_CHAR_TYPE (DB_VALUE_DOMAIN_TYPE (format)))
+    {
+      /* the format slot is compiled as a character string (pt_eval_type (), PT_STR_TO_DATE), so a value of any
+       * other type here is a bind that never went through its slot contract */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OBJ_INVALID_ARGUMENTS, 0);
+      return ER_OBJ_INVALID_ARGUMENTS;
+    }
+
+  str = db_get_string (format);
+  str_len = db_get_string_size (format);
+  if (str == NULL || str_len < 0)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OBJ_INVALID_ARGUMENTS, 0);
+      return ER_OBJ_INVALID_ARGUMENTS;
+    }
+
+  /* db_check_time_date_format () reads a NUL terminated string; a DB_VALUE string carries its own length */
+  if (str_len >= (int) sizeof (stack_buf))
+    {
+      format_str = (char *) db_private_alloc (thread_p, str_len + 1);
+      if (format_str == NULL)
+	{
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+    }
+  memcpy (format_str, str, str_len);
+  format_str[str_len] = '\0';
+
+  specifier = db_check_time_date_format (format_str);
+
+  if (format_str != stack_buf)
+    {
+      db_private_free_and_init (thread_p, format_str);
+    }
+
+  switch (specifier)
+    {
+    case TIME_SPECIFIER:
+      *domain = tp_domain_resolve_default (DB_TYPE_TIME);
+      break;
+    case DATETIME_SPECIFIER:
+      *domain = tp_domain_resolve_default (DB_TYPE_DATETIME);
+      break;
+    case DATETIMETZ_SPECIFIER:
+      *domain = tp_domain_resolve_default (DB_TYPE_DATETIMETZ);
+      break;
+    case DATE_SPECIFIER:
+    default:
+      *domain = tp_domain_resolve_default (DB_TYPE_DATE);
+      break;
+    }
+
+  return NO_ERROR;
+}
+
+/*
+ * qexec_pin_execution_domains () - complete, before the mainblock starts, the result types the plan left
+ *                                  depending on a value (see DOMAIN_PIN_PLAN in xasl.h)
+ *   return: NO_ERROR, or an error code
+ *   xasl(in): the root of the execution
+ *   xasl_state(in/out): holds this execution's answers
+ *
+ * Note: the host variables are bound and the execution environment is ready by now, so every recipe can be
+ *       resolved without reading a row.  Either all of them resolve and the consumers are connected, or the
+ *       query does not start: a half pinned plan is never executed (execution-domain-pin-contract.md section 5.2).
+ */
+static int
+qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
+{
+  DOMAIN_PIN_PLAN *plan = xasl->domain_pin_plan;
+  TP_DOMAIN **domains;
+  int error = NO_ERROR;
+  int i;
+
+  if (plan == NULL)
+    {
+      /* nothing was left open: no array and no traversal for a fully typed statement */
+      return NO_ERROR;
+    }
+
+  domains = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *) * plan->n_recipes);
+  if (domains == NULL)
+    {
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+
+  for (i = 0; i < plan->n_recipes; i++)
+    {
+      DB_VALUE *format = NULL;
+
+      /* the recipe input is a bound host variable, a session variable or a constant of the plan - the shape was
+       * checked when the plan was loaded (stx_collect_domain_pin ()), so this fetch evaluates no row, no
+       * sub-query and nothing with a side effect */
+      assert (plan->recipes[i].format_regu->type == TYPE_POS_VALUE
+	      || plan->recipes[i].format_regu->type == TYPE_DBVAL
+	      || plan->recipes[i].format_regu->type == TYPE_CONSTANT
+	      || plan->recipes[i].format_regu->type == TYPE_INARITH);
+
+      if (fetch_peek_dbval (thread_p, plan->recipes[i].format_regu, &xasl_state->vd, NULL, NULL, NULL, &format)
+	  != NO_ERROR)
+	{
+	  error = ER_FAILED;
+	  goto exit_on_error;
+	}
+
+      error = qexec_pin_domain_of_format (thread_p, format, &domains[i]);
+      if (error != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+    }
+
+  /* every recipe answered: connect the consumers */
+  for (i = 0; i < plan->n_uses; i++)
+    {
+      REGU_VARIABLE *owner = plan->uses[i].owner_regu;
+
+      owner->domain = owner->value.arithptr->domain = domains[plan->uses[i].pin_id];
+    }
+
+  xasl_state->pinned_domains = domains;
+  xasl_state->pinned_cnt = plan->n_recipes;
+
+  return NO_ERROR;
+
+exit_on_error:
+  db_private_free_and_init (thread_p, domains);
+  return (error == NO_ERROR) ? ER_FAILED : error;
+}
+
+/*
+ * qexec_install_pinned_domains () - give a parallel worker the root's pinned answers and connect its own consumers
+ *   return: NO_ERROR, or an error code
+ *   worker_root(in): the root of the tree this worker executes (its own clone or its own unpack)
+ *   worker_state(in/out): the worker's execution state
+ *   root_state(in): the state the root pinned
+ *
+ * Note: a worker never resolves a residual type itself (execution-domain-pin-contract.md D-272-05).  Its tree comes
+ *       from the same stream as the root's, so the plans agree pin for pin; a disagreement means the worker is
+ *       running a different plan, which is an error, not something to repair.
+ */
+int
+qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root, xasl_state * worker_state,
+			      const xasl_state * root_state)
+{
+  DOMAIN_PIN_PLAN *plan = worker_root->domain_pin_plan;
+  int i;
+
+  worker_state->pinned_domains = NULL;
+  worker_state->pinned_cnt = 0;
+
+  if (plan == NULL && root_state->pinned_cnt == 0)
+    {
+      return NO_ERROR;
+    }
+  if (plan == NULL || root_state->pinned_domains == NULL || plan->n_recipes != root_state->pinned_cnt)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_QPROC_INVALID_XASLNODE;
+    }
+
+  worker_state->pinned_domains = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *) * plan->n_recipes);
+  if (worker_state->pinned_domains == NULL)
+    {
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  memcpy (worker_state->pinned_domains, root_state->pinned_domains, sizeof (TP_DOMAIN *) * plan->n_recipes);
+  worker_state->pinned_cnt = plan->n_recipes;
+
+  for (i = 0; i < plan->n_uses; i++)
+    {
+      REGU_VARIABLE *owner = plan->uses[i].owner_regu;
+
+      owner->domain = owner->value.arithptr->domain = worker_state->pinned_domains[plan->uses[i].pin_id];
+    }
+
+  return NO_ERROR;
+}
+
+/*
  * qexec_execute_query () -
  *   return: Query result list file identifier, or NULL
  *   xasl(in)   : XASL Tree pointer
@@ -17584,6 +17817,10 @@ qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, c
   /* initialize error line */
   xasl_state.qp_xasl_line = 0;
 
+  /* no residual type is pinned yet (qexec_pin_execution_domains () below) */
+  xasl_state.pinned_domains = NULL;
+  xasl_state.pinned_cnt = 0;
+
   time_t sec;
   int millisec;
   util_get_second_and_ms_since_epoch (&sec, &millisec);
@@ -17623,6 +17860,15 @@ qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, c
 
   /* execute the query set the query in progress flag so that qmgr_clear_trans_wakeup() will not remove our XASL
    * tree out from under us in the event the transaction is unilaterally aborted during query execution. */
+
+  /* The bind values and the execution environment are ready: complete the result types the plan left depending on
+   * a value, before any part of the mainblock (including its own initializations) looks at a domain. */
+  stat = qexec_pin_execution_domains (thread_p, xasl, &xasl_state);
+  if (stat != NO_ERROR)
+    {
+      qexec_failure_line (__LINE__, &xasl_state);
+      goto query_error;
+    }
 
   xasl->query_in_progress = true;
   stat = qexec_execute_mainblock (thread_p, xasl, &xasl_state, NULL);
@@ -17723,6 +17969,12 @@ query_error:
 #endif /* CUBRID_DEBUG */
 
 end:
+  /* the answers belong to this execution only: the next one pins its own (no plan is ever restored) */
+  if (xasl_state.pinned_domains != NULL)
+    {
+      db_private_free_and_init (thread_p, xasl_state.pinned_domains);
+      xasl_state.pinned_cnt = 0;
+    }
 
 #if defined (SERVER_MODE)
   if (prm_get_bool_value (PRM_ID_LOG_QUERY_LISTS))

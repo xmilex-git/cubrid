@@ -170,6 +170,7 @@ extern "C"
   };
 
   extern SM_DOMAIN *db_query_format_src_domain (DB_QUERY_TYPE * query_type);
+  extern int db_query_pin_variable_column_types (DB_QUERY_RESULT * result, DB_QUERY_TYPE * query_type);
 
   extern int db_execute_with_values (const char *CSQL_query, DB_QUERY_RESULT ** result, DB_QUERY_ERROR * query_error,
 				     int arg_count, DB_VALUE * vals);

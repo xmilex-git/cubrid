@@ -84,6 +84,8 @@ struct t_query_result
   char stmt_type;
   char col_updatable;
   char include_oid;
+  char has_variable_column;	/* 1 = a column whose type only the execution can tell (a value dependent result
+				 * type); the execute response then reports the resolved column list */
   bool is_holdable;
 };
 

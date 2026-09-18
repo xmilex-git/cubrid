@@ -1066,6 +1066,53 @@ pt_fillin_type_size (PARSER_CONTEXT * parser, PT_NODE * query, DB_QUERY_TYPE * l
 }
 
 /*
+ * db_query_pin_variable_column_types () - complete the columns a statement could only type at execution time
+ *   return: number of columns completed
+ *   result(in): the result of the execution that just finished
+ *   query_type(in/out): a private copy of the statement's column list (db_get_query_type_list ())
+ *
+ * Note: one result type is still value dependent - STR_TO_DATE () over a format that is not a literal - so it is
+ *       compiled as DB_TYPE_VARIABLE and pinned before the scan starts.  The list the server returns carries the
+ *       answer of *this* execution, which is what the execute response must report, while the prepared statement
+ *       keeps its undetermined column so a later execution reports its own answer (D-272-06).
+ */
+int
+db_query_pin_variable_column_types (DB_QUERY_RESULT * result, DB_QUERY_TYPE * query_type)
+{
+  QFILE_LIST_ID *list_id;
+  DB_QUERY_TYPE *t;
+  int i, pinned = 0;
+
+  if (result == NULL || query_type == NULL || result->type != T_SELECT)
+    {
+      return 0;
+    }
+
+  list_id = &result->res.s.cursor_id.list_id;
+
+  /* an updatable result carries the instance OID as a hidden first column of the list, which the column list does
+   * not describe (db_query_get_tuple_value () offsets by it the same way); hidden columns added for ORDER BY sit
+   * after the described ones, so the loop simply ends first */
+  i = result->oid_included ? 1 : 0;
+  for (t = query_type; t != NULL && i < list_id->type_list.type_cnt; t = t->next, i++)
+    {
+      TP_DOMAIN *resolved = list_id->type_list.domp[i];
+
+      if (t->db_type != DB_TYPE_VARIABLE || resolved == NULL || TP_DOMAIN_TYPE (resolved) == DB_TYPE_VARIABLE)
+	{
+	  continue;
+	}
+
+      t->domain = resolved;
+      t->db_type = TP_DOMAIN_TYPE (resolved);
+      t->size = pt_find_size_from_dbtype (t->db_type);
+      pinned++;
+    }
+
+  return pinned;
+}
+
+/*
  * pt_new_query_result_descriptor() - allocates, initializes, returns a new
  *      query result descriptor and opens a cursor for the query's results
  *   return:  DB_QUERY_RESULT* with an open cursor

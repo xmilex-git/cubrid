@@ -45,6 +45,17 @@ struct unpack_extra_buf
   UNPACK_EXTRA_BUF *next;
 };
 
+/* A residual domain pin spotted while unpacking: the T_STR_TO_DATE regu variable whose result type is still
+ * value dependent (see DOMAIN_PIN_PLAN in xasl.h).  Collected in unpack order, which is a function of the stream
+ * alone - so every unpack of the same stream, in the root or in a parallel worker, numbers the pins identically. */
+class regu_variable_node;
+typedef struct unpack_domain_pin UNPACK_DOMAIN_PIN;
+struct unpack_domain_pin
+{
+  regu_variable_node *owner_regu;
+  UNPACK_DOMAIN_PIN *next;
+};
+
 /* structure to hold information needed during packing */
 typedef struct xasl_unpack_info XASL_UNPACK_INFO;
 struct xasl_unpack_info
@@ -75,6 +86,11 @@ struct xasl_unpack_info
   int track_allocated_bufers;
 
   bool use_xasl_clone;		/* true, if uses xasl clone */
+
+  /* residual domain pins of this unpack, newest first; turned into the root's DOMAIN_PIN_PLAN when the tree is
+   * complete (stx_map_stream_to_xasl) */
+  UNPACK_DOMAIN_PIN *domain_pins;
+  int domain_pin_cnt;
 };
 
 XASL_UNPACK_INFO *get_xasl_unpack_info_ptr (THREAD_ENTRY *thread_p);

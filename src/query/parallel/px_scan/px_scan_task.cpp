@@ -524,6 +524,10 @@ namespace parallel_scan
       }
 
     db_private_free (&thread_ref, m_vd->dbval_ptr);
+    if (m_xasl_state->pinned_domains != nullptr)
+      {
+	db_private_free (&thread_ref, m_xasl_state->pinned_domains);
+      }
     db_private_free (&thread_ref, m_xasl_state);
     qexec_clear_xasl (&thread_ref, m_xasl, true, false);
 
@@ -671,6 +675,25 @@ namespace parallel_scan
 	    pr_clone_value (&m_orig_vd->dbval_ptr[i], &m_vd->dbval_ptr[i]);
 	  }
       }
+
+    /* This worker runs its own copy of the tree, so the domains the root pinned before the mainblock are not in
+     * it yet: install the root's answers rather than resolve anything here. */
+    if (qexec_install_pinned_domains (&thread_ref, m_uses_xasl_clone ? m_xasl_clone.xasl : m_xasl_tree,
+				      m_xasl_state, m_orig_vd->xasl_state) != NO_ERROR)
+      {
+	if (m_vd->dbval_ptr != nullptr)
+	  {
+	    for (i = 0; i < m_orig_vd->dbval_cnt; i++)
+	      {
+		pr_clear_value (&m_vd->dbval_ptr[i]);
+	      }
+	    db_private_free_and_init (&thread_ref, m_vd->dbval_ptr);
+	  }
+	db_private_free_and_init (&thread_ref, m_xasl_state);
+	m_vd = nullptr;
+	return ER_FAILED;
+      }
+
     return NO_ERROR;
   }
 

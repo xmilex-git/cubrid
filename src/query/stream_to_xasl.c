@@ -86,6 +86,8 @@ static PL_SIGNATURE_TYPE *stx_restore_pl_sig (THREAD_ENTRY * thread_p, char *ptr
 static KEY_RANGE *stx_restore_key_range_array (THREAD_ENTRY * thread_p, char *ptr, int size);
 
 static char *stx_build_xasl_node (THREAD_ENTRY * thread_p, char *tmp, XASL_NODE * ptr);
+static int stx_collect_domain_pin (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var);
+static int stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static char *stx_build_xasl_header (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE_HEADER * xasl_header);
 static char *stx_build_filter_pred_node (THREAD_ENTRY * thread_p, char *ptr, PRED_EXPR_WITH_CONTEXT * pred);
 static char *stx_build_func_pred (THREAD_ENTRY * thread_p, char *tmp, FUNC_PRED * ptr);
@@ -263,6 +265,15 @@ stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool us
   /* initialize the query in progress flag to FALSE.  Note that this flag is not packed/unpacked.  It is strictly a
    * server side flag. */
   xasl->query_in_progress = false;
+
+  /* the tree is complete: turn the residual pins spotted while unpacking into the root's plan */
+  if (stx_build_domain_pin_plan (thread_p, xasl) != NO_ERROR)
+    {
+      *xasl_tree = NULL;
+      free_xasl_unpack_info (thread_p, unpack_info_p);
+      *xasl_unpack_info_ptr = NULL;
+      goto end;
+    }
 end:
   stx_free_visited_ptrs (thread_p);
 #if defined(SERVER_MODE)
@@ -270,6 +281,123 @@ end:
 #endif /* SERVER_MODE */
 
   return stx_get_xasl_errcode (thread_p);
+}
+
+/*
+ * stx_collect_domain_pin () - remember a regu variable whose result type is still value dependent
+ *   return: NO_ERROR, or an error code
+ *   regu_var(in): a T_STR_TO_DATE regu variable carrying a DB_TYPE_VARIABLE domain
+ *
+ * Note: called while the tree is being unpacked; the collected pins become the root's DOMAIN_PIN_PLAN once the
+ *       whole tree is restored (stx_build_domain_pin_plan ()).
+ */
+static int
+stx_collect_domain_pin (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var)
+{
+  XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
+  const REGU_VARIABLE *format = regu_var->value.arithptr->rightptr;
+  UNPACK_DOMAIN_PIN *pin;
+
+  /* the format argument is restricted by the type checker to a literal, an input host variable or a session
+   * variable (pt_eval_type (), PT_STR_TO_DATE), so its value exists before the first row is read.  A shape
+   * outside that set would mean the gate cannot resolve the type without executing the query: reject the plan
+   * here rather than fall back to resolving it from a row. */
+  if (format == NULL
+      || !(format->type == TYPE_POS_VALUE || format->type == TYPE_DBVAL || format->type == TYPE_CONSTANT
+	   || (format->type == TYPE_INARITH && format->value.arithptr != NULL
+	       && format->value.arithptr->opcode == T_EVALUATE_VARIABLE)))
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      stx_set_xasl_errcode (thread_p, ER_QPROC_INVALID_XASLNODE);
+      return ER_QPROC_INVALID_XASLNODE;
+    }
+
+  pin = (UNPACK_DOMAIN_PIN *) stx_alloc_struct (thread_p, (int) sizeof (UNPACK_DOMAIN_PIN));
+  if (pin == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+
+  pin->owner_regu = regu_var;
+  pin->next = xasl_unpack_info->domain_pins;
+  xasl_unpack_info->domain_pins = pin;
+  xasl_unpack_info->domain_pin_cnt++;
+
+  return NO_ERROR;
+}
+
+/*
+ * stx_build_domain_pin_plan () - turn the pins collected during unpacking into the root node's plan
+ *   return: NO_ERROR, or an error code
+ *   xasl(in/out): the root of the restored tree
+ *
+ * Note: uses are numbered in unpack order, which depends on the stream alone: the root and every parallel worker
+ *       unpacking the same stream produce the same pin_ids, which is what lets a worker install the root's
+ *       answers without resolving anything itself.  Two uses fed by the same format share one recipe.
+ */
+static int
+stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
+{
+  XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
+  UNPACK_DOMAIN_PIN *pin;
+  DOMAIN_PIN_PLAN *plan;
+  int n_uses = xasl_unpack_info->domain_pin_cnt;
+  int i, j;
+
+  xasl->domain_pin_plan = NULL;
+  if (n_uses == 0)
+    {
+      /* a statement with no residual carries no plan at all: no array to allocate and nothing to walk before the
+       * mainblock starts */
+      return NO_ERROR;
+    }
+
+  plan = (DOMAIN_PIN_PLAN *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_PIN_PLAN));
+  if (plan == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  plan->uses = (DOMAIN_PIN_USE *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_PIN_USE) * n_uses);
+  plan->recipes = (DOMAIN_PIN_RECIPE *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_PIN_RECIPE) * n_uses);
+  if (plan->uses == NULL || plan->recipes == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+
+  /* the collected list is newest first: fill the uses back to front to get unpack order */
+  for (pin = xasl_unpack_info->domain_pins, i = n_uses - 1; pin != NULL; pin = pin->next, i--)
+    {
+      plan->uses[i].owner_regu = pin->owner_regu;
+    }
+  assert (i == -1);
+
+  plan->n_recipes = 0;
+  for (i = 0; i < n_uses; i++)
+    {
+      REGU_VARIABLE *format = plan->uses[i].owner_regu->value.arithptr->rightptr;
+
+      for (j = 0; j < plan->n_recipes; j++)
+	{
+	  if (plan->recipes[j].format_regu == format)
+	    {
+	      break;
+	    }
+	}
+      if (j == plan->n_recipes)
+	{
+	  plan->recipes[j].format_regu = format;
+	  plan->n_recipes++;
+	}
+      plan->uses[i].pin_id = j;
+    }
+  plan->n_uses = n_uses;
+
+  xasl->domain_pin_plan = plan;
+
+  return NO_ERROR;
 }
 
 /*
@@ -321,6 +449,16 @@ stx_map_stream_to_filter_pred (THREAD_ENTRY * thread_p, pred_expr_with_context *
   if (pwc == NULL)
     {
       free_xasl_unpack_info (thread_p, unpack_info_p);
+      goto end;
+    }
+
+  if (unpack_info_p->domain_pin_cnt != 0)
+    {
+      /* same boundary as the function-expression stream above: no value descriptor, no gate */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      stx_set_xasl_errcode (thread_p, ER_QPROC_INVALID_XASLNODE);
+      free_xasl_unpack_info (thread_p, unpack_info_p);
+      db_private_free_and_init (thread_p, pwc);	/* allocated outside the unpack buffer, see the header comment */
       goto end;
     }
 
@@ -378,6 +516,17 @@ stx_map_stream_to_func_pred (THREAD_ENTRY * thread_p, func_pred ** xasl, char *x
   p_xasl = stx_restore_func_pred (thread_p, xasl_stream + offset);
   if (p_xasl == NULL)
     {
+      free_xasl_unpack_info (thread_p, unpack_info_p);
+      goto end;
+    }
+
+  if (unpack_info_p->domain_pin_cnt != 0)
+    {
+      /* a schema-bound expression is prepared without a value descriptor and is fetched outside
+       * qexec_execute_query (), so it has no gate to complete a residual type: reject the stream instead of
+       * resolving it from a row (execution-domain-pin-contract.md section 5.9) */
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      stx_set_xasl_errcode (thread_p, ER_QPROC_INVALID_XASLNODE);
       free_xasl_unpack_info (thread_p, unpack_info_p);
       goto end;
     }
@@ -2386,6 +2535,7 @@ stx_build_xasl_node (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE * xasl)
   memset (&xasl->func_stats, 0, sizeof (xasl->func_stats));
   xasl->analytic_stats = NULL;
   xasl->max_iterations = -1;
+  xasl->domain_pin_plan = NULL;	/* only the root carries one; filled by stx_build_domain_pin_plan () */
   xasl->px_executor = NULL;
   xasl->memoize_storage = NULL;
   xasl->executed_parallelism = 0;
@@ -5650,6 +5800,24 @@ stx_build_regu_variable (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABLE * reg
     }
 
   ptr = stx_unpack_regu_variable_value (thread_p, ptr, regu_var);
+  if (ptr == NULL)
+    {
+      return NULL;
+    }
+
+  if (regu_var->domain != NULL && TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE
+      && regu_var->type == TYPE_INARITH && regu_var->value.arithptr != NULL
+      && regu_var->value.arithptr->opcode == T_STR_TO_DATE)
+    {
+      /* the one result type compilation leaves open (see DOMAIN_PIN_PLAN): STR_TO_DATE () over a format that is
+       * not a literal.  Other undetermined domains still reaching the server belong to consumers that derive
+       * their type from this one while the execution runs; they are the subject of the removal step that follows
+       * this one, and until then they keep resolving the way they do today. */
+      if (stx_collect_domain_pin (thread_p, regu_var) != NO_ERROR)
+	{
+	  return NULL;
+	}
+    }
 
   return ptr;
 
