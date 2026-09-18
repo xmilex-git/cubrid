@@ -4127,6 +4127,13 @@ pt_to_aggregate_node (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg, int *c
 	      regu_dbval_type_init (aggregate_list->accumulator.value2, pt_node_to_db_type (tree));
 	    }
 	  aggregate_list->opr_dbtype = pt_node_to_db_type (tree->info.function.arg_list);
+	  if (aggregate_list->opr_dbtype == DB_TYPE_VARIABLE)
+	    {
+	      /* a bare host variable argument keeps PT_TYPE_MAYBE on its own node although its slot contract (and
+	       * with it this function's result type) is settled; the executor must not be handed an undecided
+	       * operand type, so take it from the function's own domain (wf268 C3, E24) */
+	      aggregate_list->opr_dbtype = TP_DOMAIN_TYPE (aggregate_list->domain);
+	    }
 
 	  if (info->out_list && info->value_list && info->regu_list)
 	    {
@@ -25890,6 +25897,11 @@ pt_to_analytic_node (PARSER_CONTEXT * parser, PT_NODE * tree, ANALYTIC_INFO * an
     {
       /* fetch operand type */
       analytic->opr_dbtype = pt_node_to_db_type (func_info->arg_list->info.pointer.node);
+      if (analytic->opr_dbtype == DB_TYPE_VARIABLE)
+	{
+	  /* see the aggregate above: a settled slot whose node still reads MAYBE (wf268 C3, E24) */
+	  analytic->opr_dbtype = TP_DOMAIN_TYPE (analytic->domain);
+	}
 
       /* PERCENTILE_DISC returns a constant operand as is */
       if (analytic->function == PT_PERCENTILE_DISC)

@@ -90,6 +90,7 @@ qdata_process_distinct_or_sort (cubthread::entry *thread_p, cubxasl::aggregate_l
     }
 
   type_list.domp[0] = agg_p->operands->value.domain;
+  assert (type_list.domp[0] == NULL || TP_DOMAIN_TYPE (type_list.domp[0]) != DB_TYPE_VARIABLE);
   /* if the agg has ORDER BY force setting 'QFILE_FLAG_ALL' : in this case, no additional SORT_LIST will be created,
    * but the one in the aggregate_list_node structure will be used */
   if (agg_p->sort_list != NULL)
@@ -475,6 +476,7 @@ qdata_aggregate_value_to_accumulator (cubthread::entry *thread_p, cubxasl::aggre
       return NO_ERROR;
     }
 
+  assert (domain != NULL && domain->value_dom != NULL);
   if (domain != NULL && domain->value_dom != NULL)
     {
       coll_id = domain->value_dom->collation_id;
@@ -785,8 +787,7 @@ qdata_agg_may_share_accumulator (const cubxasl::aggregate_list_node *agg_p)
    * leaving no accumulator for a sharer to copy. TYPE_INARITH compatibility
    * is checked by qdata_agg_share_args_equal (). */
   return (qdata_agg_is_plain_sum_avg (agg_p) && !agg_p->flag.agg_optimized
-	  && (agg_p->operands->value.type == TYPE_CONSTANT || agg_p->operands->value.type == TYPE_INARITH)
-	  && agg_p->accumulator_domain.value_dom != NULL);
+	  && (agg_p->operands->value.type == TYPE_CONSTANT || agg_p->operands->value.type == TYPE_INARITH));
 }
 
 /*
@@ -1835,9 +1836,9 @@ qdata_finalize_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
       if ((agg_p->option == Q_DISTINCT || agg_p->sort_list != NULL) && agg_p->function != PT_MAX
 	  && agg_p->function != PT_MIN)
 	{
+	  assert (agg_p->sort_list == NULL || TP_DOMAIN_TYPE (agg_p->sort_list->pos_descr.dom) != DB_TYPE_VARIABLE);
 	  if (agg_p->sort_list != NULL
-	      && (TP_DOMAIN_TYPE (agg_p->sort_list->pos_descr.dom) == DB_TYPE_VARIABLE
-		  || TP_DOMAIN_COLLATION_FLAG (agg_p->sort_list->pos_descr.dom) != TP_DOMAIN_COLL_NORMAL))
+	      && TP_DOMAIN_COLLATION_FLAG (agg_p->sort_list->pos_descr.dom) != TP_DOMAIN_COLL_NORMAL)
 	    {
 	      /* set domain of SORT LIST same as the domain from agg list */
 	      assert (agg_p->sort_list->pos_descr.pos_no < agg_p->list_id->type_list.type_cnt);
@@ -3304,7 +3305,8 @@ qdata_update_agg_interpolation_func_value_and_domain (cubxasl::aggregate_list_no
     }
 
   dbval_type = TP_DOMAIN_TYPE (agg_p->domain);
-  if (dbval_type == DB_TYPE_VARIABLE || TP_DOMAIN_COLLATION_FLAG (agg_p->domain) != TP_DOMAIN_COLL_NORMAL)
+  assert (dbval_type != DB_TYPE_VARIABLE);
+  if (TP_DOMAIN_COLLATION_FLAG (agg_p->domain) != TP_DOMAIN_COLL_NORMAL)
     {
       dbval_type = DB_VALUE_DOMAIN_TYPE (dbval);
       agg_p->domain = tp_domain_resolve_default (dbval_type);

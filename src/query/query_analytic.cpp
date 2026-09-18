@@ -48,7 +48,7 @@ static int qdata_analytic_interpolation (cubthread::entry *thread_p, cubxasl::an
  * (curr_cnt / is_active). The aggregate path uses the same split;
  * see qdata_agg_is_plain_sum_avg () in query_aggregate.cpp.
  *
- * DB_TYPE_VARIABLE and non-normal collations stay on the general path because
+ * Non-normal collations stay on the general path because
  * they require in-place coercion of the fetched value. DISTINCT uses its own
  * list file and is also excluded.
  */
@@ -56,7 +56,7 @@ static inline bool
 qdata_analytic_is_plain_sum_avg (const ANALYTIC_TYPE *func_p)
 {
   return ((func_p->function == PT_SUM || func_p->function == PT_AVG)
-	  && func_p->option != Q_DISTINCT && func_p->opr_dbtype != DB_TYPE_VARIABLE
+	  && func_p->option != Q_DISTINCT
 	  && TP_DOMAIN_COLLATION_FLAG (func_p->domain) == TP_DOMAIN_COLL_NORMAL);
 }
 
@@ -70,10 +70,17 @@ qdata_analytic_is_plain_sum_avg (const ANALYTIC_TYPE *func_p)
 int
 qdata_initialize_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p, QUERY_ID query_id)
 {
+  DB_TYPE value_type = DB_VALUE_DOMAIN_TYPE (func_p->value);
+
   func_p->curr_cnt = 0;
   func_p->sum_acc.is_active = false;
-  if (db_value_domain_init (func_p->value, DB_VALUE_DOMAIN_TYPE (func_p->value), DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE)
-      != NO_ERROR)
+  if (func_p->domain != NULL && TP_DOMAIN_TYPE (func_p->domain) != DB_TYPE_VARIABLE)
+    {
+      /* the result type of this execution: the compiler's for an ordinary function, the execution gate's for a
+       * value dependent one - which may differ from the previous execution of the same plan (wf268 C3) */
+      value_type = TP_DOMAIN_TYPE (func_p->domain);
+    }
+  if (db_value_domain_init (func_p->value, value_type, DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -185,80 +192,6 @@ qdata_evaluate_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p,
       return ER_FAILED;
     }
 
-  if ((func_p->opr_dbtype == DB_TYPE_VARIABLE || TP_DOMAIN_COLLATION_FLAG (func_p->domain) != TP_DOMAIN_COLL_NORMAL)
-      && !DB_IS_NULL (&dbval))
-    {
-      /* set function default domain when late binding */
-      switch (func_p->function)
-	{
-	case PT_COUNT:
-	case PT_COUNT_STAR:
-	  func_p->domain = tp_domain_resolve_default (DB_TYPE_BIGINT);
-	  break;
-
-	case PT_AVG:
-	case PT_STDDEV:
-	case PT_STDDEV_POP:
-	case PT_STDDEV_SAMP:
-	case PT_VARIANCE:
-	case PT_VAR_POP:
-	case PT_VAR_SAMP:
-	  func_p->domain = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-	  break;
-
-	case PT_SUM:
-	  if (TP_IS_NUMERIC_TYPE (DB_VALUE_TYPE (&dbval)))
-	    {
-	      func_p->domain = tp_domain_resolve_value (&dbval, NULL);
-	    }
-	  else
-	    {
-	      func_p->domain = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-	    }
-	  break;
-
-	case PT_MEDIAN:
-	case PT_PERCENTILE_CONT:
-	  if (TP_IS_NUMERIC_TYPE (DB_VALUE_TYPE (&dbval)))
-	    {
-	      func_p->domain = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-	    }
-	  else
-	    {
-	      func_p->domain = tp_domain_resolve_value (&dbval, NULL);
-	    }
-	  break;
-
-	default:
-	  func_p->domain = tp_domain_resolve_value (&dbval, NULL);
-	  break;
-	}
-
-      if (func_p->domain == NULL)
-	{
-	  error = ER_FAILED;
-	  goto exit;
-	}
-
-      /* coerce operand */
-      if (tp_value_coerce (&dbval, &dbval, func_p->domain) != DOMAIN_COMPATIBLE)
-	{
-	  error = ER_FAILED;
-	  goto exit;
-	}
-
-      func_p->opr_dbtype = TP_DOMAIN_TYPE (func_p->domain);
-      db_value_domain_init (func_p->value, func_p->opr_dbtype, DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE);
-
-      /* set the distinct list file domain for finalize; a *variable* readval
-       * is a no-op and would silently drop all values. */
-      if (func_p->option == Q_DISTINCT && TP_DOMAIN_TYPE (func_p->list_id->type_list.domp[0]) == DB_TYPE_VARIABLE)
-	{
-	  /* values are written after coercion to func_p->domain. */
-	  func_p->list_id->type_list.domp[0] = func_p->domain;
-	}
-    }
-
   if (DB_IS_NULL (&dbval) && func_p->function != PT_ROW_NUMBER && func_p->function != PT_FIRST_VALUE
       && func_p->function != PT_LAST_VALUE && func_p->function != PT_NTH_VALUE && func_p->function != PT_RANK
       && func_p->function != PT_DENSE_RANK && func_p->function != PT_LEAD && func_p->function != PT_LAG
@@ -281,8 +214,8 @@ qdata_evaluate_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p,
     {
       /* later rows may have different types because only the first row is coerced.
        * coerce all values to the list domain for consistent duplicate elimination and finalize. */
-      if (TP_DOMAIN_TYPE (func_p->list_id->type_list.domp[0]) != DB_TYPE_VARIABLE
-	  && DB_VALUE_DOMAIN_TYPE (&dbval) != TP_DOMAIN_TYPE (func_p->list_id->type_list.domp[0]))
+      assert (TP_DOMAIN_TYPE (func_p->list_id->type_list.domp[0]) != DB_TYPE_VARIABLE);
+      if (DB_VALUE_DOMAIN_TYPE (&dbval) != TP_DOMAIN_TYPE (func_p->list_id->type_list.domp[0]))
 	{
 	  if (tp_value_coerce (&dbval, &dbval, func_p->list_id->type_list.domp[0]) != DOMAIN_COMPATIBLE)
 	    {
@@ -680,136 +613,9 @@ qdata_evaluate_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p,
 		}
 	    }
 
-	  if (func_p->is_first_exec_time)
-	    {
-	      func_p->is_first_exec_time = false;
-	      /* determine domain based on first value */
-	      switch (func_p->opr_dbtype)
-		{
-		case DB_TYPE_SHORT:
-		case DB_TYPE_INTEGER:
-		case DB_TYPE_BIGINT:
-		case DB_TYPE_FLOAT:
-		case DB_TYPE_DOUBLE:
-		case DB_TYPE_MONETARY:
-		case DB_TYPE_NUMERIC:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      if (func_p->is_const_operand || func_p->function == PT_PERCENTILE_DISC)
-			{
-			  /* percentile_disc returns the same type as operand while median and percentile_cont return
-			   * double */
-			  func_p->domain = tp_domain_resolve_value (&dbval, NULL);
-			  if (func_p->domain == NULL)
-			    {
-			      error = er_errid ();
-			      assert (error != NO_ERROR);
-
-			      return error;
-			    }
-			}
-		      else
-			{
-			  func_p->domain = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-			}
-		    }
-		  break;
-
-		case DB_TYPE_DATE:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_DATE);
-		    }
-		  break;
-
-		case DB_TYPE_DATETIME:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_DATETIME);
-		    }
-		  break;
-
-		case DB_TYPE_DATETIMETZ:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_DATETIMETZ);
-		    }
-		  break;
-
-		case DB_TYPE_DATETIMELTZ:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_DATETIMELTZ);
-		    }
-		  break;
-
-		case DB_TYPE_TIMESTAMP:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_TIMESTAMP);
-		    }
-		  break;
-
-		case DB_TYPE_TIMESTAMPTZ:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_TIMESTAMPTZ);
-		    }
-		  break;
-
-		case DB_TYPE_TIMESTAMPLTZ:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_TIMESTAMPLTZ);
-		    }
-		  break;
-
-		case DB_TYPE_TIME:
-		  if (TP_DOMAIN_TYPE (func_p->domain) == DB_TYPE_VARIABLE)
-		    {
-		      func_p->domain = tp_domain_resolve_default (DB_TYPE_TIME);
-		    }
-		  break;
-
-		default:
-		  /* try to cast dbval to double, datetime then time */
-		  tmp_domain_p = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-
-		  dom_status = tp_value_cast (&dbval, &dbval, tmp_domain_p, false);
-		  if (dom_status != DOMAIN_COMPATIBLE)
-		    {
-		      /* try datetime */
-		      tmp_domain_p = tp_domain_resolve_default (DB_TYPE_DATETIME);
-
-		      dom_status = tp_value_cast (&dbval, &dbval, tmp_domain_p, false);
-		    }
-
-		  /* try time */
-		  if (dom_status != DOMAIN_COMPATIBLE)
-		    {
-		      tmp_domain_p = tp_domain_resolve_default (DB_TYPE_TIME);
-
-		      dom_status = tp_value_cast (&dbval, &dbval, tmp_domain_p, false);
-		    }
-
-		  if (dom_status != DOMAIN_COMPATIBLE)
-		    {
-		      error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;
-		      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, error, 2, fcode_get_uppercase_name (func_p->function),
-			      "DOUBLE, DATETIME, TIME");
-		      goto exit;
-		    }
-
-		  /* clear errors from failed casts if any cast attempt succeeds. */
-		  if (er_errid () != NO_ERROR)
-		    {
-		      er_clear ();
-		    }
-
-		  /* update domain */
-		  func_p->domain = tmp_domain_p;
-		}
-	    }
+	  /* the interpolation result type is settled before the scan starts: a non interpolable argument is a
+	   * compile error (D-276-03) and a value dependent one is pinned by the execution gate (wf268 C3, E13) */
+	  assert (TP_DOMAIN_TYPE (func_p->domain) != DB_TYPE_VARIABLE);
 	}
 
       /* percentile value check */

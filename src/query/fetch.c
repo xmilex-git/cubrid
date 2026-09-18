@@ -645,7 +645,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
   ARITH_TYPE *arithptr;
   DB_VALUE *peek_left, *peek_right, *peek_third, *peek_fourth;
   DB_VALUE tmp_value;
-  TP_DOMAIN *original_domain = NULL;
   TP_DOMAIN_STATUS dom_status;
 
   assert (regu_var != NULL);
@@ -860,8 +859,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      && (arithptr->opcode == T_STRCAT || arithptr->opcode == T_ADD))
 	    {
 	      /* check for result type. */
-	      if (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE
-		  || QSTR_IS_ANY_CHAR_OR_BIT (TP_DOMAIN_TYPE (regu_var->domain)))
+	      if (QSTR_IS_ANY_CHAR_OR_BIT (TP_DOMAIN_TYPE (regu_var->domain)))
 		{
 		  if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tpl, &peek_right) != NO_ERROR)
 		    {
@@ -1313,11 +1311,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
   /* clear any previous result */
   pr_clear_value (arithptr->value);
-  if (regu_var->domain != NULL && TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE)
-    {
-      original_domain = regu_var->domain;
-      regu_var->domain = NULL;
-    }
   switch (arithptr->opcode)
     {
     case T_ADD:
@@ -4475,20 +4468,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
   *peek_dbval = arithptr->value;
 
-  if (original_domain != NULL && TP_DOMAIN_TYPE (original_domain) == DB_TYPE_VARIABLE)
-    {
-      TP_DOMAIN *resolved_dom = tp_domain_resolve_value (arithptr->value, NULL);
-
-      /* keep DB_TYPE_VARIABLE if resolved domain is NULL */
-      if (TP_DOMAIN_TYPE (resolved_dom) != DB_TYPE_NULL)
-	{
-	  regu_var->domain = arithptr->domain = resolved_dom;
-	}
-      else
-	{
-	  regu_var->domain = arithptr->domain = original_domain;
-	}
-    }
 
   if (arithptr->domain != NULL && arithptr->domain->collation_flag != TP_DOMAIN_COLL_NORMAL
       && !DB_IS_NULL (arithptr->value))
@@ -4612,12 +4591,6 @@ fetch_peek_arith_end:
 
 error:
   thread_dec_recursion_depth (thread_p);
-
-  if (original_domain)
-    {
-      /* restores regu variable domain */
-      regu_var->domain = original_domain;
-    }
 
   return ER_FAILED;
 }
@@ -5235,8 +5208,11 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 
   if (*peek_dbval != NULL && !DB_IS_NULL (*peek_dbval))
     {
-      if (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE
-	  || TP_DOMAIN_COLLATION_FLAG (regu_var->domain) != TP_DOMAIN_COLL_NORMAL)
+      /* the type is settled by now (compile time, or the execution gate for a value dependent one); only an
+       * open slot's collation is still decided by the value it was bound to (D-277-05) */
+      assert (TP_DOMAIN_TYPE (regu_var->domain) != DB_TYPE_VARIABLE
+	      || regu_var->type == TYPE_REGU_VAR_LIST);
+      if (TP_DOMAIN_COLLATION_FLAG (regu_var->domain) != TP_DOMAIN_COLL_NORMAL)
 	{
 	  regu_var->domain = tp_domain_resolve_value (*peek_dbval, NULL);
 	}
@@ -5248,8 +5224,8 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 	  head_regu = reguval_list->regu_list->value;
 	  regu = reguval_list->current_value->value;
 
-	  if (regu->domain == NULL || TP_DOMAIN_TYPE (regu->domain) == DB_TYPE_VARIABLE
-	      || TP_DOMAIN_COLLATION_FLAG (regu->domain) != TP_DOMAIN_COLL_NORMAL)
+	  assert (regu->domain == NULL || TP_DOMAIN_TYPE (regu->domain) != DB_TYPE_VARIABLE);
+	  if (regu->domain == NULL || TP_DOMAIN_COLLATION_FLAG (regu->domain) != TP_DOMAIN_COLL_NORMAL)
 	    {
 	      regu->domain = tp_domain_resolve_value (*peek_dbval, NULL);
 	    }

@@ -6838,6 +6838,14 @@ qdata_get_valptr_type_list (THREAD_ENTRY * thread_p, valptr_list_node * valptr_l
     {
       if (!REGU_VARIABLE_IS_FLAGED (&reg_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
 	{
+	  /* boundary (b): a list file column must be described by a settled domain - a *variable* one makes
+	   * data_readval () a silent no-op that drops every value (wf268 C3) */
+	  if (reg_var_p->value.domain == NULL || TP_DOMAIN_TYPE (reg_var_p->value.domain) == DB_TYPE_VARIABLE)
+	    {
+	      assert (false);
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	      return ER_QPROC_INVALID_XASLNODE;
+	    }
 	  type_list_p->domp[i++] = reg_var_p->value.domain;
 	}
 

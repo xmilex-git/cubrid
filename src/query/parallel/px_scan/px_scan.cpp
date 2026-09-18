@@ -1724,13 +1724,8 @@ namespace parallel_scan
 		    sizeof (result_handler<RESULT_TYPE::MERGEABLE_LIST>));
 	    return ER_FAILED;
 	  }
-	if (m_xasl->type == BUILDLIST_PROC && m_xasl->proc.buildlist.g_agg_list != NULL &&
-	    !m_xasl->proc.buildlist.g_agg_domains_resolved)
-	  {
-	    m_g_agg_domain_resolve_need = true;
-	  }
 	m_result_handler = placement_new ((result_handler<RESULT_TYPE::MERGEABLE_LIST> *) m_result_handler, m_query_id,
-					  &m_interrupt, &m_err_messages, m_parallelism, m_g_agg_domain_resolve_need, m_xasl);
+					  &m_interrupt, &m_err_messages, m_parallelism, m_xasl);
 	m_result_handler->set_trace_handler (&m_trace_handler);
       }
     else if constexpr (result_type == RESULT_TYPE::XASL_SNAPSHOT)
@@ -1744,7 +1739,7 @@ namespace parallel_scan
 	    return ER_FAILED;
 	  }
 	m_result_handler = placement_new ((result_handler<RESULT_TYPE::XASL_SNAPSHOT> *) m_result_handler, m_query_id,
-					  &m_interrupt, &m_err_messages, m_parallelism, m_g_agg_domain_resolve_need, m_xasl);
+					  &m_interrupt, &m_err_messages, m_parallelism, m_xasl);
       }
     else if constexpr (result_type == RESULT_TYPE::BUILDVALUE_OPT)
       {
@@ -1974,20 +1969,6 @@ namespace parallel_scan
 	  }
 
 	fetch_val_list (m_thread_p, m_xasl->outptr_list->valptrp, m_vd, nullptr, nullptr, NULL, true);
-	if (m_g_agg_domain_resolve_need)
-	  {
-	    qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg (m_thread_p, m_xasl, m_vd,
-		&m_xasl->proc.buildlist.g_agg_domains_resolved);
-
-	    if (m_xasl->proc.buildlist.g_agg_domains_resolved)
-	      {
-		/* Sharing needs the resolved accumulator domains, so it is linked here,
-		 * at the parallel BUILDLIST's resolve point. The sort-based group-by
-		 * after the gather reads the links. */
-		qdata_link_shared_accumulators (m_xasl->proc.buildlist.g_agg_list);
-		m_g_agg_domain_resolve_need = false;
-	      }
-	  }
       }
     else if constexpr (result_type == RESULT_TYPE::XASL_SNAPSHOT)
       {

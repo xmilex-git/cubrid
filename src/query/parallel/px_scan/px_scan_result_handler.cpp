@@ -85,7 +85,7 @@ namespace parallel_scan
 
   template <RESULT_TYPE result_type>
   result_handler<result_type>::result_handler (QUERY_ID query_id, interrupt *interrupt_p,
-      err_messages_with_lock *err_messages_p, int parallelism, bool g_agg_domain_resolve_need,
+      err_messages_with_lock *err_messages_p, int parallelism,
       XASL_NODE *orig_xasl_tree_for_domain_resolve)
   {
     m_parallelism = parallelism;
@@ -286,17 +286,6 @@ namespace parallel_scan
 	    return;
 	  }
 	tl.tpl_buf.size = DB_PAGESIZE;
-	int total_val_cnt = 0;
-	for (XASL_NODE *xasl = m_.orig_xasl; xasl != nullptr; xasl = xasl->scan_ptr)
-	  {
-	    total_val_cnt += xasl->val_list->val_cnt;
-	  }
-	tl.dbvals_for_domain_resolve.resize (total_val_cnt);
-	for (DB_VALUE &dbval : tl.dbvals_for_domain_resolve)
-	  {
-	    dbval.domain.general_info.is_null = 1;
-	  }
-	tl.val_list_domain_resolved = false;
 	tl.xasl = curr_xasl;
 	if (m_.instnum_mode != parallel_scan::instnum_mode::NONE && tl.xasl->instnum_val != nullptr)
 	  {
@@ -306,7 +295,6 @@ namespace parallel_scan
 	  }
 	tl.instnum_quota_done = false;	/* tls outlives the scan; a reused worker must not inherit it */
 	tl.agg_hash_state = HS_NONE;
-	tl.g_agg_domains_resolved = TRUE;
 	if (m_.g_hash_eligible)
 	  {
 	    if (qexec_alloc_agg_hash_context_buildlist_xasl (thread_p, curr_xasl, vd->xasl_state, true) != NO_ERROR)
@@ -316,7 +304,16 @@ namespace parallel_scan
 		return;
 	      }
 	    tl.agg_hash_state = HS_ACCEPT_ALL;
-	    tl.g_agg_domains_resolved = FALSE;
+
+	    /* this worker's own XASL copy: the serial path's setup does not reach it */
+	    if (qexec_setup_aggregate_domains_for_xasl (curr_xasl) != NO_ERROR)
+	      {
+		m_err_messages_p->move_top_error_message_to_this();
+		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		return;
+	      }
+	    qexec_mark_aggregate_operand_expressions (curr_xasl);
+	    qdata_link_shared_accumulators (curr_xasl->proc.buildlist.g_agg_list);
 	  }
 	/* setup failure leaves curr_xasl->topn_items NULL; worker falls back to plain BUILDLIST and final ORDER BY+LIMIT runs on main's concat list_id via qexec_orderby_distinct_by_sorting. */
 	tl.is_topn = false;
@@ -408,30 +405,6 @@ namespace parallel_scan
 	tl.vd = nullptr;
 	{
 	  std::lock_guard<std::mutex> lock (m_result_mutex);
-
-	  HL_HEAPID heap_id = db_change_private_heap (thread_p, 0);
-	  XASL_NODE *xptr = m_.orig_xasl;
-	  int i = 0;
-	  for (; xptr != nullptr; xptr = xptr->scan_ptr)
-	    {
-	      QPROC_DB_VALUE_LIST orig_valp = xptr->val_list->valp;
-	      int end = i + xptr->val_list->val_cnt;
-	      for (; i < end; i++)
-		{
-		  if (orig_valp->val->domain.general_info.is_null && !tl.dbvals_for_domain_resolve[i].domain.general_info.is_null)
-		    {
-		      pr_clone_value (&tl.dbvals_for_domain_resolve[i], orig_valp->val);
-		    }
-		  orig_valp = orig_valp->next;
-		}
-	    }
-
-	  db_change_private_heap (thread_p, heap_id);
-	  for (DB_VALUE &dbval : tl.dbvals_for_domain_resolve)
-	    {
-	      pr_clear_value (&dbval);
-	    }
-	  tl.dbvals_for_domain_resolve.clear();
 
 	  if (hash_aggregate_append)
 	    {
@@ -888,55 +861,12 @@ namespace parallel_scan
 	    qfile_update_domains_on_type_list (thread_p, tl.writer_result_p, input);
 	    m_.is_list_id_domain_resolved = tl.writer_result_p->is_domain_resolved;
 	  }
-	if (unlikely (!tl.val_list_domain_resolved))
-	  {
-	    XASL_NODE *xptr = tl.xasl;
-	    int i = 0;
-	    tl.val_list_domain_resolved = true;
-
-	    for (; xptr != nullptr; xptr = xptr->scan_ptr)
-	      {
-		QPROC_DB_VALUE_LIST valp = xptr->val_list->valp;
-		int end = i + xptr->val_list->val_cnt;
-		for (; i < end; i++)
-		  {
-		    if (tl.dbvals_for_domain_resolve[i].domain.general_info.is_null)
-		      {
-			if (!valp->val->domain.general_info.is_null)
-			  {
-			    pr_clone_value (valp->val, &tl.dbvals_for_domain_resolve[i]);
-			  }
-			else
-			  {
-			    tl.val_list_domain_resolved = false;
-			  }
-		      }
-		    valp = valp->next;
-		  }
-	      }
-	  }
 
 	if (likely (status == QPROC_TPLDESCR_SUCCESS))
 	  {
 	    bool output_tuple = true;
 	    if (tl.agg_hash_state == HS_ACCEPT_ALL)
 	      {
-		if (unlikely (!tl.g_agg_domains_resolved))
-		  {
-		    if (qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg (thread_p, tl.xasl, tl.vd,
-			&tl.g_agg_domains_resolved) != NO_ERROR)
-		      {
-			m_err_messages_p->move_top_error_message_to_this();
-			m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-			return false;
-		      }
-
-		    /* The serial path's marking does not reach a worker's own XASL copy.
-		     * Mark it here, once per worker, like the domain resolve above. */
-		    qexec_mark_aggregate_operand_expressions (tl.xasl);
-		    /* Sharing needs the resolved accumulator domains, so it is linked here. */
-		    qdata_link_shared_accumulators (tl.xasl->proc.buildlist.g_agg_list);
-		  }
 		if (qexec_hash_gby_agg_tuple_public (thread_p, tl.xasl, tl.vd->xasl_state, &tl.tpl_buf,
 						     & (tl.writer_result_p->tpl_descr), tl.writer_result_p, &output_tuple) != NO_ERROR)
 		  {
@@ -1546,7 +1476,11 @@ namespace parallel_scan
     tl_xasl_p = xasl_p;
     tl_tpl_buf.tpl = (char *)db_private_alloc (thread_p, DB_PAGESIZE);
     tl_tpl_buf.size = DB_PAGESIZE;
-    tl_xasl_p->proc.buildvalue.agg_domains_resolved = 0;
+    if (qexec_setup_aggregate_domains_for_xasl (tl_xasl_p) != NO_ERROR)
+      {
+	assert (false);
+      }
+    qdata_link_shared_accumulators (tl_xasl_p->proc.buildvalue.agg_list);
     for (AGGREGATE_TYPE *agg_node = tl_xasl_p->proc.buildvalue.agg_list; agg_node != NULL; agg_node = agg_node->next)
       {
 	bool ok;
@@ -2140,23 +2074,6 @@ namespace parallel_scan
 
   bool result_handler<RESULT_TYPE::BUILDVALUE_OPT>::write (THREAD_ENTRY *thread_p)
   {
-    if (!tl_xasl_p->proc.buildvalue.agg_domains_resolved)
-      {
-	if (qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_buildvalue_proc (thread_p, tl_xasl_p, tl_vd,
-	    &tl_xasl_p->proc.buildvalue.agg_domains_resolved) != NO_ERROR)
-	  {
-	    return false;
-	  }
-
-	if (tl_xasl_p->proc.buildvalue.agg_domains_resolved)
-	  {
-	    /* Sharing needs the resolved accumulator domains, so it is linked here once
-	     * per worker. Any rows accumulated into a sharer before resolution are
-	     * overwritten during propagation; this only adds work, not a correctness issue.
-	     */
-	    qdata_link_shared_accumulators (tl_xasl_p->proc.buildvalue.agg_list);
-	  }
-      }
     for (AGGREGATE_TYPE *agg_node = tl_xasl_p->proc.buildvalue.agg_list; agg_node != NULL; agg_node = agg_node->next)
       {
 	AGGREGATE_ACCUMULATOR *acc = &agg_node->accumulator;
@@ -2678,13 +2595,7 @@ namespace parallel_scan
 	      break;
 	    }
 
-	  /* The host variable's domain is resolved only in worker clones that scan rows.
-	   * Copy the resolved domain to the main agg node before merging the accumulators. */
-	  if (orig_agg_p->opr_dbtype == DB_TYPE_VARIABLE && cur_agg_p->opr_dbtype != DB_TYPE_VARIABLE)
-	    {
-	      orig_agg_p->domain = cur_agg_p->domain;
-	      orig_agg_p->opr_dbtype = cur_agg_p->opr_dbtype;
-	    }
+	  assert (orig_agg_p->opr_dbtype != DB_TYPE_VARIABLE);
 
 	  switch (orig_agg_p->function)
 	    {

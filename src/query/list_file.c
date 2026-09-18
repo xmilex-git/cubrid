@@ -907,6 +907,8 @@ qfile_unify_types (QFILE_LIST_ID * list_id1_p, const QFILE_LIST_ID * list_id2_p)
       type1 = TP_DOMAIN_TYPE (list_id1_p->type_list.domp[i]);
       type2 = TP_DOMAIN_TYPE (list_id2_p->type_list.domp[i]);
 
+      /* a list file column is described by a settled domain since the plan is fully typed (wf268 C3) */
+      assert (type1 != DB_TYPE_VARIABLE && type2 != DB_TYPE_VARIABLE);
       if (type1 == DB_TYPE_VARIABLE)
 	{
 	  /* The domain of list1 is not resolved, because there is no tuple. */
@@ -4504,6 +4506,8 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
 
 	  if (p->pos_descr.dom->type->id == DB_TYPE_VARIABLE)
 	    {
+	      /* a sort key that the compiler could not type (an analytic window key, a set operation column) is
+	       * described by the list file it sorts - the list's own column domain is settled (wf268 C3) */
 	      subkey->sort_f = types->domp[i]->type->get_data_cmpdisk_function ();
 	    }
 	  else
@@ -7060,21 +7064,9 @@ qfile_update_domains_on_type_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list
 	  goto exit_on_error;
 	}
 
-      if (TP_DOMAIN_TYPE (list_id_p->type_list.domp[count]) == DB_TYPE_VARIABLE)
-	{
-	  if (TP_DOMAIN_TYPE (reg_var_p->value.domain) == DB_TYPE_VARIABLE)
-	    {
-	      /* In this case, we cannot resolve the value's domain. We will try to do for the next tuple. */
-	      if (list_id_p->is_domain_resolved)
-		{
-		  list_id_p->is_domain_resolved = false;
-		}
-	    }
-	  else
-	    {
-	      list_id_p->type_list.domp[count] = reg_var_p->value.domain;
-	    }
-	}
+      /* the type itself is settled before the first tuple exists; only an open collation is still decided by
+       * the value a host variable was bound to (D-277-05, wf268 C3) */
+      assert (TP_DOMAIN_TYPE (list_id_p->type_list.domp[count]) != DB_TYPE_VARIABLE);
 
       if (list_id_p->type_list.domp[count]->collation_flag != TP_DOMAIN_COLL_NORMAL)
 	{

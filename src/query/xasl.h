@@ -382,7 +382,6 @@ struct buildlist_proc_node
 					 * statement */
   AGGREGATE_HASH_CONTEXT *agg_hash_context;	/* hash aggregate context, not serialized */
 #endif				/* defined (SERVER_MODE) || defined (SA_MODE) */
-  int g_agg_domains_resolved;	/* domain status (not serialized) */
 };
 
 typedef struct buildvalue_proc_node BUILDVALUE_PROC_NODE;
@@ -393,7 +392,6 @@ struct buildvalue_proc_node
   AGGREGATE_TYPE *agg_list;	/* aggregate function list */
   ARITH_TYPE *outarith_list;	/* outside arithmetic list */
   int is_always_false;		/* always-false agg-query? */
-  int agg_domains_resolved;	/* domain status (not serialized) */
 };
 
 typedef struct mergelist_proc_node MERGELIST_PROC_NODE;

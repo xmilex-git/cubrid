@@ -22216,7 +22216,6 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
   DB_VALUE *new_key_value = NULL;
   int error = NO_ERROR, i = 0;
   TP_DOMAIN *domain;
-  bool has_null_domain;
 
   assert (multi_range_opt->use == true);
 
@@ -22280,7 +22279,9 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
 	}
     }
 
-  /* resolve domains */
+  /* The sort columns are index key columns, so their domains come from the index key schema.  Taking them from
+   * the first non-NULL key value instead (and retrying on every later key until one was not NULL) is the
+   * unresolved-domain handling this commit removes (wf268 C3, E17). */
   if (multi_range_opt->sort_col_dom == NULL)
     {
       multi_range_opt->sort_col_dom =
@@ -22293,31 +22294,22 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
 
       for (i = 0; i < multi_range_opt->num_attrs; i++)
 	{
-	  multi_range_opt->sort_col_dom[i] = &tp_Null_domain;
-	}
-      multi_range_opt->has_null_domain = true;
-    }
+	  int j;
 
-  if (multi_range_opt->has_null_domain)
-    {
-      has_null_domain = false;
-      for (i = 0; i < multi_range_opt->num_attrs; i++)
-	{
-	  assert (multi_range_opt->sort_col_dom[i] != NULL);
-	  if (multi_range_opt->sort_col_dom[i] == &tp_Null_domain)
+	  domain = bts->btid_int.key_type != NULL ? bts->btid_int.key_type->setdomain : NULL;
+	  for (j = 0; domain != NULL && j < multi_range_opt->sort_att_idx[i]; j++)
 	    {
-	      domain = tp_domain_resolve_value (&new_key_value[i], NULL);
-	      if (domain != &tp_Null_domain)
-		{
-		  multi_range_opt->sort_col_dom[i] = domain;
-		}
-	      else
-		{
-		  has_null_domain = true;
-		}
+	      domain = domain->next;
 	    }
+	  if (domain == NULL)
+	    {
+	      assert (false);
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	      error = ER_QPROC_INVALID_XASLNODE;
+	      goto exit;
+	    }
+	  multi_range_opt->sort_col_dom[i] = domain;
 	}
-      multi_range_opt->has_null_domain = has_null_domain;
     }
 
   if (multi_range_opt->cnt == multi_range_opt->size)
