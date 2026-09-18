@@ -1482,7 +1482,7 @@ pt_hv_set_default_slot (PARSER_CONTEXT *parser, PT_NODE *arg, PT_TYPE_ENUM slot_
     }
   if (TP_IS_CHAR_TYPE (db_type) || TP_IS_BIT_TYPE (db_type))
     {
-      d = tp_domain_resolve_default_w_coll (db_type, LANG_SYS_COLLATION, TP_DOMAIN_COLL_LEAVE);
+      d = pt_hv_open_string_domain (db_type);
     }
   else
     {

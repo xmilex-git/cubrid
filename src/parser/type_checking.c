@@ -4673,9 +4673,16 @@ pt_coerce_expression_argument (PARSER_CONTEXT * parser, PT_NODE * expr, PT_NODE 
 
   if (node->node_type == PT_HOST_VAR && node->info.host_var.index < parser->host_var_count
       && (node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE) && !pt_hv_is_open_slot (parser, node)
-      && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_VARIABLE
-      && pt_db_to_type_enum (TP_DOMAIN_TYPE (node->expected_domain)) != def_type)
+      && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_VARIABLE)
     {
+      if (pt_db_to_type_enum (TP_DOMAIN_TYPE (node->expected_domain)) == def_type)
+	{
+	  /* the slot already holds the contract this use site needs (the same type, a collation a consumer may have
+	   * decided): a contract is decided once, so nothing is re-typed here -- the semantic pass runs more than once
+	   * over the same tree and a second visit must not reset the contract to a default */
+	  return NO_ERROR;
+	}
+
       /* The marker's slot contract was decided by another consumer (a LIMIT count reused in the offset + count
        * predicate, a seeded partner type): a contract is decided once, so this use site casts the slot's value to
        * the type it needs instead of re-typing the slot (which would strand the other use and the bind). */
@@ -4712,11 +4719,15 @@ pt_coerce_expression_argument (PARSER_CONTEXT * parser, PT_NODE * expr, PT_NODE 
 	    {
 	      d = pt_data_type_to_db_domain (parser, new_dt, NULL);
 	    }
+	  else if (TP_TYPE_HAS_COLLATION (pt_type_enum_to_db (def_type)))
+	    {
+	      /* an open string slot carries the compile default as its nominal collation (pt_hv_seed_slot) */
+	      d = pt_hv_open_string_domain (pt_type_enum_to_db (def_type));
+	    }
 	  else
 	    {
-	      d =
-		tp_domain_resolve_default_w_coll (pt_type_enum_to_db (def_type), LANG_SYS_COLLATION,
-						  TP_DOMAIN_COLL_LEAVE);
+	      d = tp_domain_resolve_default_w_coll (pt_type_enum_to_db (def_type), LANG_SYS_COLLATION,
+						    TP_DOMAIN_COLL_LEAVE);
 	    }
 	  if (d == NULL)
 	    {
@@ -8768,10 +8779,14 @@ pt_wrap_with_cast_op (PARSER_CONTEXT * parser, PT_NODE * arg, PT_TYPE_ENUM new_t
 
       if (PT_HAS_COLLATION (new_type) && arg->type_enum == PT_TYPE_MAYBE)
 	{
-	  /* when wrapping a TYPE MAYBE, we don't change the collation */
+	  INTL_CODESET codeset;
+	  int coll_id;
+
+	  /* when wrapping a TYPE MAYBE, we don't change the collation; the nominal one is the compile default */
+	  pt_hv_default_charset_coll (&codeset, &coll_id);
 	  new_dt->info.data_type.collation_flag = TP_DOMAIN_COLL_LEAVE;
-	  new_dt->info.data_type.collation_id = LANG_SYS_COLLATION;
-	  new_dt->info.data_type.units = LANG_SYS_CODESET;
+	  new_dt->info.data_type.collation_id = coll_id;
+	  new_dt->info.data_type.units = codeset;
 	}
     }
   else
@@ -8867,6 +8882,36 @@ pt_hv_default_charset_coll (INTL_CODESET * codeset, int *coll_id)
       *codeset = LANG_SYS_CODESET;
       *coll_id = LANG_SYS_COLLATION;
     }
+}
+
+/*
+ * pt_hv_open_string_domain () - the domain of an open (TP_DOMAIN_COLL_LEAVE) string slot: the type's default domain
+ *				 tagged with the compile default charset/collation as its nominal collation, so that every
+ *				 reader of an undecided slot (pt_get_collation_info, the finalization) sees one default
+ *   return: a cached domain, or NULL
+ *   db_type(in): a character or bit string type
+ */
+TP_DOMAIN *
+pt_hv_open_string_domain (DB_TYPE db_type)
+{
+  TP_DOMAIN *d = tp_domain_resolve_default (db_type);
+  INTL_CODESET codeset;
+  int coll_id;
+
+  if (d == NULL || !TP_TYPE_HAS_COLLATION (db_type))
+    {
+      return d;
+    }
+  pt_hv_default_charset_coll (&codeset, &coll_id);
+  d = tp_domain_copy (d, false);
+  if (d == NULL)
+    {
+      return NULL;
+    }
+  d->codeset = (unsigned char) codeset;
+  d->collation_id = coll_id;
+  d->collation_flag = TP_DOMAIN_COLL_LEAVE;
+  return tp_domain_cache (d);
 }
 
 /*
@@ -9002,7 +9047,9 @@ pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NO
     }
   else if (TP_IS_CHAR_TYPE (db_type) || TP_IS_BIT_TYPE (db_type))
     {
-      d = tp_domain_resolve_default_w_coll (db_type, LANG_SYS_COLLATION, TP_DOMAIN_COLL_LEAVE);
+      /* the compile default is the nominal collation of the open (TP_DOMAIN_COLL_LEAVE) slot: what the consumers
+       * read until one of them decides, and what the slot keeps when none does (pt_hv_finalize_contracts) */
+      d = pt_hv_open_string_domain (db_type);
     }
   else
     {
@@ -21928,8 +21975,17 @@ pt_get_collation_info (const PT_NODE * node, PT_COLL_INFER * coll_infer)
     }
   else if (node->type_enum == PT_TYPE_MAYBE || (node->node_type == PT_VALUE && PT_HAS_COLLATION (node->type_enum)))
     {
-      coll_infer->coll_id = LANG_SYS_COLLATION;
-      coll_infer->codeset = LANG_SYS_CODESET;
+      if (node->type_enum == PT_TYPE_MAYBE)
+	{
+	  /* an untyped operand (a host variable marker without a contract yet, a residual expression) reads the
+	   * compile default, the same nominal collation its slot gets (pt_hv_seed_slot) */
+	  pt_hv_default_charset_coll (&coll_infer->codeset, &coll_infer->coll_id);
+	}
+      else
+	{
+	  coll_infer->coll_id = LANG_SYS_COLLATION;
+	  coll_infer->codeset = LANG_SYS_CODESET;
+	}
       has_collation = true;
 
       if (node->type_enum == PT_TYPE_MAYBE)
@@ -22563,6 +22619,7 @@ pt_coerce_node_collation (PARSER_CONTEXT * parser, PT_NODE * node, const int col
   PT_NODE *wrap_dt;
   PT_NODE *collection_node;
   bool preset_hv_in_collection = false;
+
   bool is_string_literal = false;
 
   assert (node != NULL);
@@ -22692,7 +22749,60 @@ pt_coerce_node_collation (PARSER_CONTEXT * parser, PT_NODE * node, const int col
       assert (PT_IS_COLLECTION_TYPE (node->type_enum) || PT_HAS_COLLATION (node->type_enum)
 	      || node->type_enum == PT_TYPE_MAYBE);
 
-      if (PT_IS_COLLECTION_TYPE (node->type_enum))
+      if (PT_IS_COLLECTION_TYPE (node->type_enum) && node->node_type == PT_FUNCTION
+	  && pt_hv_is_marker_only_collection (parser, node))
+	{
+	  /* D-277-05: 's1 IN (?, ?)' -- the use site decides the collation of the marker slots themselves: each
+	   * marker's contract takes the collation (the bound values are converted to it at bind time) and the list's
+	   * element types follow; no CAST is wrapped around the list and nothing is left to the execution */
+	  PT_NODE *dt_node, *arg;
+	  TP_DOMAIN *dom_hv;
+
+	  if (node->data_type == NULL)
+	    {
+	      assert (wrap_dt != NULL);
+	      node->data_type = wrap_dt;
+	      wrap_dt = NULL;
+	    }
+	  for (arg = node->info.function.arg_list; arg != NULL; arg = arg->next)
+	    {
+	      if (arg->expected_domain != NULL && TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (arg->expected_domain)))
+		{
+		  dom_hv = tp_domain_copy (arg->expected_domain, false);
+		}
+	      else
+		{
+		  assert (PT_IS_CHAR_STRING_TYPE (wrap_type_for_maybe));
+		  dom_hv = tp_domain_construct (pt_type_enum_to_db (wrap_type_for_maybe), NULL,
+						TP_FLOATING_PRECISION_VALUE, 0, NULL);
+		}
+	      if (dom_hv == NULL)
+		{
+		  goto cannot_coerce;
+		}
+	      dom_hv->codeset = (unsigned char) codeset;
+	      dom_hv->collation_id = coll_id;
+	      dom_hv->collation_flag = TP_DOMAIN_COLL_NORMAL;
+	      dom_hv = tp_domain_cache (dom_hv);
+	      SET_EXPECTED_DOMAIN (arg, dom_hv);
+	      pt_preset_hostvar (parser, arg);
+	    }
+	  for (dt_node = node->data_type; dt_node != NULL; dt_node = dt_node->next)
+	    {
+	      if (PT_HAS_COLLATION (dt_node->type_enum))
+		{
+		  dt_node->info.data_type.collation_id = coll_id;
+		  dt_node->info.data_type.units = (int) codeset;
+		  dt_node->info.data_type.collation_flag = TP_DOMAIN_COLL_NORMAL;
+		}
+	    }
+	  if (wrap_dt != NULL)
+	    {
+	      parser_free_node (parser, wrap_dt);
+	      wrap_dt = NULL;
+	    }
+	}
+      else if (PT_IS_COLLECTION_TYPE (node->type_enum))
 	{
 	  PT_NODE *dt_node;
 	  PT_NODE *dt = NULL, *arg;
