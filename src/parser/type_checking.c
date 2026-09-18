@@ -7643,9 +7643,10 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
 	PT_NODE **recurs_arg = NULL, **norm_arg = NULL;
 	PT_OP_TYPE op = recurs_expr->info.expr.op;
 
-	if (pt_is_range_or_comp (op))
+	if (pt_is_range_or_comp (op) || op == PT_LIKE)
 	  {
-	    /* D-277-05/D-277-07 gap (R9, e.g. 'col > ? + ?' against a collated column): pt_hv_seed_from_context()
+	    /* D-277-05/D-277-07 gap (R9, e.g. 'col > ? + ?' or 'col like ? + ?' against a collated column):
+	     * pt_hv_seed_from_context()
 	     * runs bottom-up (pt_eval_type's post-pass), so by the time it visits this comparison the inner PLUS
 	     * has already committed its two still-open markers to the "no known operand" default (D-277-07:
 	     * context-free '?+?' is the floating NUMERIC), and the comparison itself no longer sees an open slot
