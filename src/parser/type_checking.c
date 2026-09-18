@@ -222,6 +222,7 @@ static int pt_hv_prefer_string_overload (PARSER_CONTEXT * parser, const EXPRESSI
 					 PT_TYPE_ENUM arg1_type, PT_TYPE_ENUM arg2_type, PT_TYPE_ENUM arg3_type);
 static void pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index,
 				    SEMANTIC_CHK_INFO * sc_info);
+static PT_NODE *pt_hv_seed_bigint_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
 static PT_NODE *pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
 					       int *continue_walk);
 static PT_TYPE_ENUM pt_get_equivalent_type_with_op (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM arg_type,
@@ -9330,10 +9331,12 @@ pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * usin
     {
       if (l->node_type == PT_EXPR && l->type_enum == PT_TYPE_NONE)
 	{
-	  /* 'LIMIT ? - ?, ? * ?': the clause is not part of the typed tree walk; type it here so its markers hold
-	   * their contracts before the rewrite copies the expression into the numbering predicates */
+	  /* 'LIMIT ? - ?, ? * ?': the clause is not part of the typed tree walk; its markers are BIGINT slots (the
+	   * row count context, D-271-02) and the expression is typed here so the contracts are in place before the
+	   * rewrite copies it into the numbering predicates and before the key limit consumes it */
 	  save_next = l->next;
 	  l->next = NULL;
+	  (void) parser_walk_tree (parser, l, pt_hv_seed_bigint_pre, NULL, NULL, NULL);
 	  (void) pt_semantic_type (parser, l, sc_info);
 	  l->next = save_next;
 	}
@@ -9352,6 +9355,7 @@ pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * usin
 		{
 		  save_next = l->next;
 		  l->next = NULL;
+		  (void) parser_walk_tree (parser, l, pt_hv_seed_bigint_pre, NULL, NULL, NULL);
 		  (void) pt_semantic_type (parser, l, sc_info);
 		  l->next = save_next;
 		}
@@ -9362,6 +9366,19 @@ pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * usin
 	    }
 	}
     }
+}
+
+/*
+ * pt_hv_seed_bigint_pre () - walker: every open marker under a LIMIT / KEYLIMIT expression is a BIGINT slot
+ */
+static PT_NODE *
+pt_hv_seed_bigint_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  if (node != NULL && node->node_type == PT_HOST_VAR)
+    {
+      pt_hv_seed_slot (parser, node, PT_TYPE_BIGINT, NULL);
+    }
+  return node;
 }
 
 /*
@@ -9596,9 +9613,18 @@ pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
       && (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN
 	  || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_VARIABLE))
     {
-      /* D-271-02 (4): a marker no context constrained (SELECT ?, ? IS NULL, ...) is a VARCHAR slot */
+      /* D-271-02 (4): a marker no context constrained (SELECT ?, ? IS NULL, COLLATION (?), ...) is a VARCHAR slot
+       * with the compile default charset/collation (tp_domain_resolve_default_w_coll ignores the collation for
+       * TP_DOMAIN_COLL_NORMAL, so the domain is built explicitly) */
       pt_hv_default_charset_coll (&codeset, &coll_id);
-      d = tp_domain_resolve_default_w_coll (DB_TYPE_VARCHAR, coll_id, TP_DOMAIN_COLL_NORMAL);
+      d = tp_domain_construct (DB_TYPE_VARCHAR, NULL, TP_FLOATING_PRECISION_VALUE, 0, NULL);
+      if (d == NULL)
+	{
+	  return node;
+	}
+      d->codeset = (unsigned char) codeset;
+      d->collation_id = coll_id;
+      d->collation_flag = TP_DOMAIN_COLL_NORMAL;
       d = tp_domain_cache (d);
       SET_EXPECTED_DOMAIN (node, d);
       pt_preset_hostvar (parser, node);
