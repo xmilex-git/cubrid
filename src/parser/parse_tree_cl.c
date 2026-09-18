@@ -3118,6 +3118,16 @@ parser_print_tree (PARSER_CONTEXT * parser, const PT_NODE * node)
 	    }
 	  string = pt_append_nulstring (parser, string, ";bind_var_cnt=");
 	  string = pt_append_nulstring (parser, string, host_var_count);
+
+	  if (parser->host_var_count > 0)
+	    {
+	      /* a user marker's string slot contract carries the compile environment's charset/collation (D-271-05); the
+	       * same text compiled under another client collation is another plan, so the collation is part of the key */
+	      char hv_coll[24];
+
+	      snprintf (hv_coll, sizeof (hv_coll), ";hvcoll=%d", lang_get_client_collation ());
+	      string = pt_append_nulstring (parser, string, hv_coll);
+	    }
 	}
 
       if ((parser->custom_print & PT_PRINT_DBLINK_INFO) && parser->dblink_server_text)

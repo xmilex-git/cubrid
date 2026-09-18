@@ -2972,6 +2972,8 @@ do_process_prepare_statement (DB_SESSION * session, PT_NODE * statement)
   prepare_info.auto_param_count = prepared_session->parser->auto_param_count;
   /* set recompile */
   prepare_info.recompile = prepared_stmt->flag.recompile;
+  /* the compile environment's collation the slot contracts were built with */
+  prepare_info.client_collation = lang_get_client_collation ();
 
   if (prepare_info.stmt_type == CUBRID_STMT_SELECT)
     {
@@ -3103,6 +3105,13 @@ do_get_prepared_statement_info (DB_SESSION * session, int stmt_idx, int *subquer
       PT_INTERNAL_ERROR (parser, "allocate new node");
     }
   statement->info.execute.recompile = prepare_info.recompile;
+  if (prepare_info.client_collation != -1 && prepare_info.client_collation != lang_get_client_collation ()
+      && prepare_info.host_variables.size > prepare_info.auto_param_count)
+    {
+      /* the string slot contracts of the user markers were compiled under another client collation (SET NAMES since
+       * the PREPARE): the plan is another one (D-271-05 / D-271-09), so this execution recompiles */
+      statement->info.execute.recompile = 1;
+    }
   statement->info.execute.do_cache = prepare_info.do_cache;
   statement->info.execute.oids_included = prepare_info.oids_included;
 

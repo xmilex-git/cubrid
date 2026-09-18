@@ -9403,6 +9403,13 @@ pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
       return;
     }
 
+  if (op == PT_ROUND || op == PT_TRUNC)
+    {
+      /* the value operand is a number in its own right: the digits operand ('TRUNC (?, i1)') never types it */
+      pt_hv_seed_slot (parser, left, PT_TYPE_NUMERIC, NULL);
+      return;
+    }
+
   numeric = pt_is_hv_arithmetic_op (op);
   common = (op == PT_NVL || op == PT_IFNULL || op == PT_NULLIF || op == PT_COALESCE || op == PT_LEAST
 	    || op == PT_GREATEST || pt_is_range_or_comp (op));
@@ -9518,7 +9525,8 @@ pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
 	      return;
 	    }
 	  /* D-271-07 / D-277-03: a comparison with an ENUM gives the marker the ENUM definition as its contract; a
-	   * bound label or ordinal is converted before the scan (tp_value_cast to the ENUM), no pass-through */
+	   * bound label or ordinal is converted before the scan (tp_value_cast to the ENUM), no pass-through. An
+	   * ordering comparison then compares ordinals (pt_eval_expr_type casts both sides to INTEGER). */
 	}
       else if (numeric && PT_IS_DATE_TIME_TYPE (known_type))
 	{
@@ -10033,6 +10041,30 @@ pt_eval_expr_type (PARSER_CONTEXT * parser, PT_NODE * node)
 	{
 	  arg3_hv = arg3;
 	}
+    }
+
+  if (arg3 == NULL && arg1 != NULL && arg2 != NULL && pt_is_range_or_comp (op) && op != PT_EQ && op != PT_NE
+      && op != PT_NULLSAFE_EQ && op != PT_EQ_SOME && op != PT_NE_SOME && op != PT_EQ_ALL && op != PT_NE_ALL
+      && op != PT_IS_IN && op != PT_IS_NOT_IN && op != PT_RANGE && op != PT_LIKE && op != PT_NOT_LIKE
+      && arg1_type == PT_TYPE_ENUMERATION && arg2_type == PT_TYPE_ENUMERATION
+      && ((arg1->node_type == PT_HOST_VAR && arg1->info.host_var.index < parser->host_var_count)
+	  || (arg2->node_type == PT_HOST_VAR && arg2->info.host_var.index < parser->host_var_count)))
+    {
+      /* D-277-03: an ordering comparison between an ENUM and a marker holding the ENUM contract compares ordinals,
+       * as the ENUM does against a numeric literal ('e < 6' is 'cast (e as integer) < 6'): both sides are cast to
+       * INTEGER here; the bound label or ordinal was converted to the ENUM element at bind time */
+      PT_NODE *c1 = pt_wrap_with_cast_op (parser, arg1, PT_TYPE_INTEGER, 0, 0, NULL);
+      PT_NODE *c2 = (c1 != NULL) ? pt_wrap_with_cast_op (parser, arg2, PT_TYPE_INTEGER, 0, 0, NULL) : NULL;
+
+      if (c1 == NULL || c2 == NULL)
+	{
+	  node->type_enum = PT_TYPE_NONE;
+	  return node;
+	}
+      node->info.expr.arg1 = arg1 = c1;
+      node->info.expr.arg2 = arg2 = c2;
+      arg1_type = arg2_type = PT_TYPE_INTEGER;
+      arg1_hv = arg2_hv = NULL;
     }
 
   /*
@@ -21606,11 +21638,14 @@ pt_get_equivalent_type_with_op (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM a
 	  /* leave undetermined type */
 	  return PT_TYPE_MAYBE;
 	}
-      if (pt_is_symmetric_op (op))
+      if (pt_is_symmetric_op (op)
+	  && (def_type.val.generic_type == PT_GENERIC_TYPE_ANY || def_type.val.generic_type == PT_GENERIC_TYPE_PRIMITIVE
+	      || def_type.val.generic_type == PT_GENERIC_TYPE_SCALAR))
 	{
-	  /* a symmetric operator mirrors the type of its known operand onto the unresolved one in
-	   * pt_infer_common_type (); the generic default of pt_get_equivalent_type () applies only when no operand is
-	   * known, which pt_infer_common_type () decides */
+	  /* an open position of a symmetric operator: the type of the known operand is mirrored onto the unresolved
+	   * one in pt_infer_common_type (), and the statement default (NUMERIC / VARCHAR) applies only when no operand
+	   * is known, which pt_infer_common_type () decides. A position whose generic type already names a family
+	   * (NUMBER, DISCRETE_NUMBER, STRING, DATETIME, BIT) takes that family's default below, SPACE (?) is BIGINT. */
 	  return PT_TYPE_MAYBE;
 	}
     }

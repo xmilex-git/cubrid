@@ -418,6 +418,7 @@ db_init_prepare_info (DB_PREPARE_INFO * info)
   info->host_var_expected_domains = NULL;
   info->auto_param_count = 0;
   info->recompile = 0;
+  info->client_collation = -1;
   info->oids_included = 0;
   info->into_list = NULL;
   info->into_count = 0;
@@ -472,6 +473,8 @@ db_pack_prepare_info (const DB_PREPARE_INFO * info, char **buffer)
   packed_size += OR_INT_SIZE;
   /* recompile */
   packed_size += OR_INT_SIZE;
+  /* client_collation */
+  packed_size += OR_INT_SIZE;
   /* do_cache */
   packed_size += OR_INT_SIZE;
   /* oids included */
@@ -518,6 +521,8 @@ db_pack_prepare_info (const DB_PREPARE_INFO * info, char **buffer)
   ptr = or_pack_int (ptr, info->auto_param_count);
   /* recompile */
   ptr = or_pack_int (ptr, info->recompile);
+  /* client_collation */
+  ptr = or_pack_int (ptr, info->client_collation);
   /* do_cache */
   ptr = or_pack_int (ptr, info->do_cache);
   /* oids included */
@@ -589,6 +594,8 @@ db_unpack_prepare_info (DB_PREPARE_INFO * info, char *buffer)
   ptr = or_unpack_int (ptr, &info->auto_param_count);
   /* unpack recompile */
   ptr = or_unpack_int (ptr, &info->recompile);
+  /* unpack client_collation */
+  ptr = or_unpack_int (ptr, &info->client_collation);
   /* unpack do_cache */
   ptr = or_unpack_int (ptr, &info->do_cache);
   /* oids included */

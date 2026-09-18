@@ -158,6 +158,8 @@ extern "C"
     TP_DOMAIN **host_var_expected_domains;
     int auto_param_count;	/* number of auto parametrized values */
     int recompile;		/* statement should be recompiled */
+    int client_collation;	/* the client collation the statement was compiled under: its string slot contracts
+				 * carry it (D-271-05), so an EXECUTE under another client collation recompiles */
     int do_cache;		/* statement uses result cache */
     int oids_included;
     char **into_list;		/* names of the "into" variables */
