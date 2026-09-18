@@ -22308,6 +22308,20 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
 	      error = ER_QPROC_INVALID_XASLNODE;
 	      goto exit;
 	    }
+	  if (domain->is_desc)
+	    {
+	      /* the index column's descending order is already applied by multi_range_opt->is_desc_order[], so the
+	       * comparison domain must not invert a second time (btree_compare_individual_key_value ()) */
+	      TP_DOMAIN *asc_domain = tp_domain_copy (domain, false);
+
+	      if (asc_domain == NULL)
+		{
+		  error = ER_OUT_OF_VIRTUAL_MEMORY;
+		  goto exit;
+		}
+	      asc_domain->is_desc = 0;
+	      domain = tp_domain_cache (asc_domain);
+	    }
 	  multi_range_opt->sort_col_dom[i] = domain;
 	}
     }
