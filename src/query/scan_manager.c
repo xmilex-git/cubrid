@@ -8210,8 +8210,10 @@ reverse_key_list (KEY_VAL_RANGE * key_vals, int key_cnt)
  *   llsidp (in/out): pointer to list scan id structure
  *   ref_val_list (in): list of DB_VALUEs (val_list_node) used as reference
  *
- *  Note : the result types are settled before the scan starts (compile time, or the execution gate for a value
- *         dependent one); what is left open here is an open host variable slot's collation (D-277-05).
+ *  Note : this connects a position descriptor to the column of the list file it reads.  It never looks at a row
+ *         value - the list file's own type list is the reference - and it runs once per scan open, so it stays
+ *         (wf268 C3, D-280-03).  A MERGE's sub-plan reaches its source list without a producer XASL node, so
+ *         the execution gate cannot map these positions ahead of time.
  */
 static void
 resolve_domains_on_list_scan (LLIST_SCAN_ID * llsidp, val_list_node * ref_val_list)
@@ -8228,9 +8230,8 @@ resolve_domains_on_list_scan (LLIST_SCAN_ID * llsidp, val_list_node * ref_val_li
   /* resolve domains on regu_list of scan predicate */
   for (scan_regu = llsidp->scan_pred.regu_list; scan_regu != NULL; scan_regu = scan_regu->next)
     {
-      assert (TP_DOMAIN_TYPE (scan_regu->value.domain) != DB_TYPE_VARIABLE);
-      if (TP_DOMAIN_COLLATION_FLAG (scan_regu->value.domain) != TP_DOMAIN_COLL_NORMAL
-	  && scan_regu->value.type == TYPE_POSITION)
+      if ((TP_DOMAIN_TYPE (scan_regu->value.domain) == DB_TYPE_VARIABLE
+	   || TP_DOMAIN_COLLATION_FLAG (scan_regu->value.domain)) && scan_regu->value.type == TYPE_POSITION)
 	{
 	  int pos = scan_regu->value.value.pos_descr.pos_no;
 	  TP_DOMAIN *new_dom = NULL;
@@ -8238,7 +8239,8 @@ resolve_domains_on_list_scan (LLIST_SCAN_ID * llsidp, val_list_node * ref_val_li
 	  assert (pos < llsidp->list_id->type_list.type_cnt);
 	  new_dom = llsidp->list_id->type_list.domp[pos];
 
-	  if (TP_DOMAIN_COLLATION_FLAG (new_dom) != TP_DOMAIN_COLL_NORMAL)
+	  if (TP_DOMAIN_TYPE (new_dom) == DB_TYPE_VARIABLE
+	      || TP_DOMAIN_COLLATION_FLAG (new_dom) != TP_DOMAIN_COLL_NORMAL)
 	    {
 	      continue;
 	    }
@@ -8251,8 +8253,8 @@ resolve_domains_on_list_scan (LLIST_SCAN_ID * llsidp, val_list_node * ref_val_li
   /* resolve domains on rest_regu_list of scan predicate */
   for (scan_regu = llsidp->rest_regu_list; scan_regu != NULL; scan_regu = scan_regu->next)
     {
-      assert (TP_DOMAIN_TYPE (scan_regu->value.domain) != DB_TYPE_VARIABLE);
-      if (TP_DOMAIN_COLLATION_FLAG (scan_regu->value.domain) != TP_DOMAIN_COLL_NORMAL
+      if ((TP_DOMAIN_TYPE (scan_regu->value.domain) == DB_TYPE_VARIABLE
+	   || TP_DOMAIN_COLLATION_FLAG (scan_regu->value.domain) != TP_DOMAIN_COLL_NORMAL)
 	  && scan_regu->value.type == TYPE_POSITION)
 	{
 	  int pos = scan_regu->value.value.pos_descr.pos_no;
@@ -8261,7 +8263,8 @@ resolve_domains_on_list_scan (LLIST_SCAN_ID * llsidp, val_list_node * ref_val_li
 	  assert (pos < llsidp->list_id->type_list.type_cnt);
 	  new_dom = llsidp->list_id->type_list.domp[pos];
 
-	  if (TP_DOMAIN_COLLATION_FLAG (new_dom) != TP_DOMAIN_COLL_NORMAL)
+	  if (TP_DOMAIN_TYPE (new_dom) == DB_TYPE_VARIABLE
+	      || TP_DOMAIN_COLLATION_FLAG (new_dom) != TP_DOMAIN_COLL_NORMAL)
 	    {
 	      continue;
 	    }
@@ -8283,12 +8286,14 @@ resolve_domains_on_list_scan (LLIST_SCAN_ID * llsidp, val_list_node * ref_val_li
       if (ev_t.et_type == T_COMP_EVAL_TERM)
 	{
 	  if (ev_t.et.et_comp.lhs != NULL
-	      && TP_DOMAIN_COLLATION_FLAG (ev_t.et.et_comp.lhs->domain) != TP_DOMAIN_COLL_NORMAL)
+	      && (TP_DOMAIN_TYPE (ev_t.et.et_comp.lhs->domain) == DB_TYPE_VARIABLE
+		  || TP_DOMAIN_COLLATION_FLAG (ev_t.et.et_comp.lhs->domain) != TP_DOMAIN_COLL_NORMAL))
 	    {
 	      resolve_domain_on_regu_operand (ev_t.et.et_comp.lhs, ref_val_list, &(llsidp->list_id->type_list));
 	    }
 	  if (ev_t.et.et_comp.rhs != NULL
-	      && TP_DOMAIN_COLLATION_FLAG (ev_t.et.et_comp.rhs->domain) != TP_DOMAIN_COLL_NORMAL)
+	      && (TP_DOMAIN_TYPE (ev_t.et.et_comp.rhs->domain) == DB_TYPE_VARIABLE
+		  || TP_DOMAIN_COLLATION_FLAG (ev_t.et.et_comp.rhs->domain) != TP_DOMAIN_COLL_NORMAL))
 	    {
 	      resolve_domain_on_regu_operand (ev_t.et.et_comp.rhs, ref_val_list, &(llsidp->list_id->type_list));
 	    }

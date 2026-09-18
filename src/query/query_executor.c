@@ -17723,8 +17723,21 @@ qexec_pin_fix_regu (const XASL_NODE * xasl, REGU_VARIABLE * regu, int depth)
     case TYPE_CONSTANT:
       if (regu->domain != NULL && TP_DOMAIN_TYPE (regu->domain) == DB_TYPE_VARIABLE)
 	{
-	  TP_DOMAIN *dom = qexec_writer_domain_of (xasl, regu->value.dbvalptr);
+	  TP_DOMAIN *dom = NULL;
 
+	  if (regu->xasl != NULL)
+	    {
+	      /* a scalar subquery: the value is the subquery's single output column */
+	      dom = qexec_outlist_domain_at (regu->xasl->outptr_list, 0);
+	      if (dom != NULL && TP_DOMAIN_TYPE (dom) == DB_TYPE_VARIABLE)
+		{
+		  dom = NULL;
+		}
+	    }
+	  if (dom == NULL)
+	    {
+	      dom = qexec_writer_domain_of (xasl, regu->value.dbvalptr);
+	    }
 	  if (dom == NULL)
 	    {
 	      dom = qexec_function_domain_of (xasl, regu->value.dbvalptr);
@@ -17878,6 +17891,23 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
 	  qexec_propagate_pinned_domains (child);
 	}
     }
+  if (xasl->type == MERGELIST_PROC)
+    {
+      qexec_propagate_pinned_domains (xasl->proc.mergelist.outer_xasl);
+      qexec_propagate_pinned_domains (xasl->proc.mergelist.inner_xasl);
+    }
+  if (xasl->type == MERGE_PROC)
+    {
+      /* the update and insert halves are executed through qexec_execute_merge (), not through the root's own
+       * mainblock, so they need the same connection */
+      qexec_propagate_pinned_domains (xasl->proc.merge.update_xasl);
+      qexec_propagate_pinned_domains (xasl->proc.merge.insert_xasl);
+    }
+  if (xasl->type == CTE_PROC)
+    {
+      qexec_propagate_pinned_domains (xasl->proc.cte.non_recursive_part);
+      qexec_propagate_pinned_domains (xasl->proc.cte.recursive_part);
+    }
 
   /* (1) a position descriptor reads a column of its producer's output */
   for (i = 0; i < 2; i++)
@@ -17985,28 +18015,9 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
 	}
     }
 
-  /* (6) the analytic functions: same two steps as the aggregates above */
-  if (xasl->type == BUILDLIST_PROC)
-    {
-      /* the analytic regu list reads the intermediate file this node writes from a_outptr_list_interm */
-      for (regu = xasl->proc.buildlist.a_regu_list; regu != NULL; regu = regu->next)
-	{
-	  TP_DOMAIN *dom;
-
-	  if (regu->value.type != TYPE_POSITION
-	      || TP_DOMAIN_TYPE (regu->value.value.pos_descr.dom) != DB_TYPE_VARIABLE)
-	    {
-	      continue;
-	    }
-	  dom = qexec_outlist_domain_at (xasl->proc.buildlist.a_outptr_list_interm,
-					 regu->value.value.pos_descr.pos_no);
-	  if (dom != NULL && TP_DOMAIN_TYPE (dom) != DB_TYPE_VARIABLE)
-	    {
-	      regu->value.value.pos_descr.dom = dom;
-	      regu->value.domain = dom;
-	    }
-	}
-    }
+  /* (6) the analytic functions: same two steps as the aggregates above.  Their regu list reads whichever file
+   * the current evaluation pass takes as input, which only qexec_execute_analytic () knows, so that list keeps
+   * being connected there (qexec_initialize_analytic_state (), from the input list's own type list). */
   if (xasl->type == BUILDLIST_PROC)
     {
       ANALYTIC_EVAL_TYPE *eval;
