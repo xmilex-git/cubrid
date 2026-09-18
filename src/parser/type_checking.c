@@ -211,6 +211,8 @@ static bool pt_hv_is_open_slot (PARSER_CONTEXT * parser, const PT_NODE * node);
 static void pt_hv_sync_slot (PARSER_CONTEXT * parser, PT_NODE * node);
 static bool pt_hv_is_marker_only_collection (PARSER_CONTEXT * parser, const PT_NODE * node);
 static void pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NODE * source);
+static bool pt_hv_is_open_plus_chain (const PT_NODE * node);
+static void pt_hv_seed_open_plus_chain (PARSER_CONTEXT * parser, PT_NODE * node, PT_TYPE_ENUM type, PT_NODE * source);
 static void pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node);
 static void pt_hv_seed_assignment_expr (PARSER_CONTEXT * parser, PT_NODE * expr, const PT_NODE * target);
 static PT_TYPE_ENUM pt_hv_assignment_common_type (PARSER_CONTEXT * parser, const PT_NODE * expr, PT_TYPE_ENUM type);
@@ -7687,6 +7689,47 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
 		pt_hv_seed_slot (parser, cmp_sub->info.expr.arg2, PT_TYPE_VARCHAR, NULL);
 	      }
 	  }
+	else if (op == PT_PLUS)
+	  {
+	    /* R9 nested-arithmetic gap ('? + ? + s1'): this PLUS's own arg1/arg2 is itself a still-open '?+?' PLUS
+	     * chain (not a bare marker -- a lone marker sibling already gets the correct, collation-inheriting
+	     * contract from pt_hv_seed_from_context()'s own known-operand branch, seeded there instead so it is not
+	     * pre-empted here), and the other side is an already-resolved collated operand. Pre-seed every marker of
+	     * the chain to the nominal (coercible) VARCHAR category, same as plus_as_concat; the normal coercibility
+	     * merge between that nominal category and the sibling's specific collation then yields the sibling's
+	     * collation, matching what a single 's1 + ?' already produces. */
+	    PT_NODE *p_lhs = node->info.expr.arg1;
+	    PT_NODE *p_rhs = node->info.expr.arg2;
+	    PT_NODE *p_known = NULL, *p_sub = NULL;
+
+	    if (p_lhs != NULL && p_lhs->type_enum != PT_TYPE_MAYBE && p_lhs->type_enum != PT_TYPE_NONE
+		&& PT_HAS_COLLATION (p_lhs->type_enum) && p_rhs != NULL && p_rhs->node_type == PT_EXPR
+		&& p_rhs->info.expr.op == PT_PLUS && pt_hv_is_open_plus_chain (p_rhs))
+	      {
+		p_known = p_lhs;
+		p_sub = p_rhs;
+	      }
+	    else if (p_rhs != NULL && p_rhs->type_enum != PT_TYPE_MAYBE && p_rhs->type_enum != PT_TYPE_NONE
+		     && PT_HAS_COLLATION (p_rhs->type_enum) && p_lhs != NULL && p_lhs->node_type == PT_EXPR
+		     && p_lhs->info.expr.op == PT_PLUS && pt_hv_is_open_plus_chain (p_lhs))
+	      {
+		p_known = p_rhs;
+		p_sub = p_lhs;
+	      }
+
+	    if (p_known != NULL && p_sub != NULL)
+	      {
+		pt_hv_seed_open_plus_chain (parser, p_sub, PT_TYPE_VARCHAR, NULL);
+	      }
+	  }
+	else if ((op == PT_RTRIM || op == PT_LTRIM || op == PT_TRIM)
+		 && pt_hv_is_open_plus_chain (node->info.expr.arg1)
+		 && node->info.expr.arg1->node_type == PT_EXPR)
+	  {
+	    /* R9 function-argument gap ('rtrim(? + ?, ?)'): TRIM/LTRIM/RTRIM's value argument has a string-only
+	     * signature -- that alone is the known context a bare '? + ?' never gets, no collated sibling needed. */
+	    pt_hv_seed_open_plus_chain (parser, node->info.expr.arg1, PT_TYPE_VARCHAR, NULL);
+	  }
 
 	/* Because the recursive expressions with more than two arguments are build as PT_GREATEST(PT_GREATEST(...,
 	 * argn-1), argn) we need to compute the common type between all arguments in order to give a correct return
@@ -9109,6 +9152,54 @@ pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NO
   d = tp_domain_cache (d);
   SET_EXPECTED_DOMAIN (hv, d);
   pt_preset_hostvar (parser, hv);
+}
+
+/*
+ * pt_hv_is_open_plus_chain () - true if node is a still-open host var, or a PT_PLUS whose two operands both are
+ *   node(in): the operand to inspect
+ *
+ * Note: used to look past a chain of nested '?+?+?...' PLUS nodes (R9, e.g. 'rtrim(? + ?, ?)' or '? + ? + s1') to
+ *	 the still-open marker leaves, since pt_hv_seed_from_context() (bottom-up) would otherwise commit each
+ *	 inner PLUS to its own no-known-operand default before an outer context ever sees an open slot to seed.
+ */
+static bool
+pt_hv_is_open_plus_chain (const PT_NODE * node)
+{
+  if (node == NULL)
+    {
+      return false;
+    }
+  if (node->node_type == PT_HOST_VAR)
+    {
+      return (node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE);
+    }
+  if (node->node_type == PT_EXPR && node->info.expr.op == PT_PLUS)
+    {
+      return (pt_hv_is_open_plus_chain (node->info.expr.arg1) && pt_hv_is_open_plus_chain (node->info.expr.arg2));
+    }
+  return false;
+}
+
+/*
+ * pt_hv_seed_open_plus_chain () - pt_hv_seed_slot() every open marker leaf of a pt_hv_is_open_plus_chain() subtree
+ */
+static void
+pt_hv_seed_open_plus_chain (PARSER_CONTEXT * parser, PT_NODE * node, PT_TYPE_ENUM type, PT_NODE * source)
+{
+  if (node == NULL)
+    {
+      return;
+    }
+  if (node->node_type == PT_HOST_VAR)
+    {
+      pt_hv_seed_slot (parser, node, type, source);
+      return;
+    }
+  if (node->node_type == PT_EXPR && node->info.expr.op == PT_PLUS)
+    {
+      pt_hv_seed_open_plus_chain (parser, node->info.expr.arg1, type, source);
+      pt_hv_seed_open_plus_chain (parser, node->info.expr.arg2, type, source);
+    }
 }
 
 /*
