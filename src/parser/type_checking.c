@@ -208,9 +208,18 @@ static bool pt_is_range_expression (const PT_OP_TYPE op);
 static bool pt_are_unmatchable_types (const PT_ARG_TYPE def_type, const PT_TYPE_ENUM op_type);
 static bool pt_is_hv_arithmetic_op (PT_OP_TYPE op);
 static bool pt_hv_is_open_slot (PARSER_CONTEXT * parser, const PT_NODE * node);
+static void pt_hv_sync_slot (PARSER_CONTEXT * parser, PT_NODE * node);
 static bool pt_hv_is_marker_only_collection (PARSER_CONTEXT * parser, const PT_NODE * node);
 static void pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NODE * source);
 static void pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node);
+static void pt_hv_seed_assignment_expr (PARSER_CONTEXT * parser, PT_NODE * expr, const PT_NODE * target);
+static PT_TYPE_ENUM pt_hv_assignment_common_type (PARSER_CONTEXT * parser, const PT_NODE * expr, PT_TYPE_ENUM type);
+static void pt_hv_seed_assignment_markers (PARSER_CONTEXT * parser, PT_NODE * expr, PT_TYPE_ENUM type);
+static bool pt_hv_is_category_open_op (PT_OP_TYPE op);
+static bool pt_hv_is_string_arg_type (const PT_ARG_TYPE def_type);
+static int pt_hv_prefer_string_overload (PARSER_CONTEXT * parser, const EXPRESSION_DEFINITION * def, int best_match,
+					 int matches, PT_NODE * arg1, PT_NODE * arg2, PT_NODE * arg3,
+					 PT_TYPE_ENUM arg1_type, PT_TYPE_ENUM arg2_type, PT_TYPE_ENUM arg3_type);
 static void pt_hv_seed_limit_slots (PARSER_CONTEXT * parser, PT_NODE * limit, PT_NODE * using_index,
 				    SEMANTIC_CHK_INFO * sc_info);
 static PT_NODE *pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg,
@@ -6014,6 +6023,7 @@ pt_apply_expressions_definition (PARSER_CONTEXT * parser, PT_NODE ** node)
       if (match_cnt == 3)
 	{
 	  best_match = i;
+	  matches = 3;
 	  break;
 	}
       else if (match_cnt > matches)
@@ -6028,6 +6038,14 @@ pt_apply_expressions_definition (PARSER_CONTEXT * parser, PT_NODE ** node)
       /* if best_match is -1 then we have an expression definition but it cannot be applied on this arguments. */
       expr->node_type = PT_NODE_NONE;
       return ER_FAILED;
+    }
+
+  if (matches < 3 && pt_hv_is_category_open_op (op))
+    {
+      /* an open marker matches every overload of its position: when the tied candidates disagree on the category of
+       * that position, the string overload is the slot (D-276-02), the first candidate otherwise (D-277-04) */
+      best_match = pt_hv_prefer_string_overload (parser, &def, best_match, matches, arg1, arg2, arg3, arg1_type,
+						 arg2_type, arg3_type);
     }
 
   sig = def.overloads[best_match];
@@ -7474,6 +7492,25 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
 	{
 	  node->info.insert.value_clauses->info.node_list.list->info.query.flag.is_insert_select = 1;
 	}
+      else
+	{
+	  /* D-271-02 (2): the assignment target constrains the markers of a value expression before the expression's
+	   * own rules see them ('IFNULL(?, 0)' into a NUMERIC column is a NUMERIC slot, not the literal's INTEGER) */
+	  PT_NODE *vl, *v, *attr;
+
+	  for (vl = node->info.insert.value_clauses; vl != NULL; vl = vl->next)
+	    {
+	      if (vl->info.node_list.list_type != PT_IS_VALUE)
+		{
+		  continue;
+		}
+	      attr = node->info.insert.attr_list;
+	      for (v = vl->info.node_list.list; v != NULL && attr != NULL; v = v->next, attr = attr->next)
+		{
+		  pt_hv_seed_assignment_expr (parser, v, attr);
+		}
+	    }
+	}
       break;
 
     case PT_DELETE:
@@ -7518,6 +7555,19 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
     case PT_UPDATE:
       pt_hv_seed_limit_slots (parser, node->info.update.limit, node->info.update.using_index,
 			      (SEMANTIC_CHK_INFO *) arg);
+      {
+	PT_NODE *a;
+
+	/* D-271-02 (2): the assigned column constrains the markers of its value expression (see PT_INSERT) */
+	for (a = node->info.update.assignment; a != NULL; a = a->next)
+	  {
+	    if (a->node_type == PT_EXPR && a->info.expr.op == PT_ASSIGN && a->info.expr.arg1 != NULL
+		&& a->info.expr.arg1->node_type == PT_NAME)
+	      {
+		pt_hv_seed_assignment_expr (parser, a->info.expr.arg2, a->info.expr.arg1);
+	      }
+	  }
+      }
       /* rewrite limit clause as numbering expression and add it to search condition */
       if (node->info.update.limit && node->info.update.rewrite_limit)
 	{
@@ -8300,6 +8350,11 @@ pt_eval_type (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_
 	  /* type is not known yet (i.e, compile before bind a value) */
 	  node->type_enum = PT_TYPE_MAYBE;
 	}
+      if (node->info.host_var.var_type == PT_HOST_IN)
+	{
+	  /* a marker copied or rebuilt by a rewrite reads the contract its slot already has */
+	  pt_hv_sync_slot (parser, node);
+	}
       break;
     case PT_SET_OPT_LVL:
     case PT_GET_OPT_LVL:
@@ -8793,6 +8848,28 @@ pt_hv_effective_type (const PT_NODE * node)
 }
 
 /*
+ * pt_hv_default_charset_coll () - the charset and collation of a string slot no consumer constrained: what a string
+ *				   literal of this compilation gets (the client's charset and collation when the parser
+ *				   uses them, the system's otherwise; csql_grammar.y string literals), D-271-05
+ *   codeset(out): the charset
+ *   coll_id(out): the collation
+ */
+void
+pt_hv_default_charset_coll (INTL_CODESET * codeset, int *coll_id)
+{
+  if (lang_get_parser_use_client_charset ())
+    {
+      *codeset = lang_get_client_charset ();
+      *coll_id = lang_get_client_collation ();
+    }
+  else
+    {
+      *codeset = LANG_SYS_CODESET;
+      *coll_id = LANG_SYS_COLLATION;
+    }
+}
+
+/*
  * pt_is_hv_arithmetic_op () - the operators whose unresolved host variable operands take the numeric contract
  */
 static bool
@@ -8823,10 +8900,42 @@ pt_is_hv_arithmetic_op (PT_OP_TYPE op)
 static bool
 pt_hv_is_open_slot (PARSER_CONTEXT * parser, const PT_NODE * node)
 {
-  return (node != NULL && node->node_type == PT_HOST_VAR
-	  && (node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE)
-	  && node->info.host_var.index < parser->host_var_count
-	  && (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN));
+  if (node == NULL || node->node_type != PT_HOST_VAR
+      || (node->type_enum != PT_TYPE_MAYBE && node->type_enum != PT_TYPE_NONE)
+      || node->info.host_var.index >= parser->host_var_count)
+    {
+      return false;
+    }
+  pt_hv_sync_slot (parser, (PT_NODE *) node);
+  return (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN);
+}
+
+/*
+ * pt_hv_sync_slot () - a marker node that does not carry its slot's contract while the statement already decided one
+ *			(a node copied or rebuilt by a rewrite: the LIMIT clause markers copied into the numbering
+ *			predicates, view translation) adopts the contract. One slot has one contract; the array
+ *			host_var_expected_domains is the contract's home, the nodes are its readers.
+ */
+static void
+pt_hv_sync_slot (PARSER_CONTEXT * parser, PT_NODE * node)
+{
+  TP_DOMAIN *d;
+
+  if (node == NULL || node->node_type != PT_HOST_VAR || parser->host_var_expected_domains == NULL
+      || node->info.host_var.index >= parser->host_var_count
+      || node->info.host_var.index >= parser->host_var_expected_domains_size)
+    {
+      return;
+    }
+  if (node->expected_domain != NULL && TP_DOMAIN_TYPE (node->expected_domain) != DB_TYPE_UNKNOWN)
+    {
+      return;
+    }
+  d = parser->host_var_expected_domains[node->info.host_var.index];
+  if (d != NULL && TP_DOMAIN_TYPE (d) != DB_TYPE_UNKNOWN && TP_DOMAIN_TYPE (d) != DB_TYPE_VARIABLE)
+    {
+      SET_EXPECTED_DOMAIN (node, d);
+    }
 }
 
 /*
@@ -8907,6 +9016,250 @@ pt_hv_seed_slot (PARSER_CONTEXT * parser, PT_NODE * hv, PT_TYPE_ENUM type, PT_NO
   d = tp_domain_cache (d);
   SET_EXPECTED_DOMAIN (hv, d);
   pt_preset_hostvar (parser, hv);
+}
+
+/*
+ * pt_hv_assignment_common_type () - the numeric type the markers of an assigned value expression take: the common
+ *				     numeric type (pt_common_type) of the assigned column and of every typed numeric
+ *				     operand the expression's arithmetic / common-value operators combine them with
+ *				     (D-271-06: two numeric constraints on one slot resolve to their common type, in
+ *				     whatever order they appear)
+ */
+static PT_TYPE_ENUM
+pt_hv_assignment_common_type (PARSER_CONTEXT * parser, const PT_NODE * expr, PT_TYPE_ENUM type)
+{
+  const PT_NODE *args[3] = { NULL, NULL, NULL };
+  int i;
+
+  if (expr == NULL || expr->node_type != PT_EXPR)
+    {
+      return type;
+    }
+  switch (expr->info.expr.op)
+    {
+    case PT_NVL2:
+      args[0] = expr->info.expr.arg2;
+      args[1] = expr->info.expr.arg3;
+      break;
+    case PT_ROUND:
+    case PT_TRUNC:
+      args[0] = expr->info.expr.arg1;
+      break;
+    case PT_NVL:
+    case PT_IFNULL:
+    case PT_COALESCE:
+    case PT_NULLIF:
+    case PT_LEAST:
+    case PT_GREATEST:
+    case PT_PLUS:
+    case PT_MINUS:
+    case PT_TIMES:
+    case PT_DIVIDE:
+    case PT_MODULUS:
+    case PT_UNARY_MINUS:
+    case PT_ABS:
+    case PT_CEIL:
+    case PT_FLOOR:
+      args[0] = expr->info.expr.arg1;
+      args[1] = expr->info.expr.arg2;
+      break;
+    default:
+      return type;
+    }
+  for (i = 0; i < 2; i++)
+    {
+      const PT_NODE *a = args[i];
+
+      if (a == NULL)
+	{
+	  continue;
+	}
+      if (a->node_type == PT_EXPR)
+	{
+	  type = pt_hv_assignment_common_type (parser, a, type);
+	}
+      else if (a->node_type != PT_HOST_VAR && PT_IS_NUMERIC_TYPE (a->type_enum))
+	{
+	  PT_TYPE_ENUM common = pt_common_type (type, a->type_enum);
+
+	  if (PT_IS_NUMERIC_TYPE (common))
+	    {
+	      type = common;
+	    }
+	}
+    }
+  return type;
+}
+
+/*
+ * pt_hv_seed_assignment_expr () - D-271-02 (2): the markers inside a value expression assigned to a numeric column take
+ *				   the numeric type the assignment context implies before the expression's own rules
+ *				   run, so the literal partner of 'IFNULL(?, 0)' does not narrow the slot to INTEGER
+ *				   when the column is NUMERIC (R6). The type is the common numeric type of the column
+ *				   and of the typed numeric operands of the expression (pt_hv_assignment_common_type);
+ *				   only arithmetic and common-value operators are descended.
+ *   parser(in): the parser context
+ *   expr(in/out): the value expression
+ *   target(in): the assigned column (a typed PT_NAME)
+ */
+static void
+pt_hv_seed_assignment_expr (PARSER_CONTEXT * parser, PT_NODE * expr, const PT_NODE * target)
+{
+  PT_TYPE_ENUM type;
+
+  if (expr == NULL || target == NULL || parser->host_var_count <= 0 || expr->node_type != PT_EXPR
+      || !PT_IS_NUMERIC_TYPE (target->type_enum))
+    {
+      return;
+    }
+  type = pt_hv_assignment_common_type (parser, expr, target->type_enum);
+  pt_hv_seed_assignment_markers (parser, expr, type);
+}
+
+/*
+ * pt_hv_seed_assignment_markers () - seed the open markers under the arithmetic / common-value operators of expr
+ */
+static void
+pt_hv_seed_assignment_markers (PARSER_CONTEXT * parser, PT_NODE * expr, PT_TYPE_ENUM type)
+{
+  if (expr == NULL || expr->node_type != PT_EXPR)
+    {
+      return;
+    }
+  switch (expr->info.expr.op)
+    {
+    case PT_NVL2:
+      pt_hv_seed_slot (parser, expr->info.expr.arg2, type, NULL);
+      pt_hv_seed_slot (parser, expr->info.expr.arg3, type, NULL);
+      pt_hv_seed_assignment_markers (parser, expr->info.expr.arg2, type);
+      pt_hv_seed_assignment_markers (parser, expr->info.expr.arg3, type);
+      break;
+    case PT_ROUND:
+    case PT_TRUNC:
+      pt_hv_seed_slot (parser, expr->info.expr.arg1, type, NULL);
+      pt_hv_seed_assignment_markers (parser, expr->info.expr.arg1, type);
+      break;
+    case PT_NVL:
+    case PT_IFNULL:
+    case PT_COALESCE:
+    case PT_NULLIF:
+    case PT_LEAST:
+    case PT_GREATEST:
+    case PT_PLUS:
+    case PT_MINUS:
+    case PT_TIMES:
+    case PT_DIVIDE:
+    case PT_MODULUS:
+    case PT_UNARY_MINUS:
+    case PT_ABS:
+    case PT_CEIL:
+    case PT_FLOOR:
+      pt_hv_seed_slot (parser, expr->info.expr.arg1, type, NULL);
+      pt_hv_seed_slot (parser, expr->info.expr.arg2, type, NULL);
+      pt_hv_seed_assignment_markers (parser, expr->info.expr.arg1, type);
+      pt_hv_seed_assignment_markers (parser, expr->info.expr.arg2, type);
+      break;
+    default:
+      break;
+    }
+}
+
+/*
+ * pt_hv_is_category_open_op () - the operators whose overloads differ in the category of an argument position (number
+ *				  / string / date-time / bit) so that an open marker there matches every overload;
+ *				  they were the late-bound operator group. D-276-02 / D-277-04: the marker takes the
+ *				  string overload of its position when the operator has one, the first overload
+ *				  otherwise.
+ */
+static bool
+pt_hv_is_category_open_op (PT_OP_TYPE op)
+{
+  switch (op)
+    {
+    case PT_TO_CHAR:
+    case PT_HEX:
+    case PT_CONV:
+    case PT_ASCII:
+    case PT_BIT_LENGTH:
+    case PT_OCTET_LENGTH:
+    case PT_HOURF:
+    case PT_MINUTEF:
+    case PT_SECONDF:
+    case PT_ADDTIME:
+    case PT_TO_DATE:
+    case PT_TO_DATETIME:
+    case PT_TO_DATETIME_TZ:
+    case PT_TO_TIME:
+    case PT_TO_TIMESTAMP:
+    case PT_TO_TIMESTAMP_TZ:
+    case PT_FROM_TZ:
+    case PT_NEW_TIME:
+      return true;
+    default:
+      return false;
+    }
+}
+
+/*
+ * pt_hv_is_string_arg_type () - a signature argument of the character string category
+ */
+static bool
+pt_hv_is_string_arg_type (const PT_ARG_TYPE def_type)
+{
+  if (def_type.type == pt_arg_type::GENERIC)
+    {
+      return (def_type.val.generic_type == PT_GENERIC_TYPE_STRING
+	      || def_type.val.generic_type == PT_GENERIC_TYPE_STRING_VARYING
+	      || def_type.val.generic_type == PT_GENERIC_TYPE_CHAR);
+    }
+  return (def_type.type == pt_arg_type::NORMAL && PT_IS_CHAR_STRING_TYPE (def_type.val.type));
+}
+
+/*
+ * pt_hv_prefer_string_overload () - among the overloads that match the arguments equally well, the first one whose
+ *				     type at an open marker's position is a character string (D-276-02); the current
+ *				     best match when there is none
+ *   return: the index of the overload to apply
+ */
+static int
+pt_hv_prefer_string_overload (PARSER_CONTEXT * parser, const EXPRESSION_DEFINITION * def, int best_match, int matches,
+			      PT_NODE * arg1, PT_NODE * arg2, PT_NODE * arg3, PT_TYPE_ENUM arg1_type,
+			      PT_TYPE_ENUM arg2_type, PT_TYPE_ENUM arg3_type)
+{
+  bool open1 = pt_hv_is_open_slot (parser, arg1);
+  bool open2 = pt_hv_is_open_slot (parser, arg2);
+  bool open3 = pt_hv_is_open_slot (parser, arg3);
+  int i;
+
+  if (!open1 && !open2 && !open3)
+    {
+      return best_match;
+    }
+
+  for (i = 0; i < def->overloads_count; i++)
+    {
+      const EXPRESSION_SIGNATURE *sig = &def->overloads[i];
+      int match_cnt = 0;
+
+      if (pt_are_unmatchable_types (sig->arg1_type, arg1_type) || pt_are_unmatchable_types (sig->arg2_type, arg2_type)
+	  || pt_are_unmatchable_types (sig->arg3_type, arg3_type))
+	{
+	  continue;
+	}
+      match_cnt += pt_are_equivalent_types (sig->arg1_type, arg1_type) ? 1 : 0;
+      match_cnt += pt_are_equivalent_types (sig->arg2_type, arg2_type) ? 1 : 0;
+      match_cnt += pt_are_equivalent_types (sig->arg3_type, arg3_type) ? 1 : 0;
+      if (match_cnt != matches)
+	{
+	  continue;
+	}
+      if ((open1 && pt_hv_is_string_arg_type (sig->arg1_type)) || (open2 && pt_hv_is_string_arg_type (sig->arg2_type))
+	  || (open3 && pt_hv_is_string_arg_type (sig->arg3_type)))
+	{
+	  return i;
+	}
+    }
+  return best_match;
 }
 
 /*
@@ -8993,6 +9346,15 @@ pt_hv_seed_from_context (PARSER_CONTEXT * parser, PT_NODE * node)
   op = node->info.expr.op;
   left = node->info.expr.arg1;
   right = node->info.expr.arg2;
+
+  if (op == PT_TO_CHAR && pt_hv_is_open_slot (parser, left) && PT_IS_NULL_NODE (right))
+    {
+      /* 'TO_CHAR (?)' without a format: the string identity of TO_CHAR is the one overload every category shares
+       * (D-276-02: the string category is preferred when the categories of the candidates disagree); the marker is a
+       * VARCHAR slot and the expression is the marker itself (pt_eval_expr_type) */
+      pt_hv_seed_slot (parser, left, PT_TYPE_VARCHAR, NULL);
+      return;
+    }
 
   numeric = pt_is_hv_arithmetic_op (op);
   common = (op == PT_NVL || op == PT_IFNULL || op == PT_NULLIF || op == PT_COALESCE || op == PT_LEAST
@@ -9144,6 +9506,8 @@ static PT_NODE *
 pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
 {
   TP_DOMAIN *d;
+  INTL_CODESET codeset;
+  int coll_id;
 
   if (node == NULL)
     {
@@ -9157,8 +9521,9 @@ pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
       /* a string result built from host variable slots / session variables that no consumer coerced at a use
        * site (D-277-05): the compile environment's collation is its collation. Nothing at execution has to
        * resolve a collation from the values any more. */
-      node->data_type->info.data_type.units = (int) LANG_SYS_CODESET;
-      node->data_type->info.data_type.collation_id = LANG_SYS_COLLATION;
+      pt_hv_default_charset_coll (&codeset, &coll_id);
+      node->data_type->info.data_type.units = (int) codeset;
+      node->data_type->info.data_type.collation_id = coll_id;
       node->data_type->info.data_type.collation_flag = TP_DOMAIN_COLL_NORMAL;
       return node;
     }
@@ -9169,12 +9534,16 @@ pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
       return node;
     }
 
+  /* a copied / rebuilt marker adopts the contract its slot already has before any default applies */
+  pt_hv_sync_slot (parser, node);
+
   if ((node->type_enum == PT_TYPE_MAYBE || node->type_enum == PT_TYPE_NONE)
       && (node->expected_domain == NULL || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_UNKNOWN
 	  || TP_DOMAIN_TYPE (node->expected_domain) == DB_TYPE_VARIABLE))
     {
       /* D-271-02 (4): a marker no context constrained (SELECT ?, ? IS NULL, ...) is a VARCHAR slot */
-      d = tp_domain_resolve_default_w_coll (DB_TYPE_VARCHAR, LANG_SYS_COLLATION, TP_DOMAIN_COLL_NORMAL);
+      pt_hv_default_charset_coll (&codeset, &coll_id);
+      d = tp_domain_resolve_default_w_coll (DB_TYPE_VARCHAR, coll_id, TP_DOMAIN_COLL_NORMAL);
       d = tp_domain_cache (d);
       SET_EXPECTED_DOMAIN (node, d);
       pt_preset_hostvar (parser, node);
@@ -9209,9 +9578,10 @@ pt_hv_finalize_contracts_post (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
       d = tp_domain_copy (node->expected_domain, false);
       if (d != NULL)
 	{
+	  pt_hv_default_charset_coll (&codeset, &coll_id);
 	  d->collation_flag = TP_DOMAIN_COLL_NORMAL;
-	  d->codeset = LANG_SYS_CODESET;
-	  d->collation_id = LANG_SYS_COLLATION;
+	  d->codeset = codeset;
+	  d->collation_id = coll_id;
 	  d = tp_domain_cache (d);
 	  SET_EXPECTED_DOMAIN (node, d);
 	  pt_preset_hostvar (parser, node);
@@ -12496,8 +12866,14 @@ pt_upd_domain_info (PARSER_CONTEXT * parser, PT_NODE * arg1, PT_NODE * arg2, PT_
        * what the consumers of a VARCHAR operand expect (UNION compatibility casts, COERCIBILITY / COLLATION). */
       assert (dt == NULL);
       dt = pt_make_prim_data_type (parser, PT_TYPE_VARCHAR);
-      dt->info.data_type.units = (int) LANG_SYS_CODESET;
-      dt->info.data_type.collation_id = LANG_SYS_COLLATION;
+      {
+	INTL_CODESET codeset;
+	int coll_id;
+
+	pt_hv_default_charset_coll (&codeset, &coll_id);
+	dt->info.data_type.units = (int) codeset;
+	dt->info.data_type.collation_id = coll_id;
+      }
       do_detect_collation = false;
       break;
 
@@ -23186,8 +23562,7 @@ pt_check_expr_collation (PARSER_CONTEXT * parser, PT_NODE ** node)
 	  /* D-277-05: 's1 IN (?, ?)' -- the list's own collation (the session default of its slots) is not evidence;
 	   * the markers take the collation the other operand decides (pt_coerce_node_collation sets their slot
 	   * contracts, so the bound values are converted at bind time) */
-	  arg2_coll_inf.coll_id = LANG_SYS_COLLATION;
-	  arg2_coll_inf.codeset = LANG_SYS_CODESET;
+	  pt_hv_default_charset_coll (&arg2_coll_inf.codeset, &arg2_coll_inf.coll_id);
 	  arg2_coll_inf.can_force_cs = true;
 	  arg2_coll_inf.coerc_level = PT_COLLATION_FULLY_COERC;
 	  status = HAS_COLLATION;

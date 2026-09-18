@@ -1096,6 +1096,19 @@ pt_value_to_db (PARSER_CONTEXT * parser, PT_NODE * value)
 
       db_value = pt_host_var_db_value (parser, value);
 
+      if (db_value != NULL && value->info.host_var.index < parser->host_var_count
+	  && value->info.host_var.index < parser->host_var_expected_domains_size
+	  && parser->host_var_expected_domains != NULL
+	  && parser->host_var_expected_domains[value->info.host_var.index] != NULL
+	  && TP_DOMAIN_TYPE (parser->host_var_expected_domains[value->info.host_var.index]) != DB_TYPE_UNKNOWN)
+	{
+	  /* a user marker with a compiled slot contract: its value was converted to the contract when it was bound
+	   * (pt_bind_host_variable_to_domain). A node's own expected domain never re-types the shared value here: the
+	   * node is a reader of the contract, and a compile-time evaluation (LIMIT value, constant folding) converts
+	   * its own copy. */
+	  return db_value;
+	}
+
       if (db_value)
 	{
 	  if (value->type_enum != PT_TYPE_NONE && value->type_enum != PT_TYPE_NULL && value->type_enum != PT_TYPE_MAYBE
@@ -2305,8 +2318,12 @@ pt_node_to_db_domain (PARSER_CONTEXT * parser, PT_NODE * node, const char *class
 	{
 	  if (retval->collation_flag == TP_DOMAIN_COLL_LEAVE)
 	    {
-	      retval->codeset = LANG_SYS_CODESET;
-	      retval->collation_id = LANG_SYS_COLLATION;
+	      INTL_CODESET codeset;
+	      int coll_id;
+
+	      pt_hv_default_charset_coll (&codeset, &coll_id);
+	      retval->codeset = codeset;
+	      retval->collation_id = coll_id;
 	    }
 	  retval->collation_flag = TP_DOMAIN_COLL_NORMAL;
 	}

@@ -577,6 +577,7 @@ extern "C"
 
   extern void pt_preset_hostvar (PARSER_CONTEXT * parser, PT_NODE * hv_node);
   extern PT_TYPE_ENUM pt_hv_effective_type (const PT_NODE * node);
+  extern void pt_hv_default_charset_coll (INTL_CODESET * codeset, int *coll_id);
   extern void pt_hv_finalize_contracts (PARSER_CONTEXT * parser, PT_NODE * tree);
   extern void pt_set_expected_domain (PT_NODE * node, TP_DOMAIN * domain);
   extern int pt_host_var_index (const PT_NODE * hv);

@@ -6434,8 +6434,12 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
 		}
 	      if (TP_DOMAIN_COLLATION_FLAG (slot) == TP_DOMAIN_COLL_LEAVE)
 		{
-		  d->codeset = LANG_SYS_CODESET;
-		  d->collation_id = LANG_SYS_COLLATION;
+		  INTL_CODESET codeset;
+		  int coll_id;
+
+		  pt_hv_default_charset_coll (&codeset, &coll_id);
+		  d->codeset = codeset;
+		  d->collation_id = coll_id;
 		}
 	      d->collation_flag = TP_DOMAIN_COLL_NORMAL;
 	      slot = tp_domain_cache (d);
