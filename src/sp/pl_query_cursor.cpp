@@ -137,7 +137,7 @@ namespace cubpl
 	return S_END;
       }
 
-    QFILE_TUPLE_RECORD tuple_record = { NULL, 0 };
+    QFILE_TUPLE_RECORD tuple_record = QFILE_TUPLE_RECORD_INITIALIZER;
     SCAN_CODE scan_code = qfile_scan_list_next (m_thread, &m_scan_id, &tuple_record, PEEK);
     if (scan_code == S_SUCCESS)
       {
@@ -176,7 +176,7 @@ namespace cubpl
 		break;
 	      }
 
-	    if (qfile_slot_read_value (&tuple_record, i, domain, value, true, &is_null) != NO_ERROR)
+	    if (qfile_slot_read_column_value (&tuple_record, i, domain, value, true, &is_null) != NO_ERROR)
 	      {
 		scan_code = S_ERROR;
 		break;
