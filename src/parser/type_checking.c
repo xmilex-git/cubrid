@@ -7643,6 +7643,50 @@ pt_eval_type_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *conti
 	PT_NODE **recurs_arg = NULL, **norm_arg = NULL;
 	PT_OP_TYPE op = recurs_expr->info.expr.op;
 
+	if (pt_is_range_or_comp (op))
+	  {
+	    /* D-277-05/D-277-07 gap (R9, e.g. 'col > ? + ?' against a collated column): pt_hv_seed_from_context()
+	     * runs bottom-up (pt_eval_type's post-pass), so by the time it visits this comparison the inner PLUS
+	     * has already committed its two still-open markers to the "no known operand" default (D-277-07:
+	     * context-free '?+?' is the floating NUMERIC), and the comparison itself no longer sees an open slot
+	     * to seed -- its sibling is now a concrete NUMERIC value, not a marker. Pre-seed here, top-down,
+	     * before the PLUS's own bottom-up resolution runs: when one side is already a resolved collated
+	     * (string) operand and the other is a bare 'marker + marker' PLUS, give both markers the sibling's
+	     * VARCHAR category so PLUS picks the string-concat overload instead of numeric addition -- matching
+	     * what a literal in the same position already does (plus_as_concat), and the comparison then runs
+	     * the same collated string vs. string path 'col > ?' alone already takes. */
+	    PT_NODE *cmp_lhs = node->info.expr.arg1;
+	    PT_NODE *cmp_rhs = node->info.expr.arg2;
+	    PT_NODE *cmp_known = NULL, *cmp_sub = NULL;
+
+	    if (cmp_lhs != NULL && cmp_lhs->type_enum != PT_TYPE_MAYBE && cmp_lhs->type_enum != PT_TYPE_NONE
+		&& PT_HAS_COLLATION (cmp_lhs->type_enum) && cmp_rhs != NULL && cmp_rhs->node_type == PT_EXPR
+		&& cmp_rhs->info.expr.op == PT_PLUS)
+	      {
+		cmp_known = cmp_lhs;
+		cmp_sub = cmp_rhs;
+	      }
+	    else if (cmp_rhs != NULL && cmp_rhs->type_enum != PT_TYPE_MAYBE && cmp_rhs->type_enum != PT_TYPE_NONE
+		     && PT_HAS_COLLATION (cmp_rhs->type_enum) && cmp_lhs != NULL && cmp_lhs->node_type == PT_EXPR
+		     && cmp_lhs->info.expr.op == PT_PLUS)
+	      {
+		cmp_known = cmp_rhs;
+		cmp_sub = cmp_lhs;
+	      }
+
+	    if (cmp_known != NULL && cmp_sub != NULL && cmp_sub->info.expr.arg1 != NULL
+		&& cmp_sub->info.expr.arg1->node_type == PT_HOST_VAR
+		&& (cmp_sub->info.expr.arg1->type_enum == PT_TYPE_MAYBE
+		    || cmp_sub->info.expr.arg1->type_enum == PT_TYPE_NONE) && cmp_sub->info.expr.arg2 != NULL
+		&& cmp_sub->info.expr.arg2->node_type == PT_HOST_VAR
+		&& (cmp_sub->info.expr.arg2->type_enum == PT_TYPE_MAYBE
+		    || cmp_sub->info.expr.arg2->type_enum == PT_TYPE_NONE))
+	      {
+		pt_hv_seed_slot (parser, cmp_sub->info.expr.arg1, PT_TYPE_VARCHAR, NULL);
+		pt_hv_seed_slot (parser, cmp_sub->info.expr.arg2, PT_TYPE_VARCHAR, NULL);
+	      }
+	  }
+
 	/* Because the recursive expressions with more than two arguments are build as PT_GREATEST(PT_GREATEST(...,
 	 * argn-1), argn) we need to compute the common type between all arguments in order to give a correct return
 	 * type. Let's say we have the following call to PT_GREATEST: greatest(e1, e2, e3, 2) where e1, e2, e3 are
