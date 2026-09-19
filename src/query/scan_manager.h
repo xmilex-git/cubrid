@@ -240,6 +240,34 @@ struct index_skip_scan
   key_range *skipped_range;	/* range used for iterating the distinct values on the first index column */
 };
 
+/* wf268 C4: how one index key column of one key range bound reaches the index key domain.  The choice is made
+ * once, from the operand's compile-time domain and the index key schema (scan_prepare_key_conv_plans ()), and is
+ * never taken from the value that arrives at run time (D-276-05, D-273-01R C4).
+ */
+typedef enum
+{
+  KEY_CONV_AS_IS = 0,		/* operand type is the index column type: write the value as it is */
+  KEY_CONV_BY_VALUE_PRECISION,	/* same type, but NUMERIC/CHAR/BIT: the value's own precision and scale decide
+				 * whether the key is described by the index domain or by the values */
+  KEY_CONV_STRICT,		/* different type: coerce to the index column, keep the original value on loss */
+  KEY_CONV_NOT_INDEXABLE	/* the operand type cannot appear in an index key */
+} KEY_CONV_STRATEGY;
+
+typedef struct key_conv_plan KEY_CONV_PLAN;
+struct key_conv_plan
+{
+  KEY_CONV_STRATEGY *col_strategy;	/* [ncols] per index key column */
+  DB_TYPE *col_type;		/* [ncols] the operand type the plan was made for */
+  int ncols;			/* number of index key columns this bound supplies */
+  bool value_varies;		/* the operands are not all constants or host variables, so every key range
+				 * generation brings new values (correlated, join and skip-scan keys) */
+  TP_DOMAIN *value_setdomain;	/* MIDXKEY domain describing the values instead of the index columns; built on
+				 * demand, and reused across range generations only while !value_varies */
+};
+
+/* The index skip scan fetch range's own pair of plans sits after the pair of every key range. */
+#define SCAN_KEY_CONV_ISS_BASE(isidp) ((isidp)->key_conv_plan_cnt - 2)
+
 /* typedef struct indx_scan_id INDX_SCAN_ID; - already defined in btree.h */
 struct indx_scan_id
 {
@@ -287,7 +315,8 @@ struct indx_scan_id
   bool check_not_vacuumed;	/* if true then during index scan, the entries will be checked if they should've been
 				 * vacuumed. Used in checkdb. */
   DISK_ISVALID not_vacuumed_res;	/* The result of not vacuumed checking operation */
-  TP_DOMAIN **prebuilt_midxkey_domains;
+  KEY_CONV_PLAN *key_conv_plans;	/* [2 * key_cnt] key conversion plans, key1 at 2i and key2 at 2i+1 */
+  int key_conv_plan_cnt;	/* number of entries in key_conv_plans */
   /* Parallel index scan pending state. Set in scan_open_parallel_index_scan when the spec is
    * parallel-eligible; consumed by scan_start_scan to attempt the promotion after
    * qexec_evaluate_aggregates_optimize has had a chance to set need_count_only. NULL means
@@ -341,7 +370,8 @@ struct parallel_index_scan_id
   bool check_not_vacuumed;	/* if true then during index scan, the entries will be checked if they should've been
 				 * vacuumed. Used in checkdb. */
   DISK_ISVALID not_vacuumed_res;	/* The result of not vacuumed checking operation */
-  TP_DOMAIN **prebuilt_midxkey_domains;
+  KEY_CONV_PLAN *key_conv_plans;	/* mirror of INDX_SCAN_ID::key_conv_plans */
+  int key_conv_plan_cnt;	/* mirror of INDX_SCAN_ID::key_conv_plan_cnt */
   void *parallel_pending;	/* mirror of INDX_SCAN_ID::parallel_pending */
   /* parallel-only fields (must follow all isid fields) */
   // *INDENT-OFF*
@@ -587,6 +617,9 @@ extern int scan_open_index_node_info_scan (THREAD_ENTRY * thread_p, SCAN_ID * sc
 					   /* fields of INDX_SCAN_ID */
 					   indx_info * indx_info, PRED_EXPR * pr, DB_VALUE ** node_info_values,
 					   regu_variable_list_node * node_info_regu_list);
+extern int scan_prepare_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, TP_DOMAIN * btree_domainp,
+					VAL_DESCR * vd);
+extern void scan_free_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp);
 extern int scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY_VAL_RANGE * key_val_range,
 				       INDX_SCAN_ID * iscan_id, TP_DOMAIN * btree_domainp, VAL_DESCR * vd,
 				       int key_range_idx);

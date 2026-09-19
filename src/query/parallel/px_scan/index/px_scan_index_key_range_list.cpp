@@ -106,7 +106,7 @@ namespace parallel_index_scan
 	return NO_ERROR;
       }
 
-    /* scan_id needs coordinator's prebuilt_midxkey_domains; scan_dbvals_to_midxkey NULL-derefs on F_MIDXKEY otherwise. */
+    /* scan_id carries the key conversion plans; scan_dbvals_to_midxkey needs them on F_MIDXKEY. */
     if (worker_scan_id == nullptr)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
@@ -115,20 +115,11 @@ namespace parallel_index_scan
     INDX_SCAN_ID *isidp = &worker_scan_id->s.isid;
     TP_DOMAIN *btree_domainp = m_btid_int.key_type;
 
-    /* lazy-alloc prebuilt_midxkey_domains (parallel path bypasses scan_open_index_scan); scan_dbvals_to_midxkey would NULL-deref otherwise. */
-    if (isidp->prebuilt_midxkey_domains == NULL)
+    /* the worker bypasses scan_open_index_scan, so it fixes its own key conversion plans here (wf268 C4) */
+    int plan_err = scan_prepare_key_conv_plans (thread_p, isidp, btree_domainp, vd);
+    if (plan_err != NO_ERROR)
       {
-	size_t alloc_size = (size_t) key_cnt * sizeof (TP_DOMAIN *);
-	isidp->prebuilt_midxkey_domains = (TP_DOMAIN **) db_private_alloc (thread_p, alloc_size);
-	if (isidp->prebuilt_midxkey_domains == NULL)
-	  {
-	    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, alloc_size);
-	    return ER_FAILED;
-	  }
-	for (int j = 0; j < key_cnt; j++)
-	  {
-	    isidp->prebuilt_midxkey_domains[j] = NULL;
-	  }
+	return plan_err;
       }
 
     m_part_key_desc = false;

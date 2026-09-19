@@ -1265,6 +1265,10 @@ extern "C"
 	assert_release_error (false);
 	break;
       }
+
+    /* the key conversion plans were fixed on the main thread (key_range_list::init_on_main) and live on the
+     * index scan id, which this close is the only owner of (wf268 C4) */
+    scan_free_key_conv_plans (thread_p, &scan_id->s.isid);
   }
 
   /* open-phase captures needed by scan_try_promote_parallel_index_scan to build the manager; freed on promotion attempt. */

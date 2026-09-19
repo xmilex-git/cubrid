@@ -164,7 +164,11 @@ static int reverse_key_list (KEY_VAL_RANGE * key_vals, int key_cnt);
 static int check_key_vals (KEY_VAL_RANGE * key_vals, int key_cnt, QPROC_KEY_VAL_FU * chk_fn);
 static int scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * indexal,
 				   TP_DOMAIN * btree_domainp, int num_term, REGU_VARIABLE * func, VAL_DESCR * vd,
-				   int key_minmax, bool is_iss, TP_DOMAIN ** prebuilt_midxkey_domain);
+				   int key_minmax, bool is_iss, KEY_CONV_PLAN * plan);
+static bool scan_key_regu_is_invariant (const REGU_VARIABLE * regu);
+static int scan_build_key_conv_plan (THREAD_ENTRY * thread_p, KEY_CONV_PLAN * plan, REGU_VARIABLE * key,
+				     TP_DOMAIN * btree_domainp, VAL_DESCR * vd, bool is_iss);
+static bool scan_key_operand_type (REGU_VARIABLE * regu, VAL_DESCR * vd, DB_TYPE * type_out);
 /* scan_regu_key_to_index_key is declared in scan_manager.h (used by parallel index scan) */
 static int scan_get_index_oidset (THREAD_ENTRY * thread_p, SCAN_ID * s_id, DB_BIGINT * key_limit_upper,
 				  DB_BIGINT * key_limit_lower);
@@ -318,7 +322,8 @@ scan_init_index_scan (INDX_SCAN_ID * isidp, struct btree_iscan_oid_list *oid_lis
   isidp->need_count_only = false;
   isidp->check_not_vacuumed = false;
   isidp->not_vacuumed_res = DISK_VALID;
-  isidp->prebuilt_midxkey_domains = NULL;
+  isidp->key_conv_plans = NULL;
+  isidp->key_conv_plan_cnt = 0;
   isidp->parallel_pending = NULL;
 }
 
@@ -412,6 +417,7 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
   ISS_RANGE_DETAILS scan_range_det, fetch_range_det;
   bool descending_skip_key = false;
   bool descending_scan = false;
+  TP_DOMAIN *first_col_domain = NULL;
   int i;
 
   if (isidp == NULL)
@@ -590,6 +596,10 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
     }
 
   /* use last_key in scan_range */
+  /* last_key was read from the first index column, so its domain is that column's - not something to be derived
+   * from the value that happens to arrive (wf268 C4, E17). */
+  first_col_domain = isidp->bt_scan.btid_int.key_type->setdomain;
+
   for (i = 0; i < scan_range_det.key_cnt; i++)
     {
       KEY_RANGE *kr = &(scan_range_det.key_ranges[i]);
@@ -609,7 +619,7 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
 	      REGU_VARIABLE *regu = &kr->key1->value.funcp->operand->value;
 
 	      regu->type = TYPE_DBVAL;
-	      regu->domain = tp_domain_resolve_default (DB_VALUE_DOMAIN_TYPE (last_key));
+	      regu->domain = first_col_domain;
 
 	      pr_clear_value (&regu->value.dbval);
 	      pr_clone_value (last_key, &regu->value.dbval);
@@ -626,7 +636,7 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
 	      REGU_VARIABLE *regu = &kr->key2->value.funcp->operand->value;
 
 	      regu->type = TYPE_DBVAL;
-	      regu->domain = tp_domain_resolve_default (DB_VALUE_DOMAIN_TYPE (last_key));
+	      regu->domain = first_col_domain;
 
 	      pr_clear_value (&regu->value.dbval);
 	      pr_clone_value (last_key, &regu->value.dbval);
@@ -1855,6 +1865,323 @@ scan_dedup_or_merge_key_ranges (RANGE_TYPE range_type, KEY_VAL_RANGE * key_vals,
 }
 
 /*
+ * scan_key_regu_is_invariant () - can this key range operand yield a different value on a later generation?
+ *   return: true if the operand is a constant or a host variable
+ *   regu (in): key range operand
+ *
+ * Note: constants and host variables are fixed for the whole execution, so the key built from them - and the
+ *       domain describing it - is built once.  Anything else (a column, a correlated value, an expression) is
+ *       treated as varying and is converted again on every range generation (wf268 C4).
+ */
+static bool
+scan_key_regu_is_invariant (const REGU_VARIABLE * regu)
+{
+  const regu_variable_list_node *operand;
+
+  if (regu == NULL)
+    {
+      return true;
+    }
+
+  switch (regu->type)
+    {
+    case TYPE_DBVAL:
+    case TYPE_POS_VALUE:
+      return true;
+
+    case TYPE_FUNC:
+      if (regu->value.funcp == NULL)
+	{
+	  return false;
+	}
+      for (operand = regu->value.funcp->operand; operand != NULL; operand = operand->next)
+	{
+	  if (!scan_key_regu_is_invariant (&operand->value))
+	    {
+	      return false;
+	    }
+	}
+      return true;
+
+    default:
+      return false;
+    }
+}
+
+/*
+ * scan_key_operand_type () - the type of the value a key range operand will produce
+ *   return: true if the operand says what it produces
+ *   regu (in): key range operand
+ *   vd (in): value descriptor of the execution, for host variable and auto parameter slots
+ *   type_out (out): that type
+ *
+ * Note: a literal and a bound slot already hold the value the whole execution will use, so their own value is
+ *       the type the key is built from - the operand's domain can be the wider one the expression was typed
+ *       with (an auto parameter for to_number ('3') is typed NUMERIC but holds an INTEGER).  Everything else
+ *       produces its value later and is described by its domain (wf268 C4).
+ */
+static bool
+scan_key_operand_type (REGU_VARIABLE * regu, VAL_DESCR * vd, DB_TYPE * type_out)
+{
+  switch (regu->type)
+    {
+    case TYPE_DBVAL:
+      *type_out = DB_VALUE_DOMAIN_TYPE (&regu->value.dbval);
+      return true;
+
+    case TYPE_POS_VALUE:
+      if (vd != NULL && vd->dbval_ptr != NULL && regu->value.val_pos >= 0 && regu->value.val_pos < vd->dbval_cnt)
+	{
+	  *type_out = DB_VALUE_DOMAIN_TYPE (vd->dbval_ptr + regu->value.val_pos);
+	  return true;
+	}
+      break;
+
+    default:
+      break;
+    }
+
+  if (regu->domain == NULL)
+    {
+      return false;
+    }
+
+  *type_out = TP_DOMAIN_TYPE (regu->domain);
+  return true;
+}
+
+/*
+ * scan_build_key_conv_plan () - fix the conversion strategy of one key range bound
+ *   return: NO_ERROR or ER_code
+ *   plan (out): plan to fill in
+ *   key (in): key range bound: NULL, a single column key, or an F_MIDXKEY function
+ *   btree_domainp (in): index key domain
+ *   vd (in): value descriptor of the execution
+ *   is_iss (in): the scan skips the first index column
+ *
+ * Note: the strategy comes from what each operand is already known to produce (scan_key_operand_type ()) and
+ *       from the index key schema, so no key range generation ever chooses it from the value that arrives
+ *       (D-276-05, wf268 C4).
+ */
+static int
+scan_build_key_conv_plan (THREAD_ENTRY * thread_p, KEY_CONV_PLAN * plan, REGU_VARIABLE * key,
+			  TP_DOMAIN * btree_domainp, VAL_DESCR * vd, bool is_iss)
+{
+  regu_variable_list_node *operand;
+  TP_DOMAIN *idx_dom;
+  int ncols, i;
+
+  plan->col_strategy = NULL;
+  plan->col_type = NULL;
+  plan->ncols = 0;
+  plan->value_varies = true;
+  plan->value_setdomain = NULL;
+
+  if (key == NULL || key->type != TYPE_FUNC || key->value.funcp == NULL || key->value.funcp->ftype != F_MIDXKEY)
+    {
+      /* a single column key is written in its own domain - there is no per column conversion to fix */
+      return NO_ERROR;
+    }
+
+  if (btree_domainp == NULL || btree_domainp->setdomain == NULL)
+    {
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_QPROC_INVALID_XASLNODE;
+    }
+
+  ncols = 0;
+  for (operand = key->value.funcp->operand; operand != NULL; operand = operand->next)
+    {
+      ncols++;
+    }
+  if (ncols == 0)
+    {
+      return NO_ERROR;
+    }
+
+  plan->col_strategy = (KEY_CONV_STRATEGY *) db_private_alloc (thread_p, ncols * sizeof (KEY_CONV_STRATEGY));
+  if (plan->col_strategy == NULL)
+    {
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  plan->col_type = (DB_TYPE *) db_private_alloc (thread_p, ncols * sizeof (DB_TYPE));
+  if (plan->col_type == NULL)
+    {
+      db_private_free_and_init (thread_p, plan->col_strategy);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  plan->ncols = ncols;
+  plan->value_varies = is_iss || !scan_key_regu_is_invariant (key);
+
+  for (operand = key->value.funcp->operand, idx_dom = btree_domainp->setdomain, i = 0;
+       operand != NULL && idx_dom != NULL; operand = operand->next, idx_dom = idx_dom->next, i++)
+    {
+      DB_TYPE idx_type_id = TP_DOMAIN_TYPE (idx_dom);
+      DB_TYPE op_type_id;
+
+      if (!scan_key_operand_type (&operand->value, vd, &op_type_id))
+	{
+	  assert (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	  return ER_QPROC_INVALID_XASLNODE;
+	}
+
+      if (is_iss && i == 0)
+	{
+	  /* no term gives the first column: skip scan feeds it the values it reads from the index itself */
+	  op_type_id = idx_type_id;
+	}
+
+      if (op_type_id == DB_TYPE_VARIABLE)
+	{
+	  assert (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	  return ER_QPROC_INVALID_XASLNODE;
+	}
+
+      plan->col_type[i] = op_type_id;
+
+      if (op_type_id != DB_TYPE_NULL && !tp_valid_indextype (op_type_id))
+	{
+	  plan->col_strategy[i] = KEY_CONV_NOT_INDEXABLE;
+	}
+      else if (op_type_id != idx_type_id)
+	{
+	  /* strict coercion to the index column, and the original value where it would lose something */
+	  plan->col_strategy[i] = KEY_CONV_STRICT;
+	}
+      else if (idx_type_id == DB_TYPE_NUMERIC || idx_type_id == DB_TYPE_CHAR || idx_type_id == DB_TYPE_BIT)
+	{
+	  /* skip variable string domain : DB_TYPE_VARCHAR, DB_TYPE_VARBIT */
+	  plan->col_strategy[i] = KEY_CONV_BY_VALUE_PRECISION;
+	}
+      else
+	{
+	  plan->col_strategy[i] = KEY_CONV_AS_IS;
+	}
+    }
+
+  return NO_ERROR;
+}
+
+/*
+ * scan_prepare_key_conv_plans () - fix the key conversion strategy of every key range of an index scan
+ *   return: NO_ERROR or ER_code
+ *   isidp (in/out): index scan id
+ *   btree_domainp (in): index key domain
+ *
+ * Note: runs once per scan - serial scans call it from scan_open_index_scan (), parallel workers from their own
+ *       key range list.  It is idempotent: a scan that already has its plans keeps them.
+ */
+int
+scan_prepare_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, TP_DOMAIN * btree_domainp,
+			     VAL_DESCR * vd)
+{
+  KEY_RANGE *key_ranges;
+  int key_cnt, nplans, i, ret;
+
+  assert (isidp != NULL);
+
+  if (isidp->key_conv_plans != NULL || isidp->indx_info == NULL)
+    {
+      return NO_ERROR;
+    }
+
+  key_cnt = isidp->indx_info->key_info.key_cnt;
+  key_ranges = isidp->indx_info->key_info.key_ranges;
+  if (key_cnt <= 0 || key_ranges == NULL)
+    {
+      return NO_ERROR;
+    }
+
+  /* two slots per key range (key1, key2), plus the pair the index skip scan fetch range uses while it looks for
+   * the next value of the first index column (SCAN_KEY_CONV_ISS_BASE ()) */
+  nplans = 2 * key_cnt + 2;
+  isidp->key_conv_plans = (KEY_CONV_PLAN *) db_private_alloc (thread_p, nplans * sizeof (KEY_CONV_PLAN));
+  if (isidp->key_conv_plans == NULL)
+    {
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  memset (isidp->key_conv_plans, 0x0, nplans * sizeof (KEY_CONV_PLAN));
+  isidp->key_conv_plan_cnt = nplans;
+
+  for (i = 0; i < key_cnt; i++)
+    {
+      ret = scan_build_key_conv_plan (thread_p, &isidp->key_conv_plans[2 * i], key_ranges[i].key1, btree_domainp,
+				      vd, isidp->iss.use);
+      if (ret == NO_ERROR)
+	{
+	  ret = scan_build_key_conv_plan (thread_p, &isidp->key_conv_plans[2 * i + 1], key_ranges[i].key2,
+					  btree_domainp, vd, isidp->iss.use);
+	}
+
+      if (ret != NO_ERROR)
+	{
+	  scan_free_key_conv_plans (thread_p, isidp);
+	  return ret;
+	}
+    }
+
+  if (isidp->iss.use && isidp->iss.skipped_range != NULL)
+    {
+      /* The fetch range carries the first index column alone, and a descending scan moves that one bound from
+       * key1 to key2 (scan_get_next_iss_value ()), so both slots describe the same regu. */
+      for (i = 0; i < 2 && ret == NO_ERROR; i++)
+	{
+	  ret = scan_build_key_conv_plan (thread_p, &isidp->key_conv_plans[SCAN_KEY_CONV_ISS_BASE (isidp) + i],
+					  isidp->iss.skipped_range->key1, btree_domainp, vd, true);
+	}
+
+      if (ret != NO_ERROR)
+	{
+	  scan_free_key_conv_plans (thread_p, isidp);
+	  return ret;
+	}
+    }
+
+  return NO_ERROR;
+}
+
+/*
+ * scan_free_key_conv_plans () - release the key conversion plans of an index scan
+ *   return: void
+ *   isidp (in/out): index scan id
+ */
+void
+scan_free_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp)
+{
+  int i;
+
+  if (isidp == NULL || isidp->key_conv_plans == NULL)
+    {
+      return;
+    }
+
+  for (i = 0; i < isidp->key_conv_plan_cnt; i++)
+    {
+      KEY_CONV_PLAN *plan = &isidp->key_conv_plans[i];
+
+      if (plan->col_strategy != NULL)
+	{
+	  db_private_free_and_init (thread_p, plan->col_strategy);
+	}
+      if (plan->col_type != NULL)
+	{
+	  db_private_free_and_init (thread_p, plan->col_type);
+	}
+      if (plan->value_setdomain != NULL)
+	{
+	  tp_domain_free (plan->value_setdomain);
+	  plan->value_setdomain = NULL;
+	}
+    }
+
+  db_private_free_and_init (thread_p, isidp->key_conv_plans);
+  isidp->key_conv_plan_cnt = 0;
+}
+
+/*
  * scan_dbvals_to_midxkey () -
  *   return: NO_ERROR or ER_code
  *
@@ -1870,7 +2197,7 @@ scan_dedup_or_merge_key_ranges (RANGE_TYPE range_type, KEY_VAL_RANGE * key_vals,
 static int
 scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * indexable, TP_DOMAIN * btree_domainp,
 			int num_term, REGU_VARIABLE * func, VAL_DESCR * vd, int key_minmax, bool is_iss,
-			TP_DOMAIN ** prebuilt_midxkey_domain)
+			KEY_CONV_PLAN * plan)
 {
   int ret = NO_ERROR;
   DB_VALUE *val = NULL;
@@ -1893,9 +2220,21 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
   TP_DOMAIN dom_buf;
   DB_VALUE *coerced_values = NULL;
   bool *has_coerced_values = NULL;
-  bool new_setdomain_built = *prebuilt_midxkey_domain != NULL;
+  bool new_setdomain_built;
 
   *indexable = false;
+
+  assert (plan != NULL);
+
+  /* A value description built for an earlier range generation may be reused only while the key values themselves
+   * cannot change.  Correlated, join and skip-scan keys bring new values on every generation, so their description
+   * is rebuilt with them (wf268 C4, D-273-01R). */
+  if (plan->value_varies && plan->value_setdomain != NULL)
+    {
+      tp_domain_free (plan->value_setdomain);
+      plan->value_setdomain = NULL;
+    }
+  new_setdomain_built = (plan->value_setdomain != NULL);
 
   if (TP_DOMAIN_TYPE (func->domain) != DB_TYPE_MIDXKEY)
     {
@@ -1972,7 +2311,18 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
       idx_type_id = TP_DOMAIN_TYPE (idx_dom);
       val_type_id = DB_VALUE_DOMAIN_TYPE (val);
 
-      if (!tp_valid_indextype (val_type_id))
+      /* The conversion strategy was fixed from this operand's compile-time domain, so a value of another type
+       * means the plan and the execution disagree - report it instead of converting by whatever arrived
+       * (wf268 C4, verification boundary D-273-02R (b)). */
+      if (i >= plan->ncols || val_type_id != plan->col_type[i])
+	{
+	  assert (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	  ret = ER_QPROC_INVALID_XASLNODE;
+	  goto err_exit;
+	}
+
+      if (plan->col_strategy[i] == KEY_CONV_NOT_INDEXABLE)
 	{
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (idx_type_id),
 		  pr_type_name (val_type_id));
@@ -1993,7 +2343,7 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
 	    }
 	}
 
-      if (idx_type_id != val_type_id)
+      if (plan->col_strategy[i] == KEY_CONV_STRICT)
 	{
 	  /* allocate DB_VALUE array to store coerced values. */
 	  if (has_coerced_values == NULL)
@@ -2028,10 +2378,11 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
 	      has_coerced_values[i] = true;
 	    }
 	}
-      else if (idx_type_id == DB_TYPE_NUMERIC || idx_type_id == DB_TYPE_CHAR || idx_type_id == DB_TYPE_BIT)
+      else if (plan->col_strategy[i] == KEY_CONV_BY_VALUE_PRECISION)
 	{
-	  /* skip variable string domain : DB_TYPE_VARCHAR, DB_TYPE_VARBIT */
-
+	  /* The type is the index column's; only the value's own precision and scale can still make the key
+	   * describe itself rather than the index column.  This describes the value at hand - it is not a domain
+	   * derived for the plan (wf268 C4). */
 	  val_dom = tp_domain_resolve_value (val, &dom_buf);
 	  if (val_dom == NULL)
 	    {
@@ -2056,7 +2407,7 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
     }
   if (new_setdomain_built)
     {
-      prebuilt_domain = (*prebuilt_midxkey_domain)->setdomain;
+      prebuilt_domain = plan->value_setdomain->setdomain;
     }
   for (operand = func->value.funcp->operand, idx_dom = idx_setdomain, natts = 0;
        operand != NULL && idx_dom != NULL
@@ -2064,7 +2415,6 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
        operand = operand->next, idx_dom = idx_dom->next, natts++)
     {
       /* If there is coerced value, we will use it regardless of whether a new setdomain is required or not. */
-    retry:
       if (has_coerced_values != NULL && has_coerced_values[natts] == true)
 	{
 	  assert (coerced_values != NULL);
@@ -2083,13 +2433,11 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
 	{
 	  dom = prebuilt_domain;
 	  prebuilt_domain = prebuilt_domain->next;
-	  if (natts == 0 && dom->type->id == DB_TYPE_NULL && !DB_IS_NULL (val))
-	    {
-	      need_new_setdomain = true;
-	      new_setdomain_built = false;
-	      dom = NULL;
-	      goto retry;
-	    }
+
+	  /* The cached description belongs to values that cannot change (see plan->value_varies), so a column that
+	   * was NULL when it was built is NULL here too.  The rebuild-and-retry this replaces was only reachable
+	   * while a skip-scan key kept reusing a stale description (wf268 C4). */
+	  assert (natts != 0 || dom->type->id != DB_TYPE_NULL || DB_IS_NULL (val));
 	}
       else if (need_new_setdomain == true)
 	{
@@ -2179,7 +2527,7 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
   /* generate multi columns key (values -> midxkey.buf) */
   if (new_setdomain_built)
     {
-      dom = (*prebuilt_midxkey_domain)->setdomain;
+      dom = plan->value_setdomain->setdomain;
     }
   else
     {
@@ -2248,7 +2596,7 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
 	}
 
       midxkey.domain = tp_domain_cache (midxkey.domain);
-      *prebuilt_midxkey_domain = midxkey.domain;
+      plan->value_setdomain = midxkey.domain;
     }
   else
     {
@@ -2257,7 +2605,7 @@ scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * index
 
   if (new_setdomain_built)
     {
-      midxkey.domain = *prebuilt_midxkey_domain;
+      midxkey.domain = plan->value_setdomain;
     }
 
   ret = db_make_midxkey (retval, &midxkey);
@@ -2335,10 +2683,30 @@ scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY
   int ret = NO_ERROR;
   DB_TYPE db_type;
   int key_len;
+  int plan_idx;
   regu_variable_list_node *requ_list;
 
   assert ((key_ranges->range >= GE_LE && key_ranges->range <= INF_LT) || (key_ranges->range == EQ_NA));
   assert (!(key_ranges->key1 == NULL && key_ranges->key2 == NULL));
+
+  /* The conversion strategy of both bounds was fixed when the scan was prepared (wf268 C4).  An index skip scan
+   * swaps its own fetch range in while it looks for the next value of the first column, and that range has its
+   * own pair of plans. */
+  if (iscan_id->iss.use && key_ranges == iscan_id->iss.skipped_range)
+    {
+      plan_idx = SCAN_KEY_CONV_ISS_BASE (iscan_id);
+    }
+  else
+    {
+      plan_idx = 2 * key_range_idx;
+    }
+
+  if (iscan_id->key_conv_plans == NULL || plan_idx < 0 || plan_idx + 1 >= iscan_id->key_conv_plan_cnt)
+    {
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_QPROC_INVALID_XASLNODE;
+    }
 
   if (iscan_id->bt_attrs_prefix_length && iscan_id->bt_num_attrs == 1)
     {
@@ -2395,7 +2763,7 @@ scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY
 	  ret =
 	    scan_dbvals_to_midxkey (thread_p, &key_val_range->key1, &indexable, btree_domainp,
 				    key_val_range->num_index_term, key_ranges->key1, vd, key_minmax, iscan_id->iss.use,
-				    &(iscan_id->prebuilt_midxkey_domains[key_range_idx]));
+				    &(iscan_id->key_conv_plans[plan_idx]));
 	}
       else
 	{
@@ -2443,7 +2811,7 @@ scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY
 	  ret =
 	    scan_dbvals_to_midxkey (thread_p, &key_val_range->key2, &indexable, btree_domainp,
 				    key_val_range->num_index_term, key_ranges->key2, vd, key_minmax, iscan_id->iss.use,
-				    &(iscan_id->prebuilt_midxkey_domains[key_range_idx]));
+				    &(iscan_id->key_conv_plans[plan_idx + 1]));
 	}
       else
 	{
@@ -3742,18 +4110,10 @@ scan_open_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
     scan_id->scan_stats.multi_range_opt = isidp->multi_range_opt.use;
   }
 
-  if (isidp->prebuilt_midxkey_domains == NULL && isidp->indx_info->key_info.key_cnt > 0)
+  /* fix how every key range value reaches the index key domain, before any of them is built (wf268 C4) */
+  if (scan_prepare_key_conv_plans (thread_p, isidp, BTS->btid_int.key_type, vd) != NO_ERROR)
     {
-      isidp->prebuilt_midxkey_domains =
-	(TP_DOMAIN **) db_private_alloc (thread_p, isidp->indx_info->key_info.key_cnt * sizeof (TP_DOMAIN *));
-      if (isidp->prebuilt_midxkey_domains == NULL)
-	{
-	  return ER_FAILED;
-	}
-      for (int i = 0; i < isidp->indx_info->key_info.key_cnt; i++)
-	{
-	  isidp->prebuilt_midxkey_domains[i] = NULL;
-	}
+      goto exit_on_error;
     }
 
   return ret;
@@ -5415,18 +5775,7 @@ scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	}
 #endif /* SERVER_MODE && !WINDOWS */
 
-      if (isidp->prebuilt_midxkey_domains != NULL)
-	{
-	  for (int i = 0; i < isidp->indx_info->key_info.key_cnt; i++)
-	    {
-	      if (isidp->prebuilt_midxkey_domains[i])
-		{
-		  tp_domain_free (isidp->prebuilt_midxkey_domains[i]);
-		  isidp->prebuilt_midxkey_domains[i] = NULL;
-		}
-	    }
-	  db_private_free_and_init (thread_p, isidp->prebuilt_midxkey_domains);
-	}
+      scan_free_key_conv_plans (thread_p, isidp);
 
       if (isidp->key_vals)
 	{
