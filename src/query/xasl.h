@@ -111,8 +111,10 @@ struct domain_pin_plan
 {
   DOMAIN_PIN_RECIPE *recipes;
   DOMAIN_PIN_USE *uses;
+  REGU_VARIABLE **coll_regus;	/* value slots whose collation the compiler left to the bound value */
   int n_recipes;
   int n_uses;
+  int n_coll;
 };
 
 #define OR_PACK_XASL_NODE_HEADER(PTR, X) \

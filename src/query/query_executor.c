@@ -635,6 +635,7 @@ struct pin_walk_frame
 static void qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up);
 static void qexec_propagate_pinned_domains (XASL_NODE * xasl);
 static int qexec_setup_aggregate_domains (AGGREGATE_TYPE * agg_list);
+static int qexec_pin_open_collations (THREAD_ENTRY * thread_p, const DOMAIN_PIN_PLAN * plan, VAL_DESCR * vd);
 static int qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
 static int qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 					     UPDDEL_CLASS_INSTANCE_LOCK_INFO * p_class_instance_lock_info);
@@ -18112,6 +18113,40 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
 }
 
 /*
+ * qexec_pin_open_collations () - settle every collation the compiler left to a bound value
+ *   return: NO_ERROR, or an error code
+ *   plan(in): the root's pin plan, carrying the value slots that were collected when the tree was loaded
+ *   vd(in): this execution's value descriptor, holding the bound host variables
+ *
+ * Note: the type checker leaves a slot's collation open (ENFORCE or LEAVE) when every operand was a host
+ *       variable, and fetch_peek_dbval () settled it from the value -- on every row that read the slot, and
+ *       writing the answer back into the plan.  Peeking the slot once here gives the same answer from the same
+ *       value, so by the time the mainblock starts the flag is NORMAL and nothing decides it again (#286).
+ */
+static int
+qexec_pin_open_collations (THREAD_ENTRY * thread_p, const DOMAIN_PIN_PLAN * plan, VAL_DESCR * vd)
+{
+  int i;
+
+  for (i = 0; i < plan->n_coll; i++)
+    {
+      REGU_VARIABLE *regu = plan->coll_regus[i];
+      DB_VALUE *peek = NULL;
+
+      /* only a slot that reads no row is collected (stx_collect_open_collation ()), so this evaluates no row,
+       * no sub-query and nothing with a side effect */
+      assert (regu->type == TYPE_POS_VALUE || regu->type == TYPE_DBVAL);
+
+      if (fetch_peek_dbval (thread_p, regu, vd, NULL, NULL, NULL, &peek) != NO_ERROR)
+	{
+	  return ER_FAILED;
+	}
+    }
+
+  return NO_ERROR;
+}
+
+/*
  * qexec_pin_execution_domains () - complete, before the mainblock starts, the result types the plan left
  *                                  depending on a value (see DOMAIN_PIN_PLAN in xasl.h)
  *   return: NO_ERROR, or an error code
@@ -18126,7 +18161,7 @@ static int
 qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
   DOMAIN_PIN_PLAN *plan = xasl->domain_pin_plan;
-  TP_DOMAIN **domains;
+  TP_DOMAIN **domains = NULL;
   int error = NO_ERROR;
   int i;
 
@@ -18139,10 +18174,13 @@ qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
       return NO_ERROR;
     }
 
-  domains = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *) * plan->n_recipes);
-  if (domains == NULL)
+  if (plan->n_recipes > 0)
     {
-      return ER_OUT_OF_VIRTUAL_MEMORY;
+      domains = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *) * plan->n_recipes);
+      if (domains == NULL)
+	{
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
     }
 
   for (i = 0; i < plan->n_recipes; i++)
@@ -18179,6 +18217,13 @@ qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
       owner->domain = owner->value.arithptr->domain = domains[plan->uses[i].pin_id];
     }
 
+  /* the collations the compiler left to a bound value */
+  error = qexec_pin_open_collations (thread_p, plan, &xasl_state->vd);
+  if (error != NO_ERROR)
+    {
+      goto exit_on_error;
+    }
+
   /* the consumers the compiler left open because they derive from a pinned expression */
   qexec_propagate_pinned_domains (xasl);
 
@@ -18188,7 +18233,10 @@ qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
   return NO_ERROR;
 
 exit_on_error:
-  db_private_free_and_init (thread_p, domains);
+  if (domains != NULL)
+    {
+      db_private_free_and_init (thread_p, domains);
+    }
   return (error == NO_ERROR) ? ER_FAILED : error;
 }
 
@@ -18220,25 +18268,36 @@ qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root, 
       qexec_propagate_pinned_domains (worker_root);
       return NO_ERROR;
     }
-  if (plan == NULL || root_state->pinned_domains == NULL || plan->n_recipes != root_state->pinned_cnt)
+  if (plan == NULL || plan->n_recipes != root_state->pinned_cnt
+      || (plan->n_recipes > 0 && root_state->pinned_domains == NULL))
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
       return ER_QPROC_INVALID_XASLNODE;
     }
 
-  worker_state->pinned_domains = (TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *) * plan->n_recipes);
-  if (worker_state->pinned_domains == NULL)
+  if (plan->n_recipes > 0)
     {
-      return ER_OUT_OF_VIRTUAL_MEMORY;
+      worker_state->pinned_domains =
+	(TP_DOMAIN **) db_private_alloc (thread_p, sizeof (TP_DOMAIN *) * plan->n_recipes);
+      if (worker_state->pinned_domains == NULL)
+	{
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      memcpy (worker_state->pinned_domains, root_state->pinned_domains, sizeof (TP_DOMAIN *) * plan->n_recipes);
+      worker_state->pinned_cnt = plan->n_recipes;
     }
-  memcpy (worker_state->pinned_domains, root_state->pinned_domains, sizeof (TP_DOMAIN *) * plan->n_recipes);
-  worker_state->pinned_cnt = plan->n_recipes;
 
   for (i = 0; i < plan->n_uses; i++)
     {
       REGU_VARIABLE *owner = plan->uses[i].owner_regu;
 
       owner->domain = owner->value.arithptr->domain = worker_state->pinned_domains[plan->uses[i].pin_id];
+    }
+
+  /* the worker's clone carries its own copy of the open collation slots */
+  if (qexec_pin_open_collations (thread_p, plan, &worker_state->vd) != NO_ERROR)
+    {
+      return ER_FAILED;
     }
 
   /* the worker's own clone has the same derived consumers as the root's tree */

@@ -87,6 +87,7 @@ static KEY_RANGE *stx_restore_key_range_array (THREAD_ENTRY * thread_p, char *pt
 
 static char *stx_build_xasl_node (THREAD_ENTRY * thread_p, char *tmp, XASL_NODE * ptr);
 static int stx_collect_domain_pin (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var);
+static int stx_collect_open_collation (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var);
 static int stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static char *stx_build_xasl_header (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE_HEADER * xasl_header);
 static char *stx_build_filter_pred_node (THREAD_ENTRY * thread_p, char *ptr, PRED_EXPR_WITH_CONTEXT * pred);
@@ -328,6 +329,37 @@ stx_collect_domain_pin (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var)
 }
 
 /*
+ * stx_collect_open_collation () - remember a value slot whose collation is still decided by the bound value
+ *   return: NO_ERROR, or an error code
+ *   regu_var(in): a value shaped regu variable whose domain carries a non NORMAL collation flag
+ *
+ * Note: the type checker leaves the collation open when every operand was a host variable, and marks the slot
+ *       ENFORCE or LEAVE.  fetch_peek_dbval () used to settle it from the value on every row it read; the value
+ *       is already bound when the gate runs, so the gate settles it once instead (#286).  Only a slot that reads
+ *       no row is collected, so the gate never has to execute anything to answer it.
+ */
+static int
+stx_collect_open_collation (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var)
+{
+  XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
+  UNPACK_DOMAIN_PIN *pin;
+
+  pin = (UNPACK_DOMAIN_PIN *) stx_alloc_struct (thread_p, (int) sizeof (UNPACK_DOMAIN_PIN));
+  if (pin == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+
+  pin->owner_regu = regu_var;
+  pin->next = xasl_unpack_info->coll_pins;
+  xasl_unpack_info->coll_pins = pin;
+  xasl_unpack_info->coll_pin_cnt++;
+
+  return NO_ERROR;
+}
+
+/*
  * stx_build_domain_pin_plan () - turn the pins collected during unpacking into the root node's plan
  *   return: NO_ERROR, or an error code
  *   xasl(in/out): the root of the restored tree
@@ -343,13 +375,13 @@ stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
   UNPACK_DOMAIN_PIN *pin;
   DOMAIN_PIN_PLAN *plan;
   int n_uses = xasl_unpack_info->domain_pin_cnt;
+  int n_coll = xasl_unpack_info->coll_pin_cnt;
   int i, j;
 
   xasl->domain_pin_plan = NULL;
-  if (n_uses == 0)
+  if (n_uses == 0 && n_coll == 0)
     {
-      /* a statement with no residual carries no plan at all: no array to allocate and nothing to walk before the
-       * mainblock starts */
+      /* a statement with no residual carries no plan at all */
       return NO_ERROR;
     }
 
@@ -359,12 +391,36 @@ stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
       stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
-  plan->uses = (DOMAIN_PIN_USE *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_PIN_USE) * n_uses);
-  plan->recipes = (DOMAIN_PIN_RECIPE *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_PIN_RECIPE) * n_uses);
-  if (plan->uses == NULL || plan->recipes == NULL)
+  plan->uses = NULL;
+  plan->recipes = NULL;
+  plan->coll_regus = NULL;
+  plan->n_uses = plan->n_recipes = plan->n_coll = 0;
+
+  if (n_uses > 0)
     {
-      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
-      return ER_OUT_OF_VIRTUAL_MEMORY;
+      plan->uses = (DOMAIN_PIN_USE *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_PIN_USE) * n_uses);
+      plan->recipes = (DOMAIN_PIN_RECIPE *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_PIN_RECIPE) * n_uses);
+      if (plan->uses == NULL || plan->recipes == NULL)
+	{
+	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+    }
+
+  if (n_coll > 0)
+    {
+      plan->coll_regus = (REGU_VARIABLE **) stx_alloc_struct (thread_p, (int) sizeof (REGU_VARIABLE *) * n_coll);
+      if (plan->coll_regus == NULL)
+	{
+	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      for (pin = xasl_unpack_info->coll_pins, i = n_coll - 1; pin != NULL; pin = pin->next, i--)
+	{
+	  plan->coll_regus[i] = pin->owner_regu;
+	}
+      assert (i == -1);
+      plan->n_coll = n_coll;
     }
 
   /* the collected list is newest first: fill the uses back to front to get unpack order */
@@ -5803,6 +5859,15 @@ stx_build_regu_variable (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABLE * reg
   if (ptr == NULL)
     {
       return NULL;
+    }
+
+  if (regu_var->domain != NULL && TP_DOMAIN_COLLATION_FLAG (regu_var->domain) != TP_DOMAIN_COLL_NORMAL
+      && (regu_var->type == TYPE_POS_VALUE || regu_var->type == TYPE_DBVAL))
+    {
+      if (stx_collect_open_collation (thread_p, regu_var) != NO_ERROR)
+	{
+	  return NULL;
+	}
     }
 
   if (regu_var->domain != NULL && TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE

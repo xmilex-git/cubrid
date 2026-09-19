@@ -91,6 +91,8 @@ struct xasl_unpack_info
    * complete (stx_map_stream_to_xasl) */
   UNPACK_DOMAIN_PIN *domain_pins;
   int domain_pin_cnt;
+  UNPACK_DOMAIN_PIN *coll_pins;	/* value slots carrying an unresolved collation */
+  int coll_pin_cnt;
 };
 
 XASL_UNPACK_INFO *get_xasl_unpack_info_ptr (THREAD_ENTRY *thread_p);
