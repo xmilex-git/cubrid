@@ -1471,8 +1471,6 @@ qexec_clear_arith_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ARITH_TYPE 
       return NO_ERROR;
     }
 
-  /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
-  list->domain = list->original_domain;
   pr_clear_value (list->value);
   pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, list->leftptr, is_final, for_parallel_aptr);
   pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, list->rightptr, is_final, for_parallel_aptr);
@@ -1505,9 +1503,6 @@ qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE
     {
       return pg_cnt;
     }
-
-  /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
-  regu_var->domain = regu_var->original_domain;
 
 #if !defined(NDEBUG)
   if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST))
@@ -1761,7 +1756,7 @@ qexec_clear_db_val_list (QPROC_DB_VALUE_LIST list)
 static void
 qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final)
 {
-  position_descr->dom = position_descr->original_domain;
+  /* the settled domain is put back by qexec_restore_compiled_domains () when the execution ends */
 }
 
 /*
@@ -2278,8 +2273,6 @@ qexec_clear_analytic_function_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p,
 	  (void) pr_clear_value (p->value);
 	  (void) pr_clear_value (p->value2);
 	  (void) pr_clear_value (&p->part_value);
-	  p->domain = p->original_domain;
-	  p->opr_dbtype = p->original_opr_dbtype;
 	  pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, &p->operand, is_final, for_parallel_aptr);
 	  p->init ();
 	}
@@ -2333,8 +2326,6 @@ qexec_clear_agg_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, AGGREGATE_TYP
 	}
 
       pg_cnt += qexec_clear_regu_variable_list (thread_p, xasl_p, p->operands, is_final, for_parallel_aptr);
-      p->domain = p->original_domain;
-      p->opr_dbtype = p->original_opr_dbtype;
     }
 
   return pg_cnt;
@@ -18077,6 +18068,10 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
 	    }
 	}
 
+      /* the probe domain is not a slot the compiler left open, so it is not on the open slot list and nothing
+       * puts it back; the step does not need it to be.  The build list entry was picked with a precision other
+       * than the default, so after this runs once the test below is false for every later execution of the same
+       * tree, and the value it would have installed is the same one it already carries (#286 D5). */
       if (rest_regu_numeric != NULL && REGU_VARIABLE_GET_TYPE (&probe_regu->value) == DB_TYPE_NUMERIC
 	  && probe_regu->value.domain->precision == DB_DEFAULT_NUMERIC_PRECISION)
 	{
@@ -18229,6 +18224,48 @@ exit_on_error:
       db_private_free_and_init (thread_p, domains);
     }
   return (error == NO_ERROR) ? ER_FAILED : error;
+}
+
+/*
+ * qexec_restore_compiled_domains () - put every slot this execution settled back the way the compiler left it
+ *   return: void
+ *   xasl(in/out): the root of the tree that was executed
+ *
+ * Note: the tree belongs to this execution alone - xcache_find_xasl_id_for_execute () either pops a clone out
+ *       of the entry's pool under its mutex or unpacks a fresh one from the stream - so settling a domain in it
+ *       is not a shared write.  What it is not is permanent: the clone goes back into the pool afterwards
+ *       (xcache_retire_clone ()) and the next execution answers from its own values, which really can differ -
+ *       qexec_pin_domain_of_format () classifies a bound format value, and an open collation is settled from
+ *       the value the slot was bound to.  So the tree is put back the way the compiler produced it here, from
+ *       the open slot list the unpack collected (DOMAIN_OPEN_SLOT in xasl.h).  Until #286 D5 this was done a
+ *       node at a time on the clear walk, out of an original_domain / original_opr_dbtype field that every
+ *       regu variable, arith node, position descriptor, aggregate and analytic function carried whether or not
+ *       anything ever wrote to it.
+ */
+void
+qexec_restore_compiled_domains (XASL_NODE * xasl)
+{
+  DOMAIN_PIN_PLAN *plan = (xasl != NULL) ? xasl->domain_pin_plan : NULL;
+  int i;
+
+  if (plan == NULL)
+    {
+      return;
+    }
+
+  for (i = 0; i < plan->n_open; i++)
+    {
+      DOMAIN_OPEN_SLOT *open_slot = &plan->open_slots[i];
+
+      if (open_slot->dom_slot != NULL)
+	{
+	  *open_slot->dom_slot = open_slot->dom_compiled;
+	}
+      else
+	{
+	  *open_slot->type_slot = open_slot->type_compiled;
+	}
+    }
 }
 
 /*
@@ -18550,6 +18587,7 @@ query_error:
       list_id = qexec_get_xasl_list_id (xasl);
 
       (void) qexec_clear_xasl (thread_p, xasl, true, false);
+      qexec_restore_compiled_domains (xasl);
 
       /* caller will detect the error condition and free the listid */
       goto end;
@@ -18578,6 +18616,7 @@ query_error:
 
   /* clear XASL tree */
   (void) qexec_clear_xasl (thread_p, xasl, true, false);
+  qexec_restore_compiled_domains (xasl);
 
 #if defined(CUBRID_DEBUG)
   if (trace && fp)

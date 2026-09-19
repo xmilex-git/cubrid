@@ -102,6 +102,8 @@ stx_init_xasl_unpack_info (THREAD_ENTRY *thread_p, char *xasl_stream, int xasl_s
   unpack_info->domain_pin_cnt = 0;
   unpack_info->coll_pins = NULL;
   unpack_info->coll_pin_cnt = 0;
+  unpack_info->open_slots = NULL;
+  unpack_info->open_slot_cnt = 0;
 #if defined (SERVER_MODE)
   unpack_info->thrd = thread_p;
 #endif /* SERVER_MODE */

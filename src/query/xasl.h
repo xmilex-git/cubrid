@@ -106,15 +106,39 @@ struct domain_pin_use
   int pin_id;			/* index into DOMAIN_PIN_PLAN::recipes */
 };
 
+/*
+ * A slot the compiler left open, and what the compiler put in it.
+ *
+ * Execution settles such a slot from this execution's values - the gate before the mainblock for most of them,
+ * a scan open or a row for the few whose answer the query itself produces.  The tree it writes into belongs to
+ * this execution alone (xcache_find_xasl_id_for_execute () either pops a clone out of the pool under the entry
+ * mutex or unpacks a fresh one), so the write is not shared; but the clone goes back into the pool afterwards,
+ * and the next execution must find the slot as the compiler left it.  That is what this list is for: the
+ * compiled value of every open slot, collected once when the stream is unpacked, put back when the execution
+ * that settled it ends (qexec_restore_compiled_domains ()).  Before #286 D5 every regu variable, arith node,
+ * position descriptor, aggregate and analytic function carried its own copy of this in an original_domain /
+ * original_opr_dbtype field, whether or not it was ever written.
+ */
+typedef struct domain_open_slot DOMAIN_OPEN_SLOT;
+struct domain_open_slot
+{
+  TP_DOMAIN **dom_slot;		/* where execution writes a settled domain, or NULL for a DB_TYPE slot */
+  TP_DOMAIN *dom_compiled;
+  DB_TYPE *type_slot;		/* where execution writes a settled operand type, or NULL */
+  DB_TYPE type_compiled;
+};
+
 typedef struct domain_pin_plan DOMAIN_PIN_PLAN;
 struct domain_pin_plan
 {
   DOMAIN_PIN_RECIPE *recipes;
   DOMAIN_PIN_USE *uses;
   REGU_VARIABLE **coll_regus;	/* value slots whose collation the compiler left to the bound value */
+  DOMAIN_OPEN_SLOT *open_slots;	/* every slot execution settles, and what the compiler left in it */
   int n_recipes;
   int n_uses;
   int n_coll;
+  int n_open;
 };
 
 #define OR_PACK_XASL_NODE_HEADER(PTR, X) \

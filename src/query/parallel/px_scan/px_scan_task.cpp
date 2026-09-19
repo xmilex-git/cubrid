@@ -530,6 +530,8 @@ namespace parallel_scan
       }
     db_private_free (&thread_ref, m_xasl_state);
     qexec_clear_xasl (&thread_ref, m_xasl, true, false);
+    /* this worker ran its own copy of the tree; put the domains it settled back before the copy is pooled */
+    qexec_restore_compiled_domains (m_uses_xasl_clone ? m_xasl_clone.xasl : m_xasl_tree);
 
     pthread_mutex_lock (&main_thread_p->m_px_lock_mutex);
     if (m_uses_xasl_clone)
