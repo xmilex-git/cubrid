@@ -512,8 +512,11 @@ qdata_evaluate_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p,
       if (func_p->curr_cnt < 1)
 	{
 	  opr_dbval_p = &dbval;
+	  /* the value was just coerced to DOUBLE above, so the accumulators are DOUBLE by construction - reading
+	   * the type back off the first value of each partition was a decision the partition did not make
+	   * (wf268 #286 A7) */
 	  /* func_p->value contains SUM(X) */
-	  if (db_value_domain_init (func_p->value, DB_VALUE_DOMAIN_TYPE (opr_dbval_p), DB_DEFAULT_PRECISION,
+	  if (db_value_domain_init (func_p->value, DB_TYPE_DOUBLE, DB_DEFAULT_PRECISION,
 				    DB_DEFAULT_SCALE) != NO_ERROR)
 	    {
 	      error = ER_FAILED;
@@ -521,7 +524,7 @@ qdata_evaluate_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p,
 	    }
 
 	  /* func_p->value contains SUM(X^2) */
-	  if (db_value_domain_init (func_p->value2, DB_VALUE_DOMAIN_TYPE (opr_dbval_p), DB_DEFAULT_PRECISION,
+	  if (db_value_domain_init (func_p->value2, DB_TYPE_DOUBLE, DB_DEFAULT_PRECISION,
 				    DB_DEFAULT_SCALE) != NO_ERROR)
 	    {
 	      error = ER_FAILED;

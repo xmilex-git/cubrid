@@ -1273,9 +1273,6 @@ qdata_evaluate_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
 
 	      if (agg_p->sort_list == NULL)
 		{
-		  TP_DOMAIN *tmp_domain_p = NULL;
-		  TP_DOMAIN_STATUS status;
-
 		  /* host var or constant */
 		  switch (agg_p->opr_dbtype)
 		    {
@@ -1296,47 +1293,16 @@ qdata_evaluate_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
 		    case DB_TYPE_TIME:
 		      break;
 		    default:
-		      assert (agg_p->operands->value.type == TYPE_CONSTANT || agg_p->operands->value.type == TYPE_DBVAL
-			      || agg_p->operands->value.type == TYPE_POS_VALUE);
+		      /* The compiler rejects a non numeric, non date-time argument to an interpolation function and
+		       * asks for an explicit CAST (D-276-03), so the operand type is settled before execution.
+		       * Choosing the result domain here by casting the first value of each group to DOUBLE, then
+		       * DATETIME, then TIME was the per group decision this removes (wf268 #286 A6a). */
+		      error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;
+		      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, error, 2,
+			      fcode_get_uppercase_name (agg_p->function), "DOUBLE, DATETIME, TIME");
 
-		      /* try to cast dbval to double, datetime then time */
-		      tmp_domain_p = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-
-		      status = tp_value_cast (db_value_p, db_value_p, tmp_domain_p, false);
-		      if (status != DOMAIN_COMPATIBLE)
-			{
-			  /* try datetime */
-			  tmp_domain_p = tp_domain_resolve_default (DB_TYPE_DATETIME);
-
-			  status = tp_value_cast (db_value_p, db_value_p, tmp_domain_p, false);
-			}
-
-		      /* try time */
-		      if (status != DOMAIN_COMPATIBLE)
-			{
-			  tmp_domain_p = tp_domain_resolve_default (DB_TYPE_TIME);
-
-			  status = tp_value_cast (db_value_p, db_value_p, tmp_domain_p, false);
-			}
-
-		      if (status != DOMAIN_COMPATIBLE)
-			{
-			  error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;
-			  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, error, 2,
-				  fcode_get_uppercase_name (agg_p->function), "DOUBLE, DATETIME, TIME");
-
-			  pr_clear_value_vector (db_values);
-			  return error;
-			}
-
-		      /* clear errors from failed casts if any cast attempt succeeds. */
-		      if (er_errid () != NO_ERROR)
-			{
-			  er_clear ();
-			}
-
-		      /* update domain */
-		      agg_p->domain = tmp_domain_p;
+		      pr_clear_value_vector (db_values);
+		      return error;
 		    }
 
 		  pr_clear_value (agg_p->accumulator.value);
