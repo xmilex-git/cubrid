@@ -626,6 +626,13 @@ static OUTPTR_LIST *qexec_pin_outlist_at (const XASL_NODE * xasl, int i);
 static TP_DOMAIN *qexec_function_domain_of (const XASL_NODE * xasl, const DB_VALUE * val);
 static void qexec_pin_fix_regu (const XASL_NODE * xasl, REGU_VARIABLE * regu, int depth);
 static void qexec_pin_fix_outputs (XASL_NODE * xasl);
+typedef struct pin_walk_frame PIN_WALK_FRAME;
+struct pin_walk_frame
+{
+  const XASL_NODE *node;	/* a node whose visit has not finished yet */
+  const PIN_WALK_FRAME *up;	/* the visit that reached it */
+};
+static void qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up);
 static void qexec_propagate_pinned_domains (XASL_NODE * xasl);
 static int qexec_setup_aggregate_domains (AGGREGATE_TYPE * agg_list);
 static int qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
@@ -686,6 +693,10 @@ static DB_VALUE_COMPARE_RESULT bf2df_str_cmpdisk (void *mem1, void *mem2, TP_DOM
 static DB_VALUE_COMPARE_RESULT bf2df_str_cmpval (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
 						 int *start_colp, int collation);
 static void qexec_resolve_domains_on_sort_list (SORT_LIST * order_list, REGU_VARIABLE_LIST reference_regu_list);
+static OUTPTR_LIST *qexec_orderby_reference_outlist (const XASL_NODE * xasl);
+#if !defined(NDEBUG)
+static bool qexec_sort_list_is_pinned (const SORT_LIST * order_list);
+#endif /* !NDEBUG */
 static void qexec_resolve_domains_for_group_by (BUILDLIST_PROC_NODE * buildlist, OUTPTR_LIST * reference_out_list);
 static int query_multi_range_opt_check_set_sort_col (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static ACCESS_SPEC_TYPE *query_multi_range_opt_check_specs (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
@@ -4147,32 +4158,10 @@ qexec_orderby_distinct_by_sorting (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QU
 
   xasl->orderby_stats.orderby_filesort = true;
 
-  if (xasl->type == BUILDLIST_PROC)
-    {
-      /* choose appropriate list */
-      if (xasl->proc.buildlist.groupby_list != NULL)
-	{
-	  outptr_list = xasl->proc.buildlist.g_outptr_list;
-	}
-      else if (xasl->proc.buildlist.a_eval_list != NULL)
-	{
-	  outptr_list = xasl->proc.buildlist.a_outptr_list;
-	}
-      else
-	{
-	  outptr_list = xasl->outptr_list;
-	}
-    }
-  else
-    {
-      outptr_list = xasl->outptr_list;
-    }
+  outptr_list = qexec_orderby_reference_outlist (xasl);
 
-  /* late binding : resolve sort list */
-  if (outptr_list != NULL)
-    {
-      qexec_resolve_domains_on_sort_list (order_list, outptr_list->valptrp);
-    }
+  /* the sort keys were pinned before the mainblock started; sorting only reads them */
+  assert (qexec_sort_list_is_pinned (order_list));
 
   if (order_list == NULL && option != Q_DISTINCT)
     {
@@ -5487,11 +5476,8 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       db_make_bigint (buildlist->g_grbynum_val, 0);
     }
 
-  /* late binding : resolve group_by (buildlist) */
-  if (xasl->outptr_list != NULL)
-    {
-      qexec_resolve_domains_for_group_by (buildlist, xasl->outptr_list);
-    }
+  /* the GROUP BY domains were pinned before the mainblock started; grouping only reads them */
+  assert (qexec_sort_list_is_pinned (buildlist->groupby_list));
 
   if (qexec_initialize_groupby_state (&gbstate, buildlist->groupby_list, buildlist->g_having_pred,
 				      buildlist->g_grbynum_pred, buildlist->g_grbynum_val, buildlist->g_grbynum_flag,
@@ -17833,15 +17819,19 @@ qexec_pin_fix_outputs (XASL_NODE * xasl)
  *       descriptor, an aggregate, a sort key) without a domain, because the expression it reads had none.  The
  *       gate has just given the expression its domain, so every such consumer can be completed here, in plan
  *       order, before the first row exists - this replaces the row time propagation the executor used to do.
- *       Only a plan that actually left something open walks its tree (D-272-01).
+ *       Every plan walks its tree: a consumer described by reference (a sort key naming an output column, a
+ *       GROUP BY list, an aggregate over an expression) has to be connected even when no recipe waited on a
+ *       bound value, because nothing downstream decides a type any more (#286).
  */
 static void
-qexec_propagate_pinned_domains (XASL_NODE * xasl)
+qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
 {
   ACCESS_SPEC_TYPE *spec;
   REGU_VARIABLE_LIST regu;
   AGGREGATE_TYPE *agg_p;
   XASL_NODE *child;
+  PIN_WALK_FRAME frame;
+  const PIN_WALK_FRAME *seen;
   int i;
 
   if (xasl == NULL)
@@ -17849,53 +17839,66 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
       return;
     }
 
+  /* the plan is a graph, not a tree: a CONNECTBY_PROC scans its own prior list and a recursive CTE scans the
+   * node that owns it, so a node can appear again below itself.  This step is idempotent, so a node already
+   * on the path is simply left to the visit that is still in progress. */
+  for (seen = up; seen != NULL; seen = seen->up)
+    {
+      if (seen->node == xasl)
+	{
+	  return;
+	}
+    }
+  frame.node = xasl;
+  frame.up = up;
+
   /* producers first: a consumer copies what its producer already knows */
   for (child = xasl->aptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains (child);
+      qexec_propagate_pinned_domains_rec (child, &frame);
     }
   for (child = xasl->bptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains (child);
+      qexec_propagate_pinned_domains_rec (child, &frame);
     }
   for (child = xasl->dptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains (child);
+      qexec_propagate_pinned_domains_rec (child, &frame);
     }
   for (child = xasl->fptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains (child);
+      qexec_propagate_pinned_domains_rec (child, &frame);
     }
-  qexec_propagate_pinned_domains (xasl->connect_by_ptr);
-  qexec_propagate_pinned_domains (xasl->scan_ptr);
+  qexec_propagate_pinned_domains_rec (xasl->connect_by_ptr, &frame);
+  qexec_propagate_pinned_domains_rec (xasl->scan_ptr, &frame);
   if (xasl->type == UNION_PROC || xasl->type == DIFFERENCE_PROC || xasl->type == INTERSECTION_PROC)
     {
-      qexec_propagate_pinned_domains (xasl->proc.union_.left);
-      qexec_propagate_pinned_domains (xasl->proc.union_.right);
+      qexec_propagate_pinned_domains_rec (xasl->proc.union_.left, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.union_.right, &frame);
     }
   if (xasl->type == BUILDLIST_PROC)
     {
       for (child = xasl->proc.buildlist.eptr_list; child != NULL; child = child->next)
 	{
-	  qexec_propagate_pinned_domains (child);
+	  qexec_propagate_pinned_domains_rec (child, &frame);
 	}
     }
   if (xasl->type == MERGELIST_PROC)
     {
-      qexec_propagate_pinned_domains (xasl->proc.mergelist.outer_xasl);
-      qexec_propagate_pinned_domains (xasl->proc.mergelist.inner_xasl);
+      qexec_propagate_pinned_domains_rec (xasl->proc.mergelist.outer_xasl, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.mergelist.inner_xasl, &frame);
     }
   if (xasl->type == MERGE_PROC)
     {
       /* the update and insert halves are executed through qexec_execute_merge (), not through the root's own
        * mainblock, so they need the same connection */
-      qexec_propagate_pinned_domains (xasl->proc.merge.update_xasl);
-      qexec_propagate_pinned_domains (xasl->proc.merge.insert_xasl);
+      qexec_propagate_pinned_domains_rec (xasl->proc.merge.update_xasl, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.merge.insert_xasl, &frame);
     }
   if (xasl->type == CTE_PROC)
     {
-      qexec_propagate_pinned_domains (xasl->proc.cte.non_recursive_part);
-      qexec_propagate_pinned_domains (xasl->proc.cte.recursive_part);
+      qexec_propagate_pinned_domains_rec (xasl->proc.cte.non_recursive_part, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.cte.recursive_part, &frame);
     }
 
   /* (1) a position descriptor reads a column of its producer's output */
@@ -17910,7 +17913,7 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
 	    {
 	      continue;
 	    }
-	  qexec_propagate_pinned_domains (ACCESS_SPEC_XASL_NODE (spec));
+	  qexec_propagate_pinned_domains_rec (ACCESS_SPEC_XASL_NODE (spec), &frame);
 
 	  lists[0] = ACCESS_SPEC_LIST_SPEC (spec).list_regu_list_pred;
 	  lists[1] = ACCESS_SPEC_LIST_SPEC (spec).list_regu_list_rest;
@@ -17943,10 +17946,24 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
   /* (2) the output expressions: the operator steps below read this node's output list as their reference */
   qexec_pin_fix_outputs (xasl);
 
-  /* (3) the sort keys read this node's own output by position */
+  /* (3) the GROUP BY lists read this node's own output, so they can be connected the same way.
+   * this runs before the sort keys below because that is the order execution used to reach them:
+   * qexec_groupby () settled the grouped output first, and only then did ORDER BY sort it. */
+  if (xasl->type == BUILDLIST_PROC && xasl->proc.buildlist.g_regu_list != NULL && xasl->outptr_list != NULL)
+    {
+      qexec_resolve_domains_for_group_by (&xasl->proc.buildlist, xasl->outptr_list);
+    }
+
+  /* (4) the sort keys read a result list by position */
   if (xasl->outptr_list != NULL)
     {
-      qexec_resolve_domains_on_sort_list (xasl->orderby_list, xasl->outptr_list->valptrp);
+      OUTPTR_LIST *orderby_ref = qexec_orderby_reference_outlist (xasl);
+
+      if (orderby_ref != NULL)
+	{
+	  qexec_resolve_domains_on_sort_list (xasl->orderby_list, orderby_ref->valptrp);
+	}
+      /* the intermediate list file after_iscan_list sorts is built from this node's own output */
       qexec_resolve_domains_on_sort_list (xasl->after_iscan_list, xasl->outptr_list->valptrp);
       if (xasl->type == BUILDLIST_PROC)
 	{
@@ -17962,12 +17979,6 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
 		}
 	    }
 	}
-    }
-
-  /* (4) the group by lists read this node's own output, so they can be connected the same way */
-  if (xasl->type == BUILDLIST_PROC && xasl->proc.buildlist.g_regu_list != NULL && xasl->outptr_list != NULL)
-    {
-      qexec_resolve_domains_for_group_by (&xasl->proc.buildlist, xasl->outptr_list);
     }
 
   /* (5) an aggregate takes the domain of the expression it aggregates */
@@ -18047,6 +18058,57 @@ qexec_propagate_pinned_domains (XASL_NODE * xasl)
 
   /* (7) the output expressions again: they may read an aggregate or analytic result settled just above */
   qexec_pin_fix_outputs (xasl);
+
+  /* (8) a hash list scan probes with the probe list's domain, so that domain decides how the probe value is
+   * scaled.  In START WITH ... CONNECT BY, join and expression evaluation may have widened a probe item to
+   * floating numeric while the column it probes against is a fixed numeric; tp_value_coerce () would then
+   * leave the integer part unscaled and the two sides would hash differently.  Take the precision and scale
+   * from the first fixed numeric in the build (rest) list, which is what the stored key actually carries.
+   * qexec_execute_connect_by () used to do this as it started; nothing here reads a row, so it belongs to
+   * the pinning step instead (#286). */
+  if (xasl->type == CONNECTBY_PROC && xasl->spec_list != NULL && xasl->spec_list->type == TARGET_LIST
+      && xasl->spec_list->s.list_node.list_regu_list_probe != NULL
+      && xasl->spec_list->s.list_node.list_regu_list_rest != NULL)
+    {
+      REGU_VARIABLE_LIST probe_regu = xasl->spec_list->s.list_node.list_regu_list_probe;
+      REGU_VARIABLE_LIST rest_regu_numeric = NULL;
+      REGU_VARIABLE_LIST rest_iter;
+
+      for (rest_iter = xasl->spec_list->s.list_node.list_regu_list_rest; rest_iter != NULL;
+	   rest_iter = rest_iter->next)
+	{
+	  if (TP_DOMAIN_TYPE (rest_iter->value.domain) == DB_TYPE_NUMERIC
+	      && rest_iter->value.domain->precision != DB_DEFAULT_NUMERIC_PRECISION)
+	    {
+	      rest_regu_numeric = rest_iter;
+	      break;
+	    }
+	}
+
+      if (rest_regu_numeric != NULL && REGU_VARIABLE_GET_TYPE (&probe_regu->value) == DB_TYPE_NUMERIC
+	  && probe_regu->value.domain->precision == DB_DEFAULT_NUMERIC_PRECISION)
+	{
+	  TP_DOMAIN *new_domain = tp_domain_copy (probe_regu->value.domain, false);
+
+	  if (new_domain != NULL)
+	    {
+	      new_domain->precision = rest_regu_numeric->value.domain->precision;
+	      new_domain->scale = rest_regu_numeric->value.domain->scale;
+	      probe_regu->value.domain = new_domain;
+	    }
+	}
+    }
+}
+
+/*
+ * qexec_propagate_pinned_domains () - walk the whole plan once, connecting the derived consumers
+ *   return: void
+ *   xasl(in): the root of the plan to walk
+ */
+static void
+qexec_propagate_pinned_domains (XASL_NODE * xasl)
+{
+  qexec_propagate_pinned_domains_rec (xasl, NULL);
 }
 
 /*
@@ -18070,7 +18132,10 @@ qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
 
   if (plan == NULL)
     {
-      /* nothing was left open: no array and no traversal for a fully typed statement */
+      /* no recipe waits on a bound value, but the consumers the compiler could only describe by reference --
+       * a sort key naming an output column, a GROUP BY list, an aggregate over an expression -- still have to
+       * be connected, and this is the last point before the mainblock where the whole tree is in hand. */
+      qexec_propagate_pinned_domains (xasl);
       return NO_ERROR;
     }
 
@@ -18150,6 +18215,9 @@ qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root, 
 
   if (plan == NULL && root_state->pinned_cnt == 0)
     {
+      /* no recipe to carry over, but this worker runs its own clone of the tree: its derived consumers are
+       * connected here, before the worker reads its first row (same reason as qexec_pin_execution_domains ()) */
+      qexec_propagate_pinned_domains (worker_root);
       return NO_ERROR;
     }
   if (plan == NULL || root_state->pinned_domains == NULL || plan->n_recipes != root_state->pinned_cnt)
@@ -18730,7 +18798,6 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
   if (xasl->spec_list->type == TARGET_LIST && xasl->spec_list->s.list_node.list_regu_list_probe)
     {
       regu_list = xasl->spec_list->s.list_node.list_regu_list_probe;
-      REGU_VARIABLE_LIST probe_regu = regu_list;	/* Save first probe item before loop */
 
       while (regu_list)
 	{
@@ -18738,52 +18805,6 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 	  regu_list = regu_list->next;
 	}
 
-      /* Adjust probe domain precision/scale from rest_regu_list for hash list scan */
-      if (probe_regu && xasl->spec_list->s.list_node.list_regu_list_rest)
-	{
-	  REGU_VARIABLE_LIST rest_regu_numeric = NULL;
-
-	  /* Find first numeric item in rest_regu_list with fixed precision */
-	  for (REGU_VARIABLE_LIST rest_iter = xasl->spec_list->s.list_node.list_regu_list_rest;
-	       rest_iter != NULL; rest_iter = rest_iter->next)
-	    {
-	      if (TP_DOMAIN_TYPE (rest_iter->value.domain) == DB_TYPE_NUMERIC &&
-		  rest_iter->value.domain->precision != DB_DEFAULT_NUMERIC_PRECISION)
-		{
-		  rest_regu_numeric = rest_iter;
-		  break;
-		}
-	    }
-
-	  /* Adjust first numeric probe item if found */
-	  if (rest_regu_numeric)
-	    {
-	      DB_TYPE vtype1 = REGU_VARIABLE_GET_TYPE (&probe_regu->value);
-
-	      if (vtype1 == DB_TYPE_NUMERIC &&
-		  probe_regu->value.domain && probe_regu->value.domain->precision == DB_DEFAULT_NUMERIC_PRECISION)
-		{
-		  /* in START WITH ... CONNECT BY, join and expression evaluation may widen
-		   * probe_regu_list domain to float numeric.
-		   *
-		   * since tp_value_coerce() always casts values to the probe domain,
-		   * the cast behavior depends on probe_regu_list->value.domain (vtype1's domain).
-		   * when the probe domain is float numeric, integer values are not scaled,
-		   * which can produce different hash keys from fixed numeric columns.
-		   *
-		   * to avoid this mismatch, restore precision/scale from rest_regu_list
-		   * when it represents a fixed numeric domain.
-		   */
-		  TP_DOMAIN *new_domain = tp_domain_copy (probe_regu->value.domain, false);
-		  if (new_domain != NULL)
-		    {
-		      new_domain->precision = rest_regu_numeric->value.domain->precision;
-		      new_domain->scale = rest_regu_numeric->value.domain->scale;
-		      probe_regu->value.domain = new_domain;
-		    }
-		}
-	    }
-	}
     }
 
   if (xasl->spec_list->access == ACCESS_METHOD_INDEX && xasl->spec_list->indexptr)
@@ -21930,6 +21951,60 @@ bf2df_str_cmpval (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int tot
 }
 
 /*
+ * qexec_orderby_reference_outlist () - the output list ORDER BY reads by position
+ *   return: the output list the node's orderby_list refers to, or NULL
+ *   xasl(in): the node that owns the ORDER BY
+ *
+ *  Note: a node sorts whatever it last produced -- the grouped output for GROUP BY,
+ *	  the analytic output when window functions ran, its plain output otherwise.
+ *	  qexec_orderby_distinct_by_sorting () sorts that same list, so the two must
+ *	  agree on which one it is; this is the single place that decides.
+ */
+static OUTPTR_LIST *
+qexec_orderby_reference_outlist (const XASL_NODE * xasl)
+{
+  if (xasl->type != BUILDLIST_PROC)
+    {
+      return xasl->outptr_list;
+    }
+  if (xasl->proc.buildlist.groupby_list != NULL)
+    {
+      return xasl->proc.buildlist.g_outptr_list;
+    }
+  if (xasl->proc.buildlist.a_eval_list != NULL)
+    {
+      return xasl->proc.buildlist.a_outptr_list;
+    }
+  return xasl->outptr_list;
+}
+
+#if !defined(NDEBUG)
+/*
+ * qexec_sort_list_is_pinned () - every sort key already carries a concrete domain
+ *   return: true when execution has nothing left to decide about this sort list
+ *   order_list(in): the sort list to check, may be empty (NULL)
+ *
+ *  Note: qexec_pin_execution_domains () settles these before the mainblock starts and
+ *	  qexec_install_pinned_domains () before a parallel worker starts, so reaching
+ *	  execution with a VARIABLE domain means a pinning step missed this list.
+ */
+static bool
+qexec_sort_list_is_pinned (const SORT_LIST * order_list)
+{
+  const SORT_LIST *p;
+
+  for (p = order_list; p != NULL; p = p->next)
+    {
+      if (p->pos_descr.dom == NULL || TP_DOMAIN_TYPE (p->pos_descr.dom) == DB_TYPE_VARIABLE)
+	{
+	  return false;
+	}
+    }
+  return true;
+}
+#endif /* !NDEBUG */
+
+/*
  * qexec_resolve_domains_on_sort_list () - checks if the domains in the
  *	'order_list' are all solved, and if any is still unresolved (VARIABLE)
  *	it will be replaced with the domain of corresponding element from
@@ -23046,8 +23121,8 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
   /* fetch regulist and outlist */
   a_outptr_list = (is_last ? buildlist->a_outptr_list : buildlist->a_outptr_list_interm);
 
-  /* resolve late bindings in analytic sort list */
-  qexec_resolve_domains_on_sort_list (analytic_eval->sort_list, buildlist->a_outptr_list_ex->valptrp);
+  /* the analytic sort keys were pinned before the mainblock started */
+  assert (qexec_sort_list_is_pinned (analytic_eval->sort_list));
 
   /* initialized analytic functions state structure */
   if (qexec_initialize_analytic_state (thread_p, &analytic_state, analytic_eval->head, analytic_eval->sort_list,
