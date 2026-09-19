@@ -679,7 +679,7 @@ namespace parallel_scan
     /* This worker runs its own copy of the tree, so the domains the root pinned before the mainblock are not in
      * it yet: install the root's answers rather than resolve anything here. */
     if (qexec_install_pinned_domains (&thread_ref, m_uses_xasl_clone ? m_xasl_clone.xasl : m_xasl_tree,
-				      m_xasl_state, m_orig_vd->xasl_state) != NO_ERROR)
+				      m_xasl_state, m_orig_vd->xasl_state, m_xasl) != NO_ERROR)
       {
 	if (m_vd->dbval_ptr != nullptr)
 	  {

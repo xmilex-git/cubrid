@@ -322,8 +322,6 @@ scan_init_index_scan (INDX_SCAN_ID * isidp, struct btree_iscan_oid_list *oid_lis
   isidp->need_count_only = false;
   isidp->check_not_vacuumed = false;
   isidp->not_vacuumed_res = DISK_VALID;
-  isidp->key_conv_plans = NULL;
-  isidp->key_conv_plan_cnt = 0;
   isidp->parallel_pending = NULL;
 }
 
@@ -2000,15 +1998,19 @@ scan_build_key_conv_plan (THREAD_ENTRY * thread_p, KEY_CONV_PLAN * plan, REGU_VA
       return NO_ERROR;
     }
 
-  plan->col_strategy = (KEY_CONV_STRATEGY *) db_private_alloc (thread_p, ncols * sizeof (KEY_CONV_STRATEGY));
+  /* not from the thread's private heap: see scan_prepare_key_conv_plans () */
+  plan->col_strategy = (KEY_CONV_STRATEGY *) malloc (ncols * sizeof (KEY_CONV_STRATEGY));
   if (plan->col_strategy == NULL)
     {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, ncols * sizeof (KEY_CONV_STRATEGY));
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
-  plan->col_type = (DB_TYPE *) db_private_alloc (thread_p, ncols * sizeof (DB_TYPE));
+  plan->col_type = (DB_TYPE *) malloc (ncols * sizeof (DB_TYPE));
   if (plan->col_type == NULL)
     {
-      db_private_free_and_init (thread_p, plan->col_strategy);
+      free (plan->col_strategy);
+      plan->col_strategy = NULL;
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, ncols * sizeof (DB_TYPE));
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
   plan->ncols = ncols;
@@ -2066,76 +2068,88 @@ scan_build_key_conv_plan (THREAD_ENTRY * thread_p, KEY_CONV_PLAN * plan, REGU_VA
 }
 
 /*
- * scan_prepare_key_conv_plans () - fix the key conversion strategy of every key range of an index scan
+ * scan_prepare_key_conv_plans () - fix the key conversion strategy of every key range of an index access spec
  *   return: NO_ERROR or ER_code
- *   isidp (in/out): index scan id
+ *   indx_info (in/out): the plan's index information, which owns the plans
  *   btree_domainp (in): index key domain
+ *   vd (in): value descriptor of the execution
  *
- * Note: runs once per scan - serial scans call it from scan_open_index_scan (), parallel workers from their own
- *       key range list.  It is idempotent: a scan that already has its plans keeps them.
+ * Note: the gate calls this before the mainblock starts, from the key domain the compiler carried
+ *       (INDX_INFO::key_domain, wf268 #286 C6), so the scan never has to decide it when it is opened.  It is
+ *       idempotent, and the scan keeps a fallback call for the plan whose compile had no statistics to read
+ *       the key domain from (wf268 #286 A2).
+ *
+ *       The plans are not allocated from the thread's private heap.  They belong to the access spec, which no
+ *       single thread owns: the gate runs on the thread that started the query, while a parallel APTR sub-plan
+ *       is released by the worker that ran it (qexec_clear_xasl_for_parallel_aptr ()), and freeing one thread's
+ *       private heap from another aborts in mspace_free ().
  */
 int
-scan_prepare_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, TP_DOMAIN * btree_domainp,
+scan_prepare_key_conv_plans (THREAD_ENTRY * thread_p, INDX_INFO * indx_info, TP_DOMAIN * btree_domainp,
 			     VAL_DESCR * vd)
 {
   KEY_RANGE *key_ranges;
-  int key_cnt, nplans, i, ret;
+  bool is_iss;
+  int key_cnt, nplans, i, ret = NO_ERROR;
 
-  assert (isidp != NULL);
-
-  if (isidp->key_conv_plans != NULL || isidp->indx_info == NULL)
+  if (indx_info == NULL || indx_info->key_conv_plans != NULL)
     {
       return NO_ERROR;
     }
 
-  key_cnt = isidp->indx_info->key_info.key_cnt;
-  key_ranges = isidp->indx_info->key_info.key_ranges;
+  key_cnt = indx_info->key_info.key_cnt;
+  key_ranges = indx_info->key_info.key_ranges;
   if (key_cnt <= 0 || key_ranges == NULL)
     {
       return NO_ERROR;
     }
 
+  /* the same answer scan_init_iss () gives the scan, read from the plan instead of from the scan id */
+  is_iss = (indx_info->use_iss != 0);
+
   /* two slots per key range (key1, key2), plus the pair the index skip scan fetch range uses while it looks for
    * the next value of the first index column (SCAN_KEY_CONV_ISS_BASE ()) */
   nplans = 2 * key_cnt + 2;
-  isidp->key_conv_plans = (KEY_CONV_PLAN *) db_private_alloc (thread_p, nplans * sizeof (KEY_CONV_PLAN));
-  if (isidp->key_conv_plans == NULL)
+  indx_info->key_conv_plans = (KEY_CONV_PLAN *) malloc (nplans * sizeof (KEY_CONV_PLAN));
+  if (indx_info->key_conv_plans == NULL)
     {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, nplans * sizeof (KEY_CONV_PLAN));
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
-  memset (isidp->key_conv_plans, 0x0, nplans * sizeof (KEY_CONV_PLAN));
-  isidp->key_conv_plan_cnt = nplans;
+  memset (indx_info->key_conv_plans, 0x0, nplans * sizeof (KEY_CONV_PLAN));
+  indx_info->key_conv_plan_cnt = nplans;
 
   for (i = 0; i < key_cnt; i++)
     {
-      ret = scan_build_key_conv_plan (thread_p, &isidp->key_conv_plans[2 * i], key_ranges[i].key1, btree_domainp,
-				      vd, isidp->iss.use);
+      ret = scan_build_key_conv_plan (thread_p, &indx_info->key_conv_plans[2 * i], key_ranges[i].key1,
+				      btree_domainp, vd, is_iss);
       if (ret == NO_ERROR)
 	{
-	  ret = scan_build_key_conv_plan (thread_p, &isidp->key_conv_plans[2 * i + 1], key_ranges[i].key2,
-					  btree_domainp, vd, isidp->iss.use);
+	  ret = scan_build_key_conv_plan (thread_p, &indx_info->key_conv_plans[2 * i + 1], key_ranges[i].key2,
+					  btree_domainp, vd, is_iss);
 	}
 
       if (ret != NO_ERROR)
 	{
-	  scan_free_key_conv_plans (thread_p, isidp);
+	  scan_free_key_conv_plans (thread_p, indx_info);
 	  return ret;
 	}
     }
 
-  if (isidp->iss.use && isidp->iss.skipped_range != NULL)
+  if (is_iss && indx_info->iss_range.key1 != NULL)
     {
       /* The fetch range carries the first index column alone, and a descending scan moves that one bound from
        * key1 to key2 (scan_get_next_iss_value ()), so both slots describe the same regu. */
       for (i = 0; i < 2 && ret == NO_ERROR; i++)
 	{
-	  ret = scan_build_key_conv_plan (thread_p, &isidp->key_conv_plans[SCAN_KEY_CONV_ISS_BASE (isidp) + i],
-					  isidp->iss.skipped_range->key1, btree_domainp, vd, true);
+	  ret = scan_build_key_conv_plan (thread_p,
+					  &indx_info->key_conv_plans[SCAN_KEY_CONV_ISS_BASE (indx_info) + i],
+					  indx_info->iss_range.key1, btree_domainp, vd, true);
 	}
 
       if (ret != NO_ERROR)
 	{
-	  scan_free_key_conv_plans (thread_p, isidp);
+	  scan_free_key_conv_plans (thread_p, indx_info);
 	  return ret;
 	}
     }
@@ -2144,31 +2158,38 @@ scan_prepare_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, TP_D
 }
 
 /*
- * scan_free_key_conv_plans () - release the key conversion plans of an index scan
+ * scan_free_key_conv_plans () - release the key conversion plans of an index access spec
  *   return: void
- *   isidp (in/out): index scan id
+ *   indx_info (in/out): the plan's index information
+ *
+ * Note: the plans are released with the access spec they belong to (qexec_clear_access_spec_list ()), not when a
+ *       scan is closed - one execution may open and close the same scan many times, and re-deciding the strategy
+ *       on any of them is exactly what this campaign removes.  The release may run on a different thread than
+ *       the one that built them, which is why they are not on a private heap.
  */
 void
-scan_free_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp)
+scan_free_key_conv_plans (THREAD_ENTRY * thread_p, INDX_INFO * indx_info)
 {
   int i;
 
-  if (isidp == NULL || isidp->key_conv_plans == NULL)
+  if (indx_info == NULL || indx_info->key_conv_plans == NULL)
     {
       return;
     }
 
-  for (i = 0; i < isidp->key_conv_plan_cnt; i++)
+  for (i = 0; i < indx_info->key_conv_plan_cnt; i++)
     {
-      KEY_CONV_PLAN *plan = &isidp->key_conv_plans[i];
+      KEY_CONV_PLAN *plan = &indx_info->key_conv_plans[i];
 
       if (plan->col_strategy != NULL)
 	{
-	  db_private_free_and_init (thread_p, plan->col_strategy);
+	  free (plan->col_strategy);
+	  plan->col_strategy = NULL;
 	}
       if (plan->col_type != NULL)
 	{
-	  db_private_free_and_init (thread_p, plan->col_type);
+	  free (plan->col_type);
+	  plan->col_type = NULL;
 	}
       if (plan->value_setdomain != NULL)
 	{
@@ -2177,8 +2198,9 @@ scan_free_key_conv_plans (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp)
 	}
     }
 
-  db_private_free_and_init (thread_p, isidp->key_conv_plans);
-  isidp->key_conv_plan_cnt = 0;
+  free (indx_info->key_conv_plans);
+  indx_info->key_conv_plans = NULL;
+  indx_info->key_conv_plan_cnt = 0;
 }
 
 /*
@@ -2684,24 +2706,33 @@ scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY
   DB_TYPE db_type;
   int key_len;
   int plan_idx;
+  INDX_INFO *indx_info;
   regu_variable_list_node *requ_list;
 
   assert ((key_ranges->range >= GE_LE && key_ranges->range <= INF_LT) || (key_ranges->range == EQ_NA));
   assert (!(key_ranges->key1 == NULL && key_ranges->key2 == NULL));
 
-  /* The conversion strategy of both bounds was fixed when the scan was prepared (wf268 C4).  An index skip scan
-   * swaps its own fetch range in while it looks for the next value of the first column, and that range has its
-   * own pair of plans. */
+  /* The conversion strategy of both bounds was fixed before the mainblock started (wf268 C4, #286 A2), and it
+   * belongs to the plan, not to this scan.  An index skip scan swaps its own fetch range in while it looks for
+   * the next value of the first column, and that range has its own pair of plans. */
+  indx_info = iscan_id->indx_info;
+  if (indx_info == NULL)
+    {
+      assert (false);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+      return ER_QPROC_INVALID_XASLNODE;
+    }
+
   if (iscan_id->iss.use && key_ranges == iscan_id->iss.skipped_range)
     {
-      plan_idx = SCAN_KEY_CONV_ISS_BASE (iscan_id);
+      plan_idx = SCAN_KEY_CONV_ISS_BASE (indx_info);
     }
   else
     {
       plan_idx = 2 * key_range_idx;
     }
 
-  if (iscan_id->key_conv_plans == NULL || plan_idx < 0 || plan_idx + 1 >= iscan_id->key_conv_plan_cnt)
+  if (indx_info->key_conv_plans == NULL || plan_idx < 0 || plan_idx + 1 >= indx_info->key_conv_plan_cnt)
     {
       assert (false);
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
@@ -2763,7 +2794,7 @@ scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY
 	  ret =
 	    scan_dbvals_to_midxkey (thread_p, &key_val_range->key1, &indexable, btree_domainp,
 				    key_val_range->num_index_term, key_ranges->key1, vd, key_minmax, iscan_id->iss.use,
-				    &(iscan_id->key_conv_plans[plan_idx]));
+				    &(indx_info->key_conv_plans[plan_idx]));
 	}
       else
 	{
@@ -2811,7 +2842,7 @@ scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY
 	  ret =
 	    scan_dbvals_to_midxkey (thread_p, &key_val_range->key2, &indexable, btree_domainp,
 				    key_val_range->num_index_term, key_ranges->key2, vd, key_minmax, iscan_id->iss.use,
-				    &(iscan_id->key_conv_plans[plan_idx + 1]));
+				    &(indx_info->key_conv_plans[plan_idx + 1]));
 	}
       else
 	{
@@ -4116,8 +4147,15 @@ scan_open_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
   assert (indx_info == NULL || indx_info->key_domain == NULL
 	  || tp_domain_match (indx_info->key_domain, BTS->btid_int.key_type, TP_EXACT_MATCH));
 
-  /* fix how every key range value reaches the index key domain, before any of them is built (wf268 C4) */
-  if (scan_prepare_key_conv_plans (thread_p, isidp, BTS->btid_int.key_type, vd) != NO_ERROR)
+  /* The gate fixed how every key range value reaches the index key domain before the mainblock started
+   * (qexec_propagate_pinned_domains (), wf268 #286 A2).  Two kinds of plan still reach this call with nothing
+   * fixed, and for them this is where the strategy is decided: a plan whose compile had no index statistics,
+   * so it carries no key domain to decide from, and a sub-plan that hangs off a regu variable (a scalar
+   * subquery in an INSERT value list, say), which the gate's plan walk does not descend into.  What the gate
+   * did fix must still describe the key ranges this scan is about to build. */
+  assert (indx_info == NULL || indx_info->key_conv_plans == NULL
+	  || indx_info->key_conv_plan_cnt == 2 * indx_info->key_info.key_cnt + 2);
+  if (scan_prepare_key_conv_plans (thread_p, indx_info, BTS->btid_int.key_type, vd) != NO_ERROR)
     {
       goto exit_on_error;
     }
@@ -5785,8 +5823,6 @@ scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	  scan_clear_parallel_index_pending (thread_p, scan_id);
 	}
 #endif /* SERVER_MODE && !WINDOWS */
-
-      scan_free_key_conv_plans (thread_p, isidp);
 
       if (isidp->key_vals)
 	{

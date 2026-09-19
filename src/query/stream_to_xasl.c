@@ -5031,6 +5031,10 @@ stx_build_indx_info (THREAD_ENTRY * thread_p, char *ptr, INDX_INFO * indx_info)
       ptr = or_unpack_domain (ptr, &indx_info->key_domain, NULL);
     }
 
+  /* execution time only - the gate fills them in before the mainblock starts (wf268 #286 A2) */
+  indx_info->key_conv_plans = NULL;
+  indx_info->key_conv_plan_cnt = 0;
+
   ptr = or_unpack_int (ptr, &offset);
   if (offset == 0)
     {

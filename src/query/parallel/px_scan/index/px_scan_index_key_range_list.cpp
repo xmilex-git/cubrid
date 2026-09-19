@@ -106,7 +106,7 @@ namespace parallel_index_scan
 	return NO_ERROR;
       }
 
-    /* scan_id carries the key conversion plans; scan_dbvals_to_midxkey needs them on F_MIDXKEY. */
+    /* scan_regu_key_to_index_key reads the plans through the scan id's indx_info. */
     if (worker_scan_id == nullptr)
       {
 	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_FAILED, 0);
@@ -115,8 +115,10 @@ namespace parallel_index_scan
     INDX_SCAN_ID *isidp = &worker_scan_id->s.isid;
     TP_DOMAIN *btree_domainp = m_btid_int.key_type;
 
-    /* the worker bypasses scan_open_index_scan, so it fixes its own key conversion plans here (wf268 C4) */
-    int plan_err = scan_prepare_key_conv_plans (thread_p, isidp, btree_domainp, vd);
+    /* The plans belong to the plan side and were fixed by the gate (wf268 #286 A2); this is the same fallback
+     * scan_open_index_scan () keeps for a plan whose compile had no index statistics, and it is a no-op
+     * whenever the gate already answered. */
+    int plan_err = scan_prepare_key_conv_plans (thread_p, m_indx_info, btree_domainp, vd);
     if (plan_err != NO_ERROR)
       {
 	return plan_err;

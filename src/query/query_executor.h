@@ -116,7 +116,8 @@ extern qfile_list_id *qexec_get_xasl_list_id (xasl_node * xasl);
 extern xasl_state *qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state);
 extern void qexec_free_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state);
 extern int qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root,
-					xasl_state * worker_state, const xasl_state * root_state);
+					xasl_state * worker_state, const xasl_state * root_state,
+					const xasl_node * worker_owned);
 #if defined(CUBRID_DEBUG)
 extern void get_xasl_dumper_linked_in ();
 #endif

@@ -29,6 +29,7 @@
 
 // forward definitions
 class regu_variable_node;
+struct key_conv_plan;
 
 typedef enum			/* range search option */
 {
@@ -103,6 +104,10 @@ struct indx_info
   int ils_prefix_len;		/* index loose scan prefix length */
   TP_DOMAIN *key_domain;	/* the index key domain, taken from the statistics at compile time; NULL when the
 				 * optimizer had none, and the scan then reads it from the index root as before */
+  struct key_conv_plan *key_conv_plans;	/* [2 * key_cnt + 2] how every key range bound reaches the index key
+					 * domain.  Execution time only: never streamed, fixed by the gate
+					 * (scan_prepare_key_conv_plans ()) and released with the spec */
+  int key_conv_plan_cnt;	/* number of entries in key_conv_plans */
 };				/* index information structure */
 
 // TODO - move access specification code here; note - this is supposed to be common to both client and server.

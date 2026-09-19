@@ -1266,9 +1266,8 @@ extern "C"
 	break;
       }
 
-    /* the key conversion plans were fixed on the main thread (key_range_list::init_on_main) and live on the
-     * index scan id, which this close is the only owner of (wf268 C4) */
-    scan_free_key_conv_plans (thread_p, &scan_id->s.isid);
+    /* the key conversion plans belong to the access spec's INDX_INFO and are released with it
+     * (qexec_clear_access_spec_list (), wf268 #286 A2) - closing a scan must not drop them */
   }
 
   /* open-phase captures needed by scan_try_promote_parallel_index_scan to build the manager; freed on promotion attempt. */

@@ -234,6 +234,9 @@ regu_init (indx_info &ii)
   ii.iss_range.range = NA_NA;
   ii.iss_range.key1 = NULL;
   ii.iss_range.key2 = NULL;
+  ii.key_domain = NULL;
+  ii.key_conv_plans = NULL;
+  ii.key_conv_plan_cnt = 0;
 }
 
 void

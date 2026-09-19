@@ -631,9 +631,20 @@ struct pin_walk_frame
 {
   const XASL_NODE *node;	/* a node whose visit has not finished yet */
   const PIN_WALK_FRAME *up;	/* the visit that reached it */
+  bool owned;			/* this node is at or below the part of the tree the caller also releases */
 };
-static void qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up);
-static void qexec_propagate_pinned_domains (XASL_NODE * xasl);
+/* what the walk needs besides the tree: the key conversion plans it fixes are allocated, and can fail */
+typedef struct pin_walk_ctx PIN_WALK_CTX;
+struct pin_walk_ctx
+{
+  THREAD_ENTRY *thread_p;
+  VAL_DESCR *vd;		/* this execution's bound values */
+  const XASL_NODE *owned_root;	/* the root of what the caller releases again; NULL means the whole tree */
+  int error;			/* the first failure, which stops the walk */
+};
+static void qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up, PIN_WALK_CTX * ctx);
+static int qexec_propagate_pinned_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd,
+					   const XASL_NODE * owned_root);
 static int qexec_setup_aggregate_domains (AGGREGATE_TYPE * agg_list);
 static int qexec_pin_open_collations (THREAD_ENTRY * thread_p, const DOMAIN_PIN_PLAN * plan, VAL_DESCR * vd);
 static int qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
@@ -2049,7 +2060,6 @@ qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCES
 	      heap_attrinfo_end (thread_p, isidp->rest_attrs.attr_cache);
 	      isidp->caches_inited = false;
 	    }
-	  scan_free_key_conv_plans (thread_p, isidp);
 	  break;
 	case S_PARALLEL_INDEX_SCAN:
 #if SERVER_MODE
@@ -2172,6 +2182,10 @@ qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCES
 	      if (indx_info)
 		{
 		  int i, N;
+
+		  /* the key conversion plans the gate fixed belong to this spec, whatever scan read them
+		   * (serial or parallel) and however many times it was opened (wf268 #286 A2) */
+		  scan_free_key_conv_plans (thread_p, indx_info);
 
 		  N = indx_info->key_info.key_cnt;
 		  for (i = 0; i < N; i++)
@@ -17826,7 +17840,7 @@ qexec_pin_fix_outputs (XASL_NODE * xasl)
  *       bound value, because nothing downstream decides a type any more (#286).
  */
 static void
-qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
+qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up, PIN_WALK_CTX * ctx)
 {
   ACCESS_SPEC_TYPE *spec;
   REGU_VARIABLE_LIST regu;
@@ -17836,7 +17850,7 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
   const PIN_WALK_FRAME *seen;
   int i;
 
-  if (xasl == NULL)
+  if (xasl == NULL || ctx->error != NO_ERROR)
     {
       return;
     }
@@ -17853,54 +17867,58 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
     }
   frame.node = xasl;
   frame.up = up;
+  /* the key conversion plans below are allocated, and whoever asked for this walk releases them again by
+   * clearing a part of the tree.  A parallel scan worker clears only the node it executes, so the walk fixes
+   * them only there; the rest of its clone keeps the fallback in scan_open_index_scan () (wf268 #286 A2). */
+  frame.owned = (ctx->owned_root == NULL || xasl == ctx->owned_root || (up != NULL && up->owned));
 
   /* producers first: a consumer copies what its producer already knows */
   for (child = xasl->aptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains_rec (child, &frame);
+      qexec_propagate_pinned_domains_rec (child, &frame, ctx);
     }
   for (child = xasl->bptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains_rec (child, &frame);
+      qexec_propagate_pinned_domains_rec (child, &frame, ctx);
     }
   for (child = xasl->dptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains_rec (child, &frame);
+      qexec_propagate_pinned_domains_rec (child, &frame, ctx);
     }
   for (child = xasl->fptr_list; child != NULL; child = child->next)
     {
-      qexec_propagate_pinned_domains_rec (child, &frame);
+      qexec_propagate_pinned_domains_rec (child, &frame, ctx);
     }
-  qexec_propagate_pinned_domains_rec (xasl->connect_by_ptr, &frame);
-  qexec_propagate_pinned_domains_rec (xasl->scan_ptr, &frame);
+  qexec_propagate_pinned_domains_rec (xasl->connect_by_ptr, &frame, ctx);
+  qexec_propagate_pinned_domains_rec (xasl->scan_ptr, &frame, ctx);
   if (xasl->type == UNION_PROC || xasl->type == DIFFERENCE_PROC || xasl->type == INTERSECTION_PROC)
     {
-      qexec_propagate_pinned_domains_rec (xasl->proc.union_.left, &frame);
-      qexec_propagate_pinned_domains_rec (xasl->proc.union_.right, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.union_.left, &frame, ctx);
+      qexec_propagate_pinned_domains_rec (xasl->proc.union_.right, &frame, ctx);
     }
   if (xasl->type == BUILDLIST_PROC)
     {
       for (child = xasl->proc.buildlist.eptr_list; child != NULL; child = child->next)
 	{
-	  qexec_propagate_pinned_domains_rec (child, &frame);
+	  qexec_propagate_pinned_domains_rec (child, &frame, ctx);
 	}
     }
   if (xasl->type == MERGELIST_PROC)
     {
-      qexec_propagate_pinned_domains_rec (xasl->proc.mergelist.outer_xasl, &frame);
-      qexec_propagate_pinned_domains_rec (xasl->proc.mergelist.inner_xasl, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.mergelist.outer_xasl, &frame, ctx);
+      qexec_propagate_pinned_domains_rec (xasl->proc.mergelist.inner_xasl, &frame, ctx);
     }
   if (xasl->type == MERGE_PROC)
     {
       /* the update and insert halves are executed through qexec_execute_merge (), not through the root's own
        * mainblock, so they need the same connection */
-      qexec_propagate_pinned_domains_rec (xasl->proc.merge.update_xasl, &frame);
-      qexec_propagate_pinned_domains_rec (xasl->proc.merge.insert_xasl, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.merge.update_xasl, &frame, ctx);
+      qexec_propagate_pinned_domains_rec (xasl->proc.merge.insert_xasl, &frame, ctx);
     }
   if (xasl->type == CTE_PROC)
     {
-      qexec_propagate_pinned_domains_rec (xasl->proc.cte.non_recursive_part, &frame);
-      qexec_propagate_pinned_domains_rec (xasl->proc.cte.recursive_part, &frame);
+      qexec_propagate_pinned_domains_rec (xasl->proc.cte.non_recursive_part, &frame, ctx);
+      qexec_propagate_pinned_domains_rec (xasl->proc.cte.recursive_part, &frame, ctx);
     }
 
   /* (1) a position descriptor reads a column of its producer's output */
@@ -17915,7 +17933,7 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
 	    {
 	      continue;
 	    }
-	  qexec_propagate_pinned_domains_rec (ACCESS_SPEC_XASL_NODE (spec), &frame);
+	  qexec_propagate_pinned_domains_rec (ACCESS_SPEC_XASL_NODE (spec), &frame, ctx);
 
 	  lists[0] = ACCESS_SPEC_LIST_SPEC (spec).list_regu_list_pred;
 	  lists[1] = ACCESS_SPEC_LIST_SPEC (spec).list_regu_list_rest;
@@ -18090,17 +18108,55 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
 	    }
 	}
     }
+
+  /* (9) how every key range bound of an index scan reaches the index key domain.  The plan carries the index
+   * key domain from compile (INDX_INFO::key_domain, #286 C6) and the operands' own domains have just been
+   * settled above, so the strategy can be fixed here instead of when the scan is opened - which is inside the
+   * mainblock, and is opened again for every re-scan of a nested loop (#286 A2). */
+  for (i = 0; i < 2 && frame.owned; i++)
+    {
+      for (spec = (i == 0 ? xasl->spec_list : xasl->merge_spec); spec != NULL; spec = spec->next)
+	{
+	  if (spec->access != ACCESS_METHOD_INDEX || spec->indexptr == NULL
+	      || spec->indexptr->key_domain == NULL)
+	    {
+	      /* no index key ranges here, or the compile had no statistics to read the key domain from and
+	       * scan_open_index_scan () is left to answer from the index root */
+	      continue;
+	    }
+
+	  ctx->error = scan_prepare_key_conv_plans (ctx->thread_p, spec->indexptr, spec->indexptr->key_domain,
+						    ctx->vd);
+	  if (ctx->error != NO_ERROR)
+	    {
+	      return;
+	    }
+	}
+    }
 }
 
 /*
  * qexec_propagate_pinned_domains () - walk the whole plan once, connecting the derived consumers
- *   return: void
+ *   return: NO_ERROR, or an error code
  *   xasl(in): the root of the plan to walk
+ *   vd(in): this execution's value descriptor, holding the bound host variables
+ *   owned_root(in): the root of the part of the tree the caller clears again, and so the part where the walk
+ *                   may leave an allocation behind; NULL when that is the whole tree
  */
-static void
-qexec_propagate_pinned_domains (XASL_NODE * xasl)
+static int
+qexec_propagate_pinned_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd,
+				const XASL_NODE * owned_root)
 {
-  qexec_propagate_pinned_domains_rec (xasl, NULL);
+  PIN_WALK_CTX ctx;
+
+  ctx.thread_p = thread_p;
+  ctx.vd = vd;
+  ctx.owned_root = owned_root;
+  ctx.error = NO_ERROR;
+
+  qexec_propagate_pinned_domains_rec (xasl, NULL, &ctx);
+
+  return ctx.error;
 }
 
 /*
@@ -18161,8 +18217,7 @@ qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
       /* no recipe waits on a bound value, but the consumers the compiler could only describe by reference --
        * a sort key naming an output column, a GROUP BY list, an aggregate over an expression -- still have to
        * be connected, and this is the last point before the mainblock where the whole tree is in hand. */
-      qexec_propagate_pinned_domains (xasl);
-      return NO_ERROR;
+      return qexec_propagate_pinned_domains (thread_p, xasl, &xasl_state->vd, NULL);
     }
 
   if (plan->n_recipes > 0)
@@ -18216,7 +18271,11 @@ qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
     }
 
   /* the consumers the compiler left open because they derive from a pinned expression */
-  qexec_propagate_pinned_domains (xasl);
+  error = qexec_propagate_pinned_domains (thread_p, xasl, &xasl_state->vd, NULL);
+  if (error != NO_ERROR)
+    {
+      goto exit_on_error;
+    }
 
   xasl_state->pinned_domains = domains;
   xasl_state->pinned_cnt = plan->n_recipes;
@@ -18237,6 +18296,8 @@ exit_on_error:
  *   worker_root(in): the root of the tree this worker executes (its own clone or its own unpack)
  *   worker_state(in/out): the worker's execution state
  *   root_state(in): the state the root pinned
+ *   worker_owned(in): the node of that tree the worker clears again when it finishes, which bounds where this
+ *                     step may leave an allocation behind
  *
  * Note: a worker never resolves a residual type itself (execution-domain-pin-contract.md D-272-05).  Its tree comes
  *       from the same stream as the root's, so the plans agree pin for pin; a disagreement means the worker is
@@ -18244,7 +18305,7 @@ exit_on_error:
  */
 int
 qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root, xasl_state * worker_state,
-			      const xasl_state * root_state)
+			      const xasl_state * root_state, const xasl_node * worker_owned)
 {
   DOMAIN_PIN_PLAN *plan = worker_root->domain_pin_plan;
   int i;
@@ -18256,8 +18317,7 @@ qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root, 
     {
       /* no recipe to carry over, but this worker runs its own clone of the tree: its derived consumers are
        * connected here, before the worker reads its first row (same reason as qexec_pin_execution_domains ()) */
-      qexec_propagate_pinned_domains (worker_root);
-      return NO_ERROR;
+      return qexec_propagate_pinned_domains (thread_p, worker_root, &worker_state->vd, worker_owned);
     }
   if (plan == NULL || plan->n_recipes != root_state->pinned_cnt
       || (plan->n_recipes > 0 && root_state->pinned_domains == NULL))
@@ -18292,9 +18352,7 @@ qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root, 
     }
 
   /* the worker's own clone has the same derived consumers as the root's tree */
-  qexec_propagate_pinned_domains (worker_root);
-
-  return NO_ERROR;
+  return qexec_propagate_pinned_domains (thread_p, worker_root, &worker_state->vd, worker_owned);
 }
 
 /*
