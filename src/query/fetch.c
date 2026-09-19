@@ -630,6 +630,29 @@ fetch_agg_expr_eval_dbl (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_
 }
 
 /*
+ * fetch_check_result_domain () - the plan must already carry this expression's result type
+ *   return: NO_ERROR, or ER_QPROC_INVALID_XASLNODE when it does not
+ *   regu_var (in): the arithmetic regu variable being evaluated
+ *
+ * Note: COALESCE, NVL2, NULLIF, LEAST and GREATEST get their result type from the compiler
+ *       (type_checking.c), so an expression that reaches execution has one.  Inferring it here from the two
+ *       values in hand was a per row decision; a plan without a type is a broken contract, not something to
+ *       repair from a row (wf268 #286 D1, verification boundary D-273-02R (b)).
+ */
+static int
+fetch_check_result_domain (const REGU_VARIABLE * regu_var)
+{
+  if (regu_var->domain != NULL)
+    {
+      return NO_ERROR;
+    }
+
+  assert (false);
+  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+  return ER_QPROC_INVALID_XASLNODE;
+}
+
+/*
  * fetch_peek_arith () -
  *   return: NO_ERROR or ER_code
  *   regu_var(in/out): Regulator Variable of an ARITH node.
@@ -3280,6 +3303,10 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	DB_VALUE *src;
 	TP_DOMAIN *target_domain;
 
+	if (fetch_check_result_domain (regu_var) != NO_ERROR)
+	  {
+	    goto error;
+	  }
 	target_domain = regu_var->domain;
 
 	if (fetch_peek_dbval (thread_p, arithptr->leftptr, vd, NULL, obj_oid, tpl, &peek_left) != NO_ERROR)
@@ -3287,22 +3314,12 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto error;
 	  }
 
-	if (DB_IS_NULL (peek_left) || target_domain == NULL)
+	if (DB_IS_NULL (peek_left))
 	  {
 	    if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tpl, &peek_right) != NO_ERROR)
 	      {
 		goto error;
 	      }
-	  }
-
-	if (target_domain == NULL)
-	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
 	  }
 
 	src = DB_IS_NULL (peek_left) ? peek_right : peek_left;
@@ -3319,42 +3336,15 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	DB_VALUE *src;
 	TP_DOMAIN *target_domain;
 
+	if (fetch_check_result_domain (regu_var) != NO_ERROR)
+	  {
+	    goto error;
+	  }
 	target_domain = regu_var->domain;
 
 	if (fetch_peek_dbval (thread_p, arithptr->leftptr, vd, NULL, obj_oid, tpl, &peek_left) != NO_ERROR)
 	  {
 	    goto error;
-	  }
-
-	if (target_domain == NULL)
-	  {
-	    TP_DOMAIN *arg1, *arg2, *arg3, tmp_arg1, tmp_arg2, tmp_arg3;
-
-	    if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tpl, &peek_right) != NO_ERROR)
-	      {
-		goto error;
-	      }
-
-	    if (fetch_peek_dbval (thread_p, arithptr->thirdptr, vd, NULL, obj_oid, tpl, &peek_third) != NO_ERROR)
-	      {
-		goto error;
-	      }
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
-
-	    arg3 = NULL;
-	    if (peek_third)
-	      {
-		TP_DOMAIN *tmp_domain;
-
-		arg3 = tp_domain_resolve_value (peek_third, &tmp_arg3);
-		tmp_domain = tp_infer_common_domain (target_domain, arg3);
-
-		target_domain = tmp_domain;
-	      }
 	  }
 
 	if (DB_IS_NULL (peek_left))
@@ -3855,20 +3845,15 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	bool can_compare = false;
 	int cmp_res = DB_UNK;
 
+	if (fetch_check_result_domain (regu_var) != NO_ERROR)
+	  {
+	    goto error;
+	  }
 	target_domain = regu_var->domain;
 	if (DB_IS_NULL (peek_left))
 	  {
 	    PRIM_SET_NULL (arithptr->value);
 	    break;
-	  }
-	else if (target_domain == NULL)
-	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
 	  }
 
 	cmp_res = tp_value_compare_with_error (peek_left, peek_right, 1, 0, &can_compare);
@@ -3910,16 +3895,11 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto error;
 	  }
 
-	target_domain = regu_var->domain;
-	if (target_domain == NULL)
+	if (fetch_check_result_domain (regu_var) != NO_ERROR)
 	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
+	    goto error;
 	  }
+	target_domain = regu_var->domain;
 
 	dom_status = tp_value_cast (arithptr->value, arithptr->value, target_domain, false);
 	if (dom_status != DOMAIN_COMPATIBLE)
@@ -3941,16 +3921,11 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto error;
 	  }
 
-	target_domain = regu_var->domain;
-	if (target_domain == NULL)
+	if (fetch_check_result_domain (regu_var) != NO_ERROR)
 	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
+	    goto error;
 	  }
+	target_domain = regu_var->domain;
 
 	dom_status = tp_value_cast (arithptr->value, arithptr->value, target_domain, false);
 	if (dom_status != DOMAIN_COMPATIBLE)

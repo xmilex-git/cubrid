@@ -1568,6 +1568,23 @@ namespace parallel_scan
 
   }
 
+  /* wf268 #286 D3: the worker fixes its accumulator domains before it scans
+   * (qexec_setup_aggregate_domains_for_xasl () in write_initialize ()), so a row must never find one missing.
+   * Deciding it here from the value in hand was the per row fallback this replaces - an absent domain is a
+   * broken contract, not something a row repairs (verification boundary D-273-02R (b)). */
+  static bool
+  px_accumulator_domain_is_set (const AGGREGATE_ACCUMULATOR_DOMAIN *acc_dom)
+  {
+    if (acc_dom->value_dom != NULL && acc_dom->value_dom != &tp_Null_domain)
+      {
+	return true;
+      }
+
+    assert (false);
+    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+    return false;
+  }
+
   template <FUNC_CODE F>
   bool result_handler<RESULT_TYPE::BUILDVALUE_OPT>::accumulate_node (THREAD_ENTRY *thread_p, AGGREGATE_TYPE *agg_node,
       DB_VALUE *db_value_p)
@@ -1577,28 +1594,17 @@ namespace parallel_scan
 
     if constexpr (F == PT_COUNT)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    if (agg_node->domain != NULL)
-	      {
-		acc_dom->value_dom = agg_node->domain;
-	      }
-	    else
-	      {
-		acc_dom->value_dom = tp_domain_resolve_default (DB_VALUE_DOMAIN_TYPE (db_value_p));
-	      }
-	    acc_dom->value2_dom = &tp_Null_domain;
+	    return false;
 	  }
 	acc->curr_cnt++;
       }
     else if constexpr (F == PT_MIN)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    acc_dom->value_dom = agg_node->domain;
-	    acc_dom->value2_dom = &tp_Null_domain;
+	    return false;
 	  }
 	int coll_id = acc_dom->value_dom->collation_id;
 	if (acc->curr_cnt < 1
@@ -1625,11 +1631,9 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_MAX)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    acc_dom->value_dom = agg_node->domain;
-	    acc_dom->value2_dom = &tp_Null_domain;
+	    return false;
 	  }
 	int coll_id = acc_dom->value_dom->collation_id;
 	if (acc->curr_cnt < 1
@@ -1656,39 +1660,9 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_SUM || F == PT_AVG)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    if (TP_IS_NUMERIC_TYPE (DB_VALUE_DOMAIN_TYPE (db_value_p)))
-	      {
-		if (agg_node->domain != NULL && TP_DOMAIN_TYPE (agg_node->domain) == DB_TYPE_NUMERIC)
-		  {
-		    acc_dom->value_dom =
-			    tp_domain_resolve (DB_TYPE_NUMERIC, NULL, DB_MAX_NUMERIC_PRECISION,
-					       agg_node->domain->scale, NULL, 0);
-		  }
-		else if (DB_VALUE_DOMAIN_TYPE (db_value_p) == DB_TYPE_NUMERIC)
-		  {
-		    acc_dom->value_dom =
-			    tp_domain_resolve (DB_TYPE_NUMERIC, NULL, DB_MAX_NUMERIC_PRECISION,
-					       DB_VALUE_SCALE (db_value_p), NULL, 0);
-		  }
-		else if (DB_VALUE_DOMAIN_TYPE (db_value_p) == DB_TYPE_FLOAT)
-		  {
-		    acc_dom->value_dom =
-			    tp_domain_resolve (DB_TYPE_DOUBLE, NULL, DB_DOUBLE_DECIMAL_PRECISION,
-					       DB_VALUE_SCALE (db_value_p), NULL, 0);
-		  }
-		else
-		  {
-		    acc_dom->value_dom = tp_domain_resolve_default (DB_VALUE_DOMAIN_TYPE (db_value_p));
-		  }
-	      }
-	    else
-	      {
-		acc_dom->value_dom = agg_node->domain;
-	      }
-	    acc_dom->value2_dom = &tp_Null_domain;
+	    return false;
 	  }
 	/* Supported types use the word accumulator, as on the serial path.
 	 * Each worker owns its accumulator; finalize_node () merges it through
@@ -1757,11 +1731,9 @@ namespace parallel_scan
     else if constexpr (F == PT_STDDEV || F == PT_STDDEV_POP || F == PT_STDDEV_SAMP
 		       || F == PT_VARIANCE || F == PT_VAR_POP || F == PT_VAR_SAMP)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    acc_dom->value_dom = &tp_Double_domain;
-	    acc_dom->value2_dom = &tp_Double_domain;
+	    return false;
 	  }
 	DB_VALUE coerced, squared;
 	db_make_null (&coerced);
@@ -1808,11 +1780,9 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_AGG_BIT_AND || F == PT_AGG_BIT_OR || F == PT_AGG_BIT_XOR)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    acc_dom->value_dom = agg_node->domain;
-	    acc_dom->value2_dom = &tp_Null_domain;
+	    return false;
 	  }
 	DB_VALUE tmp_val;
 	db_make_bigint (&tmp_val, (DB_BIGINT) 0);
@@ -1877,11 +1847,9 @@ namespace parallel_scan
 	else
 	  {
 	    /* sort_list == NULL case; ORDER BY case is handled above */
-	    /* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	    if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	    if (!px_accumulator_domain_is_set (acc_dom))
 	      {
-		acc_dom->value_dom = agg_node->domain;
-		acc_dom->value2_dom = &tp_Null_domain;
+	        return false;
 	      }
 	    int gc_err;
 	    if (acc->curr_cnt < 1)
@@ -1901,18 +1869,9 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_JSON_ARRAYAGG)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    if (agg_node->domain != NULL)
-	      {
-		acc_dom->value_dom = agg_node->domain;
-	      }
-	    else
-	      {
-		acc_dom->value_dom = tp_domain_resolve_default (DB_VALUE_DOMAIN_TYPE (db_value_p));
-	      }
-	    acc_dom->value2_dom = &tp_Null_domain;
+	    return false;
 	  }
 	if (db_accumulate_json_arrayagg (db_value_p, acc->value) != NO_ERROR)
 	  {
@@ -1922,18 +1881,9 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_JSON_OBJECTAGG)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
-	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
+	if (!px_accumulator_domain_is_set (acc_dom))
 	  {
-	    if (agg_node->domain != NULL)
-	      {
-		acc_dom->value_dom = agg_node->domain;
-	      }
-	    else
-	      {
-		acc_dom->value_dom = tp_domain_resolve_default (DB_VALUE_DOMAIN_TYPE (db_value_p));
-	      }
-	    acc_dom->value2_dom = &tp_Null_domain;
+	    return false;
 	  }
 	REGU_VARIABLE_LIST second_operand = agg_node->operands->next;
 	if (second_operand == nullptr)

@@ -4495,6 +4495,11 @@ scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
   /* regulator variable list for other than predicates */
   llsidp->rest_regu_list = regu_list_rest;
 
+  /* the list file's column domains are known as soon as the scan is opened, so the position descriptors this
+   * scan reads are connected here - once, before the first row.  This used to run at the top of
+   * scan_next_list_scan (), i.e. on every returned row (wf268 #286 A3). */
+  resolve_domains_on_list_scan (llsidp, scan_id->val_list);
+
   /* init for hash list scan */
   /* regulator variable list for build, probe */
   llsidp->hlsid.build_regu_list = regu_list_build;
@@ -7509,8 +7514,6 @@ scan_next_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
   tplrec.size = 0;
   tplrec.tpl = (QFILE_TUPLE) NULL;
 
-  resolve_domains_on_list_scan (llsidp, scan_id->val_list);
-
   while ((qp_scan = qfile_scan_list_next (thread_p, &llsidp->lsid, &tplrec, PEEK)) == S_SUCCESS)
     {
 
@@ -8560,9 +8563,13 @@ reverse_key_list (KEY_VAL_RANGE * key_vals, int key_cnt)
  *   ref_val_list (in): list of DB_VALUEs (val_list_node) used as reference
  *
  *  Note : this connects a position descriptor to the column of the list file it reads.  It never looks at a row
- *         value - the list file's own type list is the reference - and it runs once per scan open, so it stays
- *         (wf268 C3, D-280-03).  A MERGE's sub-plan reaches its source list without a producer XASL node, so
- *         the execution gate cannot map these positions ahead of time.
+ *         value - the list file's own type list is the reference.  It runs once per scan open
+ *         (scan_open_list_scan (), and scan_build_hash_list_scan () for the hash build).
+ *
+ *         Why it is not in the execution gate: a MERGE's sub-plan reaches its source list without a producer
+ *         XASL node, and that list is produced during the same mainblock, so before the mainblock there is
+ *         nothing to read the domains from.  Scan open is the earliest point at which they exist
+ *         (wf268 #286 A3; the per row call this replaces was at the top of scan_next_list_scan ()).
  */
 static void
 resolve_domains_on_list_scan (LLIST_SCAN_ID * llsidp, val_list_node * ref_val_list)
