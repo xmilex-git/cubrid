@@ -694,6 +694,7 @@ static DB_VALUE_COMPARE_RESULT bf2df_str_cmpdisk (void *mem1, void *mem2, TP_DOM
 static DB_VALUE_COMPARE_RESULT bf2df_str_cmpval (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
 						 int *start_colp, int collation);
 static void qexec_resolve_domains_on_sort_list (SORT_LIST * order_list, REGU_VARIABLE_LIST reference_regu_list);
+static void qexec_pin_sort_keys (SORT_LIST * order_list, OUTPTR_LIST * reference);
 static OUTPTR_LIST *qexec_orderby_reference_outlist (const XASL_NODE * xasl);
 #if !defined(NDEBUG)
 static bool qexec_sort_list_is_pinned (const SORT_LIST * order_list);
@@ -17950,35 +17951,25 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
   /* (3) the GROUP BY lists read this node's own output, so they can be connected the same way.
    * this runs before the sort keys below because that is the order execution used to reach them:
    * qexec_groupby () settled the grouped output first, and only then did ORDER BY sort it. */
-  if (xasl->type == BUILDLIST_PROC && xasl->proc.buildlist.g_regu_list != NULL && xasl->outptr_list != NULL)
+  if (xasl->type == BUILDLIST_PROC && xasl->proc.buildlist.g_regu_list != NULL && xasl->outptr_list != NULL
+      && xasl->outptr_list->valptrp != NULL)
     {
       qexec_resolve_domains_for_group_by (&xasl->proc.buildlist, xasl->outptr_list);
     }
 
   /* (4) the sort keys read a result list by position */
-  if (xasl->outptr_list != NULL)
+  qexec_pin_sort_keys (xasl->orderby_list, qexec_orderby_reference_outlist (xasl));
+  /* the intermediate list file after_iscan_list sorts is built from this node's own output */
+  qexec_pin_sort_keys (xasl->after_iscan_list, xasl->outptr_list);
+  if (xasl->type == BUILDLIST_PROC)
     {
-      OUTPTR_LIST *orderby_ref = qexec_orderby_reference_outlist (xasl);
+      ANALYTIC_EVAL_TYPE *eval;
 
-      if (orderby_ref != NULL)
+      qexec_pin_sort_keys (xasl->proc.buildlist.groupby_list, xasl->outptr_list);
+      qexec_pin_sort_keys (xasl->proc.buildlist.after_groupby_list, xasl->outptr_list);
+      for (eval = xasl->proc.buildlist.a_eval_list; eval != NULL; eval = eval->next)
 	{
-	  qexec_resolve_domains_on_sort_list (xasl->orderby_list, orderby_ref->valptrp);
-	}
-      /* the intermediate list file after_iscan_list sorts is built from this node's own output */
-      qexec_resolve_domains_on_sort_list (xasl->after_iscan_list, xasl->outptr_list->valptrp);
-      if (xasl->type == BUILDLIST_PROC)
-	{
-	  ANALYTIC_EVAL_TYPE *eval;
-
-	  qexec_resolve_domains_on_sort_list (xasl->proc.buildlist.groupby_list, xasl->outptr_list->valptrp);
-	  qexec_resolve_domains_on_sort_list (xasl->proc.buildlist.after_groupby_list, xasl->outptr_list->valptrp);
-	  for (eval = xasl->proc.buildlist.a_eval_list; eval != NULL; eval = eval->next)
-	    {
-	      if (xasl->proc.buildlist.a_outptr_list_ex != NULL)
-		{
-		  qexec_resolve_domains_on_sort_list (eval->sort_list, xasl->proc.buildlist.a_outptr_list_ex->valptrp);
-		}
-	    }
+	  qexec_pin_sort_keys (eval->sort_list, xasl->proc.buildlist.a_outptr_list_ex);
 	}
     }
 
@@ -22035,6 +22026,26 @@ qexec_orderby_reference_outlist (const XASL_NODE * xasl)
       return xasl->proc.buildlist.a_outptr_list;
     }
   return xasl->outptr_list;
+}
+
+/*
+ * qexec_pin_sort_keys () - resolve one sort list against an output list, when there is one to resolve against
+ *   return: void
+ *   order_list(in/out): the sort list to complete, may be empty (NULL)
+ *   reference(in): the output list the keys name by position, may be empty or carry no columns
+ *
+ *  Note: qexec_resolve_domains_on_sort_list () is written for a caller that already knows both lists exist.
+ *	  Since every plan now walks its whole tree, the walk also reaches nodes that produce no columns, and
+ *	  a sort list there has nothing to be resolved against; leave it to the node that does produce them.
+ */
+static void
+qexec_pin_sort_keys (SORT_LIST * order_list, OUTPTR_LIST * reference)
+{
+  if (order_list == NULL || reference == NULL || reference->valptrp == NULL)
+    {
+      return;
+    }
+  qexec_resolve_domains_on_sort_list (order_list, reference->valptrp);
 }
 
 #if !defined(NDEBUG)

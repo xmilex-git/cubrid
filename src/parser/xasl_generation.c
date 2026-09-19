@@ -12327,6 +12327,12 @@ pt_to_index_info (PARSER_CONTEXT * parser, DB_OBJECT * class_, PRED_EXPR * where
       return NULL;
     }
 
+  /* Carry the index key domain the optimizer already read from the statistics, so the scan does not have to
+   * read it from the index root again to know how a key range value reaches the key (wf268 #286 C6).  It is
+   * NULL when the optimizer had no statistics for this index, and the scan then falls back to the root.  The
+   * pointer belongs to the workspace class cache, so it is only read here and serialised into the stream. */
+  indx_infop->key_domain = index_entryp->key_type;
+
   /* key limits */
   key_infop = &indx_infop->key_info;
   if (pt_to_key_limit (parser, index_entryp->key_limit, NULL, key_infop, false) != NO_ERROR)

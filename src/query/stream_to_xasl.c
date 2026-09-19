@@ -5021,6 +5021,16 @@ stx_build_indx_info (THREAD_ENTRY * thread_p, char *ptr, INDX_INFO * indx_info)
 
   ptr = or_unpack_int (ptr, &indx_info->func_idx_col_id);
 
+  ptr = or_unpack_int (ptr, &tmp);
+  if (tmp == 0)
+    {
+      indx_info->key_domain = NULL;
+    }
+  else
+    {
+      ptr = or_unpack_domain (ptr, &indx_info->key_domain, NULL);
+    }
+
   ptr = or_unpack_int (ptr, &offset);
   if (offset == 0)
     {

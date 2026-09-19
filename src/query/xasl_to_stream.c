@@ -4785,6 +4785,19 @@ xts_process_indx_info (char *ptr, const INDX_INFO * indx_info)
 
   ptr = or_pack_int (ptr, indx_info->func_idx_col_id);
 
+  /* the index key domain the optimizer already read from the statistics (wf268 #286 C6).  It is absent when
+   * the optimizer had no statistics for this index -- a filtered index on an empty table, for one -- and
+   * or_pack_domain () has no encoding for that, so the presence is streamed ahead of it. */
+  if (indx_info->key_domain == NULL)
+    {
+      ptr = or_pack_int (ptr, 0);
+    }
+  else
+    {
+      ptr = or_pack_int (ptr, 1);
+      ptr = or_pack_domain (ptr, indx_info->key_domain, 0, 0);
+    }
+
   if (indx_info->cov_list_id == NULL)
     {
       ptr = or_pack_int (ptr, 0);
@@ -7049,6 +7062,12 @@ xts_sizeof_indx_info (const INDX_INFO * indx_info)
 	   + OR_INT_SIZE	/* func_idx_col_id (int) */
 	   + OR_INT_SIZE	/* iss_range's range */
 	   + PTR_SIZE);		/* iss_range's key1 */
+
+  size += OR_INT_SIZE;		/* key_domain present */
+  if (indx_info->key_domain != NULL)
+    {
+      size += or_packed_domain_size (indx_info->key_domain, 0);	/* key_domain */
+    }
 
   return size;
 }

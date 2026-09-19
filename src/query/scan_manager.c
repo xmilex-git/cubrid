@@ -4110,6 +4110,12 @@ scan_open_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
     scan_id->scan_stats.multi_range_opt = isidp->multi_range_opt.use;
   }
 
+  /* The compiler read the same key domain from the index statistics and carried it in INDX_INFO, so that a
+   * later step can fix the key conversion before the scan is opened (wf268 #286 C6).  Check here, while both
+   * copies are in hand, that they describe the same key; a mismatch would mean the plan outlived the index. */
+  assert (indx_info == NULL || indx_info->key_domain == NULL
+	  || tp_domain_match (indx_info->key_domain, BTS->btid_int.key_type, TP_EXACT_MATCH));
+
   /* fix how every key range value reaches the index key domain, before any of them is built (wf268 C4) */
   if (scan_prepare_key_conv_plans (thread_p, isidp, BTS->btid_int.key_type, vd) != NO_ERROR)
     {
