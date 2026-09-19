@@ -427,8 +427,6 @@ static int qexec_clear_regu_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, R
 static int qexec_clear_regu_value_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VALUE_LIST * list,
 					bool is_final, bool for_parallel_aptr);
 static void qexec_clear_db_val_list (QPROC_DB_VALUE_LIST list);
-static void qexec_clear_sort_list (XASL_NODE * xasl_p, SORT_LIST * list, bool is_final);
-static void qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final);
 static int qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, bool is_final,
 			     bool for_parallel_aptr);
 static int qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCESS_SPEC_TYPE * list,
@@ -1667,9 +1665,6 @@ qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE
 #if 0				/* TODO - */
     case TYPE_LIST_ID:
 #endif
-    case TYPE_POSITION:
-      qexec_clear_pos_desc (xasl_p, &regu_var->value.pos_descr, is_final);
-      break;
     default:
       break;
     }
@@ -1743,38 +1738,6 @@ qexec_clear_db_val_list (QPROC_DB_VALUE_LIST list)
   for (p = list; p; p = p->next)
     {
       pr_clear_value (p->val);
-    }
-}
-
-/*
- * qexec_clear_sort_list () - clear position desc
- *   return: void
- *   xasl_p(in) : xasl
- *   position_descr(in)   : position desc
- *   is_final(in)  : true, if finalize needed
- */
-static void
-qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final)
-{
-  /* the settled domain is put back by qexec_restore_compiled_domains () when the execution ends */
-}
-
-/*
- * qexec_clear_sort_list () - clear the sort list
- *   return: void
- *   xasl_p(in) : xasl
- *   list(in)   : the sort list
- *   is_final(in)  : true, if finalize needed
- */
-static void
-qexec_clear_sort_list (XASL_NODE * xasl_p, SORT_LIST * list, bool is_final)
-{
-  SORT_LIST *p;
-
-  for (p = list; p; p = p->next)
-    {
-      /* restores the original domain */
-      qexec_clear_pos_desc (xasl_p, &p->pos_descr, is_final);
     }
 }
 
@@ -2512,14 +2475,6 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
 	    pg_cnt += qexec_clear_xasl (thread_p, xasl_p, is_final, false);
 	  }
 
-	if (buildlist->groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->groupby_list, is_final);
-	  }
-	if (buildlist->after_groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->after_groupby_list, is_final);
-	  }
 
 	if (xasl->curr_spec)
 	  {
@@ -2802,15 +2757,7 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
 	  pr_clear_value (xasl->ordbynum_val);
 	}
 
-      if (xasl->after_iscan_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->after_iscan_list, is_final);
-	}
 
-      if (xasl->orderby_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->orderby_list, is_final);
-	}
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->ordbynum_pred, is_final, false);
 
       if (xasl->orderby_limit)
@@ -3027,15 +2974,7 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
 	  pr_clear_value (xasl->ordbynum_val);
 	}
 
-      if (xasl->after_iscan_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->after_iscan_list, is_final);
-	}
 
-      if (xasl->orderby_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->orderby_list, is_final);
-	}
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->ordbynum_pred, is_final, true);
 
       if (xasl->orderby_limit)
@@ -3133,14 +3072,6 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
 	    pg_cnt += qexec_clear_xasl_for_parallel_aptr (thread_p, buildlist->eptr_list, is_final);
 	  }
 
-	if (buildlist->groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->groupby_list, is_final);
-	  }
-	if (buildlist->after_groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->after_groupby_list, is_final);
-	  }
 
 	if (xasl->curr_spec)
 	  {
