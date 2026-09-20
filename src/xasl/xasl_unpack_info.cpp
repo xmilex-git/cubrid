@@ -69,6 +69,15 @@ void
 free_xasl_unpack_info (THREAD_ENTRY *thread_p, REFPTR (XASL_UNPACK_INFO, xasl_unpack_info))
 {
   free_unpack_extra_buff (thread_p, xasl_unpack_info);
+  if (xasl_unpack_info)
+    {
+      /* only reached when the unpack failed before the root's list was built; stx_build_domain_pin_plan ()
+       * frees these and nulls them as soon as it has copied the addresses out */
+      free (xasl_unpack_info->open_dom_slots);
+      xasl_unpack_info->open_dom_slots = NULL;
+      free (xasl_unpack_info->open_type_slots);
+      xasl_unpack_info->open_type_slots = NULL;
+    }
 #if defined (SERVER_MODE)
   if (xasl_unpack_info)
     {

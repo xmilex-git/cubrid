@@ -25,6 +25,7 @@
 
 #include "porting.h"
 #include "system.h"
+#include "dbtype_def.h"
 #include "thread_compat.hpp"
 
 const size_t MAX_PTR_BLOCKS = 256;
@@ -93,6 +94,20 @@ struct xasl_unpack_info
   int domain_pin_cnt;
   UNPACK_DOMAIN_PIN *coll_pins;	/* value slots carrying an unresolved collation */
   int coll_pin_cnt;
+  /* Every domain and operand type slot of this tree, in unpack order.  These are the addresses execution is
+   * allowed to settle, and they are collected where the node is built rather than derived from a guess about
+   * who writes them - the field they replace was restored for every node the clear walk reached, so the only
+   * way to be sure the list is complete is to name the same nodes.  Only the addresses are gathered here; the
+   * compiled values are read off them when the root's list is built, because nothing settles a domain while
+   * the tree is still being unpacked.  Plain malloc, freed as soon as the root's list is built (or by
+   * free_xasl_unpack_info () if the unpack failed first): they must not outlive the unpack, and the unpack may
+   * run on the global heap while the free runs on a private one. */
+  struct tp_domain ***open_dom_slots;
+  int open_dom_cnt;
+  int open_dom_max;
+  DB_TYPE **open_type_slots;
+  int open_type_cnt;
+  int open_type_max;
 };
 
 XASL_UNPACK_INFO *get_xasl_unpack_info_ptr (THREAD_ENTRY *thread_p);

@@ -88,6 +88,9 @@ static KEY_RANGE *stx_restore_key_range_array (THREAD_ENTRY * thread_p, char *pt
 static char *stx_build_xasl_node (THREAD_ENTRY * thread_p, char *tmp, XASL_NODE * ptr);
 static int stx_collect_domain_pin (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var);
 static int stx_collect_open_collation (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var);
+static int stx_collect_open_domain (THREAD_ENTRY * thread_p, TP_DOMAIN ** slot);
+static int stx_collect_open_type (THREAD_ENTRY * thread_p, DB_TYPE * slot);
+static void stx_free_open_slot_arrays (XASL_UNPACK_INFO * xasl_unpack_info);
 static int stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static char *stx_build_xasl_header (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE_HEADER * xasl_header);
 static char *stx_build_filter_pred_node (THREAD_ENTRY * thread_p, char *ptr, PRED_EXPR_WITH_CONTEXT * pred);
@@ -141,7 +144,7 @@ static char *stx_build_db_value_list (THREAD_ENTRY * thread_p, char *tmp, QPROC_
 static char *stx_build_regu_variable (THREAD_ENTRY * thread_p, char *tmp, REGU_VARIABLE * ptr);
 static char *stx_unpack_regu_variable_value (THREAD_ENTRY * thread_p, char *tmp, REGU_VARIABLE * ptr);
 static char *stx_build_attr_descr (THREAD_ENTRY * thread_p, char *tmp, ATTR_DESCR * ptr);
-static char *stx_build_pos_descr (char *tmp, QFILE_TUPLE_VALUE_POSITION * ptr);
+static char *stx_build_pos_descr (THREAD_ENTRY * thread_p, char *tmp, QFILE_TUPLE_VALUE_POSITION * ptr);
 static char *stx_build_arith_type (THREAD_ENTRY * thread_p, char *tmp, ARITH_TYPE * ptr);
 static char *stx_build_aggregate_type (THREAD_ENTRY * thread_p, char *tmp, AGGREGATE_TYPE * ptr);
 static char *stx_build_function_type (THREAD_ENTRY * thread_p, char *tmp, FUNCTION_TYPE * ptr);
@@ -427,6 +430,91 @@ stx_collect_open_collation (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var)
 }
 
 /*
+ * stx_collect_open_domain () - remember where a domain of this tree lives
+ *   return: NO_ERROR, or an error code
+ *   slot(in): the address execution may write a settled domain to
+ *
+ * Note: every domain slot is collected, not only the ones that look undecided.  The field this replaces was
+ *       restored for every node the clear walk reached, whatever its domain said, and a slot left out of this
+ *       list is one that keeps whatever an execution settled in it for every later execution of the same
+ *       cached tree.  Deciding which slots to leave out means enumerating the writers, and the writers are
+ *       what #286 is still in the middle of pinning down - so the list names the nodes instead, which is the
+ *       side that is knowable now.
+ */
+static int
+stx_collect_open_domain (THREAD_ENTRY * thread_p, TP_DOMAIN ** slot)
+{
+  XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
+
+  if (xasl_unpack_info->open_dom_cnt == xasl_unpack_info->open_dom_max)
+    {
+      int new_max = (xasl_unpack_info->open_dom_max == 0) ? 64 : xasl_unpack_info->open_dom_max * 2;
+      TP_DOMAIN ***new_slots =
+	(TP_DOMAIN ***) realloc (xasl_unpack_info->open_dom_slots, sizeof (TP_DOMAIN **) * new_max);
+
+      if (new_slots == NULL)
+	{
+	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      xasl_unpack_info->open_dom_slots = new_slots;
+      xasl_unpack_info->open_dom_max = new_max;
+    }
+
+  xasl_unpack_info->open_dom_slots[xasl_unpack_info->open_dom_cnt++] = slot;
+
+  return NO_ERROR;
+}
+
+/*
+ * stx_collect_open_type () - remember where an aggregate or analytic operand type of this tree lives
+ *   return: NO_ERROR, or an error code
+ *   slot(in): the address execution may write a settled operand type to
+ */
+static int
+stx_collect_open_type (THREAD_ENTRY * thread_p, DB_TYPE * slot)
+{
+  XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
+
+  if (xasl_unpack_info->open_type_cnt == xasl_unpack_info->open_type_max)
+    {
+      int new_max = (xasl_unpack_info->open_type_max == 0) ? 16 : xasl_unpack_info->open_type_max * 2;
+      DB_TYPE **new_slots = (DB_TYPE **) realloc (xasl_unpack_info->open_type_slots, sizeof (DB_TYPE *) * new_max);
+
+      if (new_slots == NULL)
+	{
+	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      xasl_unpack_info->open_type_slots = new_slots;
+      xasl_unpack_info->open_type_max = new_max;
+    }
+
+  xasl_unpack_info->open_type_slots[xasl_unpack_info->open_type_cnt++] = slot;
+
+  return NO_ERROR;
+}
+
+/*
+ * stx_free_open_slot_arrays () - let go of the addresses gathered while unpacking
+ *   return: void
+ *   xasl_unpack_info(in/out): the unpack info that gathered them
+ *
+ * Note: they are plain malloc, and the tree they describe may outlive the heap this unpack ran on, so they are
+ *       released as soon as whatever needed them has read them.
+ */
+static void
+stx_free_open_slot_arrays (XASL_UNPACK_INFO * xasl_unpack_info)
+{
+  free (xasl_unpack_info->open_dom_slots);
+  xasl_unpack_info->open_dom_slots = NULL;
+  xasl_unpack_info->open_dom_cnt = xasl_unpack_info->open_dom_max = 0;
+  free (xasl_unpack_info->open_type_slots);
+  xasl_unpack_info->open_type_slots = NULL;
+  xasl_unpack_info->open_type_cnt = xasl_unpack_info->open_type_max = 0;
+}
+
+/*
  * stx_build_domain_pin_plan () - turn the pins collected during unpacking into the root node's plan
  *   return: NO_ERROR, or an error code
  *   xasl(in/out): the root of the restored tree
@@ -443,12 +531,15 @@ stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
   DOMAIN_PIN_PLAN *plan;
   int n_uses = xasl_unpack_info->domain_pin_cnt;
   int n_coll = xasl_unpack_info->coll_pin_cnt;
+  int n_open_domains = xasl_unpack_info->open_dom_cnt;
+  int n_open_types = xasl_unpack_info->open_type_cnt;
   int i, j;
 
   xasl->domain_pin_plan = NULL;
-  if (n_uses == 0 && n_coll == 0)
+  if (n_uses == 0 && n_coll == 0 && n_open_domains == 0 && n_open_types == 0)
     {
       /* a statement with no residual carries no plan at all */
+      stx_free_open_slot_arrays (xasl_unpack_info);
       return NO_ERROR;
     }
 
@@ -461,7 +552,10 @@ stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
   plan->uses = NULL;
   plan->recipes = NULL;
   plan->coll_regus = NULL;
+  plan->open_domains = NULL;
+  plan->open_types = NULL;
   plan->n_uses = plan->n_recipes = plan->n_coll = 0;
+  plan->n_open_domains = plan->n_open_types = 0;
 
   if (n_uses > 0)
     {
@@ -488,6 +582,42 @@ stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 	}
       assert (i == -1);
       plan->n_coll = n_coll;
+    }
+
+  /* nothing has settled a domain yet, so what each collected address holds is still what the compiler put
+   * there; read the values off now and let the address arrays go */
+  if (n_open_domains > 0)
+    {
+      plan->open_domains =
+	(DOMAIN_OPEN_SLOT *) stx_alloc_struct (thread_p, (int) sizeof (DOMAIN_OPEN_SLOT) * n_open_domains);
+      if (plan->open_domains == NULL)
+	{
+	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      for (i = 0; i < n_open_domains; i++)
+	{
+	  plan->open_domains[i].slot = xasl_unpack_info->open_dom_slots[i];
+	  plan->open_domains[i].compiled = *xasl_unpack_info->open_dom_slots[i];
+	}
+      plan->n_open_domains = n_open_domains;
+    }
+
+  if (n_open_types > 0)
+    {
+      plan->open_types =
+	(DBTYPE_OPEN_SLOT *) stx_alloc_struct (thread_p, (int) sizeof (DBTYPE_OPEN_SLOT) * n_open_types);
+      if (plan->open_types == NULL)
+	{
+	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      for (i = 0; i < n_open_types; i++)
+	{
+	  plan->open_types[i].slot = xasl_unpack_info->open_type_slots[i];
+	  plan->open_types[i].compiled = *xasl_unpack_info->open_type_slots[i];
+	}
+      plan->n_open_types = n_open_types;
     }
 
   /* the collected list is newest first: fill the uses back to front to get unpack order */
@@ -519,6 +649,7 @@ stx_build_domain_pin_plan (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
   plan->n_uses = n_uses;
 
   xasl->domain_pin_plan = plan;
+  stx_free_open_slot_arrays (xasl_unpack_info);
 
   return NO_ERROR;
 }
@@ -586,6 +717,7 @@ stx_map_stream_to_filter_pred (THREAD_ENTRY * thread_p, pred_expr_with_context *
     }
 
   /* set result */
+  stx_free_open_slot_arrays (unpack_info_p);
   pwc->unpack_info = unpack_info_p;
   *pred = pwc;
 
@@ -656,6 +788,7 @@ stx_map_stream_to_func_pred (THREAD_ENTRY * thread_p, func_pred ** xasl, char *x
 
   /* set result */
   *xasl = p_xasl;
+  stx_free_open_slot_arrays (unpack_info_p);
   *xasl_unpack_info_ptr = unpack_info_p;
 
 end:
@@ -5898,8 +6031,6 @@ stx_build_regu_variable (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABLE * reg
   XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
 
   ptr = or_unpack_domain (ptr, &regu_var->domain, NULL);
-  /* save the original domain */
-  regu_var->original_domain = regu_var->domain;
 
   ptr = or_unpack_int (ptr, &tmp);
   regu_var->type = (REGU_DATATYPE) tmp;
@@ -5938,6 +6069,11 @@ stx_build_regu_variable (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABLE * reg
 
   ptr = stx_unpack_regu_variable_value (thread_p, ptr, regu_var);
   if (ptr == NULL)
+    {
+      return NULL;
+    }
+
+  if (stx_collect_open_domain (thread_p, &regu_var->domain) != NO_ERROR)
     {
       return NULL;
     }
@@ -6118,7 +6254,7 @@ stx_unpack_regu_variable_value (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABL
       break;
 
     case TYPE_POSITION:
-      ptr = stx_build_pos_descr (ptr, &regu_var->value.pos_descr);
+      ptr = stx_build_pos_descr (thread_p, ptr, &regu_var->value.pos_descr);
       break;
 
     case TYPE_POS_VALUE:
@@ -6175,11 +6311,15 @@ stx_build_attr_descr (THREAD_ENTRY * thread_p, char *ptr, ATTR_DESCR * attr_desc
 }
 
 static char *
-stx_build_pos_descr (char *ptr, QFILE_TUPLE_VALUE_POSITION * position_descr)
+stx_build_pos_descr (THREAD_ENTRY * thread_p, char *ptr, QFILE_TUPLE_VALUE_POSITION * position_descr)
 {
   ptr = or_unpack_int (ptr, &position_descr->pos_no);
   ptr = or_unpack_domain (ptr, &position_descr->dom, NULL);
-  position_descr->original_domain = position_descr->dom;
+
+  if (stx_collect_open_domain (thread_p, &position_descr->dom) != NO_ERROR)
+    {
+      return NULL;
+    }
 
   return ptr;
 }
@@ -6191,8 +6331,10 @@ stx_build_arith_type (THREAD_ENTRY * thread_p, char *ptr, ARITH_TYPE * arith_typ
   XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
 
   ptr = or_unpack_domain (ptr, &arith_type->domain, NULL);
-  /* save the original domain */
-  arith_type->original_domain = arith_type->domain;
+  if (stx_collect_open_domain (thread_p, &arith_type->domain) != NO_ERROR)
+    {
+      return NULL;
+    }
 
   ptr = or_unpack_int (ptr, &offset);
   if (offset == 0)
@@ -6300,7 +6442,10 @@ stx_build_aggregate_type (THREAD_ENTRY * thread_p, char *ptr, AGGREGATE_TYPE * a
 
   /* domain */
   ptr = or_unpack_domain (ptr, &aggregate->domain, NULL);
-  aggregate->original_domain = aggregate->domain;
+  if (stx_collect_open_domain (thread_p, &aggregate->domain) != NO_ERROR)
+    {
+      return NULL;
+    }
 
   /* accumulator */
   aggregate->accumulator.clear_value_at_clone_decache = false;
@@ -6372,7 +6517,10 @@ stx_build_aggregate_type (THREAD_ENTRY * thread_p, char *ptr, AGGREGATE_TYPE * a
   /* opr_dbtype */
   ptr = or_unpack_int (ptr, &tmp);
   aggregate->opr_dbtype = (DB_TYPE) tmp;
-  aggregate->original_opr_dbtype = aggregate->opr_dbtype;
+  if (stx_collect_open_type (thread_p, &aggregate->opr_dbtype) != NO_ERROR)
+    {
+      return NULL;
+    }
 
   ptr = stx_build_regu_variable_list (thread_p, ptr, &aggregate->operands);
   if (ptr == NULL)
@@ -6577,7 +6725,10 @@ stx_build_analytic_type (THREAD_ENTRY * thread_p, char *ptr, ANALYTIC_TYPE * ana
 
   /* domain */
   ptr = or_unpack_domain (ptr, &analytic->domain, NULL);
-  analytic->original_domain = analytic->domain;
+  if (stx_collect_open_domain (thread_p, &analytic->domain) != NO_ERROR)
+    {
+      return NULL;
+    }
 
   /* value */
   ptr = or_unpack_int (ptr, &offset);
@@ -6659,7 +6810,10 @@ stx_build_analytic_type (THREAD_ENTRY * thread_p, char *ptr, ANALYTIC_TYPE * ana
   /* opr_dbtype */
   ptr = or_unpack_int (ptr, &tmp_i);
   analytic->opr_dbtype = (DB_TYPE) tmp_i;
-  analytic->original_opr_dbtype = analytic->opr_dbtype;
+  if (stx_collect_open_type (thread_p, &analytic->opr_dbtype) != NO_ERROR)
+    {
+      return NULL;
+    }
 
   /* operand */
   ptr = stx_build_regu_variable (thread_p, ptr, &analytic->operand);
@@ -6838,7 +6992,7 @@ stx_build_sort_list (THREAD_ENTRY * thread_p, char *ptr, SORT_LIST * sort_list)
 	}
     }
 
-  ptr = stx_build_pos_descr (ptr, &sort_list->pos_descr);
+  ptr = stx_build_pos_descr (thread_p, ptr, &sort_list->pos_descr);
   if (ptr == NULL)
     {
       return NULL;
@@ -7161,8 +7315,10 @@ stx_build_regu_value_list (THREAD_ENTRY * thread_p, char *ptr, REGU_VALUE_LIST *
       ptr = or_unpack_int (ptr, &tmp);
       regu->type = (REGU_DATATYPE) tmp;
       regu->domain = domain;
-      /* save te original domain */
-      regu->original_domain = domain;
+      if (stx_collect_open_domain (thread_p, &regu->domain) != NO_ERROR)
+	{
+	  goto error;
+	}
 
       if (regu->type != TYPE_DBVAL && regu->type != TYPE_INARITH && regu->type != TYPE_POS_VALUE)
 	{

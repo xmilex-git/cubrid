@@ -71,10 +71,8 @@ namespace cubxasl
     FUNC_CODE function;		/* analytic function type */
     QUERY_OPTIONS option;		/* DISTINCT/ALL option */
     tp_domain *domain;		/* domain of the result */
-    tp_domain *original_domain;	/* domain of the result */
 
     DB_TYPE opr_dbtype;		/* operand data type */
-    DB_TYPE original_opr_dbtype;	/* original operand data type */
     regu_variable_node operand;	/* operand */
 
     int flag;			/* flags */

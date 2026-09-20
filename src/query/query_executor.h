@@ -115,6 +115,7 @@ extern int qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, xasl_nod
 extern qfile_list_id *qexec_get_xasl_list_id (xasl_node * xasl);
 extern xasl_state *qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state);
 extern void qexec_free_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state);
+extern void qexec_restore_compiled_domains (xasl_node * xasl);
 extern int qexec_install_pinned_domains (THREAD_ENTRY * thread_p, xasl_node * worker_root,
 					xasl_state * worker_state, const xasl_state * root_state,
 					const xasl_node * worker_owned);
