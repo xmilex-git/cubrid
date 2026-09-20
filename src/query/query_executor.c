@@ -23167,6 +23167,11 @@ query_multi_range_opt_check_set_sort_col (THREAD_ENTRY * thread_p, XASL_NODE * x
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, count * sizeof (int));
 	  goto exit_on_error;
 	}
+      multi_range_opt->sort_col_dom = (TP_DOMAIN **) db_private_alloc (thread_p, count * sizeof (TP_DOMAIN *));
+      if (multi_range_opt->sort_col_dom == NULL)
+	{
+	  goto exit_on_error;
+	}
     }
   else
     {
@@ -23209,6 +23214,23 @@ query_multi_range_opt_check_set_sort_col (THREAD_ENTRY * thread_p, XASL_NODE * x
 	}
       multi_range_opt->is_desc_order[index] = (orderby_list->s_order == S_DESC) ? true : false;
       multi_range_opt->sort_att_idx[index] = sort_index_pos;
+
+      /* Install the compiler's index column domain with the column mapping, before any key is read.
+       * The MRO comparator applies is_desc_order separately, so the schema domain need not be copied just
+       * to clear its physical index direction. */
+      TP_DOMAIN *domain = spec->indexptr->key_domain;
+      domain = domain != NULL ? domain->setdomain : NULL;
+      for (i = 0; domain != NULL && i < sort_index_pos; i++)
+	{
+	  domain = domain->next;
+	}
+      if (domain == NULL)
+	{
+	  assert (false);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
+	  goto exit_on_error;
+	}
+      multi_range_opt->sort_col_dom[index] = domain;
     }
 
   /* disable order by in XASL for this execution */

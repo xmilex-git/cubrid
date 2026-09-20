@@ -3088,8 +3088,8 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    {
 	      goto error;
 	    }
-	  regu_var->domain->precision = arithptr->value->domain.numeric_info.precision;
-	  regu_var->domain->scale = arithptr->value->domain.numeric_info.scale;
+	  /* The compiled result is floating NUMERIC. Precision and scale describe this value, not the
+	   * shared result contract; db_to_number () has already stored both in arithptr->value. */
 	}
       break;
 

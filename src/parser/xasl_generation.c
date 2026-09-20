@@ -12100,6 +12100,7 @@ pt_to_index_info (PARSER_CONTEXT * parser, DB_OBJECT * class_, PRED_EXPR * where
   int i;
   bool is_prefix_index;
   SM_FUNCTION_INFO *fi_info = NULL;
+  TP_DOMAIN *iss_domain = NULL;
 
   assert (parser != NULL);
   assert (class_ != NULL);
@@ -12309,22 +12310,10 @@ pt_to_index_info (PARSER_CONTEXT * parser, DB_OBJECT * class_, PRED_EXPR * where
     {
       indx_infop->func_idx_col_id = fi_info->col_id;
       assert (indx_infop->func_idx_col_id != -1);
-
-      rc =
-	pt_create_iss_range (indx_infop,
-			     tp_domain_resolve (fi_info->fi_domain->type->id, class_, fi_info->fi_domain->precision,
-						fi_info->fi_domain->scale, NULL, fi_info->fi_domain->collation_id));
     }
   else
     {
       indx_infop->func_idx_col_id = -1;
-
-      rc = pt_create_iss_range (indx_infop, index_entryp->constraints->attributes[0]->domain);
-    }
-  if (rc != NO_ERROR)
-    {
-      PT_INTERNAL_ERROR (parser, "index plan generation - create iss range fail");
-      return NULL;
     }
 
   /* Carry the index key domain so the scan does not have to read it from the index root again to know how a
@@ -12336,6 +12325,33 @@ pt_to_index_info (PARSER_CONTEXT * parser, DB_OBJECT * class_, PRED_EXPR * where
   if (indx_infop->key_domain == NULL)
     {
       indx_infop->key_domain = sm_index_key_domain (index_entryp->constraints);
+    }
+
+  if (indx_infop->use_iss)
+    {
+      if (indx_infop->key_domain == NULL || TP_DOMAIN_TYPE (indx_infop->key_domain) != DB_TYPE_MIDXKEY
+	  || indx_infop->key_domain->setdomain == NULL)
+	{
+	  PT_INTERNAL_ERROR (parser, "index plan generation - missing iss key domain");
+	  return NULL;
+	}
+
+      /* Both ISS ranges consume the first physical index column. Copy only that column, not its linked
+       * siblings, into a scalar contract; function-index position and descending metadata come from the
+       * same key schema as the scan. Execution replaces the value, never this domain (wf268 #286 C1). */
+      TP_DOMAIN first_column = *indx_infop->key_domain->setdomain;
+      first_column.next = NULL;
+      iss_domain = tp_domain_copy (&first_column, false);
+      if (iss_domain == NULL)
+	{
+	  return NULL;
+	}
+      iss_domain = tp_domain_cache (iss_domain);
+      if (pt_create_iss_range (indx_infop, iss_domain) != NO_ERROR)
+	{
+	  PT_INTERNAL_ERROR (parser, "index plan generation - create iss range fail");
+	  return NULL;
+	}
     }
 
   /* key limits */
@@ -12437,6 +12453,29 @@ pt_to_index_info (PARSER_CONTEXT * parser, DB_OBJECT * class_, PRED_EXPR * where
     }
 
 end:
+  if (indx_infop->use_iss)
+    {
+      for (i = 0; i < key_infop->key_cnt; i++)
+	{
+	  REGU_VARIABLE *bounds[2] = { key_infop->key_ranges[i].key1, key_infop->key_ranges[i].key2 };
+	  for (int j = 0; j < 2; j++)
+	    {
+	      REGU_VARIABLE *key = bounds[j];
+	      if (key == NULL)
+		{
+		  continue;
+		}
+	      if (key->type != TYPE_FUNC || key->value.funcp == NULL || key->value.funcp->ftype != F_MIDXKEY
+		  || key->value.funcp->operand == NULL
+		  || key->value.funcp->operand->value.type != TYPE_DBVAL)
+		{
+		  PT_INTERNAL_ERROR (parser, "index plan generation - invalid iss operand");
+		  return NULL;
+		}
+	      key->value.funcp->operand->value.domain = iss_domain;
+	    }
+	}
+    }
   if (key_infop->key_cnt > 0)
     {
       regu_array_alloc (&key_infop->key_vals, key_infop->key_cnt);

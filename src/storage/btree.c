@@ -22145,6 +22145,8 @@ btree_compare_key (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN * key_domain, int
  * key2 (in) :
  * key_domain (in) :
  *
+ * Compare in ascending order: every caller is an MRO comparison that applies its requested sort direction
+ * separately. The physical index direction in key_domain must not invert that comparison a second time.
  * Function expects that both keys are not MIDXKEY. Please also look at btree_compare_key_value.
  */
 static int
@@ -22169,7 +22171,7 @@ btree_compare_individual_key_value (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN 
       else
 	{
 	  /* NULL vs. key2 */
-	  return key_domain->is_desc ? DB_GT : DB_LT;
+	  return DB_LT;
 	}
     }
   else
@@ -22177,7 +22179,7 @@ btree_compare_individual_key_value (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN 
       if (key2_is_null)
 	{
 	  /* key1 vs. NULL */
-	  return key_domain->is_desc ? DB_LT : DB_GT;
+	  return DB_GT;
 	}
     }
 
@@ -22188,11 +22190,6 @@ btree_compare_individual_key_value (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN 
    * if the other argument has char-type 
    */
   c = key_domain->type->cmpval (key1, key2, 2, 1, NULL, key_domain->collation_id);
-
-  if (key_domain->is_desc)
-    {
-      c = ((c == DB_GT) ? DB_LT : (c == DB_LT) ? DB_GT : c);
-    }
 
   assert (DB_LT <= c && c <= DB_GT);
   return c;
@@ -22215,9 +22212,9 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
   DB_MIDXKEY *new_mkey = NULL;
   DB_VALUE *new_key_value = NULL;
   int error = NO_ERROR, i = 0;
-  TP_DOMAIN *domain;
 
   assert (multi_range_opt->use == true);
+  assert (multi_range_opt->sort_col_dom != NULL);
 
   if (DB_VALUE_DOMAIN_TYPE (&(bts->cur_key)) != DB_TYPE_MIDXKEY || multi_range_opt->sort_att_idx == NULL)
     {
@@ -22276,53 +22273,6 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
 	    {
 	      goto exit;
 	    }
-	}
-    }
-
-  /* The sort columns are index key columns, so their domains come from the index key schema.  Taking them from
-   * the first non-NULL key value instead (and retrying on every later key until one was not NULL) is the
-   * unresolved-domain handling this commit removes (wf268 C3, E17). */
-  if (multi_range_opt->sort_col_dom == NULL)
-    {
-      multi_range_opt->sort_col_dom =
-	(TP_DOMAIN **) db_private_alloc (thread_p, multi_range_opt->num_attrs * sizeof (TP_DOMAIN *));
-      if (multi_range_opt->sort_col_dom == NULL)
-	{
-	  error = ER_OUT_OF_VIRTUAL_MEMORY;
-	  goto exit;
-	}
-
-      for (i = 0; i < multi_range_opt->num_attrs; i++)
-	{
-	  int j;
-
-	  domain = bts->btid_int.key_type != NULL ? bts->btid_int.key_type->setdomain : NULL;
-	  for (j = 0; domain != NULL && j < multi_range_opt->sort_att_idx[i]; j++)
-	    {
-	      domain = domain->next;
-	    }
-	  if (domain == NULL)
-	    {
-	      assert (false);
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INVALID_XASLNODE, 0);
-	      error = ER_QPROC_INVALID_XASLNODE;
-	      goto exit;
-	    }
-	  if (domain->is_desc)
-	    {
-	      /* the index column's descending order is already applied by multi_range_opt->is_desc_order[], so the
-	       * comparison domain must not invert a second time (btree_compare_individual_key_value ()) */
-	      TP_DOMAIN *asc_domain = tp_domain_copy (domain, false);
-
-	      if (asc_domain == NULL)
-		{
-		  error = ER_OUT_OF_VIRTUAL_MEMORY;
-		  goto exit;
-		}
-	      asc_domain->is_desc = 0;
-	      domain = tp_domain_cache (asc_domain);
-	    }
-	  multi_range_opt->sort_col_dom[i] = domain;
 	}
     }
 

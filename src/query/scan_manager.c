@@ -415,7 +415,6 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
   ISS_RANGE_DETAILS scan_range_det, fetch_range_det;
   bool descending_skip_key = false;
   bool descending_scan = false;
-  TP_DOMAIN *first_col_domain = NULL;
   int i;
 
   if (isidp == NULL)
@@ -593,11 +592,7 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
       pr_clear_value (&first_midxkey_val);
     }
 
-  /* use last_key in scan_range */
-  /* last_key was read from the first index column, so its domain is that column's - not something to be derived
-   * from the value that happens to arrive (wf268 C4, E17). */
-  first_col_domain = isidp->bt_scan.btid_int.key_type->setdomain;
-
+  /* Replace only the skipped value. The compiler bound both ranges to the first index column's domain. */
   for (i = 0; i < scan_range_det.key_cnt; i++)
     {
       KEY_RANGE *kr = &(scan_range_det.key_ranges[i]);
@@ -616,8 +611,7 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
 	    {
 	      REGU_VARIABLE *regu = &kr->key1->value.funcp->operand->value;
 
-	      regu->type = TYPE_DBVAL;
-	      regu->domain = first_col_domain;
+	      assert (regu->type == TYPE_DBVAL);
 
 	      pr_clear_value (&regu->value.dbval);
 	      pr_clone_value (last_key, &regu->value.dbval);
@@ -633,8 +627,7 @@ scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_I
 	    {
 	      REGU_VARIABLE *regu = &kr->key2->value.funcp->operand->value;
 
-	      regu->type = TYPE_DBVAL;
-	      regu->domain = first_col_domain;
+	      assert (regu->type == TYPE_DBVAL);
 
 	      pr_clear_value (&regu->value.dbval);
 	      pr_clone_value (last_key, &regu->value.dbval);
@@ -3983,6 +3976,7 @@ scan_open_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 
   /* indicator whether covering index is used or not */
   coverage_enabled = (indx_info->coverage != 0) && (scan_op_type == S_SELECT) && !mvcc_select_lock_needed;
+  scan_id->scan_stats.index_skip_scan = indx_info->use_iss != 0;
   scan_id->scan_stats.loose_index_scan = indx_info->ils_prefix_len > 0;
 
   /* is a single range? */
