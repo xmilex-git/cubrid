@@ -1935,6 +1935,23 @@ btree_fix_root_with_info (THREAD_ENTRY * thread_p, BTID * btid, PGBUF_LATCH_MODE
 }
 
 /*
+ * btree_bind_stored_key_domain () - Attach the persisted schema to an encoded storage key.
+ *
+ * Heap/checkdb keys may carry bytes without a domain. This is storage entry binding, not SQL type inference:
+ * never replace a supplied comparison domain, whose precision/scale may intentionally preserve a search value.
+ * The schema is obtained from the index root and is cached independently of the key's lifetime.
+ */
+STATIC_INLINE void
+btree_bind_stored_key_domain (DB_VALUE * key, TP_DOMAIN * key_type)
+{
+  if (DB_VALUE_TYPE (key) == DB_TYPE_MIDXKEY && key->data.midxkey.domain == NULL)
+    {
+      assert (key_type != NULL && TP_DOMAIN_TYPE (key_type) == DB_TYPE_MIDXKEY);
+      key->data.midxkey.domain = key_type;
+    }
+}
+
+/*
  * btree_leaf_record_is_fence () - Return whether a leaf record is a fence key.
  *
  * return    : True if the record is a fence key.
@@ -6231,6 +6248,7 @@ btree_remake_foreign_key_with_PK (THREAD_ENTRY * thread_p, BTID * btid, DB_VALUE
 {
   DB_MIDXKEY midxkey;
   TP_DOMAIN *tp_dom = NULL;
+  TP_DOMAIN *fk_domain = NULL;
   TP_DOMAIN *setdomain_ptr = NULL;
   DB_VALUE new_key_dbvals_array[8];
   DB_VALUE *new_key_dbvals = NULL;
@@ -6301,10 +6319,18 @@ btree_remake_foreign_key_with_PK (THREAD_ENTRY * thread_p, BTID * btid, DB_VALUE
       setdomain_ptr = tp_dom;
     }
 
-  // ----------------------------------------------------------------------------------
+  /* Bind the target FK schema before publishing either range key. SQL RESTRICT/CASCADE/SET NULL callers
+   * use this producer too; the PK domain does not describe the added deduplicate column or FK ordering. */
+  fk_domain = btree_read_key_type (thread_p, btid);
+  if (fk_domain == NULL)
+    {
+      ASSERT_ERROR_AND_SET (ret);
+      goto clear_pos;
+    }
+
   /* build midxkey */
   midxkey.buf = NULL;
-  midxkey.domain = NULL;	// If you set it to NULL, btree_prepare_bts() will automatically set it.
+  midxkey.domain = fk_domain;
   midxkey.ncolumns = 0;
   midxkey.size = 0;
   midxkey.min_max_val.position = num_attrs;
@@ -9415,11 +9441,23 @@ btree_check_all (THREAD_ENTRY * thread_p)
 int
 btree_keyoid_checkscan_start (THREAD_ENTRY * thread_p, BTID * btid, BTREE_CHECKSCAN * btscan)
 {
+  PAGE_PTR root_page;
+  int error_code;
+
   assert (btid != NULL);
 
-  /* initialize scan structure */
+  /* Bind persisted index metadata once for the entire heap-to-index check, before its row loop. */
   btscan->btid = *btid;
   BTREE_INIT_SCAN (&btscan->btree_scan);
+  root_page = btree_fix_root_with_info (thread_p, &btscan->btid, PGBUF_LATCH_READ, NULL, NULL,
+                                      &btscan->btree_scan.btid_int);
+  if (root_page == NULL)
+    {
+      ASSERT_ERROR_AND_SET (error_code);
+      return error_code;
+    }
+  pgbuf_unfix_and_init (thread_p, root_page);
+  btscan->btree_scan.is_btid_int_valid = true;
 
   /* Initialize OID list. */
   btscan->oid_list.oidp = (OID *) os_malloc (ISCAN_OID_BUFFER_CAPACITY);
@@ -9463,8 +9501,11 @@ btree_keyoid_checkscan_check (THREAD_ENTRY * thread_p, BTREE_CHECKSCAN * btscan,
       return DISK_INVALID;
     }
 
-  /* initialize scan structure */
+  /* Reset the per-key cursor, retaining the schema bound by checkscan_start. BTREE_INIT_SCAN does not
+   * overwrite btid_int. scan_init_index_scan disables the check_not_vacuumed-only root check. */
   BTREE_INIT_SCAN (&btscan->btree_scan);
+  btscan->btree_scan.is_btid_int_valid = true;
+  btree_bind_stored_key_domain (key, btscan->btree_scan.btid_int.key_type);
 
   scan_init_index_scan (&isid, &btscan->oid_list, mvcc_snapshot);
 
@@ -9482,13 +9523,6 @@ btree_keyoid_checkscan_check (THREAD_ENTRY * thread_p, BTREE_CHECKSCAN * btscan,
 	btree_keyval_search (thread_p, &btscan->btid, S_SELECT, &btscan->btree_scan, &kv_range, cls_oid, NULL,
 			     &isid, false);
       assert (btscan->oid_list.oid_cnt <= btscan->oid_list.capacity);
-
-      if (DB_VALUE_DOMAIN_TYPE (key) == DB_TYPE_MIDXKEY && key->data.midxkey.domain == NULL)
-	{
-	  /* set the appropriate domain, as it might be needed for printing if the given key-oid pair does not exist in
-	   * the index. */
-	  key->data.midxkey.domain = btscan->btree_scan.btid_int.key_type;
-	}
 
       if (btscan->oid_list.oid_cnt < 0)
 	{
@@ -18090,11 +18124,8 @@ btree_coerce_key (DB_VALUE * keyp, int keysize, TP_DOMAIN * btree_domainp, int k
 	}
       else if (ssize == dsize)
 	{
-	  if (midxkey->domain == NULL)	/* checkdb */
-	    {
-	      midxkey->domain = btree_domainp;
-	    }
-
+	  /* Search-key producers must supply their comparison domain before value coercion. */
+	  assert (midxkey->domain != NULL);
 	  return NO_ERROR;
 	}
       else
@@ -18360,40 +18391,23 @@ btree_prepare_bts (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, BTID * btid, INDX_
       /* Root page is no longer needed. */
       pgbuf_unfix_and_init (thread_p, root_page);
 
-      /* TODO: Why is the below code here? What does constructing btid have to do with the issue described below?
-       * Shouldn't this be always verified? It doesn't look like belonging here. */
-      /*
-       * The asc/desc properties in midxkey from log_applier may be
-       * inaccurate. therefore, we should use btree header's domain while
-       * processing btree search request from log_applier.
-       */
-      if (DB_VALUE_TYPE (&kv_range->key1) == DB_TYPE_MIDXKEY)
+      /* Storage scan entry: these callers have no SQL-bound index descriptor. Attach the persisted schema
+       * before copying/comparing range keys. A supplied SQL comparison domain must retain its value precision.
+       * Log-applier exact lookup keys are different: their reconstructed asc/desc flags are not authoritative,
+       * so their storage representation is bound to the target index schema here, once before scanning. */
+      DB_VALUE *storage_keys[] = { &kv_range->key1, &kv_range->key2 };
+      for (i = 0; i < 2; i++)
 	{
-	  midxkey = db_get_midxkey (&kv_range->key1);
-	  if (midxkey->domain == NULL || LOG_CHECK_LOG_APPLIER (thread_p))
+	  DB_VALUE *storage_key = storage_keys[i];
+	  if (LOG_CHECK_LOG_APPLIER (thread_p) && DB_VALUE_TYPE (storage_key) == DB_TYPE_MIDXKEY)
 	    {
-	      /*
-	       * The asc/desc properties in midxkey from log_applier may be
-	       * inaccurate. therefore, we should use btree header's domain
-	       * while processing btree search request from log_applier.
-	       */
-	      if (midxkey->domain)
-		{
-		  tp_domain_free (midxkey->domain);
-		}
+	      midxkey = db_get_midxkey (storage_key);
+	      tp_domain_free (midxkey->domain);
 	      midxkey->domain = bts->btid_int.key_type;
 	    }
-	}
-      if (DB_VALUE_TYPE (&kv_range->key2) == DB_TYPE_MIDXKEY)
-	{
-	  midxkey = db_get_midxkey (&kv_range->key2);
-	  if (midxkey->domain == NULL || LOG_CHECK_LOG_APPLIER (thread_p))
+	  else
 	    {
-	      if (midxkey->domain)
-		{
-		  tp_domain_free (midxkey->domain);
-		}
-	      midxkey->domain = bts->btid_int.key_type;
+	      btree_bind_stored_key_domain (storage_key, bts->btid_int.key_type);
 	    }
 	}
 
@@ -25925,11 +25939,9 @@ btree_get_root_with_key (THREAD_ENTRY * thread_p, BTID * btid, BTID_INT * btid_i
     }
   assert (btid_int != NULL);
 
-  if (DB_VALUE_TYPE (key) == DB_TYPE_MIDXKEY && key->data.midxkey.domain == NULL)
-    {
-      /* Use domain from b-tree info. */
-      key->data.midxkey.domain = btid_int->key_type;
-    }
+  /* Unique-key/heap probes enter storage here without a SQL range descriptor. The root is the first
+   * authoritative schema available, before any leaf comparison; retain already-bound search-value domains. */
+  btree_bind_stored_key_domain (key, btid_int->key_type);
 
   *is_leaf = (root_header->node.node_level == 1);
   if (*is_leaf)
