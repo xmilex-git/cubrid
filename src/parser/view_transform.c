@@ -15346,6 +15346,16 @@ mq_rewrite_order_dependent_query (PARSER_CONTEXT * parser, PT_NODE * select, int
 	      parent->info.query.q.select.list = parser_append_node (attr, parent->info.query.q.select.list);
 	    }
 
+	  /* the spec's as_attr_list is the position map the parent reads the derived table by: entry i must be
+	   * column i of the list file the derived table delivers.  An entry was just made for this node whether
+	   * it is hidden or not, so the node has to be delivered whether it is hidden or not - a hidden column
+	   * is dropped on the way out and every attribute after it would then be read one position too far,
+	   * past the end of the tuple.  mq_rewrite_order_dependent_nodes () already un-hides the ones an order
+	   * dependent node reuses verbatim ("Whatever it was, now it is visible"), which is why the common shape
+	   * works; do it for the rest of them too.  The parent's own select list was decided just above and does
+	   * not gain the column, so the query's result is unchanged (D-286-OD1). */
+	  list->flag.is_hidden_column = 0;
+
 	  /* advance in list */
 	  list_prev = list;
 	  list = list_next;
