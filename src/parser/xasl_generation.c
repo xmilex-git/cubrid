@@ -12327,11 +12327,16 @@ pt_to_index_info (PARSER_CONTEXT * parser, DB_OBJECT * class_, PRED_EXPR * where
       return NULL;
     }
 
-  /* Carry the index key domain the optimizer already read from the statistics, so the scan does not have to
-   * read it from the index root again to know how a key range value reaches the key (wf268 #286 C6).  It is
-   * NULL when the optimizer had no statistics for this index, and the scan then falls back to the root.  The
-   * pointer belongs to the workspace class cache, so it is only read here and serialised into the stream. */
+  /* Carry the index key domain so the scan does not have to read it from the index root again to know how a
+   * key range value reaches the key (wf268 #286 C6).  The optimizer read it from the statistics; when there
+   * were none it left it NULL, and the schema answers instead -- the constraint describes the same key the
+   * index was built on.  Both pointers belong to the workspace class cache, so they are only read here and
+   * serialised into the stream. */
   indx_infop->key_domain = index_entryp->key_type;
+  if (indx_infop->key_domain == NULL)
+    {
+      indx_infop->key_domain = sm_index_key_domain (index_entryp->constraints);
+    }
 
   /* key limits */
   key_infop = &indx_infop->key_info;

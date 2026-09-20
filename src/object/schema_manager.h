@@ -303,6 +303,7 @@ extern void sm_init (OID * rootclass_oid, HFID * rootclass_hfid);
 #if defined (ENABLE_UNUSED_FUNCTION)	/* to disable TEXT */
 extern int sm_has_text_domain (DB_ATTRIBUTE * attributes, int check_all);
 #endif /* ENABLE_UNUSED_FUNCTION */
+extern TP_DOMAIN *sm_index_key_domain (SM_CLASS_CONSTRAINT * con);
 extern int sm_class_has_unique_constraint (MOBJ classobj, MOP classop, bool check_subclasses, bool * has_unique);
 extern int sm_att_unique_constrained (MOP classop, const char *name);
 extern int sm_att_in_unique_filter_constraint_predicate (MOP classop, const char *name);

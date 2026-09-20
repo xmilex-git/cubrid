@@ -643,6 +643,8 @@ struct pin_walk_ctx
   int error;			/* the first failure, which stops the walk */
 };
 static void qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up, PIN_WALK_CTX * ctx);
+static void qexec_pin_walk_regu_subplans (REGU_VARIABLE * regu, const PIN_WALK_FRAME * frame,
+					 PIN_WALK_CTX * ctx, int depth);
 static int qexec_propagate_pinned_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd,
 					   const XASL_NODE * owned_root);
 static int qexec_setup_aggregate_domains (AGGREGATE_TYPE * agg_list);
@@ -17827,6 +17829,68 @@ qexec_pin_fix_outputs (XASL_NODE * xasl)
 }
 
 /*
+ * qexec_pin_walk_regu_subplans () - reach the sub-plans a regu variable owns
+ *   return: void
+ *   regu(in): a regu variable that may own a sub-plan, or read one through an operand
+ *   frame(in): the walk frame of the node that owns this regu variable
+ *   ctx(in/out): the walk's context
+ *   depth(in): operand nesting depth, bounded like qexec_pin_fix_regu ()
+ *
+ *  Note: a scalar sub-query reached through EXECUTE_REGU_VARIABLE_XASL hangs off REGU_VARIABLE::xasl and is
+ *	  not on any of the node lists the walk follows -- the value list of an INSERT is where this shows up.
+ *	  Such a sub-plan produces rows like any other, so it needs the same settling before the mainblock, and
+ *	  it is the one shape scan_open_index_scan () still had to answer for itself (#286 A2).
+ */
+static void
+qexec_pin_walk_regu_subplans (REGU_VARIABLE * regu, const PIN_WALK_FRAME * frame, PIN_WALK_CTX * ctx, int depth)
+{
+  REGU_VARIABLE_LIST operand;
+
+  if (regu == NULL || depth > 32)
+    {
+      return;
+    }
+
+  if (regu->xasl != NULL)
+    {
+      qexec_propagate_pinned_domains_rec (regu->xasl, frame, ctx);
+    }
+
+  switch (regu->type)
+    {
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      if (regu->value.arithptr != NULL)
+	{
+	  qexec_pin_walk_regu_subplans (regu->value.arithptr->leftptr, frame, ctx, depth + 1);
+	  qexec_pin_walk_regu_subplans (regu->value.arithptr->rightptr, frame, ctx, depth + 1);
+	  qexec_pin_walk_regu_subplans (regu->value.arithptr->thirdptr, frame, ctx, depth + 1);
+	}
+      break;
+
+    case TYPE_FUNC:
+      if (regu->value.funcp != NULL)
+	{
+	  for (operand = regu->value.funcp->operand; operand != NULL; operand = operand->next)
+	    {
+	      qexec_pin_walk_regu_subplans (&operand->value, frame, ctx, depth + 1);
+	    }
+	}
+      break;
+
+    case TYPE_REGU_VAR_LIST:
+      for (operand = regu->value.regu_var_list; operand != NULL; operand = operand->next)
+	{
+	  qexec_pin_walk_regu_subplans (&operand->value, frame, ctx, depth + 1);
+	}
+      break;
+
+    default:
+      break;
+    }
+}
+
+/*
  * qexec_propagate_pinned_domains () - hand the pinned result types to the consumers the plan derives from them
  *   return: void
  *   xasl(in/out): the root of the execution
@@ -17891,6 +17955,39 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up,
     }
   qexec_propagate_pinned_domains_rec (xasl->connect_by_ptr, &frame, ctx);
   qexec_propagate_pinned_domains_rec (xasl->scan_ptr, &frame, ctx);
+
+  /* a sub-plan a regu variable owns is on no node list; it is still a producer, so it is settled first */
+  {
+    REGU_VARIABLE_LIST rv;
+
+    for (rv = (xasl->outptr_list != NULL ? xasl->outptr_list->valptrp : NULL); rv != NULL; rv = rv->next)
+      {
+	qexec_pin_walk_regu_subplans (&rv->value, &frame, ctx, 0);
+      }
+    if (xasl->type == INSERT_PROC)
+      {
+	int vi;
+
+	for (vi = 0; vi < xasl->proc.insert.num_val_lists; vi++)
+	  {
+	    if (xasl->proc.insert.valptr_lists[vi] == NULL)
+	      {
+		continue;
+	      }
+	    for (rv = xasl->proc.insert.valptr_lists[vi]->valptrp; rv != NULL; rv = rv->next)
+	      {
+		qexec_pin_walk_regu_subplans (&rv->value, &frame, ctx, 0);
+	      }
+	  }
+	if (xasl->proc.insert.odku != NULL)
+	  {
+	    for (vi = 0; vi < xasl->proc.insert.odku->num_assigns; vi++)
+	      {
+		qexec_pin_walk_regu_subplans (xasl->proc.insert.odku->assignments[vi].regu_var, &frame, ctx, 0);
+	      }
+	  }
+      }
+  }
   if (xasl->type == UNION_PROC || xasl->type == DIFFERENCE_PROC || xasl->type == INTERSECTION_PROC)
     {
       qexec_propagate_pinned_domains_rec (xasl->proc.union_.left, &frame, ctx);

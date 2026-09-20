@@ -10411,6 +10411,50 @@ fixup_self_reference_domains (MOP classop, SM_TEMPLATE * flat)
     }
 }
 
+/*
+ * sm_index_key_domain () - the key domain of an existing index, from the schema
+ *   return: the cached key domain, or NULL
+ *   con(in): the constraint that describes the index
+ *
+ *  Note: this is the same construction index creation performs (sm_load_online_index () and its siblings), so
+ *	  it answers what the index root actually holds.  The optimizer normally reads the key domain out of the
+ *	  statistics; when there are none, the compiler asks here instead, so that a plan always carries the key
+ *	  domain it needs to fix a key conversion before the scan opens (wf268 #286 C6).
+ */
+TP_DOMAIN *
+sm_index_key_domain (SM_CLASS_CONSTRAINT * con)
+{
+  int n_attrs;
+
+  if (con == NULL || con->attributes == NULL)
+    {
+      return NULL;
+    }
+
+  if (con->func_index_info != NULL)
+    {
+      if (con->func_index_info->attr_index_start == 0)
+	{
+	  /* a single column function index is keyed on the function result alone */
+	  return con->func_index_info->fi_domain;
+	}
+      return construct_index_key_domain (con->func_index_info->attr_index_start, con->attributes, con->asc_desc,
+					 con->attrs_prefix_length, con->func_index_info->col_id,
+					 con->func_index_info->fi_domain);
+    }
+
+  for (n_attrs = 0; con->attributes[n_attrs] != NULL; n_attrs++)
+    {
+      ;
+    }
+  if (n_attrs == 0)
+    {
+      return NULL;
+    }
+
+  return construct_index_key_domain (n_attrs, con->attributes, con->asc_desc, con->attrs_prefix_length, -1, NULL);
+}
+
 /* DISK STRUCTURE ALLOCATION */
 /*
  * construct_index_key_domain()
