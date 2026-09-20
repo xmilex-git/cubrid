@@ -17714,7 +17714,11 @@ qexec_pin_fix_regu (const XASL_NODE * xasl, REGU_VARIABLE * regu, int depth)
   switch (regu->type)
     {
     case TYPE_CONSTANT:
-      if (regu->domain != NULL && TP_DOMAIN_TYPE (regu->domain) == DB_TYPE_VARIABLE)
+      /* one producer answers both axes: the slot holds a value another part of the plan writes, so its type
+       * and its collation are that producer's (wf268 #286) */
+      if (regu->domain != NULL
+	  && (TP_DOMAIN_TYPE (regu->domain) == DB_TYPE_VARIABLE
+	      || TP_DOMAIN_COLLATION_FLAG (regu->domain) != TP_DOMAIN_COLL_NORMAL))
 	{
 	  TP_DOMAIN *dom = NULL;
 
@@ -18279,12 +18283,43 @@ qexec_pin_open_collations (THREAD_ENTRY * thread_p, const DOMAIN_PIN_PLAN * plan
 
       /* only a slot that reads no row is collected (stx_collect_open_collation ()), so this evaluates no row,
        * no sub-query and nothing with a side effect */
-      assert (regu->type == TYPE_POS_VALUE || regu->type == TYPE_DBVAL);
-
-      if (fetch_peek_dbval (thread_p, regu, vd, NULL, NULL, NULL, &peek) != NO_ERROR)
+      if (regu->type == TYPE_POS_VALUE || regu->type == TYPE_DBVAL)
 	{
-	  return ER_FAILED;
+	  /* the marker sits on this regu variable's own domain, and fetch_peek_dbval () replaces that domain
+	   * with the answer: marker and answer are the same field, so the slot closes. */
+	  if (fetch_peek_dbval (thread_p, regu, vd, NULL, NULL, NULL, &peek) != NO_ERROR)
+	    {
+	      return ER_FAILED;
+	    }
+	  continue;
 	}
+
+      /* An operator's result: the marker sits on arithptr->domain but fetch_peek_arith () writes the answer
+       * to the owning regu variable, so the marker never clears and the slot is re-decided on every row that
+       * reads it.  Settle it here in the field that carries it.
+       *
+       * The query might never have evaluated this expression -- a predicate can be satisfied before the
+       * branch holding it is reached -- so evaluating it here must not be able to raise an error the query
+       * would not have raised: a failure is swallowed and the slot is left as it is today. */
+      er_stack_push ();
+      if (fetch_peek_dbval (thread_p, regu, vd, NULL, NULL, NULL, &peek) == NO_ERROR
+	  && regu->domain != NULL && TP_DOMAIN_COLLATION_FLAG (regu->domain) == TP_DOMAIN_COLL_NORMAL
+	  && TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (regu->domain)))
+	{
+	  ARITH_TYPE *arithptr = regu->value.arithptr;
+	  TP_DOMAIN *settled = tp_domain_copy (arithptr->domain, false);
+
+	  if (settled != NULL)
+	    {
+	      /* keep the result type and precision the operator was compiled to produce; only the collation was
+	       * left open, and the answer is the one the evaluation just settled on. */
+	      settled->codeset = TP_DOMAIN_CODESET (regu->domain);
+	      settled->collation_id = TP_DOMAIN_COLLATION (regu->domain);
+	      settled->collation_flag = TP_DOMAIN_COLL_NORMAL;
+	      arithptr->domain = tp_domain_cache (settled);
+	    }
+	}
+      er_stack_pop ();
     }
 
   return NO_ERROR;

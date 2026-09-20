@@ -329,6 +329,73 @@ stx_collect_domain_pin (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var)
 }
 
 /*
+ * stx_regu_is_value_invariant () - the regu variable reads no row
+ *   return: true when every leaf is a bound value or a constant of the plan
+ *   regu(in): the regu variable to examine
+ *   depth(in): operand nesting depth, bounded
+ *
+ *  Note: such a regu variable answers the same before the first row as on every row, so whatever the compiler
+ *	  left open in it can be settled once, before the mainblock (wf268 #286).
+ */
+static bool
+stx_regu_is_value_invariant (const REGU_VARIABLE * regu, int depth)
+{
+  const regu_variable_list_node *operand;
+
+  if (regu == NULL || depth > 16 || regu->xasl != NULL)
+    {
+      return false;
+    }
+
+  switch (regu->type)
+    {
+    case TYPE_DBVAL:
+    case TYPE_POS_VALUE:
+      return true;
+
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      if (regu->value.arithptr == NULL || regu->value.arithptr->pred != NULL)
+	{
+	  return false;
+	}
+      if (regu->value.arithptr->leftptr != NULL
+	  && !stx_regu_is_value_invariant (regu->value.arithptr->leftptr, depth + 1))
+	{
+	  return false;
+	}
+      if (regu->value.arithptr->rightptr != NULL
+	  && !stx_regu_is_value_invariant (regu->value.arithptr->rightptr, depth + 1))
+	{
+	  return false;
+	}
+      if (regu->value.arithptr->thirdptr != NULL
+	  && !stx_regu_is_value_invariant (regu->value.arithptr->thirdptr, depth + 1))
+	{
+	  return false;
+	}
+      return true;
+
+    case TYPE_FUNC:
+      if (regu->value.funcp == NULL)
+	{
+	  return false;
+	}
+      for (operand = regu->value.funcp->operand; operand != NULL; operand = operand->next)
+	{
+	  if (!stx_regu_is_value_invariant (&operand->value, depth + 1))
+	    {
+	      return false;
+	    }
+	}
+      return true;
+
+    default:
+      return false;
+    }
+}
+
+/*
  * stx_collect_open_collation () - remember a value slot whose collation is still decided by the bound value
  *   return: NO_ERROR, or an error code
  *   regu_var(in): a value shaped regu variable whose domain carries a non NORMAL collation flag
@@ -5875,8 +5942,15 @@ stx_build_regu_variable (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABLE * reg
       return NULL;
     }
 
-  if (regu_var->domain != NULL && TP_DOMAIN_COLLATION_FLAG (regu_var->domain) != TP_DOMAIN_COLL_NORMAL
-      && (regu_var->type == TYPE_POS_VALUE || regu_var->type == TYPE_DBVAL))
+  /* a slot whose collation the compiler left open, and which answers without reading a row.  The marker may
+   * sit on the regu variable's own domain (a bound value) or on an operator's result domain (an expression
+   * over such values); both are collected, and the gate settles each in the field that carries its marker. */
+  if ((regu_var->domain != NULL && TP_DOMAIN_COLLATION_FLAG (regu_var->domain) != TP_DOMAIN_COLL_NORMAL
+       && (regu_var->type == TYPE_POS_VALUE || regu_var->type == TYPE_DBVAL))
+      || ((regu_var->type == TYPE_INARITH || regu_var->type == TYPE_OUTARITH)
+	  && regu_var->value.arithptr != NULL && regu_var->value.arithptr->domain != NULL
+	  && TP_DOMAIN_COLLATION_FLAG (regu_var->value.arithptr->domain) != TP_DOMAIN_COLL_NORMAL
+	  && stx_regu_is_value_invariant (regu_var, 0)))
     {
       if (stx_collect_open_collation (thread_p, regu_var) != NO_ERROR)
 	{
