@@ -540,6 +540,27 @@ typedef enum
   DEFAULT_EXPR_EVAL_BY_STATEMENT_ONLY
 } DEFAULT_EXPR_EVAL_MODE;
 
+/* The schema fixes every default source type. TO_CHAR consumes system string metadata for
+ * persisted formats; neither the generated value nor the format length selects a contract. */
+static TP_DOMAIN *
+do_default_to_char_domain (const SM_ATTRIBUTE *att)
+{
+  if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (att->domain)))
+    {
+      return att->domain;
+    }
+  switch (att->default_value.default_expr.default_expr_type)
+    {
+    case DB_DEFAULT_USER:
+    case DB_DEFAULT_CURR_USER:
+    case DB_DEFAULT_SYSGUID:
+      /* Preserve TO_CHAR's clone-and-retag contract for these statically character-valued defaults. */
+      return NULL;
+    default:
+      return &tp_String_domain;
+    }
+}
+
 /*
  * do_evaluate_default_expr_by_smclass () - evaluates default expressions for class attributes.
  *   return: Error code
@@ -580,6 +601,9 @@ do_evaluate_default_expr_by_smclass (PARSER_CONTEXT * parser, SM_CLASS * smclass
 	      continue;
 	    }
 
+          /* Attach the schema contract before evaluating any statement/row-dependent default value. */
+          result_domain = att->default_value.default_expr.default_expr_op == T_TO_CHAR
+                          ? do_default_to_char_domain (att) : NULL;
 	  error = NO_ERROR;
 	  switch (default_expr_type)
 	    {
@@ -743,27 +767,6 @@ do_evaluate_default_expr_by_smclass (PARSER_CONTEXT * parser, SM_CLASS * smclass
 	      lang_str = prm_get_string_value (PRM_ID_INTL_DATE_LANG);
 	      lang_set_flag_from_lang (lang_str, has_user_format, 0, &flag);
 	      db_make_int (&lang_val, flag);
-
-	      if (!TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (att->domain)))
-		{
-		  /* TO_CHAR returns a string value, we need to pass an expected domain of the result */
-		  if (TP_IS_CHAR_TYPE (DB_VALUE_TYPE (&default_value)))
-		    {
-		      result_domain = NULL;
-		    }
-		  else if (DB_IS_NULL (&format_val))
-		    {
-		      result_domain = tp_domain_resolve_default (DB_TYPE_STRING);
-		    }
-		  else
-		    {
-		      result_domain = tp_domain_resolve_value (&format_val, NULL);
-		    }
-		}
-	      else
-		{
-		  result_domain = att->domain;
-		}
 
 	      error = db_to_char (&default_value, &format_val, &lang_val, &att->default_value.value, result_domain);
 
