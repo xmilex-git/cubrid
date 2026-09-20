@@ -57,20 +57,6 @@ struct unpack_domain_pin
   UNPACK_DOMAIN_PIN *next;
 };
 
-/* A slot this unpack leaves open: a domain (or an aggregate operand type) the compiler could not decide, which
- * execution settles from this execution's values.  The tree is handed back to the clone pool holding what the
- * compiler produced, so what the compiler produced is remembered here rather than in a field of every node
- * (#286 D5).  A DB_TYPE slot is distinguished by dom_slot being NULL. */
-typedef struct unpack_open_slot UNPACK_OPEN_SLOT;
-struct unpack_open_slot
-{
-  struct tp_domain **dom_slot;	/* where execution writes a settled domain, or NULL for a DB_TYPE slot */
-  struct tp_domain *dom_compiled;
-  DB_TYPE *type_slot;		/* where execution writes a settled operand type, or NULL */
-  DB_TYPE type_compiled;
-  UNPACK_OPEN_SLOT *next;
-};
-
 /* structure to hold information needed during packing */
 typedef struct xasl_unpack_info XASL_UNPACK_INFO;
 struct xasl_unpack_info
@@ -108,10 +94,20 @@ struct xasl_unpack_info
   int domain_pin_cnt;
   UNPACK_DOMAIN_PIN *coll_pins;	/* value slots carrying an unresolved collation */
   int coll_pin_cnt;
-  /* the slots this tree leaves for execution to settle, newest first; turned into the root's open slot lists
-   * when the tree is complete (stx_build_domain_pin_plan ()) */
-  UNPACK_OPEN_SLOT *open_slots;
-  int open_slot_cnt;
+  /* Every domain and operand type slot of this tree, in unpack order.  These are the addresses execution is
+   * allowed to settle, and they are collected where the node is built rather than derived from a guess about
+   * who writes them - the field they replace was restored for every node the clear walk reached, so the only
+   * way to be sure the list is complete is to name the same nodes.  Only the addresses are gathered here; the
+   * compiled values are read off them when the root's list is built, because nothing settles a domain while
+   * the tree is still being unpacked.  Plain malloc, freed as soon as the root's list is built (or by
+   * free_xasl_unpack_info () if the unpack failed first): they must not outlive the unpack, and the unpack may
+   * run on the global heap while the free runs on a private one. */
+  struct tp_domain ***open_dom_slots;
+  int open_dom_cnt;
+  int open_dom_max;
+  DB_TYPE **open_type_slots;
+  int open_type_cnt;
+  int open_type_max;
 };
 
 XASL_UNPACK_INFO *get_xasl_unpack_info_ptr (THREAD_ENTRY *thread_p);

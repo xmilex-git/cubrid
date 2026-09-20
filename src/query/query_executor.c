@@ -17999,10 +17999,6 @@ qexec_propagate_pinned_domains_rec (XASL_NODE * xasl, const PIN_WALK_FRAME * up)
 	    }
 	}
 
-      /* the probe domain is not a slot the compiler left open, so it is not on the open slot list and nothing
-       * puts it back; the step does not need it to be.  The build list entry was picked with a precision other
-       * than the default, so after this runs once the test below is false for every later execution of the same
-       * tree, and the value it would have installed is the same one it already carries (#286 D5). */
       if (rest_regu_numeric != NULL && REGU_VARIABLE_GET_TYPE (&probe_regu->value) == DB_TYPE_NUMERIC
 	  && probe_regu->value.domain->precision == DB_DEFAULT_NUMERIC_PRECISION)
 	{
@@ -18170,8 +18166,9 @@ exit_on_error:
  *       the value the slot was bound to.  So the tree is put back the way the compiler produced it here, from
  *       the open slot list the unpack collected (DOMAIN_OPEN_SLOT in xasl.h).  Until #286 D5 this was done a
  *       node at a time on the clear walk, out of an original_domain / original_opr_dbtype field that every
- *       regu variable, arith node, position descriptor, aggregate and analytic function carried whether or not
- *       anything ever wrote to it.
+ *       regu variable, arith node, position descriptor, aggregate and analytic function carried.  The list
+ *       names those same nodes, all of them: which of them an execution actually writes is exactly what this
+ *       campaign has not finished establishing, so the list does not assume an answer to it.
  */
 void
 qexec_restore_compiled_domains (XASL_NODE * xasl)
@@ -18184,18 +18181,14 @@ qexec_restore_compiled_domains (XASL_NODE * xasl)
       return;
     }
 
-  for (i = 0; i < plan->n_open; i++)
+  for (i = 0; i < plan->n_open_domains; i++)
     {
-      DOMAIN_OPEN_SLOT *open_slot = &plan->open_slots[i];
+      *plan->open_domains[i].slot = plan->open_domains[i].compiled;
+    }
 
-      if (open_slot->dom_slot != NULL)
-	{
-	  *open_slot->dom_slot = open_slot->dom_compiled;
-	}
-      else
-	{
-	  *open_slot->type_slot = open_slot->type_compiled;
-	}
+  for (i = 0; i < plan->n_open_types; i++)
+    {
+      *plan->open_types[i].slot = plan->open_types[i].compiled;
     }
 }
 
