@@ -647,6 +647,7 @@ static int qexec_propagate_pinned_domains (THREAD_ENTRY * thread_p, XASL_NODE * 
 					   const XASL_NODE * owned_root);
 static int qexec_setup_aggregate_domains (AGGREGATE_TYPE * agg_list);
 static int qexec_pin_open_collations (THREAD_ENTRY * thread_p, const DOMAIN_PIN_PLAN * plan, VAL_DESCR * vd);
+static void qexec_pin_release_peeked (REGU_VARIABLE * regu, int depth);
 static int qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
 static int qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 					     UPDDEL_CLASS_INSTANCE_LOCK_INFO * p_class_instance_lock_info);
@@ -18183,6 +18184,65 @@ qexec_propagate_pinned_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_D
 }
 
 /*
+ * qexec_pin_release_peeked () - release the value a gate peek left behind in an operator slot
+ *   return: void
+ *   regu(in/out): the slot the gate evaluated; its operands are released with it
+ *   depth(in): operand nesting depth, bounded like stx_regu_is_value_invariant ()
+ *
+ * Note: the gate runs on the thread that owns the root, but the node holding this slot may be executed and
+ *       cleared by a parallel worker: execute_job_internal () runs an aptr of the same tree on the job's thread
+ *       and qexec_clear_xasl_for_parallel_aptr () frees whatever it finds in the slots there.  Private heaps are
+ *       per thread, so a value the gate's evaluation cached in the slot (fetch_peek_arith () keeps a value-
+ *       invariant result under REGU_VARIABLE_FETCH_ALL_CONST and never evaluates it again) would be freed on a
+ *       heap that did not allocate it -- mspace_free () aborts when it notices and corrupts both heaps when it
+ *       does not (#307).  The gate needs the answer the evaluation settled, which lives in the domain fields, not
+ *       the value: the value is released here, on the thread that allocated it, and the fetch flags are reset so
+ *       whichever thread executes the node evaluates the slot again in its own heap.  The same rule keeps a
+ *       worker's gate (qexec_install_pinned_domains ()) from leaving its allocation in a tree the root clears.
+ */
+static void
+qexec_pin_release_peeked (REGU_VARIABLE * regu, int depth)
+{
+  REGU_VARIABLE_LIST operand;
+
+  if (regu == NULL || depth > 16)
+    {
+      return;
+    }
+
+  REGU_VARIABLE_CLEAR_FLAG (regu, REGU_VARIABLE_FETCH_ALL_CONST);
+  REGU_VARIABLE_CLEAR_FLAG (regu, REGU_VARIABLE_FETCH_NOT_CONST);
+
+  switch (regu->type)
+    {
+    case TYPE_INARITH:
+    case TYPE_OUTARITH:
+      if (regu->value.arithptr != NULL)
+	{
+	  pr_clear_value (regu->value.arithptr->value);
+	  qexec_pin_release_peeked (regu->value.arithptr->leftptr, depth + 1);
+	  qexec_pin_release_peeked (regu->value.arithptr->rightptr, depth + 1);
+	  qexec_pin_release_peeked (regu->value.arithptr->thirdptr, depth + 1);
+	}
+      break;
+
+    case TYPE_FUNC:
+      if (regu->value.funcp != NULL)
+	{
+	  pr_clear_value (regu->value.funcp->value);
+	  for (operand = regu->value.funcp->operand; operand != NULL; operand = operand->next)
+	    {
+	      qexec_pin_release_peeked (&operand->value, depth + 1);
+	    }
+	}
+      break;
+
+    default:
+      break;
+    }
+}
+
+/*
  * qexec_pin_open_collations () - settle every collation the compiler left to a bound value
  *   return: NO_ERROR, or an error code
  *   plan(in): the root's pin plan, carrying the value slots that were collected when the tree was loaded
@@ -18242,6 +18302,9 @@ qexec_pin_open_collations (THREAD_ENTRY * thread_p, const DOMAIN_PIN_PLAN * plan
 	    }
 	}
       er_stack_pop ();
+
+      /* the answer is in the domain fields now; the value must not outlive the gate (see the helper) */
+      qexec_pin_release_peeked (regu, 0);
     }
 
   return NO_ERROR;
@@ -18303,6 +18366,9 @@ qexec_pin_execution_domains (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STA
 	}
 
       error = qexec_pin_domain_of_format (thread_p, format, &domains[i]);
+
+      /* the recipe is answered; a format computed by an operator must not stay in the slot (#307) */
+      qexec_pin_release_peeked (plan->recipes[i].format_regu, 0);
       if (error != NO_ERROR)
 	{
 	  goto exit_on_error;
