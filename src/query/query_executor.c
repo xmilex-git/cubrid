@@ -96,6 +96,8 @@
 #include "px_query_executor.hpp"
 #include <vector>
 #include "dblink_scan.h"
+#include "perf_monitor.h"
+#include "thread_manager.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -1481,6 +1483,10 @@ qexec_clear_arith_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ARITH_TYPE 
     }
 
   /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
+  if (list->domain != list->original_domain)
+    {
+      perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_RESTORE_CLONE);
+    }
   list->domain = list->original_domain;
   pr_clear_value (list->value);
   pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, list->leftptr, is_final, for_parallel_aptr);
@@ -1516,6 +1522,10 @@ qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE
     }
 
   /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
+  if (regu_var->domain != regu_var->original_domain)
+    {
+      perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_RESTORE_CLONE);
+    }
   regu_var->domain = regu_var->original_domain;
 
 #if !defined(NDEBUG)
@@ -1770,6 +1780,10 @@ qexec_clear_db_val_list (QPROC_DB_VALUE_LIST list)
 static void
 qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final)
 {
+  if (perfmon_is_perf_tracking () && position_descr->dom != position_descr->original_domain)
+    {
+      perfmon_inc_stat (thread_get_thread_entry_info (), PSTAT_QM_NUM_DOMAIN_RESTORE_CLONE);
+    }
   position_descr->dom = position_descr->original_domain;
 }
 
@@ -2298,6 +2312,10 @@ qexec_clear_analytic_function_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p,
 	  (void) pr_clear_value (p->value);
 	  (void) pr_clear_value (p->value2);
 	  (void) pr_clear_value (&p->part_value);
+	  if (p->domain != p->original_domain || p->opr_dbtype != p->original_opr_dbtype)
+	    {
+	      perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_RESTORE_CLONE);
+	    }
 	  p->domain = p->original_domain;
 	  p->opr_dbtype = p->original_opr_dbtype;
 	  pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, &p->operand, is_final, for_parallel_aptr);
@@ -2353,6 +2371,10 @@ qexec_clear_agg_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, AGGREGATE_TYP
 	}
 
       pg_cnt += qexec_clear_regu_variable_list (thread_p, xasl_p, p->operands, is_final, for_parallel_aptr);
+      if (p->domain != p->original_domain || p->opr_dbtype != p->original_opr_dbtype)
+        {
+          perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_RESTORE_CLONE);
+        }
       p->domain = p->original_domain;
       p->opr_dbtype = p->original_opr_dbtype;
     }
@@ -18013,6 +18035,7 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 		    {
 		      new_domain->precision = rest_regu_numeric->value.domain->precision;
 		      new_domain->scale = rest_regu_numeric->value.domain->scale;
+		      perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_RESOLVE_LIST);
 		      probe_regu->value.domain = new_domain;
 		    }
 		}
@@ -21201,6 +21224,10 @@ qexec_resolve_domains_on_sort_list (SORT_LIST * order_list, REGU_VARIABLE_LIST r
 	    }
 	  if (regu_list)
 	    {
+	      if (perfmon_is_perf_tracking ())
+	        {
+	          perfmon_inc_stat (thread_get_thread_entry_info (), PSTAT_QM_NUM_DOMAIN_RESOLVE_LIST);
+	        }
 	      orderby_ptr->pos_descr.dom = regu_list->value.domain;
 	    }
 	}
@@ -21226,6 +21253,11 @@ qexec_resolve_domains_for_group_by (BUILDLIST_PROC_NODE * buildlist, OUTPTR_LIST
   REGU_VARIABLE_LIST group_regu = NULL;
   REGU_VARIABLE_LIST reference_regu_list = reference_out_list->valptrp;
   AGGREGATE_TYPE *agg_p;
+
+  if (perfmon_is_perf_tracking ())
+    {
+      perfmon_inc_stat (thread_get_thread_entry_info (), PSTAT_QM_NUM_DOMAIN_RESOLVE_LIST);
+    }
 
   assert (buildlist != NULL && reference_regu_list != NULL);
 
@@ -21509,6 +21541,8 @@ qexec_resolve_domains_for_aggregation (THREAD_ENTRY * thread_p, AGGREGATE_TYPE *
   DB_VALUE *dbval;
   int error;
   HL_HEAPID save_heapid = 0;
+
+  perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_RESOLVE_AGG);
 
   /* fetch values */
   if (regu_list != NULL)
@@ -23139,6 +23173,7 @@ resolve_domain:
 	  int pos = regu_list->value.value.pos_descr.pos_no;
 	  if (pos <= type_list->type_cnt)
 	    {
+	      perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_RESOLVE_LIST);
 	      regu_list->value.value.pos_descr.dom = type_list->domp[pos];
 	      regu_list->value.domain = type_list->domp[pos];
 	    }
@@ -27787,6 +27822,10 @@ qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec)
 	  || TP_DOMAIN_COLLATION_FLAG (sort_spec->pos_descr.dom) != TP_DOMAIN_COLL_NORMAL)
 	{
 	  /* In cases like order by val + ?, the domain of the expression is not known at compile time */
+	  if (perfmon_is_perf_tracking ())
+	    {
+	      perfmon_inc_stat (thread_get_thread_entry_info (), PSTAT_QM_NUM_DOMAIN_COERCE_COMPARE);
+	    }
 	  cmp = tp_value_compare (left, right, 1, 1);
 	}
       else
