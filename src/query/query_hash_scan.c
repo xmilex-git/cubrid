@@ -416,10 +416,7 @@ qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *dat
   HASH_METHOD hash_list_scan_type;
   QFILE_TUPLE_VALUE_TYPE_LIST *type_list_p;
   DB_VALUE dbval;
-  const PR_TYPE *pr_type_p;
   int i;
-  char *tuple_p;
-  OR_BUF buf;
 
   if (data == NULL || type_list == NULL || args == NULL)
     {
@@ -438,8 +435,7 @@ qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *dat
       return false;
     }
 
-  QFILE_TUPLE_RECORD slot = { NULL, 0 };
-  int len;
+  QFILE_TUPLE_RECORD slot = QFILE_TUPLE_RECORD_INITIALIZER;
   bool is_null;
 
   db_make_null (&dbval);
@@ -455,12 +451,12 @@ qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *dat
     {
       fprintf (fp, "data_size = [%d], data = { ", QFILE_GET_TUPLE_LENGTH ((QFILE_TUPLE) data));
 
-      qfile_slot_fill (&slot, (char *) data, type_list_p);
+      qfile_slot_set_tuple_ptr_and_layout (&slot, (char *) data, 0, type_list_p);
 
       for (i = 0; i < type_list_p->type_cnt; i++)
 	{
-	  if (qfile_slot_read_value (&slot, i, type_list_p->domp[i], &dbval, false /* Don't copy */ , &is_null) == NO_ERROR
-	      && !is_null)
+	  if (qfile_slot_read_column_value (&slot, i, type_list_p->domp[i], &dbval, false /* Don't copy */ , &is_null)
+	      == NO_ERROR && !is_null)
 	    {
 	      db_fprint_value (fp, &dbval);
 

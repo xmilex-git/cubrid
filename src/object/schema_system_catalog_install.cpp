@@ -692,7 +692,7 @@ namespace cubschema
       {"filter_expression", format_varchar (1073741823)},
       {"have_function", "integer"},
       {"status", "integer"},
-      {"referential_index", CT_INDEX_NAME},
+      {"referential_class", "object"},
       {"delete_rule", "integer"},
       {"update_rule", "integer"},
       {"referential_match_option", "integer"},
@@ -1846,6 +1846,7 @@ namespace cubschema
       {"lang", format_varchar (16)},
       {"authid", format_varchar (16)},
       {"is_deterministic", format_varchar (3)},
+      {"is_parallel_enabled", format_varchar (3)},
       {"target", format_varchar (4096)},
       {"owner", format_varchar (DB_MAX_USER_LENGTH)},
       {"code", format_varchar (1073741823)},
@@ -2222,16 +2223,19 @@ namespace cubschema
   system_catalog_definition
   system_catalog_initializer::get_view_db_histogram ()
   {
-// db_class
     return system_catalog_definition (
 		   // name
 		   CTV_HISTOGRAM_NAME,
 		   // columns
     {
-      {"class_name", "object"},
-      {"key_attr", format_varchar (255)},
-      {"with_fullscan", format_varchar (32)},
-      {"null_frequency", "double"},
+      /* the view domain overrides the query spec result type, so class_name must be declared as a string
+       * (it was "object") and null_frequency must match the NUMERIC (18, 12) the spec casts to (CBRD-27043) */
+      {"owner_name", format_varchar (DB_MAX_USER_LENGTH)},
+      {"class_name", format_varchar (255)},
+      {"attr_name", format_varchar (255)},
+      {"scan_type", format_varchar (32)},
+      {"null_frequency", format_numeric (18, 12)},
+      // query specs
       {attribute_kind::QUERY_SPEC, sm_define_view_histogram_spec ()}
     },
 // constraint
