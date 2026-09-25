@@ -328,7 +328,17 @@ namespace parallel_scan
 		return;
 	      }
 	    tl.agg_hash_state = HS_ACCEPT_ALL;
-	    tl.g_agg_domains_resolved = FALSE;
+	    /* #341: the clone's aggregates are set up from the plan decisions it inherited, before its first row */
+	    if (qexec_setup_parallel_aggregates (thread_p, curr_xasl, vd, &tl.g_agg_domains_resolved) != NO_ERROR)
+	      {
+		m_err_messages_p->move_top_error_message_to_this();
+		m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		return;
+	      }
+	    if (tl.g_agg_domains_resolved)
+	      {
+		qdata_link_shared_accumulators (curr_xasl->proc.buildlist.g_agg_list);
+	      }
 	  }
 	/* setup failure leaves curr_xasl->topn_items NULL; worker falls back to plain BUILDLIST and final ORDER BY+LIMIT runs on main's concat list_id via qexec_orderby_distinct_by_sorting. */
 	tl.is_topn = false;
@@ -941,20 +951,19 @@ namespace parallel_scan
 	      {
 		if (unlikely (!tl.g_agg_domains_resolved))
 		  {
-		    perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_PX_RESOLVE);
-		    if (qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg (thread_p, tl.xasl, tl.vd,
-			&tl.g_agg_domains_resolved) != NO_ERROR)
+		    /* #341: what the clone's aggregates still take from their first values */
+		    if (qexec_parallel_aggregate_first_values (thread_p, tl.xasl, tl.vd, &tl.g_agg_domains_resolved)
+			!= NO_ERROR)
 		      {
 			m_err_messages_p->move_top_error_message_to_this();
 			m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
 			return false;
 		      }
-
-		    /* The serial path's marking does not reach a worker's own XASL copy.
-		     * Mark it here, once per worker, like the domain resolve above. */
-		    qexec_mark_aggregate_operand_expressions (tl.xasl);
-		    /* Sharing needs the resolved accumulator domains, so it is linked here. */
-		    qdata_link_shared_accumulators (tl.xasl->proc.buildlist.g_agg_list);
+		    if (tl.g_agg_domains_resolved)
+		      {
+			/* Sharing needs the accumulator domains, so it is linked once they are set. */
+			qdata_link_shared_accumulators (tl.xasl->proc.buildlist.g_agg_list);
+		      }
 		  }
 		if (qexec_hash_gby_agg_tuple_public (thread_p, tl.xasl, tl.vd->xasl_state, &tl.tpl_buf,
 						     & (tl.writer_result_p->tpl_descr), tl.writer_result_p, &output_tuple) != NO_ERROR)
@@ -1568,12 +1577,28 @@ namespace parallel_scan
     tl_xasl_p->proc.buildvalue.agg_domains_resolved = 0;
     for (AGGREGATE_TYPE *agg_node = tl_xasl_p->proc.buildvalue.agg_list; agg_node != NULL; agg_node = agg_node->next)
       {
-	bool ok;
 	/* #340: a worker's clone comes from the pool the leaders use and keeps the accumulator domains of the execution
-	 * that used it last (CBRD-27484), and the first row sets them up only when they are empty. Empty them as the
-	 * leader does before its scan, so this execution's binds and gate decisions set them. */
+	 * that used it last (CBRD-27484). Empty them as the leader does before its scan, so this execution's binds and
+	 * gate decisions set them. */
 	agg_node->accumulator_domain.value_dom = NULL;
 	agg_node->accumulator_domain.value2_dom = NULL;
+      }
+    /* #341: set up from the plan decisions the clone inherited before its lists open (initialize_node) */
+    if (qexec_setup_parallel_aggregates (thread_p, tl_xasl_p, vd, &tl_xasl_p->proc.buildvalue.agg_domains_resolved)
+	!= NO_ERROR)
+      {
+	m_err_messages_p->move_top_error_message_to_this ();
+	m_interrupt_p->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+	return;
+      }
+    if (tl_xasl_p->proc.buildvalue.agg_domains_resolved)
+      {
+	/* Sharing needs the accumulator domains, so it is linked once they are set. */
+	qdata_link_shared_accumulators (tl_xasl_p->proc.buildvalue.agg_list);
+      }
+    for (AGGREGATE_TYPE *agg_node = tl_xasl_p->proc.buildvalue.agg_list; agg_node != NULL; agg_node = agg_node->next)
+      {
+	bool ok;
 	switch (agg_node->function)
 	  {
 	  case PT_COUNT_STAR:
@@ -1667,7 +1692,7 @@ namespace parallel_scan
 
     if constexpr (F == PT_COUNT)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    if (agg_node->domain != NULL)
@@ -1685,7 +1710,7 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_MIN)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    acc_dom->value_dom = agg_node->domain;
@@ -1716,7 +1741,7 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_MAX)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    acc_dom->value_dom = agg_node->domain;
@@ -1747,7 +1772,7 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_SUM || F == PT_AVG)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    if (TP_IS_NUMERIC_TYPE (DB_VALUE_DOMAIN_TYPE (db_value_p)))
@@ -1849,7 +1874,7 @@ namespace parallel_scan
     else if constexpr (F == PT_STDDEV || F == PT_STDDEV_POP || F == PT_STDDEV_SAMP
 		       || F == PT_VARIANCE || F == PT_VAR_POP || F == PT_VAR_SAMP)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    acc_dom->value_dom = &tp_Double_domain;
@@ -1900,7 +1925,7 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_AGG_BIT_AND || F == PT_AGG_BIT_OR || F == PT_AGG_BIT_XOR)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    acc_dom->value_dom = agg_node->domain;
@@ -1969,7 +1994,7 @@ namespace parallel_scan
 	else
 	  {
 	    /* sort_list == NULL case; ORDER BY case is handled above */
-	    /* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	    /* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	    if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	      {
 		acc_dom->value_dom = agg_node->domain;
@@ -1993,7 +2018,7 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_JSON_ARRAYAGG)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    if (agg_node->domain != NULL)
@@ -2015,7 +2040,7 @@ namespace parallel_scan
       }
     else if constexpr (F == PT_JSON_OBJECTAGG)
       {
-	/* per-row domain fallback: qexec_resolve_domains_for_aggregation may leave NULL domain for covering index NULL values. */
+	/* per-row domain fallback (S-36, workspace#343): the setup (qexec_setup_parallel_aggregates) leaves no domain to a function whose decision has no value. */
 	if (acc_dom->value_dom == NULL || acc_dom->value_dom == &tp_Null_domain)
 	  {
 	    if (agg_node->domain != NULL)
@@ -2170,8 +2195,8 @@ namespace parallel_scan
   {
     if (!tl_xasl_p->proc.buildvalue.agg_domains_resolved)
       {
-	perfmon_inc_stat (thread_p, PSTAT_QM_NUM_DOMAIN_PX_RESOLVE);
-	if (qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_buildvalue_proc (thread_p, tl_xasl_p, tl_vd,
+	/* #341: what the clone's aggregates still take from their first values */
+	if (qexec_parallel_aggregate_first_values (thread_p, tl_xasl_p, tl_vd,
 	    &tl_xasl_p->proc.buildvalue.agg_domains_resolved) != NO_ERROR)
 	  {
 	    return false;
@@ -2179,9 +2204,8 @@ namespace parallel_scan
 
 	if (tl_xasl_p->proc.buildvalue.agg_domains_resolved)
 	  {
-	    /* Sharing needs the resolved accumulator domains, so it is linked here once
-	     * per worker. Any rows accumulated into a sharer before resolution are
-	     * overwritten during propagation; this only adds work, not a correctness issue.
+	    /* Sharing needs the accumulator domains, so it is linked once they are set. Any rows accumulated into a
+	     * sharer before are overwritten during propagation; this only adds work, not a correctness issue.
 	     */
 	    qdata_link_shared_accumulators (tl_xasl_p->proc.buildvalue.agg_list);
 	  }
