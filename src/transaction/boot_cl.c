@@ -112,6 +112,7 @@
 
 #if defined(SA_MODE)
 #include "catalog_class.h"
+#include "domain_resolver.h"
 #endif /* SA_MODE */
 
 #define BOOT_FORMAT_MAX_LENGTH 500
@@ -668,6 +669,10 @@ boot_restart_failure_cleanup (DB_INFO * db,
       sm_final ();
       ws_final ();
       es_final ();
+#if defined(SA_MODE)
+      /* the key pair table's string targets are cached domains (#354) */
+      domain_key_pairs_final ();
+#endif /* SA_MODE */
       tp_final ();
 
 #if !defined(WINDOWS)
@@ -1562,6 +1567,10 @@ boot_client_all_finalize (int final_level)
 	  method_callback_final ();
 	  ws_final ();
 	  es_final ();
+#if defined(SA_MODE)
+	  /* the key pair table's string targets are cached domains (#354) */
+	  domain_key_pairs_final ();
+#endif /* SA_MODE */
 	  tp_final ();
 	}
 
