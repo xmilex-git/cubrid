@@ -90,6 +90,18 @@ enum query_trace_format
 };
 typedef enum query_trace_format QUERY_TRACE_FORMAT;
 
+/* plan_cache_mode (CBRD-27583): how a statement whose binds have no expected domain is planned */
+enum plan_cache_mode
+{
+  PLAN_CACHE_MODE_AUTO = 0,	/* a plan per bind type signature, a generic plan past the variant limit */
+  PLAN_CACHE_MODE_FORCE_GENERIC,	/* one plan; variable binds resolve before execution */
+  PLAN_CACHE_MODE_FORCE_TYPED	/* a plan per signature, no limit */
+};
+typedef enum plan_cache_mode PLAN_CACHE_MODE;
+
+/* typed variants one statement handle compiles before it settles on the generic plan (auto) */
+#define PLAN_CACHE_TYPED_VARIANTS_MAX 8
+
 /* NOTE:
  * System parameter ids must respect the order in prm_Def array
  * When adding a new system paramter, insert it before PRM_LAST_ID and change PRM_LAST_ID to it
@@ -561,9 +573,10 @@ enum param_id
   PRM_ID_COST_CPU_TUPLES_PER_PAGE,
   PRM_ID_COST_EFFECTIVE_CACHE_PAGES,
   PRM_ID_COST_HEAP_FETCH_PER_OID,
+  PRM_ID_PLAN_CACHE_MODE,
 
   /* change PRM_LAST_ID when adding new system parameters */
-  PRM_LAST_ID = PRM_ID_COST_HEAP_FETCH_PER_OID
+  PRM_LAST_ID = PRM_ID_PLAN_CACHE_MODE
 };
 typedef enum param_id PARAM_ID;
 

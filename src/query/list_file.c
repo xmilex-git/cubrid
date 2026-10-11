@@ -939,6 +939,12 @@ qfile_unify_types (QFILE_LIST_ID * list_id1_p, const QFILE_LIST_ID * list_id2_p,
 		{
 		  /* OK for variable string types with different precision or json types */
 		}
+	      else if (type1 == DB_TYPE_NUMERIC && type2 == DB_TYPE_NUMERIC)
+		{
+		  /* NUMERIC columns of different precision or scale: the float NUMERIC column, every value reads
+		   * back in its own (CBRD-27583 D-27583-19) */
+		  list_id1_p->type_list.domp[i] = &tp_Numeric_domain;
+		}
 	      else
 		{
 		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INCOMPATIBLE_TYPES, 0);

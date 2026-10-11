@@ -1783,8 +1783,9 @@
 #define ER_QPROC_DOMAIN_UNRESOLVED                  -1383
 
 #define ER_QPROC_SESSION_VARIABLE_TYPE              -1384
+#define ER_QPROC_BIND_TYPE_MISMATCH                 -1385
 
-#define ER_LAST_ERROR                               -1385
+#define ER_LAST_ERROR                               -1386
 
 
 /*

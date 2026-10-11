@@ -814,7 +814,10 @@ domain_interpolation_final (int function, const TP_DOMAIN * domain, DB_TYPE argu
 static bool
 domain_function_is_late_bound (const TP_DOMAIN * compiled, const DOMAIN_OPERAND * operand)
 {
-  return operand->is_variable_pos || compiled == NULL || TP_DOMAIN_COLLATION_FLAG (compiled) != TP_DOMAIN_COLL_NORMAL;
+  /* a function the compiler did not type (VARIABLE: sum (?)) takes its argument's domain whether the argument is a
+   * variable POS (the generic plan) or a bind a typed plan compiled in the value's domain (CBRD-27583) */
+  return operand->is_variable_pos || compiled == NULL || TP_DOMAIN_TYPE (compiled) == DB_TYPE_VARIABLE
+    || TP_DOMAIN_COLLATION_FLAG (compiled) != TP_DOMAIN_COLL_NORMAL;
 }
 
 /*
@@ -1314,6 +1317,13 @@ domain_resolve_list_column (const DOMAIN_OPERAND * operands, int n_operands, RES
 	{
 	  domain = branch;
 	}
+      else if (branch != domain && TP_DOMAIN_TYPE (branch) == DB_TYPE_NUMERIC
+	       && TP_DOMAIN_TYPE (domain) == DB_TYPE_NUMERIC)
+	{
+	  /* NUMERIC branches of different precision or scale: the float NUMERIC column, every value in its own
+	   * (CBRD-27583 D-27583-19) */
+	  domain = &tp_Numeric_domain;
+	}
       else if (branch != domain
 	       && !(TP_DOMAIN_TYPE (branch) == TP_DOMAIN_TYPE (domain)
 		    && ((pr_is_string_type (TP_DOMAIN_TYPE (domain)) && pr_is_variable_type (TP_DOMAIN_TYPE (domain)))
@@ -1588,20 +1598,10 @@ domain_value_domain (const DB_VALUE * value)
       break;
 
     case DB_TYPE_NUMERIC:
-      {
-	/* a default precision or scale reads as NUMERIC's default */
-	int precision = db_value_precision (value);
-	int scale = db_value_scale (value);
-	if (precision == DB_DEFAULT_PRECISION)
-	  {
-	    precision = DB_DEFAULT_NUMERIC_PRECISION;
-	  }
-	if (scale == DB_DEFAULT_SCALE)
-	  {
-	    scale = DB_DEFAULT_NUMERIC_SCALE;
-	  }
-	domain = tp_domain_find_numeric (DB_TYPE_NUMERIC, precision, scale, false);
-      }
+      /* the float NUMERIC domain (CBRD-27583 D-27583-19): the value carries its precision and scale, the plan
+       * records neither -- a typed plan compiles a NUMERIC bind in this domain, and the generic plan resolves it
+       * to the same */
+      domain = &tp_Numeric_domain;
       break;
 
     default:
@@ -1614,8 +1614,9 @@ domain_value_domain (const DB_VALUE * value)
       return tp_domain_resolve_value (value, NULL);
     }
 #if !defined (NDEBUG)
-  /* debug cross-check (optdebug): tp_domain_resolve_value finds the same cached domain */
-  assert (domain == tp_domain_resolve_value (value, NULL));
+  /* debug cross-check (optdebug): tp_domain_resolve_value finds the same cached domain; a NUMERIC value's own
+   * precision and scale domain is answered by the float NUMERIC domain (D-27583-19) */
+  assert (domain == tp_domain_resolve_value (value, NULL) || domain == &tp_Numeric_domain);
 #endif
   return domain;
 }

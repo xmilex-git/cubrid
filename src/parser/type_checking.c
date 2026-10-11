@@ -14551,8 +14551,9 @@ pt_evaluate_db_value_expr (PARSER_CONTEXT * parser, PT_NODE * expr, PT_OP_TYPE o
 		bi1 = bi2 = 0;
 		if (typ1 != typ2)
 		  {
-		    assert (false);
-
+		    /* operands of two types: a LIMIT expression over host variables the client cast into different
+		     * expected domains (limit ?*?-?/?), peeked at a value-bound compile (pt_get_query_limit_from_limit)
+		     * -- no value, as for an unbound LIMIT */
 		    db_make_null (result);
 		    break;
 		  }

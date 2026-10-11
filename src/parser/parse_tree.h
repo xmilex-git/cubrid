@@ -3778,6 +3778,9 @@ struct parser_node
   TP_DOMAIN *expected_domain;	/* expected domain for input marker */
   PT_NODE *data_type;		/* for non-primitive types, Sets, objects stec. */
   XASL_ID *xasl_id;		/* XASL_ID for this SQL statement */
+  char *bind_signature;		/* CBRD-27583: the bind type signature xasl_id was compiled under (a typed plan);
+				 * NULL = the generic plan. Freed with xasl_id. */
+  unsigned char n_bind_signatures;	/* typed plans this statement has compiled (the generic fallback counts) */
   const char *alias_print;	/* the column alias */
   PARSER_VARCHAR *expr_before_const_folding;	/* text before constant folding (used by value, host var nodes) */
   PT_TYPE_ENUM type_enum;	/* type enumeration tag PT_TYPE_??? */
@@ -3915,6 +3918,8 @@ struct parser_context
   QUERY_ID query_id;		/* id assigned to current query */
   DB_VALUE *host_variables;	/* host variables place holder; DB_VALUE array */
   TP_DOMAIN **host_var_expected_domains;	/* expected domains for host variables */
+  const char *typed_bind_signature;	/* CBRD-27583: while a typed plan is prepared, the statement's bind type
+					 * signature (flag.typed_bind_plan); the cache key text carries it */
   EXECUTION_STATE_VALUES execution_values;	/* values kept across the execution of statements during a client
 						 * session. */
   int host_var_count;		/* number of input host variables */
@@ -3969,6 +3974,8 @@ struct parser_context
     unsigned abort:1;		/* this flag is for aborting a transaction */
     /* if deadlock occurs during query execution */
     unsigned set_host_var:1;	/* 1 if the user has set host variables */
+    unsigned typed_bind_plan:1;	/* CBRD-27583: the plan being generated is a typed plan (statement->bind_signature):
+				 * every host variable's regu domain is the bound value's domain */
     unsigned dont_prt_long_string:1;	/* make pt_print_value fail if the string is too long to print */
     unsigned long_string_skipped:1;	/* pt_print_value sets it to 1 when it skipped printing a long string */
     unsigned print_type_ambiguity:1;	/* pt_print_value sets it to 1 when it printed a value whose type cannot be

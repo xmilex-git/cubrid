@@ -827,6 +827,7 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 #define PRM_NAME_COST_CPU_TUPLES_PER_PAGE "cost_cpu_tuples_per_page"
 #define PRM_NAME_COST_EFFECTIVE_CACHE_PAGES "cost_effective_cache_pages"
 #define PRM_NAME_COST_HEAP_FETCH_PER_OID "cost_heap_fetch_per_oid"
+#define PRM_NAME_PLAN_CACHE_MODE "plan_cache_mode"
 
 // #endregion
 
@@ -5680,6 +5681,24 @@ SYSPRM_PARAM prm_Def[] = {
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},
+  /* CBRD-27583: how a statement with variable-domain binds (no expected domain: a numeric comparison,
+   * arithmetic, a function argument) is planned. auto: a plan per bind type signature (the signature is
+   * appended to the cache key), falling back to one generic plan -- every variable POS resolved before
+   * execution from the bound values -- once a statement handle has compiled PLAN_CACHE_TYPED_VARIANTS_MAX
+   * signatures; force_generic: the generic plan only; force_typed: a plan per signature, no fallback.
+   * Client-side: the client builds the signature and chooses the plan; the server only sees the key. */
+  {PRM_ID_PLAN_CACHE_MODE,
+   PRM_NAME_PLAN_CACHE_MODE,
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_SESSION),
+   PRM_KEYWORD,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.i = PLAN_CACHE_MODE_AUTO}},
+   {false, {.i = PLAN_CACHE_MODE_AUTO}},
+   {false, {.i = PLAN_CACHE_MODE_FORCE_TYPED}},
+   {false, {.i = PLAN_CACHE_MODE_AUTO}},
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
 };
 
 /* The PL server (cub_pl) is a separate Java process that hard-codes the ordinals of the
@@ -5873,6 +5892,12 @@ static const KEYVAL check_peer_alive_words[] = {
 static const KEYVAL query_trace_format_words[] = {
   {"text", QUERY_TRACE_TEXT},
   {"json", QUERY_TRACE_JSON},
+};
+
+static const KEYVAL plan_cache_mode_words[] = {
+  {"auto", PLAN_CACHE_MODE_AUTO},
+  {"force_generic", PLAN_CACHE_MODE_FORCE_GENERIC},
+  {"force_typed", PLAN_CACHE_MODE_FORCE_TYPED},
 };
 
 static const KEYVAL fi_test_words[] = {
@@ -7872,6 +7897,9 @@ prm_get_keyval (const SYSPRM_PARAM * prm, int value, const char *name)
 
     case PRM_ID_QUERY_TRACE_FORMAT:
       return prm_keyword (value, name, query_trace_format_words, DIM (query_trace_format_words));
+
+    case PRM_ID_PLAN_CACHE_MODE:
+      return prm_keyword (value, name, plan_cache_mode_words, DIM (plan_cache_mode_words));
 
     case PRM_ID_FAULT_INJECTION_TEST:
       return prm_keyword (value, name, fi_test_words, DIM (fi_test_words));

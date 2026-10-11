@@ -4090,11 +4090,27 @@ do_prepare_statement (PARSER_CONTEXT * parser, PT_NODE * statement)
 
   init_compile_context (parser);
 
+  /* CBRD-27583: a statement with a bind type signature prepares its typed plan: every host variable is
+   * compiled in the bound value's domain and the cache key text carries the signature. The nested prepares
+   * (an UPDATE's SELECT, a cached subquery) read the same parser flag. */
+  parser->flag.typed_bind_plan = (statement->bind_signature != NULL);
+  parser->typed_bind_signature = statement->bind_signature;
+  /* a typed plan is generated from the bound values' types, not from the values (D-27583-21): the generation sees
+   * the host variables unbound, as PREPARE does -- no constant folding, no coercion of a value, no UPDATE assignment
+   * constant baked into the cached plan -- while pt_make_regu_hostvar reads the values' domains and the optimizer
+   * their selectivity directly (parser->host_variables). The LIMIT peek (pt_get_query_limit_from_limit) binds them
+   * for its own span, as it does for the bound-limit recompile (db_check_limit_need_recompile) */
+  const unsigned save_set_host_var = parser->flag.set_host_var;
+  if (parser->flag.typed_bind_plan)
+    {
+      parser->flag.set_host_var = 0;
+    }
+
   /* All CTE and sub-queries included in the query must be prepared first. */
   err = do_check_subquery_cache (parser, statement);
   if (err != NO_ERROR)
     {
-      return err;
+      goto err_exit;
     }
 
   switch (statement->node_type)
@@ -4126,8 +4142,62 @@ do_prepare_statement (PARSER_CONTEXT * parser, PT_NODE * statement)
     }
 
 err_exit:
+  parser->flag.set_host_var = save_set_host_var;
+  parser->flag.typed_bind_plan = 0;
+  parser->typed_bind_signature = NULL;
   return ((err == ER_FAILED && (err = er_errid ()) == NO_ERROR) ? ER_GENERIC_ERROR : err);
 }				/* do_prepare_statement() */
+
+/*
+ * do_prepare_hash_text () - CBRD-27583: the XASL cache key text of a statement and its SHA-1. The text is the
+ *   statement's hash print plus, for a typed plan, the bind type signature of the positions the plan compiles
+ *   from values: every auto-parameter's literal type (`id = 5` and `id = 5.5` are two typed plans, each in its
+ *   literal's type) and the host variables the client does not cast (parser->typed_bind_signature). A generic
+ *   plan keeps the hash print alone (develop's key): its variable positions resolve before execution.
+ *   return : error code
+ */
+static int
+do_prepare_hash_text (PARSER_CONTEXT * parser, PT_NODE * statement, COMPILE_CONTEXT * contextp)
+{
+  contextp->sql_hash_text = (char *) statement->alias_print;
+  if (parser->flag.typed_bind_plan)
+    {
+      char stack_buf[1024];
+      const int from = parser->host_var_count;
+      const int to = from + parser->auto_param_count;
+      const size_t needed = (size_t) (to - from) * 12 + 1;
+      char *buf = needed <= sizeof (stack_buf) ? stack_buf : (char *) malloc (needed);
+      if (buf == NULL)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, needed);
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      const int len =
+	pt_bind_type_signature (parser, from, to, buf, needed <= sizeof (stack_buf) ? sizeof (stack_buf) : needed);
+      assert (len >= 0);
+      const char *typed = parser->flag.typed_bind_plan ? parser->typed_bind_signature : NULL;
+      if (len > 0 || typed != NULL)
+	{
+	  PARSER_VARCHAR *text = pt_append_nulstring (parser, NULL, statement->alias_print);
+	  text = pt_append_nulstring (parser, text, "?bt=");
+	  if (len > 0)
+	    {
+	      text = pt_append_nulstring (parser, text, buf);
+	    }
+	  if (typed != NULL)
+	    {
+	      text = pt_append_nulstring (parser, text, typed);
+	    }
+	  contextp->sql_hash_text = (char *) pt_get_varchar_bytes (text);
+	}
+      if (buf != stack_buf)
+	{
+	  free (buf);
+	}
+    }
+  return SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
+		      &contextp->sha1);
+}
 
 /*
  * do_execute_statement() - Execute a prepared statement
@@ -9926,10 +9996,7 @@ do_prepare_update (PARSER_CONTEXT * parser, PT_NODE * statement)
 	  parser->flag.long_string_skipped = 0;
 	  parser->flag.print_type_ambiguity = 0;
 	  PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-	  contextp->sql_hash_text = (char *) statement->alias_print;
-	  err =
-	    SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
-			 &contextp->sha1);
+	  err = do_prepare_hash_text (parser, statement, contextp);
 	  if (err != NO_ERROR)
 	    {
 	      ASSERT_ERROR ();
@@ -11308,10 +11375,7 @@ do_prepare_delete (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE * paren
 	  parser->flag.long_string_skipped = 0;
 	  parser->flag.print_type_ambiguity = 0;
 	  PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-	  contextp->sql_hash_text = (char *) statement->alias_print;
-	  err =
-	    SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
-			 &contextp->sha1);
+	  err = do_prepare_hash_text (parser, statement, contextp);
 	  if (err != NO_ERROR)
 	    {
 	      ASSERT_ERROR ();
@@ -11969,10 +12033,7 @@ do_prepare_insert_internal (PARSER_CONTEXT * parser, PT_NODE * statement)
   parser->flag.long_string_skipped = 0;
   parser->flag.print_type_ambiguity = 0;
   PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-  contextp->sql_hash_text = (char *) statement->alias_print;
-  error =
-    SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
-		 &contextp->sha1);
+  error = do_prepare_hash_text (parser, statement, contextp);
   if (error != NO_ERROR)
     {
       ASSERT_ERROR ();
@@ -15272,10 +15333,7 @@ do_prepare_select (PARSER_CONTEXT * parser, PT_NODE * statement)
   PT_NODE_PRINT_TO_ALIAS (parser, statement,
 			  (CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_DIFFERENT_SYSTEM_PARAMETERS | PT_PRINT_LOWER));
 
-  contextp->sql_hash_text = (char *) statement->alias_print;
-  err =
-    SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
-		 &contextp->sha1);
+  err = do_prepare_hash_text (parser, statement, contextp);
   if (err != NO_ERROR)
     {
       ASSERT_ERROR ();
@@ -18344,9 +18402,7 @@ do_prepare_merge (PARSER_CONTEXT * parser, PT_NODE * statement)
       parser->flag.long_string_skipped = 0;
       parser->flag.print_type_ambiguity = 0;
       PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-      contextp->sql_hash_text = (char *) statement->alias_print;
-      err = SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
-			 &contextp->sha1);
+      err = do_prepare_hash_text (parser, statement, contextp);
       if (err != NO_ERROR)
 	{
 	  ASSERT_ERROR ();

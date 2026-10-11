@@ -10094,6 +10094,72 @@ pt_partition_name (PARSER_CONTEXT * parser, const char *class_name, const char *
 }
 
 /*
+ * pt_bind_type_signature () - CBRD-27583: the bind type signature of host variables [from, to): one token per
+ *   variable POS -- a position the client does not cast (no expected domain, an ENUM, an ENFORCE collation) and
+ *   every auto-parameter (to >= host_var_count) -- in position order: n (NULL), c/s<codeset>.<collation> (CHAR /
+ *   VARCHAR), N (NUMERIC: the float NUMERIC domain, the value carries its precision and scale), else the
+ *   DB_TYPE number. A typed plan compiles these positions in these domains and keys its cache entry by the text.
+ *   return : the signature length, 0 when the range has no variable POS, -1 when buf is too small
+ *   buf (out), size (in): the caller's buffer; (to - from) * 12 + 1 bytes always suffice
+ */
+int
+pt_bind_type_signature (const PARSER_CONTEXT * parser, int from, int to, char *buf, size_t size)
+{
+  int len = 0;
+  for (int i = from; i < to; i++)
+    {
+      if (i < parser->host_var_count)
+	{
+	  const TP_DOMAIN *expected = parser->host_var_expected_domains[i];
+	  if (expected != NULL && TP_DOMAIN_TYPE (expected) != DB_TYPE_UNKNOWN
+	      && TP_DOMAIN_TYPE (expected) != DB_TYPE_ENUMERATION && expected->collation_flag != TP_DOMAIN_COLL_ENFORCE)
+	    {
+	      /* the client casts the value into the expected domain: the plan domain, whatever the value */
+	      continue;
+	    }
+	}
+      const DB_VALUE *val = &parser->host_variables[i];
+      const DB_TYPE type = DB_IS_NULL (val) ? DB_TYPE_NULL : DB_VALUE_DOMAIN_TYPE (val);
+      char token[16];
+      int n;
+      if (type == DB_TYPE_NULL)
+	{
+	  n = snprintf (token, sizeof (token), "%dn,", i);
+	}
+      else if (TP_IS_CHAR_TYPE (type) && i < parser->host_var_count)
+	{
+	  /* a string bind: its type and codeset; its collation is left to each execution (the typed plan compiles
+	   * the position with TP_DOMAIN_COLL_LEAVE, D-27583-20), so `set names` changes no plan */
+	  n = snprintf (token, sizeof (token), "%d%c%d,", i, type == DB_TYPE_CHAR ? 'c' : 's',
+			db_get_string_codeset (val));
+	}
+      else if (TP_IS_CHAR_TYPE (type))
+	{
+	  /* an auto-parameterized literal: its type only. Its codeset and collation are the compiling session's,
+	   * and a prepared statement keeps its prepare-time collation through the shared plan when the client
+	   * recompiles it under another session collation (csql EXECUTE; bug_bts_10057, issue_8391) */
+	  n = snprintf (token, sizeof (token), "%d%c,", i, type == DB_TYPE_CHAR ? 'c' : 's');
+	}
+      else if (type == DB_TYPE_NUMERIC)
+	{
+	  /* every NUMERIC is the float NUMERIC domain (D-27583-19): the value carries its own precision and scale */
+	  n = snprintf (token, sizeof (token), "%dN,", i);
+	}
+      else
+	{
+	  n = snprintf (token, sizeof (token), "%d:%d,", i, (int) type);
+	}
+      if (n < 0 || (size_t) (len + n) >= size)
+	{
+	  return -1;
+	}
+      memcpy (buf + len, token, (size_t) n + 1);
+      len += n;
+    }
+  return len;
+}
+
+/*
  * pt_free_statement_xasl_id () - free XASL_ID object of a prepared statement
  * return : void
  * statement (in) : statement
@@ -10109,6 +10175,10 @@ pt_free_statement_xasl_id (PT_NODE * statement)
   if (statement->xasl_id != NULL)
     {
       free_and_init (statement->xasl_id);
+    }
+  if (statement->bind_signature != NULL)
+    {
+      free_and_init (statement->bind_signature);
     }
 
   if (statement->node_type == PT_DELETE)

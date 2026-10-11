@@ -697,6 +697,7 @@ extern "C"
 
   extern const char *pt_partition_name (PARSER_CONTEXT * parser, const char *class_name, const char *partition);
   extern void pt_free_statement_xasl_id (PT_NODE * statement);
+  extern int pt_bind_type_signature (const PARSER_CONTEXT * parser, int from, int to, char *buf, size_t size);
   extern int pt_check_enum_data_type (PARSER_CONTEXT * parser, PT_NODE * dt);
   extern bool pt_recompile_for_limit_optimizations (PARSER_CONTEXT * parser, PT_NODE * statement, int xasl_flag);
   extern bool pt_recompile_for_like_optimizations (PARSER_CONTEXT * parser, PT_NODE * statement, int xasl_flag);

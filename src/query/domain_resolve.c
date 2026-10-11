@@ -3028,20 +3028,23 @@ qexec_resolve_domains_internal (THREAD_ENTRY * thread_p, xasl_node * xasl, xasl_
 		  qexec_convert_list_bind (&resolved.vals[ref], item->fixed.domain);
 		  continue;
 		}
-#if !defined (NDEBUG)
 	      if (!(item->flags & DOMAIN_PLAN_LATE_BIND) && item->fixed.domain != NULL && !DB_IS_NULL (source)
 		  && !(item->flags & DOMAIN_PLAN_CONSUMER_CONVERTS))
 		{
 		  /* "value type == plan domain" for every bind the compiler typed: the client cast
-		   * the value into the plan domain; CHAR vs VARCHAR is the kept original value. A statement
-		   * sharing the plan - a literal form and its bind form - binds another type only where the plan
-		   * does not read it as the compiled type: a comparison or a key resolves by the value, an assignment
-		   * converts it into its attribute's domain (heap_attrinfo_set), an output list's bind above */
+		   * the value into the plan domain, or (CBRD-27583) chose the plan compiled for the value's
+		   * type signature; CHAR vs VARCHAR is the kept original value. Any other value is a plan the
+		   * client should not have run with these values: an error, not a silent read in the wrong type. */
 		  const DB_TYPE plan_type = TP_DOMAIN_TYPE (item->fixed.domain);
 		  const DB_TYPE value_type = DB_VALUE_DOMAIN_TYPE (source);
-		  assert (plan_type == value_type || (TP_IS_CHAR_TYPE (plan_type) && TP_IS_CHAR_TYPE (value_type)));
+		  if (plan_type != value_type && !(TP_IS_CHAR_TYPE (plan_type) && TP_IS_CHAR_TYPE (value_type)))
+		    {
+		      assert (false);
+		      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_BIND_TYPE_MISMATCH, 3, val_pos,
+			      pr_type_name (value_type), pr_type_name (plan_type));
+		      return ER_QPROC_BIND_TYPE_MISMATCH;
+		    }
 		}
-#endif
 	    }
 	}
       else if (ref < dbval_cnt && (plan == NULL || ref < plan->dbval_cnt))

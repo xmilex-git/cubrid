@@ -232,6 +232,7 @@ static SORT_LIST *pt_to_sort_list (PARSER_CONTEXT * parser, PT_NODE * node_list,
 static int regu_make_constant_vid (DB_VALUE * val, DB_VALUE ** dbvalptr);
 static int set_has_objs (DB_SET * seq);
 static int setof_mop_to_setof_vobj (PARSER_CONTEXT * parser, DB_SET * seq, DB_VALUE * new_val);
+static DB_TYPE pt_typed_bind_type (const PARSER_CONTEXT * parser, const PT_NODE * node);
 static REGU_VARIABLE *pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node);
 static REGU_VARIABLE *pt_make_regu_reguvalues_list (PARSER_CONTEXT * parser, const PT_NODE * node, UNBOX unbox);
 static REGU_VARIABLE *pt_make_regu_constant (PARSER_CONTEXT * parser, DB_VALUE * db_value, const DB_TYPE db_type,
@@ -4133,6 +4134,12 @@ pt_to_aggregate_node (PARSER_CONTEXT * parser, PT_NODE * tree, void *arg, int *c
 	      regu_dbval_type_init (aggregate_list->accumulator.value2, pt_node_to_db_type (tree));
 	    }
 	  aggregate_list->opr_dbtype = pt_node_to_db_type (tree->info.function.arg_list);
+	  if (aggregate_list->opr_dbtype == DB_TYPE_VARIABLE)
+	    {
+	      /* a typed plan compiles a bind argument in the value's type (avg (?): the setup keys the accumulator on
+	       * the operand type the compiler gave, and no execution resolves one) */
+	      aggregate_list->opr_dbtype = pt_typed_bind_type (parser, tree->info.function.arg_list);
+	    }
 
 	  if (info->out_list && info->value_list && info->regu_list)
 	    {
@@ -6422,6 +6429,24 @@ failure:
 
 
 /*
+ * pt_typed_bind_type () - the type a typed plan (CBRD-27583: parser->flag.typed_bind_plan, a plan compiled for one
+ *   bind type signature and keyed by it) compiles a user host variable in: the bound value's type for the classes the
+ *   signature keys (a number, a string, a BIT, a date or time); DB_TYPE_VARIABLE for any other node or plan
+ */
+static DB_TYPE
+pt_typed_bind_type (const PARSER_CONTEXT * parser, const PT_NODE * node)
+{
+  if (!parser->flag.typed_bind_plan || node == NULL || node->node_type != PT_HOST_VAR
+      || node->info.host_var.index >= parser->host_var_count)
+    {
+      return DB_TYPE_VARIABLE;
+    }
+  const DB_TYPE typ = DB_VALUE_DOMAIN_TYPE (&parser->host_variables[node->info.host_var.index]);
+  return (TP_IS_NUMERIC_TYPE (typ) || TP_IS_CHAR_TYPE (typ) || TP_IS_BIT_TYPE (typ) || TP_IS_DATE_OR_TIME_TYPE (typ))
+    ? typ : DB_TYPE_VARIABLE;
+}
+
+/*
  * pt_make_regu_hostvar () - takes a pt_node of host variable and make
  *                           a regu_variable of host variable reference
  *   return:
@@ -6484,8 +6509,13 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
       /* A user host variable never takes its domain from the bound value, so the plan does
        * not depend on the values; the client casts the value to its expected
        * domain. An auto-parameter's value is its literal, so it keeps the literal
-       * domain. */
-      if (regu->domain == NULL && node->info.host_var.index >= parser->host_var_count && typ != DB_TYPE_NULL)
+       * domain. CBRD-27583: a typed plan (parser->flag.typed_bind_plan) is compiled for one bind type
+       * signature and keyed by it, so its user host variables take the bound value's domain like an
+       * auto-parameter -- a string at floating precision, a NUMERIC as the float NUMERIC domain -- and no
+       * position is left to resolve_domains. */
+      const bool typed_bind = pt_typed_bind_type (parser, node) != DB_TYPE_VARIABLE;
+      if (regu->domain == NULL && typ != DB_TYPE_NULL
+	  && (node->info.host_var.index >= parser->host_var_count || typed_bind))
 	{
 	  TP_DOMAIN *domain;
 	  if (TP_IS_CHAR_TYPE (typ))
@@ -6496,8 +6526,14 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
 		{
 		  regu->domain->codeset = db_get_string_codeset (val);
 		  regu->domain->collation_id = db_get_string_collation (val);
-		  regu->domain->precision = db_value_precision (val);
+		  regu->domain->precision = typed_bind ? TP_FLOATING_PRECISION_VALUE : db_value_precision (val);
 		  regu->domain->scale = db_value_scale (val);
+		  if (typed_bind)
+		    {
+		      /* the bind type signature keys the type and codeset only (D-27583-20): the collation is the
+		       * bound value's at each execution, as a LEAVE expected domain leaves it */
+		      regu->domain->collation_flag = TP_DOMAIN_COLL_LEAVE;
+		    }
 		  regu->domain = tp_domain_cache (regu->domain);
 		  if (regu->domain == NULL)
 		    {
@@ -6513,6 +6549,14 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
 	    {
 	      regu->domain = pt_xasl_type_enum_to_domain (pt_db_to_type_enum (typ));
 	    }
+	}
+
+      if (typ == DB_TYPE_NUMERIC && regu->domain != NULL && TP_DOMAIN_TYPE (regu->domain) == DB_TYPE_NUMERIC
+	  && (typed_bind || node->info.host_var.index >= parser->host_var_count))
+	{
+	  /* CBRD-27583 (D-27583-19): a NUMERIC bind or literal is the float NUMERIC domain -- the value carries its
+	   * own precision and scale, the plan records neither, so one plan serves every precision and scale */
+	  regu->domain = &tp_Numeric_domain;
 	}
 
       if (regu->domain == NULL && node->info.host_var.index >= parser->host_var_count && node->expected_domain)
@@ -18532,7 +18576,7 @@ pt_plan_query (PARSER_CONTEXT * parser, PT_NODE * select_node)
       xasl = pt_to_buildlist_proc (parser, select_node, plan);
     }
 
-  if (xasl != NULL && !parser->flag.set_host_var && parser->host_var_count > 0
+  if (xasl != NULL && !parser->flag.set_host_var && !parser->flag.typed_bind_plan && parser->host_var_count > 0
       && histogram_stmt_has_hv_predicate (parser, select_node))
     {
       /* the plan was chosen with unbound host-variable predicate markers (default
@@ -22473,7 +22517,7 @@ pt_to_delete_xasl (PARSER_CONTEXT * parser, PT_NODE * statement)
       parser_free_tree (parser, aptr_statement);
     }
 
-  if (xasl != NULL && !parser->flag.set_host_var && parser->host_var_count > 0
+  if (xasl != NULL && !parser->flag.set_host_var && !parser->flag.typed_bind_plan && parser->host_var_count > 0
       && histogram_stmt_has_hv_predicate (parser, statement))
     {
       /* same contract as the SELECT producer in pt_plan_query (): the plan was chosen with
@@ -23412,7 +23456,7 @@ cleanup:
       xasl = NULL;
     }
 
-  if (xasl != NULL && !parser->flag.set_host_var && parser->host_var_count > 0
+  if (xasl != NULL && !parser->flag.set_host_var && !parser->flag.typed_bind_plan && parser->host_var_count > 0
       && histogram_stmt_has_hv_predicate (parser, statement))
     {
       /* same contract as the SELECT producer in pt_plan_query (): the plan was chosen with
