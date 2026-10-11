@@ -6590,10 +6590,11 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
 	}
 
       exptyp = TP_DOMAIN_TYPE (regu->domain);
-      if (parser->flag.set_host_var == 0 && typ == DB_TYPE_NULL)
+      if (parser->flag.set_host_var == 0 && typ == DB_TYPE_NULL && !parser->flag.typed_bind_plan)
 	{
 	  /* If the host variable was not given before by the user, preset it by the expected domain. When the user
-	   * set the host variable, its value will be casted to this domain if necessary. */
+	   * set the host variable, its value will be casted to this domain if necessary. A typed plan's generation
+	   * runs over the execution's own values with set_host_var off (D-27583-21): a bound NULL stays as bound */
 	  (void) db_value_domain_init (val, exptyp, regu->domain->precision, regu->domain->scale);
 	  if (TP_IS_CHAR_TYPE (exptyp))
 	    {

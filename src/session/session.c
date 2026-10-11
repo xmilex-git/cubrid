@@ -47,6 +47,7 @@
 #include "lock_free.h"
 #include "object_primitive.h"
 #include "dbtype.h"
+#include "language_support.h"
 #include "string_opfunc.h"
 
 #if defined (SERVER_MODE)
@@ -1115,6 +1116,21 @@ free_session_variable (SESSION_VARIABLE * var)
   free_and_init (var);
 }
 
+/* the type a session variable's value has for the fixed-type error: the type name, a string's with its charset */
+static void
+session_variable_type_name (const DB_VALUE * value, char *buf, size_t size)
+{
+  const DB_TYPE type = DB_VALUE_DOMAIN_TYPE (value);
+  if (TP_IS_CHAR_TYPE (type))
+    {
+      snprintf (buf, size, "%s (%s)", pr_type_name (type), lang_charset_name (db_get_string_codeset (value)));
+    }
+  else
+    {
+      snprintf (buf, size, "%s", pr_type_name (type));
+    }
+}
+
 /*
  * session_add_variable () - add a session variable to the list
  * return:   error code
@@ -1168,6 +1184,21 @@ session_add_variable (SESSION_STATE * state_p, const DB_VALUE * name, DB_VALUE *
 
       if (intl_identifier_casecmp (name_str, current->name) == 0)
 	{
+	  /* CBRD-27583 (D-27583-13): a variable keeps the type its first value gave it (a string: its codeset too)
+	   * until it is dropped, so a plan compiled over it stays valid; a NULL takes and gives no type */
+	  const DB_VALUE *held = current->value;
+	  if (held != NULL && !DB_IS_NULL (held) && !DB_IS_NULL (value)
+	      && (DB_VALUE_DOMAIN_TYPE (held) != DB_VALUE_DOMAIN_TYPE (value)
+		  || (TP_IS_CHAR_TYPE (DB_VALUE_DOMAIN_TYPE (held))
+		      && db_get_string_codeset (held) != db_get_string_codeset (value))))
+	    {
+	      char held_type[64], value_type[64];
+	      session_variable_type_name (held, held_type, sizeof (held_type));
+	      session_variable_type_name (value, value_type, sizeof (value_type));
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_SES_VARIABLE_TYPE_FIXED, 3, current->name, held_type,
+		      value_type);
+	      return ER_SES_VARIABLE_TYPE_FIXED;
+	    }
 	  /* if it already exists, just update the value */
 	  update_session_variable (current, value);
 	  return NO_ERROR;

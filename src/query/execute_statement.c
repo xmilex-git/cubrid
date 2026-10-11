@@ -4095,6 +4095,9 @@ do_prepare_statement (PARSER_CONTEXT * parser, PT_NODE * statement)
    * (an UPDATE's SELECT, a cached subquery) read the same parser flag. */
   parser->flag.typed_bind_plan = (statement->bind_signature != NULL);
   parser->typed_bind_signature = statement->bind_signature;
+  /* the flag describes the plan this prepare ends with: a typed plan prepared after an unpeeked generic one (the
+   * compile-first EXECUTE path) must not inherit the generic plan's mark, or every execution would replan it */
+  statement->flag.hv_pred_plan_unpeeked = 0;
   /* a typed plan is generated from the bound values' types, not from the values (D-27583-21): the generation sees
    * the host variables unbound, as PREPARE does -- no constant folding, no coercion of a value, no UPDATE assignment
    * constant baked into the cached plan -- while pt_make_regu_hostvar reads the values' domains and the optimizer

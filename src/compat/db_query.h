@@ -152,6 +152,8 @@ extern "C"
   struct db_prepare_info
   {
     char *statement;		/* statement literal */
+    char *hash_text;		/* CBRD-27583: the plan's cache key text (alias print); EXECUTE looks the typed plan up by
+				 * it and the bind type signature */
     DB_QUERY_TYPE *columns;	/* columns */
     CUBRID_STMT_TYPE stmt_type;	/* statement type */
     DB_VALUE_ARRAY host_variables;	/* statement host variables */

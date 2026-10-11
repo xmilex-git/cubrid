@@ -10093,6 +10093,25 @@ pt_partition_name (PARSER_CONTEXT * parser, const char *class_name, const char *
   return name;
 }
 
+/* the decimal digits of a non-negative number (a position, a codeset, a DB_TYPE), no terminator */
+static char *
+pt_bind_signature_number (char *p, int number)
+{
+  char digits[12];
+  int n = 0;
+  do
+    {
+      digits[n++] = (char) ('0' + number % 10);
+      number /= 10;
+    }
+  while (number > 0);
+  while (n > 0)
+    {
+      *p++ = digits[--n];
+    }
+  return p;
+}
+
 /*
  * pt_bind_type_signature () - CBRD-27583: the bind type signature of host variables [from, to): one token per
  *   position, in position order, from the value as bound (a user variable: after the client's cast into its
@@ -10107,48 +10126,50 @@ pt_partition_name (PARSER_CONTEXT * parser, const char *class_name, const char *
 int
 pt_bind_type_signature (const PARSER_CONTEXT * parser, int from, int to, char *buf, size_t size)
 {
-  int len = 0;
+  /* a token is at most 12 bytes: the position and the type number have at most 4 digits each (the position is a
+   * host variable index, the type a DB_TYPE), plus the class letter, '.' or ':' and ',' */
+  size_t len = 0;
   for (int i = from; i < to; i++)
     {
+      if (len + 12 >= size)
+	{
+	  return -1;
+	}
       const DB_VALUE *val = &parser->host_variables[i];
       const DB_TYPE type = DB_VALUE_DOMAIN_TYPE (val);
-      char token[16];
-      int n;
+      char *p = pt_bind_signature_number (buf + len, i);
       if (type == DB_TYPE_NULL)
 	{
-	  n = snprintf (token, sizeof (token), "%dn,", i);
-	}
-      else if (TP_IS_CHAR_TYPE (type) && i < parser->host_var_count)
-	{
-	  /* a string bind: its type and codeset; its collation is left to each execution (the typed plan compiles
-	   * the position with TP_DOMAIN_COLL_LEAVE, D-27583-20), so `set names` changes no plan */
-	  n = snprintf (token, sizeof (token), "%d%c%d,", i, type == DB_TYPE_CHAR ? 'c' : 's',
-			db_get_string_codeset (val));
+	  *p++ = 'n';
 	}
       else if (TP_IS_CHAR_TYPE (type))
 	{
-	  /* an auto-parameterized literal: its type only. Its codeset and collation are the compiling session's,
-	   * and a prepared statement keeps its prepare-time collation through the shared plan when the client
-	   * recompiles it under another session collation (csql EXECUTE; bug_bts_10057, issue_8391) */
-	  n = snprintf (token, sizeof (token), "%d%c,", i, type == DB_TYPE_CHAR ? 'c' : 's');
+	  /* a string bind: its type and codeset; its collation is left to each execution (the typed plan compiles
+	   * the position with TP_DOMAIN_COLL_LEAVE, D-27583-20), so `set names` changes no plan. An auto-parameterized
+	   * literal: its type only -- its codeset and collation are the compiling session's, and a prepared
+	   * statement keeps its prepare-time collation through the shared plan when the client recompiles it under
+	   * another session collation (csql EXECUTE; bug_bts_10057, issue_8391) */
+	  *p++ = type == DB_TYPE_CHAR ? 'c' : 's';
+	  if (i < parser->host_var_count)
+	    {
+	      p = pt_bind_signature_number (p, (int) db_get_string_codeset (val));
+	    }
 	}
       else if (type == DB_TYPE_NUMERIC)
 	{
 	  /* every NUMERIC is the float NUMERIC domain (D-27583-19): the value carries its own precision and scale */
-	  n = snprintf (token, sizeof (token), "%dN,", i);
+	  *p++ = 'N';
 	}
       else
 	{
-	  n = snprintf (token, sizeof (token), "%d:%d,", i, (int) type);
+	  *p++ = ':';
+	  p = pt_bind_signature_number (p, (int) type);
 	}
-      if (n < 0 || (size_t) (len + n) >= size)
-	{
-	  return -1;
-	}
-      memcpy (buf + len, token, (size_t) n + 1);
-      len += n;
+      *p++ = ',';
+      len = (size_t) (p - buf);
     }
-  return len;
+  buf[len] = '\0';
+  return (int) len;
 }
 
 /*

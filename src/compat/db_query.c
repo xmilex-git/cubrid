@@ -412,6 +412,7 @@ db_init_prepare_info (DB_PREPARE_INFO * info)
 {
   assert (info != NULL);
   info->statement = NULL;
+  info->hash_text = NULL;
   info->columns = NULL;
   info->host_variables.size = 0;
   info->host_variables.vals = NULL;
@@ -466,6 +467,8 @@ db_pack_prepare_info (const DB_PREPARE_INFO * info, char **buffer)
   packed_size += or_packed_query_format_size (info->columns, &columns_cnt);
   /* packed size for query */
   packed_size += or_packed_string_length (info->statement, &query_len);
+  int hash_text_len = 0;
+  packed_size += or_packed_string_length (info->hash_text, &hash_text_len);
   /* statement type */
   packed_size += OR_INT_SIZE;
   /* auto parameters count */
@@ -512,6 +515,7 @@ db_pack_prepare_info (const DB_PREPARE_INFO * info, char **buffer)
   ptr = or_pack_query_format (ptr, info->columns, columns_cnt);
   /* query */
   ptr = or_pack_string_with_length (ptr, info->statement, query_len);
+  ptr = or_pack_string_with_length (ptr, info->hash_text, hash_text_len);
   /* statement type */
   ptr = or_pack_int (ptr, info->stmt_type);
   /* auto parameters count */
@@ -583,6 +587,7 @@ db_unpack_prepare_info (DB_PREPARE_INFO * info, char *buffer)
   ptr = or_unpack_query_format (buffer, &info->columns);
   /* unpack query */
   ptr = or_unpack_string_alloc (ptr, &info->statement);
+  ptr = or_unpack_string_alloc (ptr, &info->hash_text);
   /* unpack statement type */
   ptr = or_unpack_int (ptr, (int *) &info->stmt_type);
   /* unpack auto parameters count */
@@ -681,6 +686,10 @@ error:
   if (info->statement != NULL)
     {
       free_and_init (info->statement);
+    }
+  if (info->hash_text != NULL)
+    {
+      free_and_init (info->hash_text);
     }
   if (info->columns != NULL)
     {

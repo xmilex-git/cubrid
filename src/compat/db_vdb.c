@@ -60,6 +60,7 @@
 #include "util_func.h"
 #include "xasl.h"
 #include "query_cl.h"
+#include "crypt_opfunc.h"
 
 #define BUF_SIZE 1024
 
@@ -2966,6 +2967,8 @@ do_process_prepare_statement (DB_SESSION * session, PT_NODE * statement)
 
   /* set statement literal */
   prepare_info.statement = (char *) statement_literal;
+  /* CBRD-27583: the plan's key text, for EXECUTE's typed plan lookup */
+  prepare_info.hash_text = (char *) prepared_stmt->alias_print;
   /* set columns */
   prepare_info.columns = prepared_session->type_list[0];
   /* set statement type */
@@ -3049,6 +3052,70 @@ cleanup:
       free_and_init (prepare_info.subquery_info);
     }
 
+  return err;
+}
+
+/*
+ * do_find_typed_plan () - CBRD-27583: look the typed plan of the bound values' signature up by the PREPARE plan's key
+ *   text (EXECUTE of a prepared SELECT). Found, xasl_id and xasl_header become the typed plan's; not found, they
+ *   stay the PREPARE plan's and the recompile path compiles the typed plan.
+ * return : error code
+ * parser (in)	  : the EXECUTE node's parser: host_variables (cast), host_var_count = the user variables,
+ *		    auto_param_count = the PREPARE plan's auto-parameters after them
+ * hash_text (in) : the PREPARE plan's key text
+ */
+static int
+do_find_typed_plan (PARSER_CONTEXT * parser, const char *hash_text, XASL_ID * xasl_id, XASL_NODE_HEADER * xasl_header)
+{
+  const int n_positions = parser->host_var_count + parser->auto_param_count;
+  const size_t text_len = strlen (hash_text);
+  const size_t needed = text_len + 4 + (size_t) n_positions * 12 + 1;
+  char *text = (char *) malloc (needed);
+  if (text == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, needed);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  memcpy (text, hash_text, text_len);
+  memcpy (text + text_len, "?bt=", 4);
+  size_t len = text_len + 4;
+  /* the typed key: the auto-parameters' tokens, then the user variables' (do_prepare_hash_text) */
+  int n = pt_bind_type_signature (parser, parser->host_var_count, n_positions, text + len, needed - len);
+  if (n >= 0)
+    {
+      len += (size_t) n;
+      n = pt_bind_type_signature (parser, 0, parser->host_var_count, text + len, needed - len);
+    }
+  if (n < 0)
+    {
+      assert (false);
+      free (text);
+      return NO_ERROR;
+    }
+  COMPILE_CONTEXT context;
+  XASL_STREAM stream;
+  XASL_NODE_HEADER header = { 0, 0 };
+  memset (&context, 0, sizeof (context));
+  memset (&stream, 0, sizeof (stream));
+  context.sql_hash_text = text;
+  context.sql_user_text = (char *) hash_text;
+  context.sql_user_text_len = (int) text_len;
+  int err = SHA1Compute ((unsigned char *) text, (unsigned) strlen (text), &context.sha1);
+  if (err == NO_ERROR)
+    {
+      stream.xasl_header = &header;
+      err = prepare_query (&context, &stream);
+    }
+  if (err == NO_ERROR && stream.xasl_id != NULL)
+    {
+      XASL_ID_COPY (xasl_id, stream.xasl_id);
+      *xasl_header = header;
+    }
+  if (stream.xasl_id != NULL)
+    {
+      free_and_init (stream.xasl_id);
+    }
+  free (text);
   return err;
 }
 
@@ -3155,6 +3222,21 @@ do_get_prepared_statement_info (DB_SESSION * session, int stmt_idx, int *subquer
       goto cleanup;
     }
 
+  if (prepare_info.hash_text != NULL && prepare_info.stmt_type == CUBRID_STMT_SELECT && !XASL_ID_IS_NULL (&xasl_id)
+      && !statement->info.execute.recompile && parser->host_var_count > 0
+      && prm_get_integer_value (PRM_ID_PLAN_CACHE_MODE) != PLAN_CACHE_MODE_FORCE_GENERIC)
+    {
+      /* CBRD-27583: the typed plan of these values' signature, when an earlier execution compiled it: it runs in
+       * place of the PREPARE plan, and this execution recompiles nothing (the values are cast into their expected
+       * domains by now, as the signature expects) */
+      err = do_find_typed_plan (parser, prepare_info.hash_text, &xasl_id, &xasl_header);
+      if (err != NO_ERROR)
+	{
+	  goto cleanup;
+	}
+      XASL_ID_COPY (&statement->info.execute.xasl_id, &xasl_id);
+    }
+
   parser->host_var_count += prepare_info.auto_param_count;
   parser->auto_param_count = 0;
   parser->flag.set_host_var = 1;
@@ -3227,6 +3309,10 @@ cleanup:
   if (prepare_info.statement != NULL)
     {
       free_and_init (prepare_info.statement);
+    }
+  if (prepare_info.hash_text != NULL)
+    {
+      free_and_init (prepare_info.hash_text);
     }
   if (prepare_info.into_list != NULL)
     {
