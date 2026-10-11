@@ -746,32 +746,34 @@ qexec_resolve_elt_branch (const DOMAIN_PLAN * plan, const RESOLVED_DOMAIN_TABLE 
   return branch > 0 && branch < link->n_operands ? (int) branch : 0;
 }
 
-/* A late-binding cast's resolution: the converter into the node's compiled domain for every operand the node casts
- * into it (the cast's source; the two arms of NVL / IFNULL / COALESCE; the second and third of NVL2), at the operand's
- * fetch index - the link skips a cast's empty first operand, so its source is link operand 0 and fetch operand 1. An
- * operand without a value type (a NULL bind, a node without a value) gets no converter: its NULL casts to NULL. */
+/* A late-binding cast's resolution: the converter for every operand the row casts before the node computes
+ * (domain_operand_cast_target: into the node's compiled domain, or a function's built-in argument domain), at the
+ * operand's fetch index - the link skips the empty first operand of a cast, OCTET_LENGTH or BIT_LENGTH, so their
+ * argument is link operand 0 and fetch operand 1. An operand without a value type (a NULL bind, a node without a
+ * value) gets no converter: its NULL casts to NULL. */
 static void
 qexec_resolve_cast_coercion (int opcode, const DOMAIN_OPERAND * operands, int n_operands, const TP_DOMAIN * target,
 			     RESOLVED_DOMAIN * entry)
 {
   *entry = RESOLVED_DOMAIN ();
-  const bool is_cast = opcode == T_CAST || opcode == T_CAST_WRAP || opcode == T_CAST_NOFAIL;
-  for (int k = 0; k < n_operands && k < 3; k++)
+  const int first_fetch_index = (opcode == T_CAST || opcode == T_CAST_WRAP || opcode == T_CAST_NOFAIL
+				 || opcode == T_OCTET_LENGTH || opcode == T_BIT_LENGTH) ? 1 : 0;
+  for (int k = 0; k < n_operands && k + first_fetch_index < 3; k++)
     {
-      const int fetch_index = is_cast ? 1 : k;
-      const bool casts_into_node = is_cast || (opcode == T_NVL2 ? k > 0 : k < 2);
-      if (!casts_into_node)
-	{
-	  continue;
-	}
+      const int fetch_index = k + first_fetch_index;
       const DB_TYPE type = operands[k].val_type != DB_TYPE_NULL ? operands[k].val_type
 	: operands[k].domain != NULL ? TP_DOMAIN_TYPE (operands[k].domain) : DB_TYPE_NULL;
       if (type == DB_TYPE_NULL || type == DB_TYPE_VARIABLE || target == NULL)
 	{
 	  continue;
 	}
-      entry->operand_domain[fetch_index] = target;
-      entry->conv[fetch_index] = tp_value_find_converter (type, target, DOMAIN_CONVERT_ASSIGN);
+      const TP_DOMAIN *operand_target = domain_operand_cast_target (opcode, fetch_index, n_operands, target, type);
+      if (operand_target == NULL)
+	{
+	  continue;
+	}
+      entry->operand_domain[fetch_index] = operand_target;
+      entry->conv[fetch_index] = tp_value_find_converter (type, operand_target, DOMAIN_CONVERT_ASSIGN);
     }
 }
 

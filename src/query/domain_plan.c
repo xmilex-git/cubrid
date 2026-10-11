@@ -224,36 +224,28 @@ domain_character_is_variable (const TP_DOMAIN * domain)
     && TP_DOMAIN_COLLATION_FLAG (domain) != TP_DOMAIN_COLL_NORMAL;
 }
 
-/* Whether a cast, or a NVL / IFNULL / COALESCE / NVL2, casts an operand the compiler did not type into the node's
- * domain: the cast's source (rightptr), the two arms of NVL / IFNULL / COALESCE, the second and third of NVL2. */
-static bool
-domain_cast_operand_is_variable (const ARITH_TYPE * arith, REGU_VARIABLE * const *operands)
+/* The type the plan knows an operand by: its compiled domain's, VARIABLE without one. */
+static DB_TYPE
+domain_operand_compiled_type (const REGU_VARIABLE * operand)
 {
-  int first, last;
-  switch (arith->opcode)
-    {
-    case T_CAST:
-    case T_CAST_WRAP:
-    case T_CAST_NOFAIL:
-      first = last = 1;
-      break;
-    case T_NVL:
-    case T_IFNULL:
-    case T_COALESCE:
-      first = 0;
-      last = 1;
-      break;
-    case T_NVL2:
-      first = 1;
-      last = 2;
-      break;
-    default:
-      return false;
-    }
+  return operand->domain != NULL ? TP_DOMAIN_TYPE (operand->domain) : DB_TYPE_VARIABLE;
+}
+
+/* Whether the node casts an operand the compiler did not type (domain_operand_cast_target): resolve_domains then
+ * finds the converter from the operand's resolved type. */
+static bool
+domain_cast_operand_is_variable (const ARITH_TYPE * arith, REGU_VARIABLE * const *operands, int n_operands)
+{
   bool variable = false;
-  for (int i = first; i <= last; i++)
+  for (int i = 0; i < 3; i++)
     {
-      if (operands[i] == NULL || operands[i]->plan_item == NULL)
+      if (operands[i] == NULL
+	  || domain_operand_cast_target (arith->opcode, i, n_operands, arith->domain,
+					 domain_operand_compiled_type (operands[i])) == NULL)
+	{
+	  continue;
+	}
+      if (operands[i]->plan_item == NULL)
 	{
 	  return false;
 	}
@@ -1259,8 +1251,9 @@ domain_walk_arith (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * arith, bool field_bot
    * over an operand the compiler did not type (a bind, a late-binding node): the converter into that domain is
    * resolve_domains', from the operand's resolved type (qexec_resolve_cast_coercion); the row calls it
    * (fetch_cast_operand) instead of the cast's per-value lookup */
+  const int n_operands = (operands[0] != NULL) + (operands[1] != NULL) + (operands[2] != NULL);
   const bool cast_variable = !late_bound && !collation_variable && !coercion_variable
-    && domain_type_is_fixed (arith->domain) && domain_cast_operand_is_variable (arith, operands);
+    && domain_type_is_fixed (arith->domain) && domain_cast_operand_is_variable (arith, operands, n_operands);
   if (item != NULL && (late_bound || collation_variable || coercion_variable || cast_variable))
     {
       DOMAIN_LOAD_ENTRY *load_entry = domain_load_entry_of (item);
@@ -1294,12 +1287,12 @@ domain_walk_arith (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * arith, bool field_bot
 	{
 	  /* Static operand targets come from compiled operand domains, never
 	   * from an arithmetic result domain (DATE + INTEGER is not DATE + DATE).
-	   * A CAST, and a NVL, IFNULL, COALESCE or NVL2 result operand, is cast into the node's domain at the row
-	   * (fetch_cast_operand): its target is that domain, and the cast takes the converter found here. */
-	  const bool casts_into_node = is_cast
-	    || ((arith->opcode == T_NVL || arith->opcode == T_IFNULL || arith->opcode == T_COALESCE) && i < 2)
-	    || (arith->opcode == T_NVL2 && i > 0);
-	  domain_fixed_operand (item, i, operands[i]->domain, casts_into_node ? arith->domain : operands[i]->domain,
+	   * An operand the row casts before the node computes (domain_operand_cast_target: into the node's domain,
+	   * or a function's built-in argument domain) has that target, and the cast (fetch_cast_operand) takes the
+	   * converter found here. */
+	  const TP_DOMAIN *target = domain_operand_cast_target (arith->opcode, i, n_operands, arith->domain,
+								domain_operand_compiled_type (operands[i]));
+	  domain_fixed_operand (item, i, operands[i]->domain, target != NULL ? target : operands[i]->domain,
 				DOMAIN_CTX_ASSIGN);
 	}
     }

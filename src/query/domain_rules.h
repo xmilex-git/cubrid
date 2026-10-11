@@ -160,6 +160,18 @@ int domain_resolve_character (int opcode, const DOMAIN_OPERAND * operands, int n
 int domain_resolve_branch_pick (const DOMAIN_OPERAND * operands, int n_operands, int branch, RESOLVED_DOMAIN * result);
 int domain_resolve_branch_merge (const DOMAIN_OPERAND * operands, int n_operands, RESOLVED_DOMAIN * result);
 
+/* The domain the row casts operand i of an operator node into before it computes - i the fetch index (left 0,
+ * right 1, third 2), n_operands the operands the node has, source_type the operand's type (compiled, resolved, or
+ * VARIABLE) - or NULL where the row takes the operand as it is: the node's domain for a CAST and for the operand a
+ * NVL, IFNULL, COALESCE, NVL2, IF, CASE, DECODE, NULLIF, LEAST, GREATEST, one-operand CONCAT or CONCAT_WS returns; a
+ * built-in domain for an argument a function prints or converts first (TO_DATE and the other TO_* parse a string, so
+ * any other value prints as CHAR; OCTET_LENGTH and BIT_LENGTH measure a BLOB as VARBIT and a non-string as CHAR;
+ * LEFT and RIGHT take an INTEGER length). The load (domain_fixed_operand), resolve_domains
+ * (qexec_resolve_cast_coercion) and the row (fetch_cast_operand) ask this one rule, so the converter the plan carries
+ * is the one the row needs. */
+const TP_DOMAIN *domain_operand_cast_target (int opcode, int i, int n_operands, const TP_DOMAIN * node_domain,
+					     DB_TYPE source_type);
+
 /* The domain tp_domain_resolve_value gives a value of this domain: a variable string's floating precision reads as
  * its maximum, and an ENUM value keeps no element list. */
 const TP_DOMAIN *domain_as_value_domain (const TP_DOMAIN * domain);

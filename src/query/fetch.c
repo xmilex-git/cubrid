@@ -834,12 +834,14 @@ fetch_constant_evaluated (const VAL_DESCR * vd, const DOMAIN_PLAN_ITEM * item)
  */
 static int
 fetch_least_or_greatest (THREAD_ENTRY * thread_p, ARITH_TYPE * arithptr, val_descr * vd, DB_VALUE * peek_left,
-			 DB_VALUE * peek_right, bool least)
+			 DB_VALUE * peek_right, bool least, int *picked)
 {
   bool can_compare = true;
   const DB_VALUE_COMPARE_RESULT cmp_result =
     eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 0), vd, peek_left, peek_right, 0,
 				  &can_compare);
+  /* the operand db_least_or_greatest_by returns: the left on a tie, else the smaller (LEAST) or the greater */
+  *picked = cmp_result != DB_EQ && (cmp_result == DB_GT) == least ? 1 : 0;
   return db_least_or_greatest_by (peek_left, peek_right, cmp_result, can_compare, arithptr->value, least);
 }
 
@@ -954,6 +956,23 @@ fetch_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int i, co
   return force ? tp_value_cast_force (value, result, domain, false) : tp_value_cast (value, result, domain, false);
 }
 
+/* fetch_cast_operand with tp_value_auto_cast's answer to a cast that fails: NULL under
+ * return_null_on_function_errors */
+static inline TP_DOMAIN_STATUS
+fetch_auto_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int i, const DB_VALUE * value,
+			 DB_VALUE * result, const TP_DOMAIN * domain)
+{
+  const TP_DOMAIN_STATUS status = fetch_cast_operand (vd, arithptr, i, value, result, domain, false);
+  if (status != DOMAIN_COMPATIBLE && prm_get_bool_value (PRM_ID_RETURN_NULL_ON_FUNCTION_ERRORS))
+    {
+      pr_clear_value (result);
+      db_make_null (result);
+      er_clear ();
+      return DOMAIN_COMPATIBLE;
+    }
+  return status;
+}
+
 /*
  * fetch_peek_arith () -
  *   return: NO_ERROR or ER_code
@@ -969,7 +988,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 {
   ARITH_TYPE *arithptr;
   DB_VALUE *peek_left, *peek_right, *peek_third, *peek_fourth;
-  DB_VALUE tmp_value;
   TP_DOMAIN *no_value_domain = NULL;	/* FETCH_RESOLVED_NO_VALUE: the compiled domain the node keeps */
   TP_DOMAIN_STATUS dom_status;
 
@@ -2215,7 +2233,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  DB_VALUE tval;
 
 	  db_make_null (&tval);
-	  dom_status = tp_value_cast (peek_right, &tval, &tp_VarBit_domain, false);
+	  dom_status = fetch_cast_operand (vd, arithptr, 1, peek_right, &tval, &tp_VarBit_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, &tp_VarBit_domain);
@@ -2231,7 +2249,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  DB_VALUE tval;
 
 	  db_make_null (&tval);
-	  dom_status = tp_value_cast (peek_right, &tval, &tp_Char_domain, false);
+	  dom_status = fetch_cast_operand (vd, arithptr, 1, peek_right, &tval, &tp_Char_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, &tp_Char_domain);
@@ -2265,7 +2283,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  int len = 0;
 
 	  db_make_null (&tval);
-	  dom_status = tp_value_cast (peek_right, &tval, &tp_VarBit_domain, false);
+	  dom_status = fetch_cast_operand (vd, arithptr, 1, peek_right, &tval, &tp_VarBit_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, &tp_VarBit_domain);
@@ -2282,7 +2300,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  DB_VALUE tval;
 
 	  db_make_null (&tval);
-	  dom_status = tp_value_cast (peek_right, &tval, &tp_Char_domain, false);
+	  dom_status = fetch_cast_operand (vd, arithptr, 1, peek_right, &tval, &tp_Char_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, &tp_Char_domain);
@@ -3298,7 +3316,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  DB_VALUE tval;
 
 	  db_make_null (&tval);
-	  dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
+	  dom_status = fetch_cast_operand (vd, arithptr, 0, peek_left, &tval, &tp_Char_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
@@ -3327,7 +3345,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  DB_VALUE tval;
 
 	  db_make_null (&tval);
-	  dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
+	  dom_status = fetch_cast_operand (vd, arithptr, 0, peek_left, &tval, &tp_Char_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
@@ -3360,7 +3378,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      DB_VALUE tval;
 
 	      db_make_null (&tval);
-	      dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
+	      dom_status = fetch_cast_operand (vd, arithptr, 0, peek_left, &tval, &tp_Char_domain, false);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
 		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
@@ -3394,7 +3412,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      DB_VALUE tval;
 
 	      db_make_null (&tval);
-	      dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
+	      dom_status = fetch_cast_operand (vd, arithptr, 0, peek_left, &tval, &tp_Char_domain, false);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
 		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
@@ -3556,64 +3574,61 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
     case T_CASE:
     case T_DECODE:
     case T_IF:
-      /* fetch values */
-      switch (eval_pred (thread_p, arithptr->pred, vd, obj_oid))
-	{
-	case V_FALSE:
-	case V_UNKNOWN:	/* unknown pred result, including cases of NULL pred operands */
-	  if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_left) != NO_ERROR)
-	    {
-	      goto error;
-	    }
-	  break;
+      {
+	int branch;		/* the operand the predicate picks: left 0, right 1 */
 
-	case V_TRUE:
-	  if (fetch_peek_dbval (thread_p, arithptr->leftptr, vd, NULL, obj_oid, tplrec, &peek_left) != NO_ERROR)
-	    {
-	      goto error;
-	    }
-	  break;
+	switch (eval_pred (thread_p, arithptr->pred, vd, obj_oid))
+	  {
+	  case V_FALSE:
+	  case V_UNKNOWN:	/* unknown pred result, including cases of NULL pred operands */
+	    branch = 1;
+	    if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_left) != NO_ERROR)
+	      {
+		goto error;
+	      }
+	    break;
 
-	default:
-	  goto error;
-	}
+	  case V_TRUE:
+	    branch = 0;
+	    if (fetch_peek_dbval (thread_p, arithptr->leftptr, vd, NULL, obj_oid, tplrec, &peek_left) != NO_ERROR)
+	      {
+		goto error;
+	      }
+	    break;
 
-      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
-	  goto error;
-	}
-      /* branches whose collations resolve_domains merged: the picked value takes the merged domain */
-      if (fetch_convert_to_resolved_branch (vd, arithptr->plan_item, arithptr->value) != NO_ERROR)
-	{
-	  goto error;
-	}
+	  default:
+	    goto error;
+	  }
+
+	dom_status = fetch_auto_cast_operand (vd, arithptr, branch, peek_left, arithptr->value, domain);
+	if (dom_status != DOMAIN_COMPATIBLE)
+	  {
+	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
+	    goto error;
+	  }
+	/* branches whose collations resolve_domains merged: the picked value takes the merged domain */
+	if (fetch_convert_to_resolved_branch (vd, arithptr->plan_item, arithptr->value) != NO_ERROR)
+	  {
+	    goto error;
+	  }
+      }
       break;
 
     case T_PREDICATE:
-      /* return 0,1 or NULL accordingly */
-      peek_left = &tmp_value;
-
+      /* return 0,1 or NULL accordingly: the node is typed INTEGER (PT_TYPE_LOGICAL), so the value is the result */
+      assert (domain == NULL || TP_DOMAIN_TYPE (domain) == DB_TYPE_INTEGER);
       switch (eval_pred (thread_p, arithptr->pred, vd, obj_oid))
 	{
 	case V_UNKNOWN:
-	  db_make_null (peek_left);
+	  PRIM_SET_NULL (arithptr->value);
 	  break;
 	case V_FALSE:
-	  db_make_int (peek_left, 0);
+	  db_make_int (arithptr->value, 0);
 	  break;
 	case V_TRUE:
-	  db_make_int (peek_left, 1);
+	  db_make_int (arithptr->value, 1);
 	  break;
 	default:
-	  goto error;
-	}
-
-      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
 	  goto error;
 	}
       break;
@@ -3756,7 +3771,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	}
       else
 	{
-	  dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
+	  dom_status = fetch_auto_cast_operand (vd, arithptr, 0, peek_left, arithptr->value, domain);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
@@ -3779,7 +3794,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    }
 	  else if (DB_IS_NULL (peek_left))
 	    {
-	      dom_status = tp_value_auto_cast (peek_right, arithptr->value, domain);
+	      dom_status = fetch_auto_cast_operand (vd, arithptr, 1, peek_right, arithptr->value, domain);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
 		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, domain);
@@ -3788,7 +3803,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    }
 	  else if (DB_IS_NULL (peek_right))
 	    {
-	      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
+	      dom_status = fetch_auto_cast_operand (vd, arithptr, 0, peek_left, arithptr->value, domain);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
 		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
@@ -3820,7 +3835,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    }
 	  else
 	    {
-	      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
+	      dom_status = fetch_auto_cast_operand (vd, arithptr, 0, peek_left, arithptr->value, domain);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
 		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
@@ -3944,7 +3959,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  DB_VALUE tmp_val, tmp_val2;
 
-	  dom_status = tp_value_auto_cast (peek_right, &tmp_val2, &tp_Integer_domain);
+	  dom_status = fetch_auto_cast_operand (vd, arithptr, 1, peek_right, &tmp_val2, &tp_Integer_domain);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, &tp_Integer_domain);
@@ -3989,7 +4004,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      break;
 	    }
 
-	  dom_status = tp_value_auto_cast (peek_right, &tmp_val2, &tp_Integer_domain);
+	  dom_status = fetch_auto_cast_operand (vd, arithptr, 1, peek_right, &tmp_val2, &tp_Integer_domain);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
 	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, &tp_Integer_domain);
@@ -4236,7 +4251,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  }
 	else
 	  {
-	    dom_status = tp_value_cast (peek_left, arithptr->value, target_domain, false);
+	    dom_status = fetch_cast_operand (vd, arithptr, 0, peek_left, arithptr->value, target_domain, false);
 	    if (dom_status != DOMAIN_COMPATIBLE)
 	      {
 		(void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, target_domain);
@@ -4255,10 +4270,10 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_LEAST:
       {
-	int error;
+	int error, picked;
 	TP_DOMAIN *target_domain;
 
-	error = fetch_least_or_greatest (thread_p, arithptr, vd, peek_left, peek_right, true);
+	error = fetch_least_or_greatest (thread_p, arithptr, vd, peek_left, peek_right, true, &picked);
 	if (error != NO_ERROR)
 	  {
 	    goto error;
@@ -4278,7 +4293,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto error;
 	  }
 
-	dom_status = tp_value_cast (arithptr->value, arithptr->value, target_domain, false);
+	dom_status = fetch_cast_operand (vd, arithptr, picked, arithptr->value, arithptr->value, target_domain, false);
 	if (dom_status != DOMAIN_COMPATIBLE)
 	  {
 	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, arithptr->value, target_domain);
@@ -4289,10 +4304,10 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_GREATEST:
       {
-	int error;
+	int error, picked;
 	TP_DOMAIN *target_domain;
 
-	error = fetch_least_or_greatest (thread_p, arithptr, vd, peek_left, peek_right, false);
+	error = fetch_least_or_greatest (thread_p, arithptr, vd, peek_left, peek_right, false, &picked);
 	if (error != NO_ERROR)
 	  {
 	    goto error;
@@ -4312,7 +4327,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto error;
 	  }
 
-	dom_status = tp_value_cast (arithptr->value, arithptr->value, target_domain, false);
+	dom_status = fetch_cast_operand (vd, arithptr, picked, arithptr->value, arithptr->value, target_domain, false);
 	if (dom_status != DOMAIN_COMPATIBLE)
 	  {
 	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, arithptr->value, target_domain);

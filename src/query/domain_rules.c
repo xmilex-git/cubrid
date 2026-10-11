@@ -750,6 +750,53 @@ domain_resolve_compare (const DOMAIN_OPERAND * operands, RESOLVED_DOMAIN * resul
   return NO_ERROR;
 }
 
+const TP_DOMAIN *
+domain_operand_cast_target (int opcode, int i, int n_operands, const TP_DOMAIN * node_domain, DB_TYPE source_type)
+{
+  switch (opcode)
+    {
+    case T_CAST:
+    case T_CAST_WRAP:
+    case T_CAST_NOFAIL:
+      return i == 1 ? node_domain : NULL;
+    case T_NVL:
+    case T_IFNULL:
+    case T_COALESCE:
+    case T_IF:
+    case T_CASE:
+    case T_DECODE:
+    case T_LEAST:
+    case T_GREATEST:
+    case T_CONCAT_WS:
+      return i < 2 ? node_domain : NULL;
+    case T_NVL2:
+      return i > 0 ? node_domain : NULL;
+    case T_NULLIF:
+      return i == 0 ? node_domain : NULL;
+    case T_CONCAT:
+      /* one operand is returned cast; two are concatenated (qdata_strcat_dbval) */
+      return i == 0 && n_operands == 1 ? node_domain : NULL;
+    case T_TO_DATE:
+    case T_TO_TIME:
+    case T_TO_TIMESTAMP:
+    case T_TO_TIMESTAMP_TZ:
+    case T_TO_DATETIME:
+    case T_TO_DATETIME_TZ:
+      return i == 0 && !TP_IS_CHAR_TYPE (source_type) ? &tp_Char_domain : NULL;
+    case T_OCTET_LENGTH:
+      return i != 1 ? NULL : source_type == DB_TYPE_BLOB ? &tp_VarBit_domain
+	: !TP_IS_STRING_TYPE (source_type) ? &tp_Char_domain : NULL;
+    case T_BIT_LENGTH:
+      return i != 1 ? NULL : source_type == DB_TYPE_BLOB ? &tp_VarBit_domain
+	: !TP_IS_STRING_TYPE (source_type) ? &tp_Char_domain : NULL;
+    case T_LEFT:
+    case T_RIGHT:
+      return i == 1 ? &tp_Integer_domain : NULL;
+    default:
+      return NULL;
+    }
+}
+
 /* tp_infer_common_domain folded left to right: NVL/NVL2/IFNULL/COALESCE/NULLIF/LEAST/GREATEST. */
 static int
 domain_resolve_common_value (const DOMAIN_OPERAND * operands, int n_operands, RESOLVED_DOMAIN * result)
