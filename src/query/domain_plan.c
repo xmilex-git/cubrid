@@ -3286,7 +3286,13 @@ domain_compare_side (const DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const *load_e
     {
       comparison->constant[side] = item;
       comparison->bind[side] = plan->items_cold[item - plan->items].val_pos >= 0;
-      return DOMAIN_SIDE_LATE_BIND;
+      if (!plan->typed || item->resolved_index >= 0 || !domain_fixes_values (item->fixed.domain))
+	{
+	  return DOMAIN_SIDE_LATE_BIND;
+	}
+      /* a typed plan's fixed position holds a value of its plan domain (checked before any row,
+       * qexec_resolve_domains): the load decides the comparison; one that converts the value keeps the constant
+       * side's once-per-execution conversion (domain_plan_add_comparison) */
     }
   if (regu->type == TYPE_DBVAL)
     {
@@ -4938,6 +4944,7 @@ stx_build_domain_plan (THREAD_ENTRY * thread_p, XASL_NODE * root, XASL_UNPACK_IN
       return ER_OUT_OF_VIRTUAL_MEMORY;
     }
   memset (plan, 0, sizeof (*plan));
+  plan->typed = XASL_IS_FLAGED (root, XASL_TYPED_BIND_PLAN);
   plan->dbval_cnt = root->dbval_cnt;
   plan->n_refs = root->dbval_cnt;
   /* the execution's scope comes first (DOMAIN_SCOPE_EXECUTION) */

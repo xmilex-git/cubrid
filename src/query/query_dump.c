@@ -2501,6 +2501,13 @@ qdump_print_xasl (xasl_node * xasl_p)
 	  nflag++;
 	}
 
+      if (XASL_IS_FLAGED (xasl_p, XASL_TYPED_BIND_PLAN))
+	{
+	  XASL_CLEAR_FLAG (xasl_p, XASL_TYPED_BIND_PLAN);
+	  fprintf (foutput, "%sXASL_TYPED_BIND_PLAN", (nflag ? "|" : ""));
+	  nflag++;
+	}
+
       if (xasl_p->flag)
 	{
 	  fprintf (foutput, "%s%d", (nflag ? "|" : ""), xasl_p->flag);

@@ -6441,9 +6441,11 @@ pt_typed_bind_type (const PARSER_CONTEXT * parser, const PT_NODE * node)
     {
       return DB_TYPE_VARIABLE;
     }
-  const DB_TYPE typ = DB_VALUE_DOMAIN_TYPE (&parser->host_variables[node->info.host_var.index]);
+  const DB_VALUE *val = &parser->host_variables[node->info.host_var.index];
+  const DB_TYPE typ = DB_VALUE_DOMAIN_TYPE (val);
+  /* a NULL cast into its expected domain carries that domain's type: the position is that type (its token too) */
   return (TP_IS_NUMERIC_TYPE (typ) || TP_IS_CHAR_TYPE (typ) || TP_IS_BIT_TYPE (typ) || TP_IS_DATE_OR_TIME_TYPE (typ))
-    ? typ : DB_TYPE_VARIABLE;
+    && !(DB_IS_NULL (val) && typ == DB_TYPE_NULL) ? typ : DB_TYPE_VARIABLE;
 }
 
 /*
@@ -6475,6 +6477,7 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
 
       /* determine the domain of this host var */
       regu->domain = NULL;
+      TP_DOMAIN *cast_domain = NULL;
 
       if (node->info.host_var.index < parser->host_var_count)
 	{
@@ -6484,7 +6487,6 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
 	   * CUBRIDSUS-9007; `enum_col op ?` compares the bound value), or an untyped copy (the LIMIT
 	   * operand). A compile-only expected domain the client does not apply -- the collation axis's ENFORCE
 	   * on `str_col + ?` / `enum_col + ?` -- is not a plan domain. */
-	  TP_DOMAIN *cast_domain = NULL;
 	  if (parser->host_var_expected_domains != NULL)
 	    {
 	      cast_domain = parser->host_var_expected_domains[node->info.host_var.index];
@@ -6514,8 +6516,16 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
        * auto-parameter -- a string at floating precision, a NUMERIC as the float NUMERIC domain -- and no
        * position is left to resolve_domains. */
       const bool typed_bind = pt_typed_bind_type (parser, node) != DB_TYPE_VARIABLE;
-      if (regu->domain == NULL && typ != DB_TYPE_NULL
-	  && (node->info.host_var.index >= parser->host_var_count || typed_bind))
+      if (typed_bind && !DB_IS_NULL (val))
+	{
+	  /* the value is cast into its expected domain already (pt_set_host_variables): the position is the
+	   * value's own domain, CHAR or VARCHAR as the client kept it, so that "value type == plan domain" holds
+	   * for every position of a typed plan (the load decides its comparisons, D-27583-20); a NULL cast into
+	   * the expected domain keeps that domain */
+	  regu->domain = NULL;
+	}
+      if (regu->domain == NULL
+	  && (typed_bind || (typ != DB_TYPE_NULL && node->info.host_var.index >= parser->host_var_count)))
 	{
 	  TP_DOMAIN *domain;
 	  if (TP_IS_CHAR_TYPE (typ))
@@ -6528,9 +6538,10 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
 		  regu->domain->collation_id = db_get_string_collation (val);
 		  regu->domain->precision = typed_bind ? TP_FLOATING_PRECISION_VALUE : db_value_precision (val);
 		  regu->domain->scale = db_value_scale (val);
-		  if (typed_bind)
+		  if (typed_bind && (cast_domain == NULL || cast_domain->collation_flag != TP_DOMAIN_COLL_NORMAL))
 		    {
-		      /* the bind type signature keys the type and codeset only (D-27583-20): the collation is the
+		      /* the bind type signature keys the type and codeset only (D-27583-20): a position the client
+		       * casts into a collation holds that collation; any other string position's collation is the
 		       * bound value's at each execution, as a LEAVE expected domain leaves it */
 		      regu->domain->collation_flag = TP_DOMAIN_COLL_LEAVE;
 		    }

@@ -4148,6 +4148,16 @@ err_exit:
   return ((err == ER_FAILED && (err = er_errid ()) == NO_ERROR) ? ER_GENERIC_ERROR : err);
 }				/* do_prepare_statement() */
 
+/* CBRD-27583: the root of a typed plan carries XASL_TYPED_BIND_PLAN, which the server's domain load reads */
+static void
+do_mark_typed_bind_plan (const PARSER_CONTEXT * parser, XASL_NODE * xasl)
+{
+  if (xasl != NULL && parser->flag.typed_bind_plan)
+    {
+      XASL_SET_FLAG (xasl, XASL_TYPED_BIND_PLAN);
+    }
+}
+
 /*
  * do_prepare_hash_text () - CBRD-27583: the XASL cache key text of a statement and its SHA-1. The text is the
  *   statement's hash print plus, for a typed plan, the bind type signature of the positions the plan compiles
@@ -10060,6 +10070,7 @@ do_prepare_update (PARSER_CONTEXT * parser, PT_NODE * statement)
 
 	      /* pt_to_update_xasl() will build XASL tree from parse tree */
 	      contextp->xasl = pt_to_update_xasl (parser, statement, &not_nulls);
+	      do_mark_typed_bind_plan (parser, contextp->xasl);
 	      if (contextp->xasl && (contextp->xasl->header.xasl_flag & HV_PRED_PLAN_UNPEEKED))
 		{
 		  /* freshly compiled with unbound host-variable markers */
@@ -11429,6 +11440,7 @@ do_prepare_delete (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE * paren
 
 	      /* pt_to_delete_xasl() will build XASL tree from parse tree */
 	      contextp->xasl = pt_to_delete_xasl (parser, statement);
+	      do_mark_typed_bind_plan (parser, contextp->xasl);
 	      if (contextp->xasl && (contextp->xasl->header.xasl_flag & HV_PRED_PLAN_UNPEEKED))
 		{
 		  /* freshly compiled with unbound host-variable markers */
@@ -12070,6 +12082,7 @@ do_prepare_insert_internal (PARSER_CONTEXT * parser, PT_NODE * statement)
       /* mark the beginning of another level of xasl packing */
       pt_enter_packing_buf ();
       contextp->xasl = pt_to_insert_xasl (parser, statement);
+      do_mark_typed_bind_plan (parser, contextp->xasl);
 
       if (contextp->xasl)
 	{
@@ -15406,6 +15419,7 @@ do_prepare_select (PARSER_CONTEXT * parser, PT_NODE * statement)
       AU_SAVE_AND_DISABLE (au_save);	/* this prevents authorization checking during generating XASL */
       /* parser_generate_xasl() will build XASL tree from parse tree */
       contextp->xasl = parser_generate_xasl (parser, statement);
+      do_mark_typed_bind_plan (parser, contextp->xasl);
       if (contextp->xasl && statement->info.query.oids_included)
 	{
 	  contextp->xasl->header.xasl_flag |= RESULT_CACHE_INHIBITED;
@@ -18458,6 +18472,7 @@ do_prepare_merge (PARSER_CONTEXT * parser, PT_NODE * statement)
 	  bool backup_flag = parser->flag.is_skip_auto_parameterize;
 	  parser->flag.is_skip_auto_parameterize = 1;
 	  contextp->xasl = pt_to_merge_xasl (parser, statement, &non_nulls_upd, &non_nulls_ins, default_expr_attrs);
+	  do_mark_typed_bind_plan (parser, contextp->xasl);
 	  parser->flag.is_skip_auto_parameterize = backup_flag;
 
 	  stream.buffer = NULL;

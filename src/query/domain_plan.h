@@ -402,6 +402,9 @@ struct RESOLVED_INDEX_KEYS
 typedef struct domain_plan DOMAIN_PLAN;
 struct domain_plan
 {
+  bool typed;			/* CBRD-27583: a typed plan (XASL_TYPED_BIND_PLAN): every bind position is compiled in its
+				 * value's domain, so a fixed position compares by the plan's key and every reference is
+				 * checked against its value's type */
   int n_items;
   DOMAIN_PLAN_ITEM *items;
   DOMAIN_PLAN_ITEM_COLD *items_cold;

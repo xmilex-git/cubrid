@@ -3029,7 +3029,7 @@ qexec_resolve_domains_internal (THREAD_ENTRY * thread_p, xasl_node * xasl, xasl_
 		  continue;
 		}
 	      if (!(item->flags & DOMAIN_PLAN_LATE_BIND) && item->fixed.domain != NULL && !DB_IS_NULL (source)
-		  && !(item->flags & DOMAIN_PLAN_CONSUMER_CONVERTS))
+		  && (plan->typed || !(item->flags & DOMAIN_PLAN_CONSUMER_CONVERTS)))
 		{
 		  /* "value type == plan domain" for every bind the compiler typed: the client cast
 		   * the value into the plan domain, or (CBRD-27583) chose the plan compiled for the value's
