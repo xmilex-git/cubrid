@@ -1296,6 +1296,12 @@ domain_walk_arith (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * arith, bool field_bot
 				DOMAIN_CTX_ASSIGN);
 	}
     }
+  if (arith->opcode == T_SYS_CONNECT_BY_PATH)
+    {
+      /* the path the function makes is a system string (db_make_string), cast into the node's domain at the row
+       * (fetch_cast_value): the converter of a VARCHAR into it, at operand 0 */
+      domain_fixed_operand (item, 0, &tp_String_domain, arith->domain, DOMAIN_CTX_ASSIGN);
+    }
   if (operand_coercion && item != NULL)
     {
       /* planned once the producers are linked (domain_plan_compiled_operand_coercion): until then, no value */

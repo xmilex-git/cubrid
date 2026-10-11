@@ -40,6 +40,7 @@
 #include "error_manager.h"
 #include "file_manager.h"
 #include "log_append.hpp"
+#include "object_domain_convert.h"
 #include "object_primitive.h"
 #include "object_representation.h"
 #include "perf_monitor.h"
@@ -4349,6 +4350,7 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
 	  subkey->col = p->pos_descr.pos_no;
 	  subkey->col_dom = p->pos_descr.dom;
 	  subkey->cmp_dom = NULL;
+	  subkey->cmp_conv = NULL;
 	  subkey->use_cmp_dom = false;
 	  subkey->cmp_dom_session_read = false;
 
@@ -4378,6 +4380,7 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
 	  subkey->permuted_col = i;
 	  subkey->col_dom = types->domp[i];
 	  subkey->cmp_dom = NULL;
+	  subkey->cmp_conv = NULL;
 	  subkey->use_cmp_dom = false;
 	  subkey->cmp_dom_session_read = false;
 	  subkey->sort_f = types->domp[i]->type->get_data_cmpdisk_function ();
@@ -7175,6 +7178,29 @@ qfile_check_interpolation_type (DB_VALUE * value, const TP_DOMAIN * resolved)
 }
 #endif
 
+/* A col_dom string of an interpolation sort key into cmp_dom, in place, with the converter found with cmp_dom
+ * (qexec_plan_interpolation_sort_key). shortcut: a key without a converter (a column type none converts) takes the
+ * generic cast, until the unresolved-domain check covers it (C7, D step) */
+static TP_DOMAIN_STATUS
+qfile_convert_interpolation_value (const SUBKEY_INFO * subkey, DB_VALUE * value)
+{
+  if (subkey->cmp_conv == NULL)
+    {
+      return tp_value_cast (value, value, subkey->cmp_dom, false);
+    }
+  DB_VALUE converted;
+  db_make_null (&converted);
+  const TP_DOMAIN_STATUS status = tp_value_convert (subkey->cmp_conv, subkey->cmp_dom, value, &converted);
+  if (status != DOMAIN_COMPATIBLE)
+    {
+      pr_clear_value (&converted);
+      return status;
+    }
+  pr_clear_value (value);
+  *value = converted;
+  return DOMAIN_COMPATIBLE;
+}
+
 /*
  * qfile_compare_with_interpolation_domain () -
  *  return: compare result
@@ -7252,15 +7278,16 @@ qfile_compare_with_interpolation_domain (const QFILE_COL_LAYOUT * c, const char 
     }
 #endif
 
+  /* both values are col_dom strings: the converter found with cmp_dom, in place */
   cast_domain = subkey->cmp_dom;
-  status = tp_value_cast (&val0, &val0, cast_domain, false);
+  status = qfile_convert_interpolation_value (subkey, &val0);
   if (status != DOMAIN_COMPATIBLE)
     {
       error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;
       goto end;
     }
 
-  status = tp_value_cast (&val1, &val1, cast_domain, false);
+  status = qfile_convert_interpolation_value (subkey, &val1);
   if (status != DOMAIN_COMPATIBLE)
     {
       error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;

@@ -925,22 +925,20 @@ fetch_arith_binary_operand_coercion (THREAD_ENTRY * thread_p, const val_descr * 
 }
 
 /*
- * fetch_cast_operand () - the cast of operand i's value into the node's domain (a CAST; the operand a NVL,
- *   IFNULL, COALESCE or NVL2 row picks), with the converter the load found for the operand's compiled type
- *   (domain_fixed_operand): the cast skips its per-value lookup for a value of that type
+ * fetch_cast_value () - the cast of a value of source_type, operand i's, into the domain the row casts it into
+ *   (domain_operand_cast_target), with the converter the load found for the operand's compiled type
+ *   (domain_fixed_operand) or resolve_domains for its resolved type (qexec_resolve_cast_coercion): the cast skips its
+ *   per-value lookup for a value of that type
  *   force(in): tp_value_cast_force's coercion, else tp_value_cast's
  */
 static inline TP_DOMAIN_STATUS
-fetch_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int i, const DB_VALUE * value,
-		    DB_VALUE * result, const TP_DOMAIN * domain, bool force)
+fetch_cast_value (const val_descr * vd, const DOMAIN_PLAN_ITEM * item, int i, DB_TYPE source_type,
+		  const DB_VALUE * value, DB_VALUE * result, const TP_DOMAIN * domain, bool force)
 {
-  const DOMAIN_PLAN_ITEM *item = arithptr->plan_item;
-  const REGU_VARIABLE *operand = i == 0 ? arithptr->leftptr : i == 1 ? arithptr->rightptr : arithptr->thirdptr;
-  if (item != NULL && item->fixed.conv[i] != NULL && item->fixed.operand_domain[i] == domain && operand != NULL
-      && operand->domain != NULL)
+  if (item != NULL && item->fixed.conv[i] != NULL && item->fixed.operand_domain[i] == domain
+      && source_type != DB_TYPE_NULL)
     {
-      return tp_value_cast_with_converter (value, result, domain, force, TP_DOMAIN_TYPE (operand->domain),
-					   item->fixed.conv[i]);
+      return tp_value_cast_with_converter (value, result, domain, force, source_type, item->fixed.conv[i]);
     }
   if (item != NULL && (item->flags & DOMAIN_PLAN_LATE_BIND_COERCION) && value != NULL && !DB_IS_NULL (value))
     {
@@ -956,13 +954,23 @@ fetch_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int i, co
   return force ? tp_value_cast_force (value, result, domain, false) : tp_value_cast (value, result, domain, false);
 }
 
-/* fetch_cast_operand with tp_value_auto_cast's answer to a cast that fails: NULL under
- * return_null_on_function_errors */
+/* fetch_cast_value over operand i's value, of the operand's compiled type */
 static inline TP_DOMAIN_STATUS
-fetch_auto_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int i, const DB_VALUE * value,
-			 DB_VALUE * result, const TP_DOMAIN * domain)
+fetch_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int i, const DB_VALUE * value,
+		    DB_VALUE * result, const TP_DOMAIN * domain, bool force)
 {
-  const TP_DOMAIN_STATUS status = fetch_cast_operand (vd, arithptr, i, value, result, domain, false);
+  const REGU_VARIABLE *operand = i == 0 ? arithptr->leftptr : i == 1 ? arithptr->rightptr : arithptr->thirdptr;
+  return fetch_cast_value (vd, arithptr->plan_item, i,
+			   operand != NULL && operand->domain != NULL ? TP_DOMAIN_TYPE (operand->domain) : DB_TYPE_NULL,
+			   value, result, domain, force);
+}
+
+/* fetch_cast_value with tp_value_auto_cast's answer to a cast that fails: NULL under return_null_on_function_errors */
+static inline TP_DOMAIN_STATUS
+fetch_auto_cast_value (const val_descr * vd, const DOMAIN_PLAN_ITEM * item, int i, DB_TYPE source_type,
+		       const DB_VALUE * value, DB_VALUE * result, const TP_DOMAIN * domain)
+{
+  const TP_DOMAIN_STATUS status = fetch_cast_value (vd, item, i, source_type, value, result, domain, false);
   if (status != DOMAIN_COMPATIBLE && prm_get_bool_value (PRM_ID_RETURN_NULL_ON_FUNCTION_ERRORS))
     {
       pr_clear_value (result);
@@ -971,6 +979,16 @@ fetch_auto_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int 
       return DOMAIN_COMPATIBLE;
     }
   return status;
+}
+
+static inline TP_DOMAIN_STATUS
+fetch_auto_cast_operand (const val_descr * vd, const ARITH_TYPE * arithptr, int i, const DB_VALUE * value,
+			 DB_VALUE * result, const TP_DOMAIN * domain)
+{
+  const REGU_VARIABLE *operand = i == 0 ? arithptr->leftptr : i == 1 ? arithptr->rightptr : arithptr->thirdptr;
+  return fetch_auto_cast_value (vd, arithptr->plan_item, i,
+				operand != NULL && operand->domain != NULL ? TP_DOMAIN_TYPE (operand->domain)
+				: DB_TYPE_NULL, value, result, domain);
 }
 
 /*
@@ -2497,20 +2515,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_TRIM:
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_INFER_COLLATION) && !DB_IS_NULL (peek_left) && peek_right
-	  && !DB_IS_NULL (peek_right))
-	{
-	  TP_DOMAIN_STATUS status = tp_value_change_coll_and_codeset (peek_right, peek_right,
-								      db_get_string_collation (peek_left),
-								      db_get_string_codeset (peek_left));
-
-	  if (status != DOMAIN_COMPATIBLE)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (DB_VALUE_TYPE (peek_right)),
-		      pr_type_name (DB_VALUE_TYPE (peek_left)));
-	      goto error;
-	    }
-	}
       if (DB_IS_NULL (peek_left) || (peek_right && DB_IS_NULL (peek_right)))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -2522,20 +2526,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_LTRIM:
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_INFER_COLLATION) && !DB_IS_NULL (peek_left) && peek_right
-	  && !DB_IS_NULL (peek_right))
-	{
-	  TP_DOMAIN_STATUS status = tp_value_change_coll_and_codeset (peek_right, peek_right,
-								      db_get_string_collation (peek_left),
-								      db_get_string_codeset (peek_left));
-
-	  if (status != DOMAIN_COMPATIBLE)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (DB_VALUE_TYPE (peek_right)),
-		      pr_type_name (DB_VALUE_TYPE (peek_left)));
-	      goto error;
-	    }
-	}
       if (DB_IS_NULL (peek_left) || (peek_right && DB_IS_NULL (peek_right)))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -2547,20 +2537,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_RTRIM:
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_INFER_COLLATION) && !DB_IS_NULL (peek_left) && peek_right
-	  && !DB_IS_NULL (peek_right))
-	{
-	  TP_DOMAIN_STATUS status = tp_value_change_coll_and_codeset (peek_right, peek_right,
-								      db_get_string_collation (peek_left),
-								      db_get_string_codeset (peek_left));
-
-	  if (status != DOMAIN_COMPATIBLE)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (DB_VALUE_TYPE (peek_right)),
-		      pr_type_name (DB_VALUE_TYPE (peek_left)));
-	      goto error;
-	    }
-	}
       if (DB_IS_NULL (peek_left) || (peek_right && DB_IS_NULL (peek_right)))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -2583,20 +2559,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_LPAD:
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_INFER_COLLATION) && !DB_IS_NULL (peek_left) && peek_third
-	  && !DB_IS_NULL (peek_third))
-	{
-	  TP_DOMAIN_STATUS status = tp_value_change_coll_and_codeset (peek_third, peek_third,
-								      db_get_string_collation (peek_left),
-								      db_get_string_codeset (peek_left));
-
-	  if (status != DOMAIN_COMPATIBLE)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (DB_VALUE_TYPE (peek_third)),
-		      pr_type_name (DB_VALUE_TYPE (peek_left)));
-	      goto error;
-	    }
-	}
       if (DB_IS_NULL (peek_left) || (peek_third && DB_IS_NULL (peek_third)))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -2608,20 +2570,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_RPAD:
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_INFER_COLLATION) && !DB_IS_NULL (peek_left) && peek_third
-	  && !DB_IS_NULL (peek_third))
-	{
-	  TP_DOMAIN_STATUS status = tp_value_change_coll_and_codeset (peek_third, peek_third,
-								      db_get_string_collation (peek_left),
-								      db_get_string_codeset (peek_left));
-
-	  if (status != DOMAIN_COMPATIBLE)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (DB_VALUE_TYPE (peek_third)),
-		      pr_type_name (DB_VALUE_TYPE (peek_left)));
-	      goto error;
-	    }
-	}
       if (DB_IS_NULL (peek_left) || (peek_third && DB_IS_NULL (peek_third)))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -2633,20 +2581,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_REPLACE:
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_INFER_COLLATION) && !DB_IS_NULL (peek_left) && peek_third
-	  && !DB_IS_NULL (peek_third))
-	{
-	  TP_DOMAIN_STATUS status = tp_value_change_coll_and_codeset (peek_third, peek_third,
-								      db_get_string_collation (peek_left),
-								      db_get_string_codeset (peek_left));
-
-	  if (status != DOMAIN_COMPATIBLE)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (DB_VALUE_TYPE (peek_third)),
-		      pr_type_name (DB_VALUE_TYPE (peek_left)));
-	      goto error;
-	    }
-	}
       if (!prm_get_bool_value (PRM_ID_ORACLE_STYLE_EMPTY_STRING)
 	  && (DB_IS_NULL (peek_left) || DB_IS_NULL (peek_right) || (peek_third && DB_IS_NULL (peek_third))))
 	{
@@ -2659,19 +2593,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_TRANSLATE:
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_INFER_COLLATION) && !DB_IS_NULL (peek_left))
-	{
-	  TP_DOMAIN_STATUS status = tp_value_change_coll_and_codeset (peek_third, peek_third,
-								      db_get_string_collation (peek_left),
-								      db_get_string_codeset (peek_left));
-
-	  if (status != DOMAIN_COMPATIBLE)
-	    {
-	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (DB_VALUE_TYPE (peek_third)),
-		      pr_type_name (DB_VALUE_TYPE (peek_left)));
-	      goto error;
-	    }
-	}
       if (DB_IS_NULL (peek_left))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -4344,7 +4265,9 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto error;
 	  }
 
-	dom_status = tp_value_auto_cast (arithptr->value, arithptr->value, domain);
+	/* the path is a system string (db_make_string): into the node's domain with the converter the load found */
+	dom_status = fetch_auto_cast_value (vd, arithptr->plan_item, 0, DB_TYPE_VARCHAR, arithptr->value,
+					    arithptr->value, domain);
 	if (dom_status != DOMAIN_COMPATIBLE)
 	  {
 	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, arithptr->value, domain);

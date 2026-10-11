@@ -3933,6 +3933,18 @@ qexec_setup_aggregate_accumulators (const VAL_DESCR * vd, AGGREGATE_TYPE * agg_p
     case PT_VAR_SAMP:
       accumulator_domain->value_dom = &tp_Double_domain;
       accumulator_domain->value2_dom = &tp_Double_domain;
+      {
+	/* [1] the converter of a value into DOUBLE (tp_value_coerce's implicit mode), as the analytic's; none for a
+	 * DOUBLE argument, or one without a type */
+	const TP_DOMAIN *argument = qexec_value_domain (vd, agg_p->operands != NULL ? &agg_p->operands->value : NULL);
+	if (argument != NULL && TP_DOMAIN_TYPE (argument) != DB_TYPE_VARIABLE
+	    && TP_DOMAIN_TYPE (argument) != DB_TYPE_NULL && TP_DOMAIN_TYPE (argument) != DB_TYPE_DOUBLE)
+	  {
+	    accumulator_domain->operand_coercion.operand_domain[1] = &tp_Double_domain;
+	    accumulator_domain->operand_coercion.conv[1] =
+	      tp_value_find_converter (TP_DOMAIN_TYPE (argument), &tp_Double_domain, DOMAIN_CONVERT_IMPLICIT);
+	  }
+      }
       break;
 
     case PT_MEDIAN:
@@ -3949,6 +3961,16 @@ qexec_setup_aggregate_accumulators (const VAL_DESCR * vd, AGGREGATE_TYPE * agg_p
 	  {
 	    accumulator_domain->value_dom = domain;
 	    accumulator_domain->value2_dom = &tp_Null_domain;
+	    /* [1] the converter of a value of the argument's type into the function's (default) domain, which the row
+	     * casts each value to (qdata_evaluate_aggregate_list) */
+	    if (operand_type != DB_TYPE_NULL && operand_type != DB_TYPE_VARIABLE)
+	      {
+		accumulator_domain->operand_coercion.operand_domain[1] =
+		  tp_domain_resolve_default (TP_DOMAIN_TYPE (domain));
+		accumulator_domain->operand_coercion.conv[1] =
+		  tp_value_find_converter (operand_type, accumulator_domain->operand_coercion.operand_domain[1],
+					   DOMAIN_CONVERT_ASSIGN);
+	      }
 	  }
       }
       break;

@@ -470,6 +470,37 @@ qdata_aggregate_accumulator_to_accumulator (cubthread::entry *thread_p, cubxasl:
 }
 
 /*
+ * qdata_coerce_to_double () - a STDDEV / VARIANCE value into DOUBLE, in place, with the converter the setup found
+ *   for the argument's type (operand_coercion [1]); a DOUBLE stays as it is
+ *   return: error code
+ *
+ * shortcut: a value whose argument the setup could not type takes the generic coercion (tp_value_coerce), until
+ * the unresolved-domain check covers it (C7, D step)
+ */
+static int
+qdata_coerce_to_double (const cubxasl::aggregate_accumulator_domain *acc_dom, DB_VALUE *value)
+{
+  if (DB_VALUE_DOMAIN_TYPE (value) == DB_TYPE_DOUBLE)
+    {
+      return NO_ERROR;
+    }
+  DB_VALUE coerced;
+  db_make_null (&coerced);
+  const TP_DOMAIN_STATUS status = acc_dom->operand_coercion.conv[1] != NULL
+				  ? tp_value_convert (acc_dom->operand_coercion.conv[1], &tp_Double_domain, value, &coerced)
+				  : tp_value_coerce (value, &coerced, &tp_Double_domain);
+  if (status != DOMAIN_COMPATIBLE)
+    {
+      pr_clear_value (&coerced);
+      const int error = tp_domain_status_er_set (status, ARG_FILE_LINE, value, &tp_Double_domain);
+      return error != NO_ERROR ? error : ER_FAILED;
+    }
+  pr_clear_value (value);
+  *value = coerced;
+  return NO_ERROR;
+}
+
+/*
  * qdata_aggregate_value_to_accumulator () - aggregate a value to accumulator
  *   returns: error code or NO_ERROR
  *   thread_p(in): thread
@@ -655,7 +686,7 @@ qdata_aggregate_value_to_accumulator (cubthread::entry *thread_p, cubxasl::aggre
     case PT_VAR_POP:
     case PT_VAR_SAMP:
       /* coerce value to DOUBLE domain */
-      if (tp_value_coerce (value, value, domain->value_dom) != DOMAIN_COMPATIBLE)
+      if (qdata_coerce_to_double (domain, value) != NO_ERROR)
 	{
 	  return ER_FAILED;
 	}
@@ -1356,7 +1387,10 @@ qdata_evaluate_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
 			  return qexec_domain_unresolved (val_desc_p, agg_p->plan_item, agg_domain);
 			}
 		      tmp_domain_p = tp_domain_resolve_default (TP_DOMAIN_TYPE (agg_domain));
-		      status = tp_value_cast (db_value_p, db_value_p, tmp_domain_p, false);
+		      /* with the converter the setup found for the argument's type (operand_coercion [1]) */
+		      status = tp_value_cast_with_converter (db_value_p, db_value_p, tmp_domain_p, false, agg_operand_type,
+							     qexec_accumulator_domain (val_desc_p, agg_p->plan_item)
+							     ->operand_coercion.conv[1]);
 		      if (status != DOMAIN_COMPATIBLE)
 			{
 			  error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;
@@ -2040,7 +2074,8 @@ qdata_finalize_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_li
 			      || agg_p->function == PT_VAR_POP || agg_p->function == PT_STDDEV_POP
 			      || agg_p->function == PT_VAR_SAMP || agg_p->function == PT_STDDEV_SAMP)
 			    {
-			      if (tp_value_coerce (&dbval, &dbval, tmp_domain_ptr) != DOMAIN_COMPATIBLE)
+			      if (qdata_coerce_to_double (qexec_accumulator_domain (vd, agg_p->plan_item), &dbval)
+				  != NO_ERROR)
 				{
 				  ASSERT_ERROR_AND_SET (error);
 				  (void) pr_clear_value (&dbval);
