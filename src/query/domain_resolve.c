@@ -4302,8 +4302,77 @@ qexec_setup_analytic_accumulator (const VAL_DESCR * vd, ANALYTIC_TYPE * func_p, 
     }
 }
 
+/* The operand at index i of a block's analytic operand list (a_regu_list), NULL past its end */
+static const REGU_VARIABLE *
+qexec_analytic_list_operand (REGU_VARIABLE_LIST operands, int i)
+{
+  for (; operands != NULL && i > 0; operands = operands->next, i--)
+    {
+      ;
+    }
+  return operands != NULL ? &operands->value : NULL;
+}
+
+/*
+ * qexec_setup_analytic_offsets () - a LEAD / LAG / NTH_VALUE's converters of its offset into INTEGER (NTH_VALUE:
+ *   DOUBLE) and of its default into the function's domain, once per execution from the operands' domains
+ *   (tp_value_coerce's implicit mode); the rows convert with them (qexec_analytic_convert_operand). The accumulator
+ *   domain's operand coercion, which these functions do not sum with, carries them: [0] the offset, [1] the default.
+ *   None for an operand without a type, or of the target's type.
+ *   domain(in): the function's domain in this execution
+ */
+static void
+qexec_setup_analytic_offsets (const VAL_DESCR * vd, ANALYTIC_TYPE * func_p, REGU_VARIABLE_LIST operands,
+			      const TP_DOMAIN * domain)
+{
+  if (!QPROC_ANALYTIC_IS_OFFSET_FUNCTION (func_p))
+    {
+      return;
+    }
+  DOMAIN_OPERAND_COERCION *coercion = &qexec_accumulator_domain (vd, func_p->plan_item)->operand_coercion;
+  const TP_DOMAIN *targets[2] = { func_p->function == PT_NTH_VALUE ? &tp_Double_domain : &tp_Integer_domain, domain };
+  const int indexes[2] = { func_p->offset_idx, func_p->default_idx };
+  for (int i = 0; i < 2; i++)
+    {
+      const TP_DOMAIN *operand = qexec_value_domain (vd, qexec_analytic_list_operand (operands, indexes[i]));
+      coercion->operand_domain[i] = targets[i];
+      coercion->conv[i] = NULL;
+      if (operand != NULL && targets[i] != NULL && TP_DOMAIN_TYPE (operand) != DB_TYPE_VARIABLE
+	  && TP_DOMAIN_TYPE (operand) != DB_TYPE_NULL && TP_DOMAIN_TYPE (operand) != TP_DOMAIN_TYPE (targets[i]))
+	{
+	  coercion->conv[i] = tp_value_find_converter (TP_DOMAIN_TYPE (operand), targets[i], DOMAIN_CONVERT_IMPLICIT);
+	}
+    }
+}
+
+/*
+ * qexec_analytic_convert_operand () - a LEAD / LAG / NTH_VALUE's offset (i = 0) or default (i = 1) value into
+ *   target, with the converter the setup found (qexec_setup_analytic_offsets); a NULL stays NULL
+ *   return: tp_value_coerce's status
+ *   result(out): a value that holds nothing
+ *
+ * shortcut: a value whose operand the setup could not type takes the generic coercion, until the unresolved-domain
+ * check covers it (C7, D step)
+ */
+TP_DOMAIN_STATUS
+qexec_analytic_convert_operand (const VAL_DESCR * vd, const ANALYTIC_TYPE * func_p, int i, const DB_VALUE * value,
+				DB_VALUE * result, const TP_DOMAIN * target)
+{
+  if (DB_IS_NULL (value))
+    {
+      db_make_null (result);
+      return DOMAIN_COMPATIBLE;
+    }
+  const DOMAIN_OPERAND_COERCION *coercion = &qexec_accumulator_domain (vd, func_p->plan_item)->operand_coercion;
+  if (coercion->conv[i] != NULL && coercion->operand_domain[i] == target)
+    {
+      return tp_value_convert (coercion->conv[i], target, value, result);
+    }
+  return tp_value_coerce (value, result, target);
+}
+
 int
-qexec_setup_analytic_domains (const VAL_DESCR * vd, ANALYTIC_EVAL_TYPE * eval_list)
+qexec_setup_analytic_domains (const VAL_DESCR * vd, ANALYTIC_EVAL_TYPE * eval_list, REGU_VARIABLE_LIST operands)
 {
   for (ANALYTIC_EVAL_TYPE * eval = eval_list; eval != NULL; eval = eval->next)
     {
@@ -4355,6 +4424,8 @@ qexec_setup_analytic_domains (const VAL_DESCR * vd, ANALYTIC_EVAL_TYPE * eval_li
 	      qexec_set_node_domain (vd, func_p->plan_item, func_p->domain, settled);
 	    }
 	  qexec_setup_analytic_accumulator (vd, func_p, qexec_get_node_domain (vd, func_p->domain, func_p->plan_item));
+	  qexec_setup_analytic_offsets (vd, func_p, operands,
+					qexec_get_node_domain (vd, func_p->domain, func_p->plan_item));
 	}
     }
   return NO_ERROR;

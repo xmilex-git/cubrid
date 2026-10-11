@@ -16381,7 +16381,8 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 	  if (xasl->proc.buildlist.a_eval_list)
 	    {
 	      /* the analytic functions' domains, settled before the scan: no value settles one */
-	      if (qexec_setup_analytic_domains (&xasl_state->vd, xasl->proc.buildlist.a_eval_list) != NO_ERROR)
+	      if (qexec_setup_analytic_domains (&xasl_state->vd, xasl->proc.buildlist.a_eval_list,
+						xasl->proc.buildlist.a_regu_list) != NO_ERROR)
 		{
 		  GOTO_EXIT_ON_ERROR;
 		}
@@ -23141,7 +23142,8 @@ qexec_analytic_evaluate_offset_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCT
     {
     case PT_LEAD:
     case PT_LAG:
-      dom_status = tp_value_coerce (regulist->value.vfetch_to, &offset_val, &tp_Integer_domain);
+      dom_status = qexec_analytic_convert_operand (func_state->vd, func_p, 0, regulist->value.vfetch_to, &offset_val,
+						   &tp_Integer_domain);
       if (dom_status != DOMAIN_COMPATIBLE)
 	{
 	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, regulist->value.vfetch_to, &tp_Integer_domain);
@@ -23178,7 +23180,8 @@ qexec_analytic_evaluate_offset_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCT
       break;
 
     case PT_NTH_VALUE:
-      dom_status = tp_value_coerce (regulist->value.vfetch_to, &offset_val, &tp_Double_domain);
+      dom_status = qexec_analytic_convert_operand (func_state->vd, func_p, 0, regulist->value.vfetch_to, &offset_val,
+						   &tp_Double_domain);
       if (dom_status != DOMAIN_COMPATIBLE)
 	{
 	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, regulist->value.vfetch_to, &tp_Double_domain);
@@ -23267,7 +23270,7 @@ qexec_analytic_evaluate_offset_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCT
     {
       /* coerce value to default domain */
       TP_DOMAIN *domain = qexec_get_node_domain (func_state->vd, func_p->domain, func_p->plan_item);
-      dom_status = tp_value_coerce (default_val_p, &default_val, domain);
+      dom_status = qexec_analytic_convert_operand (func_state->vd, func_p, 1, default_val_p, &default_val, domain);
       if (dom_status != DOMAIN_COMPATIBLE)
 	{
 	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, default_val_p, domain);

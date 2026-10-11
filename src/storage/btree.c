@@ -19442,42 +19442,10 @@ btree_coerce_key (DB_VALUE * keyp, int keysize, TP_DOMAIN * btree_domainp, int k
     }
   else
     {
-      DB_VALUE temp_val;
-
-      db_make_null (&temp_val);
-
-      if (tp_more_general_type (dtype, stype) > 0)
-	{
-	  /* the other case, do real coercing using 'tp_value_coerce()' */
-	  if (tp_value_coerce (keyp, &temp_val, btree_domainp) == DOMAIN_COMPATIBLE)
-	    {
-	      pr_clear_value (keyp);
-	      pr_clone_value (&temp_val, keyp);
-	    }
-
-	  pr_clear_value (&temp_val);
-	}
-      else if (TP_IS_NUMERIC_TYPE (dtype) || TP_IS_DATE_OR_TIME_TYPE (dtype))
-	{
-	  /* try to strict cast keyp to dtype */
-	  err = tp_value_coerce_strict (keyp, &temp_val, btree_domainp);
-	  if (err == NO_ERROR)
-	    {
-	      pr_clear_value (keyp);
-	      pr_clone_value (&temp_val, keyp);
-	    }
-	  else
-	    {
-	      /* unsuccessful, */
-	      err = NO_ERROR;
-	    }
-
-	  pr_clear_value (&temp_val);
-	}
-      else
-	{
-	  err = NO_ERROR;
-	}
+      /* a single-column key reaches the scan converted by its key plan (scan_dbvals_to_midxkey is the only caller,
+       * with a MIDXKEY): no coercion here */
+      assert (false);
+      err = ER_FAILED;
     }
 
   if (err != NO_ERROR)

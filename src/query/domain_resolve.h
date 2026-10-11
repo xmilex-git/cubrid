@@ -38,6 +38,7 @@ namespace cubxasl
 {
   struct aggregate_list_node;
   struct analytic_eval_type;
+  struct analytic_list_node;
 }
 struct buildlist_proc_node;
 struct regu_variable_list_node;
@@ -373,7 +374,12 @@ extern void qexec_finish_group_by_domains (const VAL_DESCR * vd, buildlist_proc_
 extern void qexec_setup_hash_aggregate_lists (const VAL_DESCR * vd, buildlist_proc_node * buildlist);
 extern int qexec_setup_aggregate_domains (cubxasl::aggregate_list_node * agg_list, const VAL_DESCR * vd);
 extern void qexec_type_accumulator_outputs (const VAL_DESCR * vd, xasl_node * xasl);
-extern int qexec_setup_analytic_domains (const VAL_DESCR * vd, cubxasl::analytic_eval_type * eval_list);
+extern int qexec_setup_analytic_domains (const VAL_DESCR * vd, cubxasl::analytic_eval_type * eval_list,
+					 REGU_VARIABLE_LIST operands);
+extern TP_DOMAIN_STATUS qexec_analytic_convert_operand (const VAL_DESCR * vd,
+							const cubxasl::analytic_list_node * func_p, int i,
+							const DB_VALUE * value, DB_VALUE * result,
+							const TP_DOMAIN * target);
 extern int qexec_setup_parallel_aggregates (xasl_node * xasl, const VAL_DESCR * vd);
 
 #endif /* _DOMAIN_RESOLVE_H_ */
