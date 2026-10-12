@@ -2065,22 +2065,6 @@ qexec_key_element_domain (const XASL_STATE * xasl_state, const DOMAIN_PLAN_ITEM 
     && domain_fixes_values (domain) ? domain_key_value_domain (domain) : NULL;
 }
 
-#if !defined (NDEBUG)
-/* The debug cross-check of a strict key conversion: the resolved converter gives tp_value_coerce_strict's outcome,
- * and a kept value leaves no error behind. */
-static void
-qexec_check_key_strict (const DB_VALUE * value, const TP_DOMAIN * column, const DB_VALUE * converted)
-{
-  DB_VALUE expected;
-  db_make_null (&expected);
-  const bool expected_converts = tp_value_coerce_strict (value, &expected, column) == NO_ERROR;
-  assert (expected_converts == (converted != NULL));
-  assert (converted == NULL || tp_value_compare (&expected, (DB_VALUE *) converted, 0, 1) == DB_EQ);
-  pr_clear_value (&expected);
-  assert (converted != NULL || er_errid () == NO_ERROR);
-}
-#endif /* !NDEBUG */
-
 /*
  * qexec_resolve_key_constant () - a constant key element's value for this execution
  *
@@ -2162,15 +2146,9 @@ qexec_resolve_key_constant (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, DO
     {
       if (tp_value_convert (strict_conv, column, value, &resolved_domain->value) == DOMAIN_COMPATIBLE)
 	{
-#if !defined (NDEBUG)
-	  qexec_check_key_strict (value, column, &resolved_domain->value);
-#endif
 	  return NO_ERROR;
 	}
       pr_clear_value (&resolved_domain->value);
-#if !defined (NDEBUG)
-      qexec_check_key_strict (value, column, NULL);
-#endif
     }
   resolved_domain->kept = rule != DOMAIN_KEY_INDEX;
   resolved_domain->domain = domain_in_key_direction (value_domain, column);

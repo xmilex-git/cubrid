@@ -951,6 +951,9 @@ fetch_cast_value (const val_descr * vd, const DOMAIN_PLAN_ITEM * item, int i, DB
 					       resolved->conv[i]);
 	}
     }
+  /* a value of the target's own type (a precision or collation the cast adjusts), a pair no converter takes (the
+   * cast reports the incompatibility), or a node without a plan item (a function index key evaluated by
+   * heap_eval_function_index) */
   return force ? tp_value_cast_force (value, result, domain, false) : tp_value_cast (value, result, domain, false);
 }
 

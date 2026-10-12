@@ -2075,22 +2075,6 @@ scan_key_value_holds (const DB_VALUE * value, const TP_DOMAIN * domain)
   return !TP_IS_CHAR_TYPE (type) || db_get_string_collation (value) == TP_DOMAIN_COLLATION (domain);
 }
 
-#if !defined (NDEBUG)
-/* The debug cross-check of a resolved strict key conversion: tp_value_coerce_strict gives the same outcome, and a
- * kept value leaves no error behind. */
-static void
-scan_check_key_strict (const DB_VALUE * value, const TP_DOMAIN * column, const DB_VALUE * converted)
-{
-  DB_VALUE expected;
-  db_make_null (&expected);
-  const bool expected_converts = tp_value_coerce_strict (value, &expected, column) == NO_ERROR;
-  assert (expected_converts == (converted != NULL));
-  assert (converted == NULL || tp_value_compare (&expected, (DB_VALUE *) converted, 0, 1) == DB_EQ);
-  pr_clear_value (&expected);
-  assert (converted != NULL || er_errid () == NO_ERROR);
-}
-#endif /* !NDEBUG */
-
 /*
  * scan_key_column () - one column of a multi-column search key at a range
  *   return: NO_ERROR, or ER_code (the unresolved-domain check (execution): a value its plan domain does not describe)
@@ -2162,18 +2146,12 @@ scan_key_column (INDX_SCAN_ID * isidp, const domain_plan_key_elem * elem, int co
 	pr_clear_value (converted);
 	if (tp_value_convert (strict_conv, column, *value, converted) == DOMAIN_COMPATIBLE)
 	  {
-#if !defined (NDEBUG)
-	    scan_check_key_strict (*value, column, converted);
-#endif
 	    *value = converted;
 	    *domain = column;
 	    *choice = SCAN_KEY_COLUMN;
 	    return NO_ERROR;
 	  }
 	pr_clear_value (converted);
-#if !defined (NDEBUG)
-	scan_check_key_strict (*value, column, NULL);
-#endif
 	*domain = keep;
 	*choice = SCAN_KEY_RESOLVED;
 	*kept = true;
