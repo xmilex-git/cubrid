@@ -1136,9 +1136,27 @@ namespace memoize
 // *INDENT-ON*
 struct domain_plan;
 
+/*
+ * CBRD-27583: a bind value the compiler decided to convert before the main block. The compiler allocates a new
+ * host-variable position (dst_pos >= the positions the client sends) and points every regu that read src_pos in
+ * domain at dst_pos; the execution converts vd->dbval_ptr[src_pos] into [dst_pos] once (qexec_convert_bind_values)
+ * and the rows read it like any other position. A value the converter refuses is copied as it is, so the rows
+ * meet it where develop met it.
+ */
+typedef struct bind_conversion BIND_CONVERSION;
+struct bind_conversion
+{
+  int src_pos;			/* the position the client sends */
+  int dst_pos;			/* the position the tree reads */
+  TP_DOMAIN *domain;		/* what [dst_pos] holds */
+  TP_VALUE_CONVERTER conv;	/* server, found at unpack from (value type, domain); not serialized */
+};
+
 struct xasl_node
 {
   struct domain_plan *domain_plan;	/* tree-wide unpack-arena plan, not serialized */
+  BIND_CONVERSION *bind_conversions;	/* CBRD-27583: [n_bind_conversions], in the stream header (root only) */
+  int n_bind_conversions;
   XASL_NODE_HEADER header;	/* XASL header */
   XASL_NODE *next;		/* next XASL block */
   PROC_TYPE type;		/* XASL type */

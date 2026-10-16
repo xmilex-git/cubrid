@@ -95,6 +95,7 @@ static int do_cast_host_variables_to_expected_domain (DB_SESSION * session);
 static int do_recompile_and_execute_prepared_statement (DB_SESSION * session, PT_NODE * statement,
 							DB_QUERY_RESULT ** result);
 static int do_replan_statement_with_bind_peek (PARSER_CONTEXT * parser, PT_NODE * statement);
+static int db_choose_bind_type_plan (PARSER_CONTEXT * parser, PT_NODE * statement, bool * replanned);
 static int do_reexecute_prepared_statement_from_kept_tree (DB_SESSION * session, DB_SESSION * kept,
 							   PT_NODE * statement, DB_QUERY_RESULT ** result,
 							   bool force_replan);
@@ -2235,9 +2236,21 @@ db_execute_and_keep_statement_local (DB_SESSION * session, int stmt_ndx, DB_QUER
        * this, CCI/JDBC prepared statements -- which never build a PT_EXECUTE_PREPARE node and so never
        * reach the header-flag consumer in do_get_prepared_statement_info () -- would never price a
        * `?` predicate with real values. */
+      /* CBRD-27583: the plan compiled for this execution's bind type signature. A plan prepared here is chosen
+       * under these values, so the bind-peek replan below is not needed on top of it. */
+      bool typed_replanned = false;
+      err = db_choose_bind_type_plan (parser, statement, &typed_replanned);
+      if (err != NO_ERROR)
+	{
+	  update_execution_values (parser, -1, CUBRID_MAX_STMT_TYPE);
+	  assert (result == NULL || *result == NULL);
+	  return err;
+	}
+
       bind_fp_p = db_stmt_bind_fp_ptr (statement);
-      if ((statement->flag.hv_pred_plan_unpeeked || db_is_bind_sensitive (statement)) && bind_fp_p != NULL
-	  && parser->flag.set_host_var && parser->host_var_count > 0 && statement->xasl_id != NULL)
+      if (!typed_replanned && (statement->flag.hv_pred_plan_unpeeked || db_is_bind_sensitive (statement))
+	  && bind_fp_p != NULL && parser->flag.set_host_var && parser->host_var_count > 0
+	  && statement->xasl_id != NULL)
 	{
 	  UINT64 bind_fp = 0;
 
@@ -3516,6 +3529,64 @@ db_reset_cte_xasl_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *
   return node;
 }
 
+/*
+ * db_choose_bind_type_plan () - CBRD-27583: run the plan compiled for this execution's bind type signature. The
+ *   signature is built from the bound values; when it differs from the one xasl_id was compiled under, the
+ *   statement is prepared again under it -- a cache hit when this signature ran before, a new XASL otherwise.
+ *   There is no plan without types: a statement with host variables always runs a typed plan.
+ * return : error code
+ * parser (in)      : the statement's parser; its host variables are bound
+ * statement (in)   : the statement about to execute
+ * replanned (out)  : the statement was prepared again under the bound values
+ */
+static int
+db_choose_bind_type_plan (PARSER_CONTEXT * parser, PT_NODE * statement, bool * replanned)
+{
+  char stack_buf[1024];
+  *replanned = false;
+  if (statement->xasl_id == NULL || statement->flag.cannot_prepare || statement->node_type == PT_EXECUTE_PREPARE
+      || parser->host_var_count <= 0 || parser->host_variables == NULL
+      || prm_get_integer_value (PRM_ID_XASL_CACHE_MAX_ENTRIES) <= 0)
+    {
+      return NO_ERROR;
+    }
+  const size_t needed = (size_t) (parser->host_var_count + parser->auto_param_count) * 24 + 1;
+  const bool on_stack = needed <= sizeof (stack_buf);
+  char *buf = on_stack ? stack_buf : (char *) malloc (needed);
+  if (buf == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, needed);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  const int len = pt_bind_type_signature (parser, buf, on_stack ? sizeof (stack_buf) : needed);
+  int err = NO_ERROR;
+  assert (len >= 0);
+  if (len > 0 && (statement->bind_signature == NULL || strcmp (statement->bind_signature, buf) != 0))
+    {
+      char *signature = strdup (buf);
+      if (signature == NULL)
+	{
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) len + 1);
+	  err = ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      else
+	{
+	  if (statement->bind_signature != NULL)
+	    {
+	      free_and_init (statement->bind_signature);
+	    }
+	  statement->bind_signature = signature;
+	  err = do_replan_statement_with_bind_peek (parser, statement);
+	  *replanned = (err == NO_ERROR);
+	}
+    }
+  if (!on_stack)
+    {
+      free (buf);
+    }
+  return err;
+}
+
 static int
 do_replan_statement_with_bind_peek (PARSER_CONTEXT * parser, PT_NODE * statement)
 {
@@ -3523,10 +3594,14 @@ do_replan_statement_with_bind_peek (PARSER_CONTEXT * parser, PT_NODE * statement
   unsigned int save_recompile = statement->flag.recompile;
   int save_level;
 
+  /* the signature survives the XASL_ID it was compiled under: the replan keys by it again */
+  char *bind_signature = statement->bind_signature;
+  statement->bind_signature = NULL;
   if (statement->xasl_id != NULL)
     {
       pt_free_statement_xasl_id (statement);
     }
+  statement->bind_signature = bind_signature;
   (void) parser_walk_tree (parser, statement, db_reset_cte_xasl_pre, NULL, NULL, NULL);
   statement->flag.recompile = 1;
   er_clear ();
@@ -3571,7 +3646,13 @@ do_replan_statement_with_bind_peek (PARSER_CONTEXT * parser, PT_NODE * statement
       parser->num_plan_trace = 0;
     }
 
+  /* CBRD-27583: the values are bound, so this prepare is the typed plan of their signature: every user host
+   * variable compiles in its value's domain and the cache key carries the signature */
+  parser->typed_bind_signature = statement->bind_signature;
+  parser->flag.typed_bind_plan = statement->bind_signature != NULL;
   err = do_prepare_statement (parser, statement);
+  parser->typed_bind_signature = NULL;
+  parser->flag.typed_bind_plan = 0;
 
   qo_set_optimization_param (NULL, QO_PARAM_LEVEL, save_level);
 

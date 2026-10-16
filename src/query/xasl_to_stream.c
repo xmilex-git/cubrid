@@ -291,7 +291,14 @@ xts_map_xasl_to_stream (const XASL_NODE * xasl_tree, XASL_STREAM * stream)
 
   /* reserve space for new XASL format */
   header_size = sizeof (int)	/* xasl->dbval_cnt */
-    + sizeof (OID)		/* xasl->creator_oid */
+    + sizeof (int);		/* xasl->n_bind_conversions */
+  for (i = 0; i < xasl_tree->n_bind_conversions; i++)
+    {
+      /* CBRD-27583: src_pos, dst_pos, domain */
+      header_size += sizeof (int) + sizeof (int)
+	+ or_packed_domain_size (xasl_tree->bind_conversions[i].domain, 0);
+    }
+  header_size += sizeof (OID)	/* xasl->creator_oid */
     + sizeof (int)		/* xasl->n_oid_list */
     + sizeof (OID) * xasl_tree->n_oid_list	/* xasl->class_oid_list */
     + sizeof (int) * xasl_tree->n_oid_list	/* xasl->class_locks */
@@ -342,6 +349,15 @@ xts_map_xasl_to_stream (const XASL_NODE * xasl_tree, XASL_STREAM * stream)
   for (i = 0; i < xasl_tree->n_oid_list; i++)
     {
       p = or_pack_int (p, xasl_tree->tcard_list[i]);
+    }
+  /* CBRD-27583: the bind conversions close the header, after the fields other readers of the header
+   * (xqmgr_prepare_query) take from its front */
+  p = or_pack_int (p, xasl_tree->n_bind_conversions);
+  for (i = 0; i < xasl_tree->n_bind_conversions; i++)
+    {
+      p = or_pack_int (p, xasl_tree->bind_conversions[i].src_pos);
+      p = or_pack_int (p, xasl_tree->bind_conversions[i].dst_pos);
+      p = or_pack_domain (p, xasl_tree->bind_conversions[i].domain, 0, 0);
     }
 
   /* set body size of new XASL format */
@@ -4551,6 +4567,18 @@ xts_process_comp_eval_term (char *ptr, const COMP_EVAL_TERM * comp_eval_term)
 
   ptr = or_pack_int (ptr, comp_eval_term->type);
 
+  /* CBRD-27583: the compiler's decision; a side kept as it is has no target */
+  for (int side = 0; side < 2; side++)
+    {
+      ptr = or_pack_int (ptr, comp_eval_term->cmp_target[side] != NULL);
+      if (comp_eval_term->cmp_target[side] != NULL)
+	{
+	  ptr = or_pack_domain (ptr, comp_eval_term->cmp_target[side], 0, 0);
+	}
+    }
+  ptr = or_pack_int (ptr, comp_eval_term->cmp_collation);
+  ptr = or_pack_int (ptr, comp_eval_term->cmp_method);
+
   return ptr;
 }
 
@@ -6854,6 +6882,16 @@ xts_sizeof_comp_eval_term (const COMP_EVAL_TERM * comp_eval_term)
 	   + PTR_SIZE		/* rhs */
 	   + OR_INT_SIZE	/* rel_op */
 	   + OR_INT_SIZE);	/* type */
+  /* CBRD-27583: cmp_target[2], cmp_collation, cmp_method */
+  for (int side = 0; side < 2; side++)
+    {
+      size += OR_INT_SIZE;
+      if (comp_eval_term->cmp_target[side] != NULL)
+	{
+	  size += or_packed_domain_size (comp_eval_term->cmp_target[side], 0);
+	}
+    }
+  size += OR_INT_SIZE + OR_INT_SIZE;
 
   return size;
 }

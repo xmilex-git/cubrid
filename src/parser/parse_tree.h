@@ -3780,6 +3780,7 @@ struct parser_node
   TP_DOMAIN *expected_domain;	/* expected domain for input marker */
   PT_NODE *data_type;		/* for non-primitive types, Sets, objects stec. */
   XASL_ID *xasl_id;		/* XASL_ID for this SQL statement */
+  char *bind_signature;		/* CBRD-27583: the bind type signature xasl_id was compiled under; freed with xasl_id */
   const char *alias_print;	/* the column alias */
   PARSER_VARCHAR *expr_before_const_folding;	/* text before constant folding (used by value, host var nodes) */
   PT_TYPE_ENUM type_enum;	/* type enumeration tag PT_TYPE_??? */
@@ -3923,6 +3924,12 @@ struct parser_context
   int auto_param_count;		/* number of auto parameterized variables */
 
   int dbval_cnt;		/* to be assigned to XASL */
+  struct bind_conversion *bind_conversions;	/* CBRD-27583: the bind positions the tree converts before the main
+						 * block (dbval_cnt counts their new positions) */
+  int n_bind_conversions;
+  int max_bind_conversions;
+  const char *typed_bind_signature;	/* CBRD-27583: the signature the plan being generated is for; the cache key
+					 * text carries it */
   int line, column;		/* current input line and column */
 
   void *etc;			/* application context */
@@ -3993,6 +4000,8 @@ struct parser_context
     unsigned is_parsing_static_sql:1;	/* For PL/CSQL's static SQL: parameterize PL/CSQL variable symbols (to host variable) */
     unsigned is_unloading_plcsql_def:1;
     unsigned is_parsing_trigger:1;
+    unsigned typed_bind_plan:1;	/* CBRD-27583: generating a plan for one bind type signature: every user host
+				 * variable's regu domain is the bound value's */
     unsigned is_skip_auto_parameterize:1;	/* set to 1 when skip auto parameterize, now only used for merge xasl generation */
     unsigned dblink_skip_implicit_serial_qualifier:1;	/* DBLink: do not merge current schema into unqualified SERIAL names */
   } flag;

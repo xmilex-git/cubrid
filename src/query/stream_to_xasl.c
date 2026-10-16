@@ -254,6 +254,44 @@ stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool us
 
   /* restore header data of new XASL format */
   p = or_unpack_int (p, &xasl->dbval_cnt);
+  {
+    /* CBRD-27583: the bind conversions close the header: skip creator_oid, n_oid_list and its three lists */
+    OID skipped_oid;
+    int skipped_n;
+    p = or_unpack_oid (p, &skipped_oid);
+    p = or_unpack_int (p, &skipped_n);
+    for (int i = 0; i < skipped_n; i++)
+      {
+	p = or_unpack_oid (p, &skipped_oid);
+      }
+    p += 2 * skipped_n * OR_INT_SIZE;
+  }
+  p = or_unpack_int (p, &xasl->n_bind_conversions);
+  xasl->bind_conversions = NULL;
+  if (xasl->n_bind_conversions > 0)
+    {
+      /* CBRD-27583: the converter of each bind is found here, once per load, from the position's value type the
+       * compiler knew (the domain of the position it reads) */
+      xasl->bind_conversions =
+	(BIND_CONVERSION *) stx_alloc_struct (thread_p, xasl->n_bind_conversions * sizeof (BIND_CONVERSION));
+      if (xasl->bind_conversions == NULL)
+	{
+	  free_xasl_unpack_info (thread_p, unpack_info_p);
+	  *xasl_tree = NULL;
+	  *xasl_unpack_info_ptr = NULL;
+	  goto end;
+	}
+      for (int i = 0; i < xasl->n_bind_conversions; i++)
+	{
+	  BIND_CONVERSION *conversion = &xasl->bind_conversions[i];
+	  int is_null;
+	  p = or_unpack_int (p, &conversion->src_pos);
+	  p = or_unpack_int (p, &conversion->dst_pos);
+	  p = or_unpack_domain (p, &conversion->domain, &is_null);
+	  conversion->domain = tp_domain_cache (conversion->domain);
+	  conversion->conv = NULL;	/* qexec_convert_bind_values finds it from the value's type */
+	}
+    }
   OID_SET_NULL (&xasl->creator_oid);
   xasl->n_oid_list = 0;
   xasl->class_oid_list = NULL;
@@ -1798,6 +1836,8 @@ stx_build_xasl_node (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE * xasl)
 {
   xasl->domain_plan = NULL;
   xasl->limit_compare = NULL;
+  xasl->bind_conversions = NULL;
+  xasl->n_bind_conversions = 0;
   int offset;
   int tmp, i;
   XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
@@ -4469,6 +4509,59 @@ stx_build_eval_term (THREAD_ENTRY * thread_p, char *ptr, EVAL_TERM * eval_term)
   return ptr;
 }
 
+/*
+ * stx_build_term_compare () - CBRD-27583: the function pointers of a comparison the compiler decided: the converter
+ *   of each side into its target and the comparison function of the compared type. The server decides nothing here;
+ *   it looks the pointers up for the decision the stream carries. NULL for an undecided term.
+ */
+static const DOMAIN_COMPARE *
+stx_build_term_compare (THREAD_ENTRY * thread_p, const COMP_EVAL_TERM * term)
+{
+  if (term->cmp_method != DOMAIN_COMPARE_DIRECT && term->cmp_method != DOMAIN_COMPARE_CONVERT)
+    {
+      return NULL;
+    }
+  if (term->lhs == NULL || term->rhs == NULL || term->lhs->domain == NULL || term->rhs->domain == NULL)
+    {
+      return NULL;
+    }
+  DOMAIN_COMPARE *compare = (DOMAIN_COMPARE *) stx_alloc_struct (thread_p, sizeof (*compare));
+  if (compare == NULL)
+    {
+      return NULL;
+    }
+  memset (compare, 0, sizeof (*compare));
+  const DB_TYPE source[2] = { TP_DOMAIN_TYPE (term->lhs->domain), TP_DOMAIN_TYPE (term->rhs->domain) };
+  DB_TYPE after[2] = { source[0], source[1] };
+  compare->method = term->cmp_method;
+  compare->coercion = 1;
+  compare->collation = term->cmp_collation;
+  compare->value[0] = compare->value[1] = -1;
+  compare->compare_index = -1;
+  compare->codeset_side = -1;
+  compare->source[0] = (unsigned char) source[0];
+  compare->source[1] = (unsigned char) source[1];
+  for (int side = 0; side < 2; side++)
+    {
+      compare->target[side] = term->cmp_target[side];
+      if (term->cmp_target[side] != NULL)
+	{
+	  compare->conv[side] = tp_value_find_converter (source[side], term->cmp_target[side], DOMAIN_CONVERT_COMPARE);
+	  after[side] = TP_DOMAIN_TYPE (term->cmp_target[side]);
+	  if (compare->conv[side] == NULL)
+	    {
+	      /* no converter for the pair: the term stays with the load's derivation */
+	      return NULL;
+	    }
+	}
+    }
+  compare->first = (unsigned char) (compare->conv[0] != NULL ? 0 : 1);
+  compare->converted_first = (unsigned char) after[compare->first];
+  compare->cmp = pr_type_from_id (after[0]);
+  domain_compare_set_operator_functions (compare);
+  return compare;
+}
+
 static char *
 stx_build_comp_eval_term (THREAD_ENTRY * thread_p, char *ptr, COMP_EVAL_TERM * comp_eval_term)
 {
@@ -4511,6 +4604,24 @@ stx_build_comp_eval_term (THREAD_ENTRY * thread_p, char *ptr, COMP_EVAL_TERM * c
   ptr = or_unpack_int (ptr, &tmp);
   comp_eval_term->type = (DB_TYPE) tmp;
   comp_eval_term->domain_compare = NULL;
+
+  /* CBRD-27583: the compiler's decision, turned into the function pointers the rows call */
+  for (int side = 0; side < 2; side++)
+    {
+      int has_target, is_null;
+      ptr = or_unpack_int (ptr, &has_target);
+      comp_eval_term->cmp_target[side] = NULL;
+      if (has_target)
+	{
+	  ptr = or_unpack_domain (ptr, &comp_eval_term->cmp_target[side], &is_null);
+	  comp_eval_term->cmp_target[side] = tp_domain_cache (comp_eval_term->cmp_target[side]);
+	}
+    }
+  ptr = or_unpack_int (ptr, &tmp);
+  comp_eval_term->cmp_collation = (short) tmp;
+  ptr = or_unpack_int (ptr, &tmp);
+  comp_eval_term->cmp_method = (unsigned char) tmp;
+  comp_eval_term->compare = stx_build_term_compare (thread_p, comp_eval_term);
 
   return ptr;
 }

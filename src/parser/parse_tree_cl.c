@@ -977,6 +977,18 @@ copy_node_in_tree_pre (PARSER_CONTEXT * parser, PT_NODE * old_node, void *arg, i
       XASL_ID_SET_NULL (new_node->xasl_id);
       XASL_ID_COPY (new_node->xasl_id, old_node->xasl_id);
     }
+  /* CBRD-27583: the signature travels with the XASL_ID it was compiled under */
+  new_node->bind_signature = NULL;
+  if (old_node->bind_signature != NULL)
+    {
+      new_node->bind_signature = strdup (old_node->bind_signature);
+      if (new_node->bind_signature == NULL)
+	{
+	  PT_ERRORmf (parser, old_node, MSGCAT_SET_PARSER_RUNTIME, MSGCAT_RUNTIME_OUT_OF_MEMORY,
+		      strlen (old_node->bind_signature) + 1);
+	  return NULL;
+	}
+    }
 
   /* if node is copied from another parser context, deepcopy string contents */
   if (old_node->parser_id != parser->id)

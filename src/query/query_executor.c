@@ -17445,6 +17445,59 @@ qexec_clear_a_eval_values (THREAD_ENTRY * thread_p, ANALYTIC_EVAL_TYPE * a_eval_
 #define QP_MAX_RE_EXECUTES_UNDER_DEADLOCKS 10
 #endif
 
+/*
+ * qexec_convert_bind_values () - CBRD-27583: the value array an execution reads: the client's positions, then the
+ *   positions the compiler added, each holding the source bind converted into the domain the compiler decided. A
+ *   value the converter refuses keeps the source value, so the rows meet it as develop did. The converter is found
+ *   once per load from the value's type (BIND_CONVERSION.conv); the server decides no domain here.
+ *   return: the array, the caller's to clear and free; NULL on error
+ */
+static DB_VALUE *
+qexec_convert_bind_values (THREAD_ENTRY * thread_p, XASL_NODE * xasl, int dbval_cnt, const DB_VALUE * dbval_ptr)
+{
+  const int count = xasl->dbval_cnt;
+  DB_VALUE *values = (DB_VALUE *) db_private_alloc (thread_p, count * sizeof (DB_VALUE));
+  if (values == NULL)
+    {
+      return NULL;
+    }
+  for (int i = 0; i < count; i++)
+    {
+      db_make_null (&values[i]);
+    }
+  for (int i = 0; i < dbval_cnt && i < count; i++)
+    {
+      pr_clone_value (&dbval_ptr[i], &values[i]);
+    }
+  for (int i = 0; i < xasl->n_bind_conversions; i++)
+    {
+      BIND_CONVERSION *conversion = &xasl->bind_conversions[i];
+      const DB_VALUE *source = &values[conversion->src_pos];
+      DB_VALUE *target = &values[conversion->dst_pos];
+      if (conversion->dst_pos >= count || conversion->src_pos >= count)
+	{
+	  assert (false);
+	  continue;
+	}
+      if (!DB_IS_NULL (source))
+	{
+	  if (conversion->conv == NULL)
+	    {
+	      conversion->conv =
+		tp_value_find_converter (DB_VALUE_DOMAIN_TYPE (source), conversion->domain, DOMAIN_CONVERT_COMPARE);
+	    }
+	  if (conversion->conv != NULL
+	      && tp_value_convert (conversion->conv, conversion->domain, source, target) == DOMAIN_COMPATIBLE)
+	    {
+	      continue;
+	    }
+	  pr_clear_value (target);
+	}
+      pr_clone_value (source, target);
+    }
+  return values;
+}
+
 qfile_list_id *
 qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, const DB_VALUE * dbval_ptr,
 		     QUERY_ID query_id)
@@ -17570,6 +17623,18 @@ qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, c
   /* form the value descriptor to represent positional values */
   xasl_state.vd.dbval_cnt = dbval_cnt;
   xasl_state.vd.dbval_ptr = (DB_VALUE *) dbval_ptr;
+  DB_VALUE *converted_binds = NULL;
+  if (xasl->n_bind_conversions > 0)
+    {
+      /* CBRD-27583: the positions the compiler added hold the binds converted once for this execution */
+      converted_binds = qexec_convert_bind_values (thread_p, xasl, dbval_cnt, dbval_ptr);
+      if (converted_binds == NULL)
+	{
+	  return NULL;
+	}
+      xasl_state.vd.dbval_cnt = xasl->dbval_cnt;
+      xasl_state.vd.dbval_ptr = converted_binds;
+    }
   memset (&xasl_state.resolved_domain, 0, sizeof (xasl_state.resolved_domain));
   memset (&xasl_state.domain_execution, 0, sizeof (xasl_state.domain_execution));
 
@@ -17729,6 +17794,14 @@ query_error:
 
 end:
   qexec_clear_resolved_domains (thread_p, &xasl_state);
+  if (converted_binds != NULL)
+    {
+      for (int i = 0; i < xasl->dbval_cnt; i++)
+	{
+	  pr_clear_value (&converted_binds[i]);
+	}
+      db_private_free (thread_p, converted_binds);
+    }
 
 #if defined (SERVER_MODE)
   if (prm_get_bool_value (PRM_ID_LOG_QUERY_LISTS))

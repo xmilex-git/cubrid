@@ -607,6 +607,7 @@ extern "C"
   extern PT_NODE *pt_limit_to_numbering_expr (PARSER_CONTEXT * parser, PT_NODE * limit, PT_OP_TYPE num_op,
 					      bool is_gby_num);
   extern PT_NODE *pt_rewrite_to_auto_param (PARSER_CONTEXT * parser, PT_NODE * value);
+  extern int pt_bind_type_signature (const PARSER_CONTEXT * parser, char *buf, size_t size);
   extern void pt_copy_statement_flags (PT_NODE * source, PT_NODE * destination);
   extern void pt_set_fill_default_in_path_expression (PT_NODE * node);
   extern PT_NODE *pt_dup_key_update_stmt (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * assignment);

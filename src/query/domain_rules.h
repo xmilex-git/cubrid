@@ -19,10 +19,7 @@
 #ifndef _DOMAIN_RULES_H_
 #define _DOMAIN_RULES_H_
 
-#if !defined (SERVER_MODE) && !defined (SA_MODE)
-#error Belongs only to server or stand-alone modules.
-#endif
-
+/* CBRD-27583: one type rule module for the compiler (cs) and the executor (server, sa). */
 #include "object_domain.h"	/* TP_DOMAIN_STATUS and shared value types, no client API. */
 #include "object_domain_convert.h"
 #include "thread_compat.hpp"

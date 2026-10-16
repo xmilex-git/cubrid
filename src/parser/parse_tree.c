@@ -858,6 +858,10 @@ parser_free_node_resources (PT_NODE * node)
        * unreached by statements[]-only walkers like db_close_session_local (). */
       free_and_init (node->xasl_id);
     }
+  if (node->bind_signature != NULL)
+    {
+      free_and_init (node->bind_signature);
+    }
 }
 
 /*

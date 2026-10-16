@@ -89,6 +89,26 @@
 #include "xasl_to_stream.h"
 #include "query_cl.h"
 #include "parser_support.h"
+
+/*
+ * pt_typed_hash_text () - CBRD-27583: the XASL cache key text of a statement: its alias_print, and when the plan
+ *   being prepared is for one bind type signature (parser->typed_bind_signature), the signature after it. A plan
+ *   is compiled for one signature, so the signature is part of its key; values are not, so two executions that
+ *   differ only in values share the entry.
+ */
+static char *
+pt_typed_hash_text (PARSER_CONTEXT * parser, PT_NODE * statement)
+{
+  if (parser->typed_bind_signature == NULL || statement->alias_print == NULL)
+    {
+      return (char *) statement->alias_print;
+    }
+  PARSER_VARCHAR *text = pt_append_nulstring (parser, NULL, statement->alias_print);
+  text = pt_append_nulstring (parser, text, ";bt={");
+  text = pt_append_nulstring (parser, text, parser->typed_bind_signature);
+  text = pt_append_bytes (parser, text, "}", 1);
+  return text != NULL ? (char *) text->bytes : (char *) statement->alias_print;
+}
 #include "string_opfunc.h"
 #include "tz_support.h"
 #include "dbtype.h"
@@ -9926,7 +9946,7 @@ do_prepare_update (PARSER_CONTEXT * parser, PT_NODE * statement)
 	  parser->flag.long_string_skipped = 0;
 	  parser->flag.print_type_ambiguity = 0;
 	  PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-	  contextp->sql_hash_text = (char *) statement->alias_print;
+	  contextp->sql_hash_text = pt_typed_hash_text (parser, statement);
 	  err =
 	    SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
 			 &contextp->sha1);
@@ -11308,7 +11328,7 @@ do_prepare_delete (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE * paren
 	  parser->flag.long_string_skipped = 0;
 	  parser->flag.print_type_ambiguity = 0;
 	  PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-	  contextp->sql_hash_text = (char *) statement->alias_print;
+	  contextp->sql_hash_text = pt_typed_hash_text (parser, statement);
 	  err =
 	    SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
 			 &contextp->sha1);
@@ -11969,7 +11989,7 @@ do_prepare_insert_internal (PARSER_CONTEXT * parser, PT_NODE * statement)
   parser->flag.long_string_skipped = 0;
   parser->flag.print_type_ambiguity = 0;
   PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-  contextp->sql_hash_text = (char *) statement->alias_print;
+  contextp->sql_hash_text = pt_typed_hash_text (parser, statement);
   error =
     SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
 		 &contextp->sha1);
@@ -15272,7 +15292,7 @@ do_prepare_select (PARSER_CONTEXT * parser, PT_NODE * statement)
   PT_NODE_PRINT_TO_ALIAS (parser, statement,
 			  (CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_DIFFERENT_SYSTEM_PARAMETERS | PT_PRINT_LOWER));
 
-  contextp->sql_hash_text = (char *) statement->alias_print;
+  contextp->sql_hash_text = pt_typed_hash_text (parser, statement);
   err =
     SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
 		 &contextp->sha1);
@@ -18354,7 +18374,7 @@ do_prepare_merge (PARSER_CONTEXT * parser, PT_NODE * statement)
       parser->flag.long_string_skipped = 0;
       parser->flag.print_type_ambiguity = 0;
       PT_NODE_PRINT_TO_ALIAS (parser, statement, CUSTOM_PRINT_4_SHA_COMPUTE | PT_PRINT_LOWER);
-      contextp->sql_hash_text = (char *) statement->alias_print;
+      contextp->sql_hash_text = pt_typed_hash_text (parser, statement);
       err = SHA1Compute ((unsigned char *) contextp->sql_hash_text, (unsigned) strlen (contextp->sql_hash_text),
 			 &contextp->sha1);
       if (err != NO_ERROR)
