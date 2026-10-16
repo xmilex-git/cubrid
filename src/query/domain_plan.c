@@ -4564,8 +4564,7 @@ domain_stream_walk_pred (DOMAIN_STREAM_CONTEXT * ctx, PRED_EXPR * pred)
 	      || comp->rel_op == R_GE || comp->rel_op == R_LT || comp->rel_op == R_LE || comp->rel_op == R_EQ_TORDER
 	      || comp->rel_op == R_NULLSAFE_EQ;
 	    if (value_comparison && comp->domain_compare == NULL && comp->compare == NULL && comp->lhs != NULL
-		&& comp->rhs != NULL
-		&& comp->lhs->type != TYPE_LIST_ID && comp->rhs->type != TYPE_LIST_ID)
+		&& comp->rhs != NULL && comp->lhs->type != TYPE_LIST_ID && comp->rhs->type != TYPE_LIST_ID)
 	      {
 		DOMAIN_COMPARE_PLAN *comparison = domain_stream_compare (ctx, comp->lhs, comp->rhs);
 		if (comparison != NULL)

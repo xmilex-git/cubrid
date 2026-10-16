@@ -10110,10 +10110,6 @@ pt_free_statement_xasl_id (PT_NODE * statement)
     {
       free_and_init (statement->xasl_id);
     }
-  if (statement->bind_signature != NULL)
-    {
-      free_and_init (statement->bind_signature);
-    }
 
   if (statement->node_type == PT_DELETE)
     {
@@ -13218,56 +13214,4 @@ pt_count_name_nodes (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *co
     }
 
   return node;
-}
-
-/*
- * pt_bind_type_signature () - CBRD-27583: the bind type signature of the bound values: one token per position in
- *   position order. A user host variable: n (NULL), c|s<codeset>.<collation> (CHAR / VARCHAR: the value's
- *   collation is the plan's, so a string bind resolves nothing at execution), N (NUMERIC: one floating NUMERIC
- *   domain, whatever the value's precision and scale), else the DB_TYPE number. An auto-parameterized literal: the
- *   same, but a string carries its type only -- its codeset and collation are the compiling session's and a
- *   prepared statement keeps its prepare-time collation through the shared plan (bug_bts_10057, issue_8391).
- *   A plan is compiled for one signature and its cache key carries the text (pt_print_query_string_hash).
- *   return : the signature length, or -1 when buf is too small ((count) * 24 + 1 bytes always suffice)
- */
-int
-pt_bind_type_signature (const PARSER_CONTEXT * parser, char *buf, size_t size)
-{
-  const int count = parser->host_var_count + parser->auto_param_count;
-  int len = 0;
-  for (int i = 0; i < count; i++)
-    {
-      const DB_VALUE *val = &parser->host_variables[i];
-      const DB_TYPE type = DB_IS_NULL (val) ? DB_TYPE_NULL : DB_VALUE_DOMAIN_TYPE (val);
-      char token[32];
-      int n;
-      if (type == DB_TYPE_NULL)
-	{
-	  n = snprintf (token, sizeof (token), "n,");
-	}
-      else if (TP_IS_CHAR_TYPE (type) && i < parser->host_var_count)
-	{
-	  n = snprintf (token, sizeof (token), "%c%d.%d,", type == DB_TYPE_CHAR ? 'c' : 's',
-			db_get_string_codeset (val), db_get_string_collation (val));
-	}
-      else if (TP_IS_CHAR_TYPE (type))
-	{
-	  n = snprintf (token, sizeof (token), "%c,", type == DB_TYPE_CHAR ? 'c' : 's');
-	}
-      else if (type == DB_TYPE_NUMERIC)
-	{
-	  n = snprintf (token, sizeof (token), "N,");
-	}
-      else
-	{
-	  n = snprintf (token, sizeof (token), "%d,", (int) type);
-	}
-      if (n < 0 || (size_t) (len + n) >= size)
-	{
-	  return -1;
-	}
-      memcpy (buf + len, token, (size_t) n + 1);
-      len += n;
-    }
-  return len;
 }

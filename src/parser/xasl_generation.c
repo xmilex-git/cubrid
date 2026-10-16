@@ -186,8 +186,7 @@ struct pred_regu_variable_p_list_node
 
 static PRED_EXPR *pt_make_pred_term_not (const PRED_EXPR * arg1);
 static PRED_EXPR *pt_make_pred_term_comp (PARSER_CONTEXT * parser, const REGU_VARIABLE * arg1,
-					  const REGU_VARIABLE * arg2, const REL_OP rop,
-					  const DB_TYPE data_type);
+					  const REGU_VARIABLE * arg2, const REL_OP rop, const DB_TYPE data_type);
 static PRED_EXPR *pt_make_pred_term_some_all (const REGU_VARIABLE * arg1, const REGU_VARIABLE * arg2, const REL_OP rop,
 					      const DB_TYPE data_type, const QL_FLAG some_all);
 static PRED_EXPR *pt_make_pred_term_like (const REGU_VARIABLE * arg1, const REGU_VARIABLE * arg2,
@@ -1336,52 +1335,6 @@ pt_make_pred_term_not (const PRED_EXPR * arg1)
  *   rop(in):
  *   data_type(in):
  */
-/*
- * pt_add_bind_conversion () - CBRD-27583: the regu reads a user host variable whose value a consumer would convert
- *   into `domain` at every row. Give it a new position the execution fills once, before the main block, with the
- *   converted value (BIND_CONVERSION), and compile the regu in that domain.
- */
-static void
-pt_add_bind_conversion (PARSER_CONTEXT * parser, REGU_VARIABLE * regu, TP_DOMAIN * domain)
-{
-  if (parser->n_bind_conversions == parser->max_bind_conversions)
-    {
-      const int max = parser->max_bind_conversions == 0 ? 4 : parser->max_bind_conversions * 2;
-      BIND_CONVERSION *grown = NULL;
-      regu_array_alloc (&grown, max);
-      if (grown == NULL)
-	{
-	  return;
-	}
-      if (parser->n_bind_conversions > 0)
-	{
-	  memcpy (grown, parser->bind_conversions, parser->n_bind_conversions * sizeof (*grown));
-	}
-      parser->bind_conversions = grown;
-      parser->max_bind_conversions = max;
-    }
-  BIND_CONVERSION *conversion = &parser->bind_conversions[parser->n_bind_conversions];
-  conversion->src_pos = regu->value.val_pos;
-  conversion->dst_pos = parser->host_var_count + parser->auto_param_count + parser->n_bind_conversions;
-  conversion->domain = domain;
-  conversion->conv = NULL;
-  parser->n_bind_conversions++;
-  regu->value.val_pos = conversion->dst_pos;
-  regu->domain = domain;
-  if (parser->dbval_cnt <= conversion->dst_pos)
-    {
-      parser->dbval_cnt = conversion->dst_pos + 1;
-    }
-}
-
-/* CBRD-27583: the root XASL carries the bind conversions the tree compiled (streamed in the header) */
-static void
-pt_set_xasl_bind_conversions (PARSER_CONTEXT * parser, XASL_NODE * xasl)
-{
-  xasl->bind_conversions = parser->n_bind_conversions > 0 ? parser->bind_conversions : NULL;
-  xasl->n_bind_conversions = parser->n_bind_conversions;
-}
-
 /* CBRD-27583: whether the compiler can decide a side's comparison from its regu alone: a fixed domain */
 static bool
 pt_regu_has_fixed_domain (const REGU_VARIABLE * regu)
@@ -1394,9 +1347,9 @@ pt_regu_has_fixed_domain (const REGU_VARIABLE * regu)
 /*
  * pt_decide_comparison () - CBRD-27583: decide a comparison term at compile time, from the two sides' domains, with
  *   the type rule module the executor shares: which side is converted into which domain (cmp_target) and how the two
- *   compare then (cmp_method, cmp_collation). A user host variable the decision converts gets a bind conversion
- *   instead, so the term compares two values of one domain. A side whose domain the compiler does not know keeps the
- *   term undecided (DOMAIN_COMPARE_LATE_BIND): the server's load derives it as before.
+ *   compare then (cmp_method, cmp_collation). It decides nothing about the binds: their domains were fixed by type
+ *   checking. A side whose domain the compiler does not know keeps the term undecided (DOMAIN_COMPARE_LATE_BIND):
+ *   the server's load derives it as before.
  */
 static void
 pt_decide_comparison (PARSER_CONTEXT * parser, COMP_EVAL_TERM * et_comp)
@@ -1424,37 +1377,26 @@ pt_decide_comparison (PARSER_CONTEXT * parser, COMP_EVAL_TERM * et_comp)
       return;
     }
   DOMAIN_COMPARE compare;
-  for (int pass = 0; pass < 2; pass++)
+  DOMAIN_COMPARE_KEY key[2];
+  domain_compare_key_of (regu[0]->domain, &key[0]);
+  domain_compare_key_of (regu[1]->domain, &key[1]);
+  if (domain_resolve_comparison (&key[0], &key[1], &compare) != NO_ERROR)
     {
-      DOMAIN_COMPARE_KEY key[2];
-      domain_compare_key_of (regu[0]->domain, &key[0]);
-      domain_compare_key_of (regu[1]->domain, &key[1]);
-      if (domain_resolve_comparison (&key[0], &key[1], &compare) != NO_ERROR)
-	{
-	  return;
-	}
-      if (compare.method != DOMAIN_COMPARE_DIRECT && compare.method != DOMAIN_COMPARE_CONVERT)
-	{
-	  return;
-	}
-      bool converted_bind = false;
-      for (int side = 0; pass == 0 && side < 2; side++)
-	{
-	  if (compare.conv[side] != NULL && regu[side]->type == TYPE_POS_VALUE
-	      && regu[side]->value.val_pos < parser->host_var_count)
-	    {
-	      pt_add_bind_conversion (parser, regu[side], (TP_DOMAIN *) compare.target[side]);
-	      converted_bind = true;
-	    }
-	}
-      if (!converted_bind)
-	{
-	  break;
-	}
-      /* the bind now holds the converted value: decide the term over the converted domains */
+      return;
     }
-  et_comp->cmp_target[0] = (TP_DOMAIN *) compare.target[0];
-  et_comp->cmp_target[1] = (TP_DOMAIN *) compare.target[1];
+  if (compare.method != DOMAIN_COMPARE_DIRECT && compare.method != DOMAIN_COMPARE_CONVERT)
+    {
+      return;
+    }
+  /* A user host variable the rule converts was cast by the client before it was sent (type checking gave the
+   * position the target as its expected domain, pt_typed_bind_comparison), so its regu domain is the target and the
+   * rule converts nothing on that side. shortcut: a position two terms want in two domains keeps its converter here
+   * and the term converts the bind at the row; the full implementation gives the second occurrence a derived
+   * position the client fills. */
+  /* a side the rule converts carries its target; a side compared as it is carries none (the unpack looks a
+   * converter up for every target it finds, and a type has no converter into itself) */
+  et_comp->cmp_target[0] = compare.conv[0] != NULL ? (TP_DOMAIN *) compare.target[0] : NULL;
+  et_comp->cmp_target[1] = compare.conv[1] != NULL ? (TP_DOMAIN *) compare.target[1] : NULL;
   et_comp->cmp_collation = compare.collation;
   et_comp->cmp_method = compare.method;
 }
@@ -6612,8 +6554,15 @@ pt_make_regu_hostvar (PARSER_CONTEXT * parser, const PT_NODE * node)
        * not depend on the values; the client casts the value to its expected
        * domain. An auto-parameter's value is its literal, so it keeps the literal
        * domain. */
-      if (regu->domain == NULL && typ != DB_TYPE_NULL
-	  && (node->info.host_var.index >= parser->host_var_count || parser->flag.typed_bind_plan))
+      if (regu->domain == NULL && node->info.host_var.index < parser->host_var_count
+	  && parser->host_var_compiled_domains != NULL
+	  && parser->host_var_compiled_domains[node->info.host_var.index] != NULL)
+	{
+	  /* CBRD-27583: a value-typed position of a typed plan: the domain the plan was compiled for */
+	  regu->domain = parser->host_var_compiled_domains[node->info.host_var.index];
+	}
+
+      if (regu->domain == NULL && node->info.host_var.index >= parser->host_var_count && typ != DB_TYPE_NULL)
 	{
 	  TP_DOMAIN *domain;
 	  if (TP_IS_CHAR_TYPE (typ))
@@ -23925,7 +23874,6 @@ parser_generate_xasl (PARSER_CONTEXT * parser, PT_NODE * node)
   next = node->next;
   node->next = NULL;
   parser->dbval_cnt = 0;
-  parser->n_bind_conversions = 0;
 
   is_system_generated_stmt = node->flag.is_system_generated_stmt;
 
@@ -24045,10 +23993,8 @@ parser_generate_xasl (PARSER_CONTEXT * parser, PT_NODE * node)
       /* the tree reads only positions the client sends (host variables, then
        * auto-parameters). A nested parser_generate_xasl () or a statement the client
        * compiles in parts references a subset, so the count may be smaller. */
-      assert (parser->dbval_cnt
-	      <= parser->host_var_count + parser->auto_param_count + parser->n_bind_conversions);
+      assert (parser->dbval_cnt <= parser->host_var_count + parser->auto_param_count);
       xasl->dbval_cnt = parser->dbval_cnt;
-      pt_set_xasl_bind_conversions (parser, xasl);
     }
 
   /* free what were allocated in pt_spec_to_xasl_class_oid_list() */
@@ -25222,7 +25168,6 @@ parser_generate_do_stmt_xasl (PARSER_CONTEXT * parser, PT_NODE * node)
     }
 
   parser->dbval_cnt = 0;
-  parser->n_bind_conversions = 0;
 
   xasl = regu_xasl_node_alloc (DO_PROC);
   if (!xasl)
@@ -27802,7 +27747,6 @@ pt_to_merge_xasl (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE ** non_n
 
   /* set host variable count */
   xasl->dbval_cnt = parser->dbval_cnt;
-  pt_set_xasl_bind_conversions (parser, xasl);
 
   /* set TDE flag */
   XASL_SET_FLAG (xasl, xptr->flag & XASL_INCLUDES_TDE_CLASS);

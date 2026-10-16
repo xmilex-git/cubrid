@@ -424,6 +424,7 @@ TP_DOMAIN *domain_copy_one (const TP_DOMAIN * domain);
 
 /* The converter tp_value_coerce_strict runs to bring a value of a type into an index column's domain; NULL
  * where it refuses the column's type (only a number or a date and time is a strict target). */
+TP_VALUE_CONVERTER domain_compare_converter (DB_TYPE source, const TP_DOMAIN * target);
 TP_VALUE_CONVERTER domain_key_strict_converter (DB_TYPE source, const TP_DOMAIN * column);
 
 /* The rule a column of a search key follows for values of an element's domain (DOMAIN_KEY_INDEX, _STRICT or _KEEP),

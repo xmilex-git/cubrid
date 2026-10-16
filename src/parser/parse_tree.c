@@ -858,10 +858,6 @@ parser_free_node_resources (PT_NODE * node)
        * unreached by statements[]-only walkers like db_close_session_local (). */
       free_and_init (node->xasl_id);
     }
-  if (node->bind_signature != NULL)
-    {
-      free_and_init (node->bind_signature);
-    }
 }
 
 /*
@@ -1272,6 +1268,10 @@ parser_free_parser (PARSER_CONTEXT * parser)
   if (parser->host_var_expected_domains)
     {
       free_and_init (parser->host_var_expected_domains);
+    }
+  if (parser->host_var_compiled_domains)
+    {
+      free_and_init (parser->host_var_compiled_domains);
     }
 
   parser_free_lcks_classes (parser);

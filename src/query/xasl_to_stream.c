@@ -291,14 +291,7 @@ xts_map_xasl_to_stream (const XASL_NODE * xasl_tree, XASL_STREAM * stream)
 
   /* reserve space for new XASL format */
   header_size = sizeof (int)	/* xasl->dbval_cnt */
-    + sizeof (int);		/* xasl->n_bind_conversions */
-  for (i = 0; i < xasl_tree->n_bind_conversions; i++)
-    {
-      /* CBRD-27583: src_pos, dst_pos, domain */
-      header_size += sizeof (int) + sizeof (int)
-	+ or_packed_domain_size (xasl_tree->bind_conversions[i].domain, 0);
-    }
-  header_size += sizeof (OID)	/* xasl->creator_oid */
+    + sizeof (OID)		/* xasl->creator_oid */
     + sizeof (int)		/* xasl->n_oid_list */
     + sizeof (OID) * xasl_tree->n_oid_list	/* xasl->class_oid_list */
     + sizeof (int) * xasl_tree->n_oid_list	/* xasl->class_locks */
@@ -350,16 +343,6 @@ xts_map_xasl_to_stream (const XASL_NODE * xasl_tree, XASL_STREAM * stream)
     {
       p = or_pack_int (p, xasl_tree->tcard_list[i]);
     }
-  /* CBRD-27583: the bind conversions close the header, after the fields other readers of the header
-   * (xqmgr_prepare_query) take from its front */
-  p = or_pack_int (p, xasl_tree->n_bind_conversions);
-  for (i = 0; i < xasl_tree->n_bind_conversions; i++)
-    {
-      p = or_pack_int (p, xasl_tree->bind_conversions[i].src_pos);
-      p = or_pack_int (p, xasl_tree->bind_conversions[i].dst_pos);
-      p = or_pack_domain (p, xasl_tree->bind_conversions[i].domain, 0, 0);
-    }
-
   /* set body size of new XASL format */
   body_size = xts_Free_offset_in_stream - offset;
   p = or_pack_int (p, body_size);

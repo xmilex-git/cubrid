@@ -254,44 +254,6 @@ stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool us
 
   /* restore header data of new XASL format */
   p = or_unpack_int (p, &xasl->dbval_cnt);
-  {
-    /* CBRD-27583: the bind conversions close the header: skip creator_oid, n_oid_list and its three lists */
-    OID skipped_oid;
-    int skipped_n;
-    p = or_unpack_oid (p, &skipped_oid);
-    p = or_unpack_int (p, &skipped_n);
-    for (int i = 0; i < skipped_n; i++)
-      {
-	p = or_unpack_oid (p, &skipped_oid);
-      }
-    p += 2 * skipped_n * OR_INT_SIZE;
-  }
-  p = or_unpack_int (p, &xasl->n_bind_conversions);
-  xasl->bind_conversions = NULL;
-  if (xasl->n_bind_conversions > 0)
-    {
-      /* CBRD-27583: the converter of each bind is found here, once per load, from the position's value type the
-       * compiler knew (the domain of the position it reads) */
-      xasl->bind_conversions =
-	(BIND_CONVERSION *) stx_alloc_struct (thread_p, xasl->n_bind_conversions * sizeof (BIND_CONVERSION));
-      if (xasl->bind_conversions == NULL)
-	{
-	  free_xasl_unpack_info (thread_p, unpack_info_p);
-	  *xasl_tree = NULL;
-	  *xasl_unpack_info_ptr = NULL;
-	  goto end;
-	}
-      for (int i = 0; i < xasl->n_bind_conversions; i++)
-	{
-	  BIND_CONVERSION *conversion = &xasl->bind_conversions[i];
-	  int is_null;
-	  p = or_unpack_int (p, &conversion->src_pos);
-	  p = or_unpack_int (p, &conversion->dst_pos);
-	  p = or_unpack_domain (p, &conversion->domain, &is_null);
-	  conversion->domain = tp_domain_cache (conversion->domain);
-	  conversion->conv = NULL;	/* qexec_convert_bind_values finds it from the value's type */
-	}
-    }
   OID_SET_NULL (&xasl->creator_oid);
   xasl->n_oid_list = 0;
   xasl->class_oid_list = NULL;
@@ -1836,8 +1798,6 @@ stx_build_xasl_node (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE * xasl)
 {
   xasl->domain_plan = NULL;
   xasl->limit_compare = NULL;
-  xasl->bind_conversions = NULL;
-  xasl->n_bind_conversions = 0;
   int offset;
   int tmp, i;
   XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
@@ -4543,14 +4503,22 @@ stx_build_term_compare (THREAD_ENTRY * thread_p, const COMP_EVAL_TERM * term)
   compare->source[1] = (unsigned char) source[1];
   for (int side = 0; side < 2; side++)
     {
-      compare->target[side] = term->cmp_target[side];
+      /* a side without a target is compared as it is: its target is its own domain */
+      compare->target[side] = term->cmp_target[side] != NULL ? term->cmp_target[side]
+	: (side == 0 ? term->lhs->domain : term->rhs->domain);
       if (term->cmp_target[side] != NULL)
 	{
-	  compare->conv[side] = tp_value_find_converter (source[side], term->cmp_target[side], DOMAIN_CONVERT_COMPARE);
+	  compare->conv[side] = domain_compare_converter (source[side], term->cmp_target[side]);
 	  after[side] = TP_DOMAIN_TYPE (term->cmp_target[side]);
 	  if (compare->conv[side] == NULL)
 	    {
 	      /* no converter for the pair: the term stays with the load's derivation */
+	      return NULL;
+	    }
+	  if (compare->conv[side] == tp_value_find_converter (source[side], NULL, DOMAIN_CONVERT_ASSIGN))
+	    {
+	      /* the incompatible converter: the compiler decided a pair the rule refuses */
+	      assert (false);
 	      return NULL;
 	    }
 	}
