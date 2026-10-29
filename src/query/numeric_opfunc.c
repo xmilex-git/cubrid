@@ -55,6 +55,8 @@
 #define strlen(s1)  ((int) strlen(s1))
 #endif /* defined (SUPPRESS_STRLEN_WARNING) */
 
+#include "numeric_double_decimal.i"
+
 /* the multipler of long NUMERIC, internal used */
 #define DB_LONG_NUMERIC_MULTIPLIER 2
 
@@ -4991,6 +4993,108 @@ get_fp_value_type (double d)
 }
 
 /*
+ * numeric_internal_double_digits_to_num () - numeric_internal_real_to_num () of a double past its zero, NaN,
+ *					      infinity, overflow and underflow checks, without a decimal string:
+ *					      the digits of _dtoa () mode 0, cut to
+ *					      TP_DOUBLE_MANTISA_DECIMAL_PRECISION, placed as an integer
+ *
+ * return: NO_ERROR or ER_IT_DATA_OVERFLOW
+ * adouble(in): finite, nonzero, within the NUMERIC limits
+ * dst_scale(in), num(out), prec(out), scale(out), is_value_negative(out): as numeric_internal_real_to_num ()
+ */
+static int
+numeric_internal_double_digits_to_num (double adouble, int dst_scale, DB_C_NUMERIC num, int *prec, int *scale,
+				       bool * is_value_negative)
+{
+  const NUMERIC_DBL_DECIMAL fd = numeric_double_to_decimal (NUMERIC_ABS (adouble));
+  uint64_t mantissa = fd.mantissa;
+  uint64_t words[3];
+  int ndigits, decpt, zeros, i;
+
+  for (ndigits = 1; ndigits < 20 && mantissa >= _gv_mul_normalize_pow10_lookup[ndigits - 1]; ndigits++)
+    {
+      ;
+    }
+  decpt = ndigits + fd.exponent;
+
+  /* _dtoa () gives at most 17 digits; the string kept TP_DOUBLE_MANTISA_DECIMAL_PRECISION of them, cut */
+  while (ndigits > TP_DOUBLE_MANTISA_DECIMAL_PRECISION)
+    {
+      mantissa /= 10;
+      ndigits--;
+    }
+
+  zeros = 0;
+  if (decpt <= 0)
+    {
+      /* only the significant digits, e.g. 1.234e-10 is 1234 at scale 13 */
+      *scale = -decpt + ndigits;
+      *prec = ndigits;
+    }
+  else if (decpt > (DB_MAX_NUMERIC_PRECISION - DB_MIN_NUMERIC_SCALE))
+    {
+      /* should not happen since overflow has been checked for previously */
+      return ER_IT_DATA_OVERFLOW;
+    }
+  else if (decpt < ndigits)
+    {
+      *prec = ndigits;
+      *scale = ndigits - decpt;
+    }
+  else
+    {
+      /* zeros up to the decimal point, at most DB_MAX_NUMERIC_PRECISION digits in all with a negative scale for
+       * the rest */
+      zeros = decpt - ndigits;
+      *prec = decpt;
+      *scale = 0;
+      if (*prec > DB_MAX_NUMERIC_PRECISION)
+	{
+	  zeros -= *prec - DB_MAX_NUMERIC_PRECISION;
+	  *scale += (DB_MAX_NUMERIC_PRECISION - *prec);
+	  *prec = DB_MAX_NUMERIC_PRECISION;
+	}
+    }
+
+  /* zeros until dst_scale is reached */
+  while (*prec < DB_MAX_NUMERIC_PRECISION && *scale < dst_scale)
+    {
+      zeros++;
+      (*prec)++;
+      (*scale)++;
+    }
+
+  /* mantissa * 10^zeros in three 64-bit words, low word first; at most 40 digits, below 2^133 */
+  words[0] = mantissa;
+  words[1] = 0;
+  words[2] = 0;
+  while (zeros > 0)
+    {
+      const int step = MIN (zeros, 19);
+      const uint64_t factor = _gv_mul_normalize_pow10_lookup[step - 1];
+      uint64_t carry = 0;
+
+      for (i = 0; i < 3; i++)
+	{
+	  const uint128_t product = (uint128_t) words[i] * factor + carry;
+
+	  words[i] = (uint64_t) product;
+	  carry = (uint64_t) (product >> 64);
+	}
+      assert (carry == 0);
+      zeros -= step;
+    }
+
+  assert (words[2] <= 0xFF);
+  num[0] = (unsigned char) words[2];
+  numeric_put_uint64_to_be (num + 1, words[1]);
+  numeric_put_uint64_to_be (num + 1 + sizeof (uint64_t), words[0]);
+  *is_value_negative = adouble < 0;
+
+  return NO_ERROR;
+}
+
+/*
  * numeric_internal_real_to_num() - converts a floating point value (float or
  *				    double) to a DB_C_NUMERIC.
  *
@@ -5054,6 +5158,10 @@ numeric_internal_real_to_num (double adouble, int dst_scale, DB_C_NUMERIC num, i
 	      numeric_coerce_dec_str_to_num ("0", num, is_value_negative);
 	      return NO_ERROR;
 	    }
+	  else if (!is_float)
+	    {
+	      return numeric_internal_double_digits_to_num (adouble, dst_scale, num, prec, scale, is_value_negative);
+	    }
 	  else
 	    {
 	      /* adouble might fit into a CUBRID NUMERIC domain type with sufficient precision. Invoke _dtoa() to get
@@ -5062,18 +5170,9 @@ numeric_internal_real_to_num (double adouble, int dst_scale, DB_C_NUMERIC num, i
 	      char *rve;
 	      int ndigits;
 
-	      if (is_float)
-		{
-		  _dtoa (adouble, 0, TP_FLOAT_MANTISA_DECIMAL_PRECISION, &decpt, &sign, &rve, numeric_str + 1, 0);
+	      _dtoa (adouble, 0, TP_FLOAT_MANTISA_DECIMAL_PRECISION, &decpt, &sign, &rve, numeric_str + 1, 0);
 
-		  numeric_str[TP_FLOAT_MANTISA_DECIMAL_PRECISION + 1] = '\0';
-		}
-	      else
-		{
-		  _dtoa (adouble, 0, TP_DOUBLE_MANTISA_DECIMAL_PRECISION, &decpt, &sign, &rve, numeric_str + 1, 0);
-
-		  numeric_str[TP_DOUBLE_MANTISA_DECIMAL_PRECISION + 1] = '\0';
-		}
+	      numeric_str[TP_FLOAT_MANTISA_DECIMAL_PRECISION + 1] = '\0';
 
 	      /* shift the digits in the sequence to make room for and to reach the decimal point */
 	      ndigits = strlen (numeric_str + 1);
