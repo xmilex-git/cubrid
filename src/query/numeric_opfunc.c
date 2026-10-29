@@ -3715,6 +3715,284 @@ numeric_db_value_compare (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE
   return ret;
 }
 
+/* the words of an exact comparison: 2048 bits hold a NUMERIC coefficient or a double's mantissa scaled by the
+ * other side's powers of ten and two within the NUMERIC and double ranges (under 1950 bits) */
+#define NUMERIC_EXACT_WORDS 32
+
+/* the bit length of words, low word first */
+static int
+numeric_words_bit_length (const uint64_t * words, int n)
+{
+  while (n > 0 && words[n - 1] == 0)
+    {
+      n--;
+    }
+  return n == 0 ? 0 : 64 * (n - 1) + (64 - NUMERIC_CLZ64 (words[n - 1]));
+}
+
+/* words *= factor, low word first; the new word count */
+static int
+numeric_words_mul_small (uint64_t * words, int n, uint64_t factor)
+{
+  uint64_t carry = 0;
+  int i;
+
+  for (i = 0; i < n; i++)
+    {
+      const uint128_t product = (uint128_t) words[i] * factor + carry;
+
+      words[i] = (uint64_t) product;
+      carry = (uint64_t) (product >> 64);
+    }
+  if (carry != 0)
+    {
+      assert (n < NUMERIC_EXACT_WORDS);
+      words[n++] = carry;
+    }
+  return n;
+}
+
+/* words *= 10^power */
+static int
+numeric_words_mul_pow10 (uint64_t * words, int n, int power)
+{
+  while (power > 0)
+    {
+      const int step = MIN (power, 19);
+
+      n = numeric_words_mul_small (words, n, _gv_mul_normalize_pow10_lookup[step - 1]);
+      power -= step;
+    }
+  return n;
+}
+
+/* words <<= bits */
+static int
+numeric_words_shift_left (uint64_t * words, int n, int bits)
+{
+  const int word_shift = bits / 64, bit_shift = bits % 64;
+  int i;
+
+  assert (n + word_shift + 1 <= NUMERIC_EXACT_WORDS);
+  words[n + word_shift] = 0;
+  for (i = n - 1; i >= 0; i--)
+    {
+      words[i + word_shift + 1] |= bit_shift == 0 ? 0 : words[i] >> (64 - bit_shift);
+      words[i + word_shift] = words[i] << bit_shift;
+    }
+  for (i = 0; i < word_shift; i++)
+    {
+      words[i] = 0;
+    }
+  return n + word_shift + 1;
+}
+
+static DB_VALUE_COMPARE_RESULT
+numeric_words_compare (const uint64_t * a, int na, const uint64_t * b, int nb)
+{
+  int i;
+
+  for (i = MAX (na, nb) - 1; i >= 0; i--)
+    {
+      const uint64_t wa = i < na ? a[i] : 0;
+      const uint64_t wb = i < nb ? b[i] : 0;
+
+      if (wa != wb)
+	{
+	  return wa < wb ? DB_LT : DB_GT;
+	}
+    }
+  return DB_EQ;
+}
+
+/*
+ * numeric_compare_magnitude_double () - the order of a NUMERIC magnitude and a positive finite double by their exact
+ *					 values
+ *   return: DB_LT, DB_EQ or DB_GT of buf * 10^-scale against x
+ *   buf(in): nonzero magnitude
+ *   scale(in): the NUMERIC value's scale
+ *   x(in): positive, finite
+ */
+static DB_VALUE_COMPARE_RESULT
+numeric_compare_magnitude_double (const unsigned char *buf, int scale, double x)
+{
+  uint64_t bits, m;
+  int e, exponent_field;
+  const uint64_t c_hi = buf[0];
+  const uint64_t c_mid = numeric_get_uint64_from_be (buf + 1);
+  const uint64_t c_lo = numeric_get_uint64_from_be (buf + 1 + sizeof (uint64_t));
+
+  /* x = m * 2^e with m odd */
+  memcpy (&bits, &x, sizeof (bits));
+  exponent_field = (int) ((bits >> 52) & 0x7FF);
+  m = bits & ((UINT64_C (1) << 52) - 1);
+  if (exponent_field == 0)
+    {
+      e = -1074;
+    }
+  else
+    {
+      m |= UINT64_C (1) << 52;
+      e = exponent_field - 1075;
+    }
+  e += NUMERIC_CTZ64 (m);
+  m >>= NUMERIC_CTZ64 (m);
+
+  if (scale == 0 && c_hi == 0)
+    {
+      /* an integer below 2^128 */
+      const uint128_t c = ((uint128_t) c_mid << 64) | c_lo;
+
+      if (e >= 0 && e <= 74)
+	{
+	  const uint128_t y = (uint128_t) m << e;
+
+	  return c < y ? DB_LT : c > y ? DB_GT : DB_EQ;
+	}
+      if (e < 0)
+	{
+	  /* x is not an integer: c < x iff c <= floor (x) */
+	  const uint64_t whole = -e < 64 ? m >> -e : 0;
+
+	  return c <= whole ? DB_LT : DB_GT;
+	}
+    }
+
+  uint64_t lhs[NUMERIC_EXACT_WORDS] = { c_lo, c_mid, c_hi };
+  uint64_t rhs[NUMERIC_EXACT_WORDS] = { m };
+  int n_lhs = 3, n_rhs = 1;
+  const int power = scale >= 0 ? scale : -scale;
+  /* floor (power * log2 (10)), possibly one less */
+  const int power_bits = (int) ((int64_t) power * 3321928094LL / 1000000000LL);
+  int lhs_low, lhs_high, rhs_low, rhs_high;
+
+  /* compare the bit lengths first: a factor 10^power adds power_bits - 1 to power_bits + 2 bits */
+  lhs_low = lhs_high = numeric_words_bit_length (lhs, n_lhs);
+  rhs_low = rhs_high = numeric_words_bit_length (rhs, n_rhs);
+  if (scale < 0)
+    {
+      lhs_low += power_bits - 1;
+      lhs_high += power_bits + 2;
+    }
+  else
+    {
+      rhs_low += power_bits - 1;
+      rhs_high += power_bits + 2;
+    }
+  if (e < 0)
+    {
+      lhs_low += -e;
+      lhs_high += -e;
+    }
+  else
+    {
+      rhs_low += e;
+      rhs_high += e;
+    }
+  if (lhs_high < rhs_low)
+    {
+      return DB_LT;
+    }
+  if (rhs_high < lhs_low)
+    {
+      return DB_GT;
+    }
+
+  /* the exact values, scaled to integers: buf * 10^-scale * 2^-e against m */
+  if (scale < 0)
+    {
+      n_lhs = numeric_words_mul_pow10 (lhs, n_lhs, power);
+    }
+  else
+    {
+      n_rhs = numeric_words_mul_pow10 (rhs, n_rhs, power);
+    }
+  if (e < 0)
+    {
+      n_lhs = numeric_words_shift_left (lhs, n_lhs, -e);
+    }
+  else
+    {
+      n_rhs = numeric_words_shift_left (rhs, n_rhs, e);
+    }
+  return numeric_words_compare (lhs, n_lhs, rhs, n_rhs);
+}
+
+/*
+ * numeric_compare_num_double_exact () - the order of a NUMERIC and a DOUBLE by their exact values, without converting
+ *					 either: a DOUBLE outside the NUMERIC range or infinite compares too
+ *   return: DB_LT, DB_EQ or DB_GT of num_value against d; a NaN compares equal, as MR_CMP of two doubles answers
+ *   num_value(in): a non-NULL NUMERIC
+ *   d(in)
+ */
+DB_VALUE_COMPARE_RESULT
+numeric_compare_num_double_exact (const DB_VALUE * num_value, double d)
+{
+  const DB_C_NUMERIC buf = db_locate_numeric (num_value);
+  int precision, scale, num_sign, double_sign;
+  DB_VALUE_COMPARE_RESULT magnitude;
+
+  if (d != d)
+    {
+      return DB_EQ;
+    }
+  num_sign = numeric_is_zero (buf) ? 0 : numeric_is_negative (num_value) ? -1 : 1;
+  double_sign = d > 0 ? 1 : d < 0 ? -1 : 0;
+  if (num_sign != double_sign)
+    {
+      return num_sign < double_sign ? DB_LT : DB_GT;
+    }
+  if (num_sign == 0)
+    {
+      return DB_EQ;
+    }
+  if (std::isinf (d))
+    {
+      return num_sign > 0 ? DB_LT : DB_GT;
+    }
+  db_get_numeric_precision_and_scale (num_value, &precision, &scale, NULL);
+  magnitude = numeric_compare_magnitude_double (buf, scale, NUMERIC_ABS (d));
+  if (num_sign > 0)
+    {
+      return magnitude;
+    }
+  return magnitude == DB_LT ? DB_GT : magnitude == DB_GT ? DB_LT : DB_EQ;
+}
+
+/*
+ * numeric_compare_bigint_double_exact () - the order of an integer and a DOUBLE by their exact values, without
+ *					    converting either
+ *   return: DB_LT, DB_EQ or DB_GT of value against d; a NaN compares equal, as MR_CMP of two doubles answers
+ *   value(in), d(in)
+ */
+DB_VALUE_COMPARE_RESULT
+numeric_compare_bigint_double_exact (DB_BIGINT value, double d)
+{
+  DB_BIGINT whole;
+  double fraction;
+
+  if (d != d)
+    {
+      return DB_EQ;
+    }
+  if (d >= 9223372036854775808.0)
+    {
+      return DB_LT;
+    }
+  if (d < -9223372036854775808.0)
+    {
+      return DB_GT;
+    }
+  /* |d| < 2^63: its integer part is exact as a DB_BIGINT and its fraction exact as a double */
+  whole = (DB_BIGINT) d;
+  if (value != whole)
+    {
+      return value < whole ? DB_LT : DB_GT;
+    }
+  fraction = d - (double) whole;
+  return fraction > 0 ? DB_LT : fraction < 0 ? DB_GT : DB_EQ;
+}
+
 /*
  * numeric_coerce_int_to_num () -
  *   return:

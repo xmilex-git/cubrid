@@ -34,6 +34,7 @@
 #include "string_opfunc.h"
 #include "xasl.h"
 #include "query_sum_accumulator.h"
+#include "numeric_opfunc.h"
 #include <atomic>
 #include <cfloat>
 #include <cstddef>
@@ -1104,6 +1105,86 @@ domain_compare_target (const DOMAIN_OPERAND * coerced, DB_TYPE target_type)
   return tp_domain_resolve_default (target_type);
 }
 
+/* shortcut: CBRD-27819 survey measurement path, set by the environment variable CUBRID_NUMERIC_EXACT_COMPARE
+ * (default off): an integer or NUMERIC compared with a DOUBLE keeps its type and compares by the exact values.
+ * Index key ranges and partition pruning still convert to DOUBLE; replace with the common-type change of
+ * CBRD-27797/CBRD-27799. */
+static const bool domain_Exact_number_compare = getenv ("CUBRID_NUMERIC_EXACT_COMPARE") != NULL;
+
+static bool
+domain_compare_is_exact_number (DB_TYPE type1, DB_TYPE type2)
+{
+  if (!domain_Exact_number_compare || (type1 == DB_TYPE_DOUBLE) == (type2 == DB_TYPE_DOUBLE))
+    {
+      return false;
+    }
+  const DB_TYPE other = type1 == DB_TYPE_DOUBLE ? type2 : type1;
+  return other == DB_TYPE_SHORT || other == DB_TYPE_INTEGER || other == DB_TYPE_BIGINT || other == DB_TYPE_NUMERIC;
+}
+
+/* the exact order of an integer or NUMERIC value and a double */
+static DB_VALUE_COMPARE_RESULT
+domain_exact_number_compare (const DB_VALUE * number, double d)
+{
+  switch (DB_VALUE_DOMAIN_TYPE (number))
+    {
+    case DB_TYPE_NUMERIC:
+      return numeric_compare_num_double_exact (number, d);
+    case DB_TYPE_BIGINT:
+      return numeric_compare_bigint_double_exact (db_get_bigint (number), d);
+    case DB_TYPE_INTEGER:
+      return numeric_compare_bigint_double_exact (db_get_int (number), d);
+    default:
+      assert (DB_VALUE_DOMAIN_TYPE (number) == DB_TYPE_SHORT);
+      return numeric_compare_bigint_double_exact (db_get_short (number), d);
+    }
+}
+
+static DB_VALUE_COMPARE_RESULT
+domain_cmpval_number_double (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
+			     int *start_colp, int collation)
+{
+  return domain_exact_number_compare (value1, db_get_double (value2));
+}
+
+static DB_VALUE_COMPARE_RESULT
+domain_cmpval_double_number (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
+			     int *start_colp, int collation)
+{
+  const DB_VALUE_COMPARE_RESULT c = domain_exact_number_compare (value2, db_get_double (value1));
+  return c == DB_LT ? DB_GT : c == DB_GT ? DB_LT : c;
+}
+
+/* tp_Double with an exact comparison's cmpval, made at the first use (after tp_Double's initialization) */
+static const PR_TYPE *
+domain_exact_number_type (bool number_first)
+{
+  static const PR_TYPE number_double = [] ()
+  {
+    PR_TYPE type = tp_Double;
+    type.set_cmpval_function (domain_cmpval_number_double);
+    return type;
+  } ();
+  static const PR_TYPE double_number = [] ()
+  {
+    PR_TYPE type = tp_Double;
+    type.set_cmpval_function (domain_cmpval_double_number);
+    return type;
+  } ();
+  return number_first ? &number_double : &double_number;
+}
+
+/* the cmpval of a resolved comparison: the compared type's, or an exact number comparison's */
+const PR_TYPE *
+domain_compare_cmp (DB_TYPE source0, DB_TYPE source1, DB_TYPE compared)
+{
+  if (domain_compare_is_exact_number (source0, source1))
+    {
+      return domain_exact_number_type (source1 == DB_TYPE_DOUBLE);
+    }
+  return pr_type_from_id (compared);
+}
+
 static int
 domain_resolve_compare (const DOMAIN_OPERAND * operands, RESOLVED_DOMAIN * result)
 {
@@ -1112,7 +1193,7 @@ domain_resolve_compare (const DOMAIN_OPERAND * operands, RESOLVED_DOMAIN * resul
   const TP_DOMAIN *target1 = domain_operand_domain (&operands[0]);
   const TP_DOMAIN *target2 = domain_operand_domain (&operands[1]);
 
-  if (type1 != DB_TYPE_NULL && type2 != DB_TYPE_NULL && type1 != type2)
+  if (type1 != DB_TYPE_NULL && type2 != DB_TYPE_NULL && type1 != type2 && !domain_compare_is_exact_number (type1, type2))
     {
       switch (tp_value_compare_common_domain (type1, type2))
 	{
@@ -2241,8 +2322,9 @@ domain_compare_mirror (const DOMAIN_COMPARE * compare, DOMAIN_COMPARE * mirrored
   if (compare->cmp != NULL)
     {
       /* cmpval is the first value's type once converted */
-      mirrored->cmp = pr_type_from_id (mirrored->conv[0] != NULL ? TP_DOMAIN_TYPE (mirrored->target[0])
-				       : (DB_TYPE) mirrored->source[0]);
+      mirrored->cmp = domain_compare_cmp ((DB_TYPE) mirrored->source[0], (DB_TYPE) mirrored->source[1],
+					  mirrored->conv[0] != NULL ? TP_DOMAIN_TYPE (mirrored->target[0])
+					  : (DB_TYPE) mirrored->source[0]);
     }
 }
 
@@ -2309,7 +2391,7 @@ domain_compute_comparison (const DOMAIN_COMPARE_KEY * lhs, const DOMAIN_COMPARE_
       result->method = DOMAIN_COMPARE_OBJECT;
       return NO_ERROR;
     }
-  if (lhs->type != rhs->type)
+  if (lhs->type != rhs->type && !domain_compare_is_exact_number (lhs->type, rhs->type))
     {
       const TP_COMPARE_COERCION coercion = tp_value_compare_common_domain (lhs->type, rhs->type);
       const TP_DOMAIN *target = NULL;
@@ -2370,7 +2452,7 @@ domain_compute_comparison (const DOMAIN_COMPARE_KEY * lhs, const DOMAIN_COMPARE_
   result->converted_first = (unsigned char) after[result->first];
 
   /* the tail on the converted values: the first side's cmpval under the comparison's collation */
-  result->cmp = pr_type_from_id (after[0]);
+  result->cmp = domain_compare_cmp (lhs->type, rhs->type, after[0]);
   if (enum_side >= 0 && key[0]->collation != key[1]->collation)
     {
       /* both sides compare as strings of the ENUM's collation */

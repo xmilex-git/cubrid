@@ -145,6 +145,8 @@ extern int numeric_db_value_div (const DB_VALUE * dbv1, const DB_VALUE * dbv2, D
 
 /* Comparison routines */
 extern int numeric_db_value_compare (const DB_VALUE * dbv1, const DB_VALUE * dbv2, DB_VALUE * answer);
+extern DB_VALUE_COMPARE_RESULT numeric_compare_num_double_exact (const DB_VALUE * num_value, double d);
+extern DB_VALUE_COMPARE_RESULT numeric_compare_bigint_double_exact (DB_BIGINT value, double d);
 
 /* Coercion routines */
 extern void numeric_coerce_int_to_num (int arg, DB_C_NUMERIC answer, bool * is_value_negative);
