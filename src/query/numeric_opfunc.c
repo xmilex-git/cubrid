@@ -3960,6 +3960,73 @@ numeric_compare_num_double_exact (const DB_VALUE * num_value, double d)
 }
 
 /*
+ * numeric_compare_u64_magnitude () - the order of an unsigned integer and a NUMERIC magnitude
+ *   return: DB_LT, DB_EQ or DB_GT of value against buf * 10^-scale
+ */
+static DB_VALUE_COMPARE_RESULT
+numeric_compare_u64_magnitude (uint64_t value, const unsigned char *buf, int scale)
+{
+  const uint64_t c_hi = buf[0];
+  const uint64_t c_mid = numeric_get_uint64_from_be (buf + 1);
+  const uint64_t c_lo = numeric_get_uint64_from_be (buf + 1 + sizeof (uint64_t));
+
+  if (scale >= 0 && scale <= 19 && c_hi == 0)
+    {
+      /* value * 10^scale < 2^64 * 10^19 < 2^128 */
+      const uint128_t lhs = scale == 0 ? (uint128_t) value : (uint128_t) value * _gv_mul_normalize_pow10_lookup[scale - 1];
+      const uint128_t c = ((uint128_t) c_mid << 64) | c_lo;
+
+      return lhs < c ? DB_LT : lhs > c ? DB_GT : DB_EQ;
+    }
+
+  uint64_t lhs[NUMERIC_EXACT_WORDS] = { value };
+  uint64_t rhs[NUMERIC_EXACT_WORDS] = { c_lo, c_mid, c_hi };
+  int n_lhs = 1, n_rhs = 3;
+
+  if (scale >= 0)
+    {
+      n_lhs = numeric_words_mul_pow10 (lhs, n_lhs, scale);
+    }
+  else
+    {
+      n_rhs = numeric_words_mul_pow10 (rhs, n_rhs, -scale);
+    }
+  return numeric_words_compare (lhs, n_lhs, rhs, n_rhs);
+}
+
+/*
+ * numeric_compare_bigint_num_exact () - the order of an integer and a NUMERIC, without making the integer a NUMERIC
+ *   return: DB_LT, DB_EQ or DB_GT of value against num_value
+ *   value(in)
+ *   num_value(in): a non-NULL NUMERIC
+ */
+DB_VALUE_COMPARE_RESULT
+numeric_compare_bigint_num_exact (DB_BIGINT value, const DB_VALUE * num_value)
+{
+  const DB_C_NUMERIC buf = db_locate_numeric (num_value);
+  int precision, scale, num_sign, value_sign;
+  DB_VALUE_COMPARE_RESULT magnitude;
+
+  num_sign = numeric_is_zero (buf) ? 0 : numeric_is_negative (num_value) ? -1 : 1;
+  value_sign = value > 0 ? 1 : value < 0 ? -1 : 0;
+  if (value_sign != num_sign)
+    {
+      return value_sign < num_sign ? DB_LT : DB_GT;
+    }
+  if (value_sign == 0)
+    {
+      return DB_EQ;
+    }
+  db_get_numeric_precision_and_scale (num_value, &precision, &scale, NULL);
+  magnitude = numeric_compare_u64_magnitude (value < 0 ? -(uint64_t) value : (uint64_t) value, buf, scale);
+  if (value_sign > 0)
+    {
+      return magnitude;
+    }
+  return magnitude == DB_LT ? DB_GT : magnitude == DB_GT ? DB_LT : DB_EQ;
+}
+
+/*
  * numeric_compare_bigint_double_exact () - the order of an integer and a DOUBLE by their exact values, without
  *					    converting either
  *   return: DB_LT, DB_EQ or DB_GT of value against d; a NaN compares equal, as MR_CMP of two doubles answers

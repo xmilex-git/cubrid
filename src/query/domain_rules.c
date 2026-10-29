@@ -1112,32 +1112,60 @@ domain_compare_target (const DOMAIN_OPERAND * coerced, DB_TYPE target_type)
 static const bool domain_Exact_number_compare = getenv ("CUBRID_NUMERIC_EXACT_COMPARE") != NULL;
 
 static bool
+domain_type_is_integer (DB_TYPE type)
+{
+  return type == DB_TYPE_SHORT || type == DB_TYPE_INTEGER || type == DB_TYPE_BIGINT;
+}
+
+/* a comparison whose sides keep their types and compare by the exact values: an integer against a NUMERIC (the
+ * integer is not made a NUMERIC first), and with CUBRID_NUMERIC_EXACT_COMPARE an integer or NUMERIC against a
+ * DOUBLE */
+static bool
 domain_compare_is_exact_number (DB_TYPE type1, DB_TYPE type2)
 {
+  if ((type1 == DB_TYPE_NUMERIC && domain_type_is_integer (type2))
+      || (type2 == DB_TYPE_NUMERIC && domain_type_is_integer (type1)))
+    {
+      return true;
+    }
   if (!domain_Exact_number_compare || (type1 == DB_TYPE_DOUBLE) == (type2 == DB_TYPE_DOUBLE))
     {
       return false;
     }
   const DB_TYPE other = type1 == DB_TYPE_DOUBLE ? type2 : type1;
-  return other == DB_TYPE_SHORT || other == DB_TYPE_INTEGER || other == DB_TYPE_BIGINT || other == DB_TYPE_NUMERIC;
+  return domain_type_is_integer (other) || other == DB_TYPE_NUMERIC;
+}
+
+static DB_BIGINT
+domain_integer_value (const DB_VALUE * value)
+{
+  switch (DB_VALUE_DOMAIN_TYPE (value))
+    {
+    case DB_TYPE_BIGINT:
+      return db_get_bigint (value);
+    case DB_TYPE_INTEGER:
+      return db_get_int (value);
+    default:
+      assert (DB_VALUE_DOMAIN_TYPE (value) == DB_TYPE_SHORT);
+      return db_get_short (value);
+    }
 }
 
 /* the exact order of an integer or NUMERIC value and a double */
 static DB_VALUE_COMPARE_RESULT
 domain_exact_number_compare (const DB_VALUE * number, double d)
 {
-  switch (DB_VALUE_DOMAIN_TYPE (number))
+  if (DB_VALUE_DOMAIN_TYPE (number) == DB_TYPE_NUMERIC)
     {
-    case DB_TYPE_NUMERIC:
       return numeric_compare_num_double_exact (number, d);
-    case DB_TYPE_BIGINT:
-      return numeric_compare_bigint_double_exact (db_get_bigint (number), d);
-    case DB_TYPE_INTEGER:
-      return numeric_compare_bigint_double_exact (db_get_int (number), d);
-    default:
-      assert (DB_VALUE_DOMAIN_TYPE (number) == DB_TYPE_SHORT);
-      return numeric_compare_bigint_double_exact (db_get_short (number), d);
     }
+  return numeric_compare_bigint_double_exact (domain_integer_value (number), d);
+}
+
+static DB_VALUE_COMPARE_RESULT
+domain_compare_reverse (DB_VALUE_COMPARE_RESULT c)
+{
+  return c == DB_LT ? DB_GT : c == DB_GT ? DB_LT : c;
 }
 
 static DB_VALUE_COMPARE_RESULT
@@ -1151,38 +1179,58 @@ static DB_VALUE_COMPARE_RESULT
 domain_cmpval_double_number (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
 			     int *start_colp, int collation)
 {
-  const DB_VALUE_COMPARE_RESULT c = domain_exact_number_compare (value2, db_get_double (value1));
-  return c == DB_LT ? DB_GT : c == DB_GT ? DB_LT : c;
+  return domain_compare_reverse (domain_exact_number_compare (value2, db_get_double (value1)));
 }
 
-/* tp_Double with an exact comparison's cmpval, made at the first use (after tp_Double's initialization) */
-static const PR_TYPE *
-domain_exact_number_type (bool number_first)
+static DB_VALUE_COMPARE_RESULT
+domain_cmpval_integer_numeric (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
+			       int *start_colp, int collation)
 {
-  static const PR_TYPE number_double = [] ()
-  {
-    PR_TYPE type = tp_Double;
-    type.set_cmpval_function (domain_cmpval_number_double);
-    return type;
-  } ();
-  static const PR_TYPE double_number = [] ()
-  {
-    PR_TYPE type = tp_Double;
-    type.set_cmpval_function (domain_cmpval_double_number);
-    return type;
-  } ();
-  return number_first ? &number_double : &double_number;
+  return numeric_compare_bigint_num_exact (domain_integer_value (value1), value2);
+}
+
+static DB_VALUE_COMPARE_RESULT
+domain_cmpval_numeric_integer (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
+			       int *start_colp, int collation)
+{
+  return domain_compare_reverse (numeric_compare_bigint_num_exact (domain_integer_value (value2), value1));
+}
+
+/* the compared type's PR_TYPE with an exact comparison's cmpval, made at the first use (after tp_Double's and
+ * tp_Numeric's initialization) */
+static PR_TYPE
+domain_exact_number_type (const PR_TYPE * compared, PR_TYPE::cmpval_function_type cmpval)
+{
+  PR_TYPE type = *compared;
+  type.set_cmpval_function (cmpval);
+  return type;
 }
 
 /* the cmpval of a resolved comparison: the compared type's, or an exact number comparison's */
 const PR_TYPE *
 domain_compare_cmp (DB_TYPE source0, DB_TYPE source1, DB_TYPE compared)
 {
-  if (domain_compare_is_exact_number (source0, source1))
+  if (!domain_compare_is_exact_number (source0, source1))
     {
-      return domain_exact_number_type (source1 == DB_TYPE_DOUBLE);
+      return pr_type_from_id (compared);
     }
-  return pr_type_from_id (compared);
+  if (source1 == DB_TYPE_DOUBLE)
+    {
+      static const PR_TYPE number_double = domain_exact_number_type (&tp_Double, domain_cmpval_number_double);
+      return &number_double;
+    }
+  if (source0 == DB_TYPE_DOUBLE)
+    {
+      static const PR_TYPE double_number = domain_exact_number_type (&tp_Double, domain_cmpval_double_number);
+      return &double_number;
+    }
+  if (source1 == DB_TYPE_NUMERIC)
+    {
+      static const PR_TYPE integer_numeric = domain_exact_number_type (&tp_Numeric, domain_cmpval_integer_numeric);
+      return &integer_numeric;
+    }
+  static const PR_TYPE numeric_integer = domain_exact_number_type (&tp_Numeric, domain_cmpval_numeric_integer);
+  return &numeric_integer;
 }
 
 static int
