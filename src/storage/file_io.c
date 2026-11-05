@@ -493,6 +493,7 @@ static int fileio_create (THREAD_ENTRY * thread_p, const char *db_fullname, cons
 static int fileio_create_backup_volume (THREAD_ENTRY * thread_p, const char *db_fullname, const char *vlabel,
 					VOLID volid, bool dolock, bool dosync, int atleast_pages);
 #endif /* defined (SERVER_MODE) || (SA_MODE) */
+static bool fileio_is_temporary_purpose_volume (THREAD_ENTRY * thread_p, VOLID volid);
 static int fileio_max_permanent_volumes (int index, int num_permanent_volums);
 static int fileio_min_temporary_volumes (int index, int num_temp_volums, int num_volinfo_array);
 static FILEIO_SYSTEM_VOLUME_INFO *fileio_traverse_system_volume (THREAD_ENTRY * thread_p,
@@ -3122,6 +3123,28 @@ start:
 }
 
 /*
+ * fileio_is_temporary_purpose_volume () - recovery never reads the data of a temporary-purpose volume, so such a
+ *                                         volume is never synchronized
+ *   return: true for a temporary volume or a permanent volume with temporary purpose
+ *   volid(in): volume identifier
+ */
+static bool
+fileio_is_temporary_purpose_volume (THREAD_ENTRY * thread_p, VOLID volid)
+{
+#if defined (CS_MODE)
+  return false;
+#else /* CS_MODE */
+  if (volid < LOG_DBFIRST_VOLID)
+    {
+      /* system volumes and unknown descriptors */
+      return false;
+    }
+  /* the purpose of a permanent volume is the one the page buffer uses: known once the log is restarted */
+  return fileio_is_temp_volume (thread_p, volid) || pgbuf_is_temporary_purpose_volume (volid);
+#endif /* CS_MODE */
+}
+
+/*
  * fileio_dismount () - Dismount the volume associated with the given volume
  *                  descriptor
  *   return: void
@@ -3143,7 +3166,10 @@ fileio_dismount (THREAD_ENTRY * thread_p, int vol_fd)
   vlabel = fileio_get_volume_label_by_fd (vol_fd, PEEK);
 
 #if !defined(CS_MODE)
-  (void) dwb_synchronize (thread_p, vol_fd, vlabel);
+  if (!fileio_is_temporary_purpose_volume (thread_p, fileio_get_volume_id (vol_fd)))
+    {
+      (void) dwb_synchronize (thread_p, vol_fd, vlabel);
+    }
 #else
   (void) fileio_synchronize (thread_p, vol_fd, vlabel, true);
 #endif
@@ -3349,7 +3375,10 @@ fileio_dismount_volume (THREAD_ENTRY * thread_p, FILEIO_VOLUME_INFO * vol_info_p
   if (vol_info_p->vdes != NULL_VOLDES)
     {
 #if !defined(CS_MODE)
-      (void) dwb_synchronize (thread_p, vol_info_p->vdes, vol_info_p->vlabel);
+      if (!fileio_is_temporary_purpose_volume (thread_p, vol_info_p->volid))
+	{
+	  (void) dwb_synchronize (thread_p, vol_info_p->vdes, vol_info_p->vlabel);
+	}
 #else
       (void) fileio_synchronize (thread_p, vol_info_p->vdes, vol_info_p->vlabel, true);
 #endif
@@ -4076,7 +4105,9 @@ fileio_write_or_add_to_dwb (THREAD_ENTRY * thread_p, int vol_fd, FILEIO_PAGE * i
       /* Not permanent volume, or a page of a temporary-purpose volume - write the page. */
     }
 
-  write_mode = skip_flush ? FILEIO_WRITE_NO_COMPENSATE_WRITE : FILEIO_WRITE_DEFAULT_WRITE;
+  /* a temporary-purpose volume is never synchronized, so its pages do not count toward the compensating sync */
+  write_mode = ((skip_flush || fileio_is_temporary_purpose_volume (thread_p, fileio_get_volume_id (vol_fd)))
+		? FILEIO_WRITE_NO_COMPENSATE_WRITE : FILEIO_WRITE_DEFAULT_WRITE);
 
   return fileio_write (thread_p, vol_fd, io_page_p, page_id, page_size, write_mode);
 #else
@@ -4636,7 +4667,10 @@ fileio_synchronize_volume (THREAD_ENTRY * thread_p, FILEIO_VOLUME_INFO * vol_inf
 	  return false;
 	}
 
-      fileio_synchronize (thread_p, vol_info_p->vdes, vol_info_p->vlabel, false);
+      if (!fileio_is_temporary_purpose_volume (thread_p, vol_info_p->volid))
+	{
+	  fileio_synchronize (thread_p, vol_info_p->vdes, vol_info_p->vlabel, false);
+	}
     }
 
   return found;

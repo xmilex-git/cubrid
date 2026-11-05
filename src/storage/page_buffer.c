@@ -11069,7 +11069,9 @@ copy_unflushed_lsa:
   else
     {
       /* Record number of writes in statistics */
-      write_mode = (dwb_is_created () == true ? FILEIO_WRITE_NO_COMPENSATE_WRITE : FILEIO_WRITE_DEFAULT_WRITE);
+      /* a temporary page is never synchronized, so it does not count toward the compensating sync either */
+      write_mode = ((dwb_is_created () == true || is_temp) ? FILEIO_WRITE_NO_COMPENSATE_WRITE
+		    : FILEIO_WRITE_DEFAULT_WRITE);
 
       perfmon_inc_stat (thread_p, PSTAT_PB_NUM_IOWRITES);
       if (fileio_write (thread_p, fileio_get_volume_descriptor (bufptr->vpid.volid), iopage, bufptr->vpid.pageid,

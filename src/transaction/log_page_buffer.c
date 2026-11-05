@@ -7699,6 +7699,11 @@ logpb_checkpoint (THREAD_ENTRY * thread_p)
        * beginning of the checkpoint, modified again by concurrent transaction, written on disk again in checkpoint
        * due to volume header page modification).
        */
+      if (pgbuf_is_temporary_purpose_volume (volid))
+	{
+	  /* the data of a temporary-purpose volume is never recovered, so the volume is never synchronized */
+	  continue;
+	}
       vdes = fileio_get_volume_descriptor (volid);
       if (dwb_synchronize (thread_p, vdes, fileio_get_volume_label (vdes, PEEK)) != vdes)
 	{
@@ -7961,7 +7966,9 @@ logpb_backup_for_volume (THREAD_ENTRY * thread_p, VOLID volid, LOG_LSA * chkpt_l
     }
 
   vdes = fileio_get_volume_descriptor (volid);
-  if (dwb_synchronize (thread_p, vdes, fileio_get_volume_label (vdes, PEEK)) != vdes)
+  /* a temporary-purpose volume is never synchronized; the backup reads its pages through the OS cache anyway */
+  if (volpurpose != DB_TEMPORARY_DATA_PURPOSE
+      && dwb_synchronize (thread_p, vdes, fileio_get_volume_label (vdes, PEEK)) != vdes)
     {
       return ER_FAILED;
     }
