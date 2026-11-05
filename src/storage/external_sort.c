@@ -5836,7 +5836,7 @@ sort_write_area (THREAD_ENTRY * thread_p, VFID * vfid, FILE_FIND_NTH_CURSOR * cu
 	  ASSERT_ERROR ();
 	  return ret;
 	}
-      if (pgbuf_copy_from_area (thread_p, &vpid, 0, DB_PAGESIZE, page_ptr, true, tde_algo) == NULL)
+      if (pgbuf_copy_from_area (thread_p, &vpid, 0, DB_PAGESIZE, page_ptr, true, tde_algo, false) == NULL)
 	{
 	  ASSERT_ERROR_AND_SET (ret);
 	  return ret;

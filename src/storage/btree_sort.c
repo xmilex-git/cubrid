@@ -4656,7 +4656,9 @@ btsort_write_area (THREAD_ENTRY * thread_p, VFID * vfid, FILE_FIND_NTH_CURSOR * 
 	  ASSERT_ERROR ();
 	  return ret;
 	}
-      if (pgbuf_copy_from_area (thread_p, &vpid, 0, DB_PAGESIZE, page_ptr, true, tde_algo) == NULL)
+      /* written through: run pages would otherwise fill the pool with dirty pages that only the page flush daemon
+       * cleans, and every sort worker would wait for it */
+      if (pgbuf_copy_from_area (thread_p, &vpid, 0, DB_PAGESIZE, page_ptr, true, tde_algo, true) == NULL)
 	{
 	  ASSERT_ERROR_AND_SET (ret);
 	  return ret;

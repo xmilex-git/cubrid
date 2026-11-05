@@ -4851,6 +4851,8 @@ pgbuf_copy_temp_page_to_area_and_discard (THREAD_ENTRY * thread_p, const VPID * 
  *   area(in): Area where to copy the needed content of the page
  *   do_fetch(in): Do we want to cache the page in the buffer pool when it is
  *                 not already cached?
+ *   tde_algo(in): TDE algorithm of the page
+ *   write_through(in): write the page out before releasing it, so it stays clean in the pool
  *
  * Note: Copy the content of the given area to the page starting at the given
  *       offset. If the page is not in the page buffer pool, it is only
@@ -4867,7 +4869,7 @@ pgbuf_copy_temp_page_to_area_and_discard (THREAD_ENTRY * thread_p, const VPID * 
  */
 void *
 pgbuf_copy_from_area (THREAD_ENTRY * thread_p, const VPID * vpid, int start_offset, int length, void *area,
-		      bool do_fetch, TDE_ALGORITHM tde_algo)
+		      bool do_fetch, TDE_ALGORITHM tde_algo, bool write_through)
 {
   PGBUF_BUFFER_HASH *hash_anchor;
   PGBUF_BCB *bufptr;
@@ -4936,7 +4938,20 @@ pgbuf_copy_from_area (THREAD_ENTRY * thread_p, const VPID * vpid, int start_offs
       addr.pgptr = pgptr;
       addr.offset = 0;
       log_skip_logging (thread_p, &addr);
-      pgbuf_set_dirty (thread_p, pgptr, FREE);
+      if (write_through)
+	{
+	  /* the writer pays its own write instead of leaving a dirty page for the page flush daemon; a failed write
+	   * only leaves the page dirty for the daemon, so its error is not reported */
+	  pgbuf_set_dirty (thread_p, pgptr, DONT_FREE);
+	  er_stack_push ();
+	  (void) pgbuf_flush_with_wal (thread_p, pgptr);
+	  er_stack_pop ();
+	  pgbuf_unfix_and_init (thread_p, pgptr);
+	}
+      else
+	{
+	  pgbuf_set_dirty (thread_p, pgptr, FREE);
+	}
     }
   else
     {
