@@ -5625,6 +5625,18 @@ pgbuf_is_temporary_volume (VOLID volid)
 }
 
 /*
+ * pgbuf_is_temporary_purpose_volume () - pgbuf_is_temporary_volume for the io layer: the volumes whose pages the
+ *                                        page buffer treats as temporary
+ *   return: true if the volume has temporary purpose
+ *   volid(in): volume identifier
+ */
+bool
+pgbuf_is_temporary_purpose_volume (VOLID volid)
+{
+  return pgbuf_is_temporary_volume (volid);
+}
+
+/*
  * pgbuf_init_BCB_table () - Initializes page buffer BCB table
  *   return: NO_ERROR, or ER_code
  */

@@ -2920,12 +2920,22 @@ fileio_reset_volume (THREAD_ENTRY * thread_p, int vol_fd, const char *vlabel, DK
 
 #if !defined(CS_MODE)
   if (dwb_synchronize (thread_p, vol_fd, vlabel) != vol_fd)
-#else
-  if (fileio_synchronize (thread_p, vol_fd, vlabel, true) != vol_fd)
-#endif
     {
       success = ER_FAILED;
     }
+  /* with DWB, dwb_synchronize syncs only the volumes whose pages DWB held, and the pages of a temporary-purpose volume
+   * skip DWB except its header: sync the volume itself */
+  else if (dwb_is_created () && pgbuf_is_temporary_purpose_volume (fileio_get_volume_id (vol_fd))
+	   && fileio_synchronize (thread_p, vol_fd, vlabel, true) != vol_fd)
+    {
+      success = ER_FAILED;
+    }
+#else
+  if (fileio_synchronize (thread_p, vol_fd, vlabel, true) != vol_fd)
+    {
+      success = ER_FAILED;
+    }
+#endif
 
   return success;
 }
@@ -4039,11 +4049,16 @@ fileio_write_or_add_to_dwb (THREAD_ENTRY * thread_p, int vol_fd, FILEIO_PAGE * i
       vol_info_p = fileio_traverse_permanent_volume (thread_p, fileio_is_volume_descriptor_equal, &arg);
       if (vol_info_p)
 	{
-	  /* Permanent volumes - uses DWB. */
-	  VPID_SET (&vpid, vol_info_p->volid, page_id);
-
 	  io_page_p->prv.volid = vol_info_p->volid;
 	  io_page_p->prv.pageid = page_id;
+	}
+      /* the data of a temporary-purpose volume is never recovered, so only the header, which identifies the volume at
+       * restart, goes through DWB */
+      if (vol_info_p
+	  && (page_id == DISK_VOLHEADER_PAGE || !pgbuf_is_temporary_purpose_volume (vol_info_p->volid)))
+	{
+	  /* Permanent volumes - uses DWB. */
+	  VPID_SET (&vpid, vol_info_p->volid, page_id);
 
 	  error_code = dwb_add_page (thread_p, io_page_p, &vpid, ensure_metadata, &p_dwb_slot);
 	  if (error_code != NO_ERROR)
@@ -4058,7 +4073,7 @@ fileio_write_or_add_to_dwb (THREAD_ENTRY * thread_p, int vol_fd, FILEIO_PAGE * i
 
 	  /* DWB disabled, write the page. */
 	}
-      /* Not permanent volume - write the page. */
+      /* Not permanent volume, or a page of a temporary-purpose volume - write the page. */
     }
 
   write_mode = skip_flush ? FILEIO_WRITE_NO_COMPENSATE_WRITE : FILEIO_WRITE_DEFAULT_WRITE;
