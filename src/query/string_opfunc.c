@@ -64,12 +64,10 @@
 #include <string>
 #include <locale>
 
-#if !defined (SERVER_MODE)
+/* the server library compiles the client half, which needs parse_tree.h */
 #include "parse_tree.h"
 #include "es_common.h"
-#else
 #include "misctype_def.h"
-#endif /* !defined (SERVER_MODE) */
 
 
 /* return codes of the qstr_like_match_lockstep_* () instances (like_match_lockstep.i) */
@@ -11142,7 +11140,6 @@ error_exit:
   return error_status;
 }
 
-#if !defined (SERVER_MODE)
 /*
  * db_get_date_weekday () - compute day of week from a date type value
  *
@@ -11228,7 +11225,6 @@ error_exit:
   er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, error_status, 0);
   return error_status;
 }
-#endif /* !defined (SERVER_MODE) */
 
 /*
  * db_get_date_quarter () - compute quarter from a date type value
@@ -11846,7 +11842,6 @@ error_exit:
   return error_status;
 }
 
-#if !defined (SERVER_MODE)
 /*
  * db_get_date_item () - compute an item from a datetime value
  *
@@ -11956,7 +11951,6 @@ db_get_time_item (const DB_VALUE * src_date, const int item_type, DB_VALUE * res
 
   return NO_ERROR;
 }
-#endif /* !defined (SERVER_MODE) */
 
 
 /*

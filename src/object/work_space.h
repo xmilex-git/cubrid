@@ -35,10 +35,6 @@
 #include "dbtype_def.h"
 #include "db_multi_threads_connections.h"
 
-#if defined (SERVER_MODE)
-// cppcheck-suppress preprocessorErrorDirective
-#error does not belong to server
-#endif // SERVER_MODE
 
 /*
  * VID_INFO

@@ -28,10 +28,9 @@
 #include <string.h>
 
 #include "connection_less.h"
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
-#if defined(SERVER_MODE)
-#error Does not belong to server module
-#endif
 
 connection_less::connection_less ()
 {

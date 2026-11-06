@@ -45,14 +45,12 @@ namespace cubmethod
   int consume_tokens (const std::string &sql, int index, STATEMENT_STATUS stmt_status);
   std::size_t skip_leading_whitespace_and_comment (const std::string &sql, std::size_t index);
 
-#if !defined(SERVER_MODE)
   int get_stmt_type (std::string sql);
   int calculate_num_markers (const std::string &sql);
 
   std::string get_column_default_as_string (DB_ATTRIBUTE *attr);
   void serialize_collection_as_string (DB_VALUE *col, std::string &out);
   char get_set_domain (DB_DOMAIN *set_domain, int &precision, short &scale, char &charset);
-#endif
 }
 
 #endif

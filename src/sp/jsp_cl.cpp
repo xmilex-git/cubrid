@@ -68,6 +68,8 @@
 #include "string_buffer.hpp"
 #include "db_value_printer.hpp"
 #include "execute_statement.h"
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
 #define PT_NODE_SP_NAME(node) \
   (((node)->info.sp.name == NULL) ? "" : \
@@ -520,7 +522,8 @@ jsp_get_sp_type (const char *name)
 bool
 jsp_is_sp_parallel_eligible (const char *name)
 {
-#if defined (CS_MODE)
+  /* the client half also compiles inside cub_server, so SERVER_MODE reads the catalog like CS_MODE */
+#if defined (CS_MODE) || defined (SERVER_MODE)
   DB_OBJECT *mop_p;
   DB_VALUE directive_val;
   int save;
@@ -540,9 +543,8 @@ jsp_is_sp_parallel_eligible (const char *name)
 
   return eligible;
 #else
-  /* Only the client compiles a plan that a server can run in parallel; SA_MODE has no parallel
-   * hash join at all (px_hash_join is built into the server target alone), so answering "not
-   * eligible" here costs nothing. */
+  /* SA_MODE has no parallel hash join at all (px_hash_join is built into the server target alone),
+   * so answering "not eligible" here costs nothing. */
   (void) name;
   return false;
 #endif

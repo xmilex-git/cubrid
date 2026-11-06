@@ -451,7 +451,13 @@ static PT_MISC_TYPE parser_attr_type;
 
 static bool allow_attribute_ordering;
 
+/* db.h declares this extern "C"; keep C linkage when this generated
+ * file is compiled as C++ (SERVER_MODE build) */
+#ifdef __cplusplus
+extern "C" int parse_one_statement (int state);
+#else
 int parse_one_statement (int state);
+#endif
 static PT_NODE *pt_set_collation_modifier (PARSER_CONTEXT *parser,
 					   PT_NODE *node, PT_NODE *coll_node);
 

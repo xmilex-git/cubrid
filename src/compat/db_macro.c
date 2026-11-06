@@ -82,9 +82,7 @@ struct valcnv_buffer
 
 static const int valcnv_Max_set_elements = 10;
 
-#if !defined(SERVER_MODE)
 CUB_THREAD_LOCAL int db_Connect_status = DB_CONNECTION_STATUS_NOT_CONNECTED;
-#endif
 
 /* db_Disable_modifications?
  * 1) Purpose: This is used to indicate whether the system is in READ_ONLY_MODE.
@@ -2881,7 +2879,6 @@ valcnv_convert_collection_value_to_string_all_elements (DB_VALUE * value_p)
   return error;
 }
 
-#if !defined(SERVER_MODE)
 int
 db_get_connect_status (void)
 {
@@ -2893,7 +2890,6 @@ db_set_connect_status (int status)
 {
   db_Connect_status = status;
 }
-#endif
 
 /*
  * db_default_expression_string() -

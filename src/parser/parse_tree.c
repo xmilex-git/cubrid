@@ -44,6 +44,8 @@
 #endif /* SERVER_MODE */
 
 #include "dbtype.h"
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
 #if defined (SUPPRESS_STRLEN_WARNING)
 #define strlen(s1)  ((int) strlen(s1))
@@ -1170,9 +1172,11 @@ parser_create_parser (void)
 
   INIT_HIDE_PASSWORD_INFO (&parser->hide_pwd_info);
 
-#if !defined (SERVER_MODE)
+  /* the in-process client creates PARSER_CONTEXTs in the
+   * SERVER_MODE binary too, and pt_init_f/pt_apply_f stay NULL without this
+   * one-time table setup.  The assignment is an idempotent
+   * constant-table fill */
   parser_init_func_vectors ();
-#endif /* !SERVER_MODE */
 
 #if defined(SERVER_MODE)
   rv = pthread_mutex_lock (&parser_id_lock);

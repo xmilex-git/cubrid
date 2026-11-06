@@ -54,14 +54,14 @@
 #include "string_buffer.hpp"
 #include "db_value_printer.hpp"
 
-#if !defined (SERVER_MODE)
+/* workspace/object client semantics are compiled in SERVER_MODE too
+ * (the server library links them); runtime discrimination is db_on_server (thread_local) */
 #include "work_space.h"
 #include "virtual_object.h"
 #include "schema_manager.h"
 #include "locator_cl.h"
 #include "object_template.h"
 #include "dbi.h"
-#endif /* !defined (SERVER_MODE) */
 #if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
 #include "boot_cl.h"
 #endif
@@ -156,7 +156,11 @@ static int db_type_rank_order[DB_TYPE_LAST + 1] = { 0, };
 static AREA *tp_Domain_area = NULL;
 static bool tp_Initialized = false;
 
+#if defined (SERVER_MODE)
+extern thread_local unsigned int db_on_server;
+#else
 extern unsigned int db_on_server;
+#endif
 
 
 /*
@@ -1150,11 +1154,13 @@ tp_domain_construct (DB_TYPE domain_type, DB_OBJECT * class_obj, int precision, 
 	   */
 	  if (class_obj)
 	    {
+	      /* reached only with a real MOP (client context) */
 #if defined (SERVER_MODE)
-	      assert_release (false);
-#else /* !defined (SERVER_MODE) */
+	      /* SA executes these client bodies with db_on_server toggled; the
+	       * context-discipline invariant only holds in the server library */
+	      assert (!db_on_server);
+#endif
 	      new_dm->class_oid = class_obj->oid_info.oid;
-#endif /* !SERVER_MODE */
 	    }
 	}
 
@@ -1580,15 +1586,13 @@ tp_domain_match_internal (const TP_DOMAIN * dom1, const TP_DOMAIN * dom2, TP_MAT
     case DB_TYPE_OBJECT:
     case DB_TYPE_SUB:
 
-#if defined (SERVER_MODE)
-      match = OID_EQ (&dom1->class_oid, &dom2->class_oid);
-#else /* !defined (SERVER_MODE) */
       /*
        * if "exact" is zero, we should be checking the subclass hierarchy of
        * dom1 to see id dom2 is in it !
        */
 
-      /* Always prefer comparison of MOPs */
+      /* Always prefer comparison of MOPs (the server compares them too: a client-half domain may carry only its
+       * class_mop, and two NULL class_oids would match any two such domains) */
       if (dom1->class_mop != NULL && dom2->class_mop != NULL)
 	{
 	  match = (dom1->class_mop == dom2->class_mop);
@@ -1613,7 +1617,6 @@ tp_domain_match_internal (const TP_DOMAIN * dom1, const TP_DOMAIN * dom2, TP_MAT
 	      match = OID_EQ (WS_OID (dom1->class_mop), &dom2->class_oid);
 	    }
 	}
-#endif /* defined (SERVER_MODE) */
 
       if (match == 0 && exact == TP_SET_MATCH && dom1->class_mop == NULL && OID_ISNULL (&dom1->class_oid))
 	{
@@ -2892,9 +2895,12 @@ tp_domain_find_object (DB_TYPE type, OID * class_oid, struct db_object * class_m
 	}
       else
 	{
+	  /* class_mop is only non-NULL in client context. */
 #if defined (SERVER_MODE)
-	  assert_release (false);
-#else /* defined (SERVER_MODE) */
+	  /* SA executes these client bodies with db_on_server toggled; the
+	   * context-discipline invariant only holds in the server library */
+	  assert (!db_on_server);
+#endif
 	  /*
 	   * We have a mixture of OID & MOPS, it probably isn't necessary to be
 	   * this general but try to avoid assuming the class OIDs have been set
@@ -2914,7 +2920,6 @@ tp_domain_find_object (DB_TYPE type, OID * class_oid, struct db_object * class_m
 		  break;	/* found */
 		}
 	    }
-#endif /* defined (SERVER_MODE) */
 	}
     }
 
@@ -3406,8 +3411,14 @@ tp_domain_resolve_value (const DB_VALUE * val, TP_DOMAIN * dbuf)
 
 	case DB_TYPE_OBJECT:
 	  {
-#if !defined (SERVER_MODE)
+	    /* an OBJECT value only exists on client-context threads */
 	    DB_OBJECT *mop;
+
+#if defined (SERVER_MODE)
+	    /* SA executes these client bodies with db_on_server toggled; the
+	     * context-discipline invariant only holds in the server library */
+	    assert (!db_on_server);
+#endif
 
 	    domain = &tp_Object_domain;
 	    mop = db_get_object (val);
@@ -3423,10 +3434,6 @@ tp_domain_resolve_value (const DB_VALUE * val, TP_DOMAIN * dbuf)
 		    domain = &tp_Vobj_domain;
 		  }
 	      }
-#else
-	    /* We don't have mops on server */
-	    assert (false);
-#endif
 	  }
 	  break;
 
@@ -3795,7 +3802,6 @@ tp_domain_add (TP_DOMAIN ** dlist, TP_DOMAIN * domain)
   return error;
 }
 
-#if !defined (SERVER_MODE)
 /*
  * tp_domain_attach - concatenate two domains
  *    return: concatenated domain
@@ -3934,7 +3940,6 @@ tp_domain_drop (TP_DOMAIN ** dlist, TP_DOMAIN * domain)
 
   return dropped;
 }
-#endif /* !SERVER_MODE */
 
 
 /*
@@ -3951,16 +3956,14 @@ static int
 tp_domain_check_class (TP_DOMAIN * domain, int *change)
 {
   int error = NO_ERROR;
-#if !defined (SERVER_MODE)
   int status;
-#endif /* !SERVER_MODE */
 
   if (change != NULL)
     {
       *change = 0;
     }
 
-#if !defined (SERVER_MODE)
+  /* a server thread has no workspace: only the client half downgrades a deleted class to the "object" domain */
   if (!db_on_server)
     {
       if (domain != NULL && domain->type == tp_Type_object && domain->class_mop != NULL)
@@ -3984,7 +3987,6 @@ tp_domain_check_class (TP_DOMAIN * domain, int *change)
 	    }
 	}
     }
-#endif /* !SERVER_MODE */
 
   return error;
 }
@@ -4279,7 +4281,6 @@ tp_domain_select (const TP_DOMAIN * domain_list, const DB_VALUE * value, int all
 		}
 	    }
 	}
-#if !defined (SERVER_MODE)
       else
 	{
 	  /*
@@ -4310,7 +4311,6 @@ tp_domain_select (const TP_DOMAIN * domain_list, const DB_VALUE * value, int all
 		}
 	    }
 	}
-#endif /* !SERVER_MODE */
     }
 
   /*
@@ -4338,7 +4338,6 @@ tp_domain_select (const TP_DOMAIN * domain_list, const DB_VALUE * value, int all
 	    }
 	  return best;
 	}
-#if !defined (SERVER_MODE)
       else
 	{
 	  /*
@@ -4356,12 +4355,14 @@ tp_domain_select (const TP_DOMAIN * domain_list, const DB_VALUE * value, int all
 		}
 	    }
 	}
-#endif /* !SERVER_MODE */
     }
 
-#if !defined (SERVER_MODE)
   else if (vtype == DB_TYPE_POINTER)
     {
+#if defined (SERVER_MODE)
+      /* an object template exists only on the client half */
+      assert (!db_on_server);
+#endif
       /*
        * This is necessary in order to correctly choose an object domain from
        * the domain list when doing an insert nested inside a heterogeneous
@@ -4384,7 +4385,6 @@ tp_domain_select (const TP_DOMAIN * domain_list, const DB_VALUE * value, int all
 	    }
 	}
     }
-#endif /* !SERVER_MODE */
 
   else if (TP_IS_SET_TYPE (vtype))
     {
@@ -6540,10 +6540,8 @@ tp_value_compare_with_error (const DB_VALUE * value1, const DB_VALUE * value2, i
   int coercion, char_conv;
   DB_VALUE *v1, *v2;
   DB_TYPE vtype1, vtype2;
-#if !defined (SERVER_MODE)
   DB_OBJECT *mop;
   DB_IDENTIFIER *oid1, *oid2;
-#endif /* !defined (SERVER_MODE) */
   bool use_collation_of_v1 = false;
   bool use_collation_of_v2 = false;
   DB_VALUE_COMPARE_RESULT result = DB_UNK;
@@ -6592,15 +6590,15 @@ tp_value_compare_with_error (const DB_VALUE * value1, const DB_VALUE * value2, i
        */
       if (vtype1 != vtype2)
 	{
-#if defined (SERVER_MODE)
-	  if (vtype1 == DB_TYPE_OBJECT || vtype2 == DB_TYPE_OBJECT)
-	    {
-	      assert_release (false);
-	      return DB_UNK;
-	    }
-#else /* !defined (SERVER_MODE) */
+	  /* an OBJECT value can only originate from a
+	   * client-context thread; genuine server threads never build one */
 	  if (vtype1 == DB_TYPE_OBJECT)
 	    {
+#if defined (SERVER_MODE)
+	      /* SA executes these client bodies with db_on_server toggled; the
+	       * context-discipline invariant only holds in the server library */
+	      assert (!db_on_server);
+#endif
 	      if (vtype2 == DB_TYPE_OID)
 		{
 		  mop = db_get_object (v1);
@@ -6618,6 +6616,11 @@ tp_value_compare_with_error (const DB_VALUE * value1, const DB_VALUE * value2, i
 	    }
 	  else if (vtype2 == DB_TYPE_OBJECT)
 	    {
+#if defined (SERVER_MODE)
+	      /* SA executes these client bodies with db_on_server toggled; the
+	       * context-discipline invariant only holds in the server library */
+	      assert (!db_on_server);
+#endif
 	      if (vtype1 == DB_TYPE_OID)
 		{
 		  oid1 = db_get_oid (v1);
@@ -6634,7 +6637,6 @@ tp_value_compare_with_error (const DB_VALUE * value1, const DB_VALUE * value2, i
 		    }
 		}
 	    }
-#endif /* !defined (SERVER_MODE) */
 
 	  /*
 	   * If value types aren't exact, try coercion.

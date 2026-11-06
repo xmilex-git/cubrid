@@ -25,11 +25,9 @@
 #include "dbtype.h"
 #include "chartype.h"
 
-#if !defined(SERVER_MODE)
 #include "dbi.h"
 #include "object_domain.h"
 #include "object_primitive.h"
-#endif
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -473,7 +471,6 @@ namespace cubmethod
     return std::string (val_str);
   }
 
-#if !defined(SERVER_MODE)
   int
   get_stmt_type (std::string sql)
   {
@@ -570,7 +567,6 @@ namespace cubmethod
 
     return num_markers;
   }
-#endif /* !SERVER_MODE */
 
   int
   consume_tokens (const std::string &sql, int index, STATEMENT_STATUS stmt_status)
@@ -680,7 +676,6 @@ namespace cubmethod
     return index;
   }
 
-#if !defined(SERVER_MODE)
   std::string
   get_column_default_as_string (DB_ATTRIBUTE *attr)
   {
@@ -844,5 +839,4 @@ namespace cubmethod
 
     return (set_domain_count != 1) ? DB_TYPE_NULL : set_type;
   }
-#endif
 }

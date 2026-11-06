@@ -61,6 +61,8 @@
 #include "util_func.h"
 #include "xasl.h"
 #include "query_cl.h"
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
 #define BUF_SIZE 1024
 
@@ -6345,7 +6347,6 @@ db_check_driver_multiple_statements (DB_SESSION * session)
   return NO_ERROR;
 }
 
-#if !defined (SERVER_MODE)
 /*
  * db_get_parser() - This function returns session's parser
  * returns: session->parser
@@ -6358,7 +6359,6 @@ db_get_parser (DB_SESSION * session)
 {
   return session->parser;
 }
-#endif /* !defined (SERVER_MODE) */
 
 /*
  * db_get_statement() - This function returns session's statement for id

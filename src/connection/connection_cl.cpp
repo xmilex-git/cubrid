@@ -74,10 +74,9 @@
 #include "connection_cl.h"
 #include "network_callback_cl.hpp"
 #include "master_util.h"
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
-#if defined (SERVER_MODE)
-#error Does not belong to server module
-#endif /* defined (SERVER_MODE) */
 
 #if defined(HPUX)
 /*

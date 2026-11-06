@@ -50,14 +50,12 @@
 #include "string_buffer.hpp"
 #include "db_value_printer.hpp"
 
-#if !defined (SERVER_MODE)
 #include "work_space.h"
 #include "virtual_object.h"
 #include "schema_manager.h"
 #include "locator_cl.h"
 #include "object_template.h"
 #include "dbi.h"
-#endif /* !defined (SERVER_MODE) */
 
 #include "dbtype.h"
 #include "error_manager.h"
@@ -67,6 +65,10 @@
 #if defined (SUPPRESS_STRLEN_WARNING)
 #define strlen(s1)  ((int) strlen(s1))
 #endif /* defined (SUPPRESS_STRLEN_WARNING) */
+
+#if defined (SERVER_MODE)
+extern thread_local unsigned int db_on_server;
+#endif /* SERVER_MODE */
 
 #define DBL_MAX_DIGITS    ((int)ceil(DBL_MAX_EXP * log10((double) FLT_RADIX)))
 #define DB_DATETIMETZ_INITIALIZER { {0, 0}, 0 }
@@ -2363,11 +2365,18 @@ tp_value_convert_enumeration_to_time (const DB_VALUE *src, DB_VALUE *target, con
   return status;
 }
 
-#if !defined (SERVER_MODE)
 static TP_DOMAIN_STATUS
 tp_value_convert_object_to_object (const DB_VALUE *src, DB_VALUE *target, const TP_DOMAIN *desired_domain,
 				   date_conversion_error *error)
 {
+#if defined (SERVER_MODE)
+  if (db_on_server)
+    {
+      /* a server thread has no workspace to hold an object */
+      return DOMAIN_INCOMPATIBLE;
+    }
+#endif /* SERVER_MODE */
+
   TP_DOMAIN_STATUS status = DOMAIN_COMPATIBLE;
 
   {
@@ -2424,13 +2433,19 @@ tp_value_convert_object_to_object (const DB_VALUE *src, DB_VALUE *target, const 
 
   return status;
 }
-#endif /* !defined (SERVER_MODE) */
 
-#if !defined (SERVER_MODE)
 static TP_DOMAIN_STATUS
 tp_value_convert_oid_to_object (const DB_VALUE *src, DB_VALUE *target, const TP_DOMAIN *desired_domain,
 				date_conversion_error *error)
 {
+#if defined (SERVER_MODE)
+  if (db_on_server)
+    {
+      /* a server thread has no workspace to hold an object */
+      return DOMAIN_INCOMPATIBLE;
+    }
+#endif /* SERVER_MODE */
+
   TP_DOMAIN_STATUS status = DOMAIN_COMPATIBLE;
 
   {
@@ -2484,13 +2499,19 @@ tp_value_convert_oid_to_object (const DB_VALUE *src, DB_VALUE *target, const TP_
 
   return status;
 }
-#endif /* !defined (SERVER_MODE) */
 
-#if !defined (SERVER_MODE)
 static TP_DOMAIN_STATUS
 tp_value_convert_pointer_to_object (const DB_VALUE *src, DB_VALUE *target, const TP_DOMAIN *desired_domain,
 				    date_conversion_error *error)
 {
+#if defined (SERVER_MODE)
+  if (db_on_server)
+    {
+      /* a server thread has no workspace to hold an object */
+      return DOMAIN_INCOMPATIBLE;
+    }
+#endif /* SERVER_MODE */
+
   TP_DOMAIN_STATUS status = DOMAIN_COMPATIBLE;
 
   {
@@ -2508,13 +2529,19 @@ tp_value_convert_pointer_to_object (const DB_VALUE *src, DB_VALUE *target, const
 
   return status;
 }
-#endif /* !defined (SERVER_MODE) */
 
-#if !defined (SERVER_MODE)
 static TP_DOMAIN_STATUS
 tp_value_convert_vobj_to_object (const DB_VALUE *src, DB_VALUE *target, const TP_DOMAIN *desired_domain,
 				 date_conversion_error *error)
 {
+#if defined (SERVER_MODE)
+  if (db_on_server)
+    {
+      /* a server thread has no workspace to hold an object */
+      return DOMAIN_INCOMPATIBLE;
+    }
+#endif /* SERVER_MODE */
+
   TP_DOMAIN_STATUS status = DOMAIN_COMPATIBLE;
 
   {
@@ -2575,13 +2602,19 @@ tp_value_convert_vobj_to_object (const DB_VALUE *src, DB_VALUE *target, const TP
 
   return status;
 }
-#endif /* !defined (SERVER_MODE) */
 
-#if !defined (SERVER_MODE)
 static TP_DOMAIN_STATUS
 tp_value_convert_object_to_vobj (const DB_VALUE *src, DB_VALUE *target, const TP_DOMAIN *desired_domain,
 				 date_conversion_error *error)
 {
+#if defined (SERVER_MODE)
+  if (db_on_server)
+    {
+      /* a server thread has no workspace to hold an object */
+      return DOMAIN_INCOMPATIBLE;
+    }
+#endif /* SERVER_MODE */
+
   TP_DOMAIN_STATUS status = DOMAIN_COMPATIBLE;
 
   {
@@ -2598,7 +2631,6 @@ tp_value_convert_object_to_vobj (const DB_VALUE *src, DB_VALUE *target, const TP
 
   return status;
 }
-#endif /* !defined (SERVER_MODE) */
 
 static TP_DOMAIN_STATUS
 tp_value_convert_oid_to_vobj (const DB_VALUE *src, DB_VALUE *target, const TP_DOMAIN *desired_domain,
@@ -8336,25 +8368,14 @@ tp_value_find_converter (DB_TYPE src, DB_TYPE dst)
     case DB_TYPE_OBJECT:
       switch (src)
 	{
-#if !defined (SERVER_MODE)
 	case DB_TYPE_OBJECT:
 	  return tp_value_convert_object_to_object;
-#else /* !defined (SERVER_MODE) */
-	case DB_TYPE_OBJECT:
-	  return tp_value_convert_incompatible;
-#endif /* !defined (SERVER_MODE) */
-#if !defined (SERVER_MODE)
 	case DB_TYPE_OID:
 	  return tp_value_convert_oid_to_object;
-#endif /* !defined (SERVER_MODE) */
-#if !defined (SERVER_MODE)
 	case DB_TYPE_VOBJ:
 	  return tp_value_convert_vobj_to_object;
-#endif /* !defined (SERVER_MODE) */
-#if !defined (SERVER_MODE)
 	case DB_TYPE_POINTER:
 	  return tp_value_convert_pointer_to_object;
-#endif /* !defined (SERVER_MODE) */
 	default:
 	  break;
 	}
@@ -8372,10 +8393,8 @@ tp_value_find_converter (DB_TYPE src, DB_TYPE dst)
     case DB_TYPE_VOBJ:
       switch (src)
 	{
-#if !defined (SERVER_MODE)
 	case DB_TYPE_OBJECT:
 	  return tp_value_convert_object_to_vobj;
-#endif /* !defined (SERVER_MODE) */
 	case DB_TYPE_OID:
 	  return tp_value_convert_oid_to_vobj;
 	case DB_TYPE_VOBJ:

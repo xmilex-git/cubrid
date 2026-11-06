@@ -37,7 +37,9 @@
 #endif
 
 #include "authenticate.h"
+#if !defined (SERVER_MODE)
 #include "client_support.h"
+#endif
 #include "porting.h"
 #include "system_parameter.h"
 #include "storage_common.h"
@@ -79,6 +81,8 @@ void (*prev_sigfpe_handler) (int) = SIG_DFL;
 #else
 #include "wintcp.h"
 #endif /* !WINDOWS */
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
 /* host status for marking abnormal host status */
 typedef struct db_host_status DB_HOST_STATUS;

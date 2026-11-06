@@ -52,12 +52,15 @@
 #include "view_transform.h"
 #include "dbtype.h"
 #include "execute_statement.h"
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
+
 
 #if defined (SERVER_MODE)
-#error Does not belong to server module
-#endif
-
+extern thread_local unsigned int db_on_server;
+#else
 extern unsigned int db_on_server;
+#endif
 
 /*
  * need these to get the allocation areas initialized, avoid including

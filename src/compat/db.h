@@ -33,11 +33,9 @@
 #include "intl_support.h"
 #include "db_date.h"
 #include "object_domain.h"
-#if !defined(SERVER_MODE)
 #include "trigger_manager.h"
 #include "dbi.h"
 #include "parser.h"
-#endif
 #include "log_comm.h"
 #include "dbtype_def.h"
 #include "db_admin.h"
@@ -47,20 +45,16 @@
 #define DB_CONNECTION_STATUS_NOT_CONNECTED      0
 #define DB_CONNECTION_STATUS_CONNECTED          1
 #define DB_CONNECTION_STATUS_RESET              -1
-#if !defined(SERVER_MODE)
 extern CUB_THREAD_LOCAL int db_Connect_status;
 extern CUB_THREAD_LOCAL SESSION_ID db_Session_id;
-#endif
 
 #if !defined(_DB_DISABLE_MODIFICATIONS_)
 #define _DB_DISABLE_MODIFICATIONS_
 extern CUB_THREAD_LOCAL int db_Disable_modifications;
 #endif /* _DB_DISABLE_MODIFICATIONS_ */
 
-#if !defined(SERVER_MODE)
 extern char db_Database_name[];
 extern char db_Program_name[];
-#endif /* !SERVER_MODE */
 
 /* MACROS FOR ERROR CHECKING */
 /* These should be used at the start of every db_ function so we can check
@@ -237,10 +231,8 @@ extern int db_get_line_col_of_1st_error (DB_SESSION * session, DB_QUERY_ERROR * 
 extern DB_VALUE *db_get_hostvars (DB_SESSION * session);
 extern char **db_get_lock_classes (DB_SESSION * session);
 extern void db_drop_all_statements (DB_SESSION * session);
-#if !defined (SERVER_MODE)
 extern PARSER_CONTEXT *db_get_parser (DB_SESSION * session);
 extern int db_ensure_server_info (PARSER_CONTEXT * parser, int server_info_bits);
-#endif /* !defined (SERVER_MODE) */
 extern DB_NODE *db_get_statement (DB_SESSION * session, int id);
 extern DB_SESSION *db_make_session_for_one_statement_execution (FILE * file);
 extern int db_abort_to_savepoint_internal (const char *savepoint_name);
@@ -286,10 +278,8 @@ extern BTID *db_constraint_index (DB_CONSTRAINT * constraint, BTID * index);
 
 extern int db_col_optimize (DB_COLLECTION * col);
 
-#if !defined(SERVER_MODE)
 extern int db_get_connect_status (void);
 extern void db_set_connect_status (int status);
-#endif
 extern int db_set_otmpl_timestamps (DB_OTMPL * otmpl);
 extern int db_update_otmpl_timestamp (DB_OTMPL * otmpl);
 extern int db_update_obj_timestamp (DB_OBJECT * obj);

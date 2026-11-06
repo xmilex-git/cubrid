@@ -32,9 +32,6 @@
 #include "dbtype_def.h"
 #include "parse_tree.h"
 
-#if defined (SERVER_MODE)
-#error Does not belong to server module
-#endif /* SERVER_MODE */
 
 #ifdef __cplusplus
 extern "C"
