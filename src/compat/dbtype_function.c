@@ -52,6 +52,7 @@ extern "C"
 }
 #endif
 
+#include "numeric_opfunc.h"
 #include "dbtype_function.i"
 #ifdef __cplusplus		/* SA/CS compile this TU as plain C */
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
