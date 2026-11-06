@@ -36,10 +36,19 @@
 #include "authenticate_context.hpp"
 
 // *INDENT-OFF*
+struct mht_table;
+
 class client_session_context
 {
   public:
     authenticate_context au_context;
+
+    /* interpreter labels are session data; created lazily by
+     * pt_associate_label_with_value, released by pt_free_label_table */
+    struct mht_table *label_table = nullptr;
+
+    /* the plan dump file the session's requests name (db_query_plan_dump_file) */
+    char *plan_dump_filename = nullptr;
 };
 // *INDENT-ON*
 

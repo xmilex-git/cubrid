@@ -143,8 +143,8 @@ typedef struct mq_subquery_count
   int correlated;		/* those with a correlation level */
 } MQ_SUBQUERY_COUNT;
 
-static unsigned int top_cycle = 0;
-static DB_OBJECT *cycle_buffer[MAX_CYCLE];
+static CSQL_PARSER_TLS unsigned int top_cycle = 0;
+static CSQL_PARSER_TLS DB_OBJECT *cycle_buffer[MAX_CYCLE];
 
 
 

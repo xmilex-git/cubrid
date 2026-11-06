@@ -32,6 +32,7 @@
 #include "class_object.h"
 #include "compile_context.h"
 #include "config.h"
+#include "csql_parser_tls.h"
 #include "cursor.h"
 #include "db_function.hpp"
 #include "json_table_def.h"

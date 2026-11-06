@@ -138,9 +138,16 @@ typedef struct
   COMPATIBLE_LEVEL compatible;	/* how compatible is the sub-tree */
 } COMPATIBLE_INFO;
 
+#if defined (SERVER_MODE)
+/* a session names its plan dump file per request, and worker threads have no session affinity */
+#include "client_session_context.hpp"
+#define query_Plan_dump_filename (csc_current ()->plan_dump_filename)
+#else
 extern char *query_Plan_dump_filename;
-extern FILE *query_Plan_dump_fp;
-extern bool query_Plan_dump_fp_open;
+#endif
+/* opened and closed around one XASL generation, on the compiling thread */
+extern CSQL_PARSER_TLS FILE *query_Plan_dump_fp;
+extern CSQL_PARSER_TLS bool query_Plan_dump_fp_open;
 
 struct xasl_supp_info;
 extern struct xasl_supp_info *pt_detach_xasl_supp_info (void);

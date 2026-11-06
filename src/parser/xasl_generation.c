@@ -380,11 +380,13 @@ typedef struct corr_info
   UINTPTR id;
 } CORR_INFO;
 
-FILE *query_Plan_dump_fp = NULL;
+CSQL_PARSER_TLS FILE *query_Plan_dump_fp = NULL;
+#if !defined (SERVER_MODE)
 char *query_Plan_dump_filename = NULL;
-bool query_Plan_dump_fp_open = false;
+#endif
+CSQL_PARSER_TLS bool query_Plan_dump_fp_open = false;
 
-static XASL_SUPP_INFO xasl_Supp_info = { NULL, NULL, NULL, NULL, 0, 0, 0 };
+static CSQL_PARSER_TLS XASL_SUPP_INFO xasl_Supp_info = { NULL, NULL, NULL, NULL, 0, 0, 0 };
 
 static const int OID_LIST_GROWTH = 10;
 
@@ -6816,7 +6818,7 @@ struct pt_cte_null_reader
 };
 
 /* the readers noted while parser_generate_xasl generates a statement */
-static PT_CTE_NULL_READER *pt_Cte_null_readers = NULL;
+static CSQL_PARSER_TLS PT_CTE_NULL_READER *pt_Cte_null_readers = NULL;
 
 /* note regu (and its value list slot) when it reads column pos of a CTE the recursive part is generating, a column
  * the non-recursive part writes NULL-typed (pt_type_cte_null_readers types it later) */

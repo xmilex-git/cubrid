@@ -485,8 +485,8 @@ static PARSER_PRINT_NODE_FUNC pt_print_func_array[PT_NODE_NUMBER];
 
 extern "C"
 {
-  extern char *g_query_string;
-  extern int g_query_string_len;
+  extern CSQL_PARSER_TLS char *g_query_string;
+  extern CSQL_PARSER_TLS int g_query_string_len;
 }
 /*
  * pt_print_buffer_disable () - give the body back and let nothing more into the buffer
