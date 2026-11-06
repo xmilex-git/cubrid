@@ -54,6 +54,7 @@
 
 #include <utility>
 
+#include "client_session_context.hpp"
 /* workspace/object client semantics are compiled in SERVER_MODE too
  * (the server library links them); runtime discrimination is db_on_server (thread_local) */
 #include "work_space.h"
@@ -5156,9 +5157,9 @@ mr_index_writeval_object (OR_BUF * buf, DB_VALUE * value)
   if (DB_VALUE_TYPE (value) == DB_TYPE_OBJECT)
     {
 #if defined (SERVER_MODE)
-      /* SA executes these client bodies with db_on_server toggled; the
-       * context-discipline invariant only holds in the server library */
-      assert (!db_on_server);
+      /* only a thread holding a session bracket owns a workspace; its server half
+       * may get here with a MOP from an in-process call, as SA does */
+      assert (!db_on_server || csc_bracket_is_active ());
 #endif
       obj = db_get_object (value);
       oidp = WS_OID (obj);
@@ -5188,18 +5189,16 @@ mr_data_writeval_object (OR_BUF * buf, DB_VALUE * value)
   OID *oidp = NULL;
   int rc = NO_ERROR;
 
-  if (db_on_server || pr_Inhibit_oid_promotion)
+  if (DB_VALUE_TYPE (value) == DB_TYPE_OID)
     {
-      if (DB_VALUE_TYPE (value) == DB_TYPE_OID)
-	{
-	  oidp = db_get_oid (value);
-	  rc = or_put_oid (buf, oidp);
-	  return rc;
-	}
-      else
-	{
-	  return ER_FAILED;
-	}
+      oidp = db_get_oid (value);
+      rc = or_put_oid (buf, oidp);
+      return rc;
+    }
+  /* the server half of a session may write a MOP it got from an in-process call */
+  if ((db_on_server && !csc_bracket_is_active ()) || pr_Inhibit_oid_promotion)
+    {
+      return ER_FAILED;
     }
   if (DB_VALUE_TYPE (value) == DB_TYPE_OBJECT)
     {
@@ -5240,11 +5239,6 @@ mr_data_writeval_object (OR_BUF * buf, DB_VALUE * value)
 	    }
 	  rc = or_put_oid (buf, oidp);
 	}
-    }
-  else if (DB_VALUE_TYPE (value) == DB_TYPE_OID)
-    {
-      oidp = db_get_oid (value);
-      rc = or_put_oid (buf, oidp);
     }
   else
     {
@@ -5340,8 +5334,8 @@ mr_cmpval_object (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int tot
    * old SERVER_MODE-only body, and it must also handle virtual db_object types
    * for client-context threads */
 #if defined (SERVER_MODE)
-  /* a genuine server thread only ever compares OID-tagged values */
-  assert (!db_on_server
+  /* a thread outside a session bracket only ever compares OID-tagged values */
+  assert (!db_on_server || csc_bracket_is_active ()
 	  || (DB_VALUE_DOMAIN_TYPE (value1) == DB_TYPE_OID && DB_VALUE_DOMAIN_TYPE (value2) == DB_TYPE_OID));
 #endif
   DB_VALUE_COMPARE_RESULT c;

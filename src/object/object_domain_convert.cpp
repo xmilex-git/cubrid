@@ -50,6 +50,7 @@
 #include "string_buffer.hpp"
 #include "db_value_printer.hpp"
 
+#include "client_session_context.hpp"
 #include "work_space.h"
 #include "virtual_object.h"
 #include "schema_manager.h"
@@ -65,10 +66,6 @@
 #if defined (SUPPRESS_STRLEN_WARNING)
 #define strlen(s1)  ((int) strlen(s1))
 #endif /* defined (SUPPRESS_STRLEN_WARNING) */
-
-#if defined (SERVER_MODE)
-extern thread_local unsigned int db_on_server;
-#endif /* SERVER_MODE */
 
 #define DBL_MAX_DIGITS    ((int)ceil(DBL_MAX_EXP * log10((double) FLT_RADIX)))
 #define DB_DATETIMETZ_INITIALIZER { {0, 0}, 0 }
@@ -2370,9 +2367,9 @@ tp_value_convert_object_to_object (const DB_VALUE *src, DB_VALUE *target, const 
 				   date_conversion_error *error)
 {
 #if defined (SERVER_MODE)
-  if (db_on_server)
+  if (!csc_bracket_is_active ())
     {
-      /* a server thread has no workspace to hold an object */
+      /* only a thread inside a session bracket owns a workspace to hold an object */
       return DOMAIN_INCOMPATIBLE;
     }
 #endif /* SERVER_MODE */
@@ -2439,9 +2436,9 @@ tp_value_convert_oid_to_object (const DB_VALUE *src, DB_VALUE *target, const TP_
 				date_conversion_error *error)
 {
 #if defined (SERVER_MODE)
-  if (db_on_server)
+  if (!csc_bracket_is_active ())
     {
-      /* a server thread has no workspace to hold an object */
+      /* only a thread inside a session bracket owns a workspace to hold an object */
       return DOMAIN_INCOMPATIBLE;
     }
 #endif /* SERVER_MODE */
@@ -2505,9 +2502,9 @@ tp_value_convert_pointer_to_object (const DB_VALUE *src, DB_VALUE *target, const
 				    date_conversion_error *error)
 {
 #if defined (SERVER_MODE)
-  if (db_on_server)
+  if (!csc_bracket_is_active ())
     {
-      /* a server thread has no workspace to hold an object */
+      /* only a thread inside a session bracket owns a workspace to hold an object */
       return DOMAIN_INCOMPATIBLE;
     }
 #endif /* SERVER_MODE */
@@ -2535,9 +2532,9 @@ tp_value_convert_vobj_to_object (const DB_VALUE *src, DB_VALUE *target, const TP
 				 date_conversion_error *error)
 {
 #if defined (SERVER_MODE)
-  if (db_on_server)
+  if (!csc_bracket_is_active ())
     {
-      /* a server thread has no workspace to hold an object */
+      /* only a thread inside a session bracket owns a workspace to hold an object */
       return DOMAIN_INCOMPATIBLE;
     }
 #endif /* SERVER_MODE */
@@ -2608,9 +2605,9 @@ tp_value_convert_object_to_vobj (const DB_VALUE *src, DB_VALUE *target, const TP
 				 date_conversion_error *error)
 {
 #if defined (SERVER_MODE)
-  if (db_on_server)
+  if (!csc_bracket_is_active ())
     {
-      /* a server thread has no workspace to hold an object */
+      /* only a thread inside a session bracket owns a workspace to hold an object */
       return DOMAIN_INCOMPATIBLE;
     }
 #endif /* SERVER_MODE */

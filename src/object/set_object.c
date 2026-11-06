@@ -44,6 +44,7 @@
 #include "domain_rules.h"
 #endif
 
+#include "client_session_context.hpp"
 /* WS_OID/OBJECT_HAS_TEMP_OID below are used in SERVER_MODE too */
 #include "work_space.h"
 
@@ -1187,9 +1188,9 @@ col_find (COL * col, long *found, DB_VALUE * val, int do_coerce)
 	  if (col->sorted && col->coltype != DB_TYPE_SEQUENCE && DB_VALUE_TYPE (val) == DB_TYPE_OBJECT)
 	    {
 #if defined (SERVER_MODE)
-	      /* SA executes these client bodies with db_on_server toggled; the
-	       * context-discipline invariant only holds in the server library */
-	      assert (!db_on_server);
+	      /* only a thread holding a session bracket owns a workspace; its server half
+	       * may get here with a MOP from an in-process call, as SA does */
+	      assert (!db_on_server || csc_bracket_is_active ());
 #endif
 
 	      DB_OBJECT *obj = db_get_object (val);
@@ -1338,9 +1339,9 @@ col_put (COL * col, long colindex, DB_VALUE * val)
 	  /* OBJECT values only come
 	   * from client-context threads; the old SERVER_MODE branch hard-failed */
 #if defined (SERVER_MODE)
-	  /* SA executes these client bodies with db_on_server toggled; the
-	   * context-discipline invariant only holds in the server library */
-	  assert (!db_on_server);
+	  /* only a thread holding a session bracket owns a workspace; its server half
+	   * may get here with a MOP from an in-process call, as SA does */
+	  assert (!db_on_server || csc_bracket_is_active ());
 #endif
 	  DB_OBJECT *obj = db_get_object (val);
 	  if (obj != NULL && OBJECT_HAS_TEMP_OID (obj))
@@ -1460,9 +1461,9 @@ col_insert (COL * col, long colindex, DB_VALUE * val)
 	   * only come from client-context threads; the old SERVER_MODE branch
 	   * hard-failed with assert_release */
 #if defined (SERVER_MODE)
-	  /* SA executes these client bodies with db_on_server toggled; the
-	   * context-discipline invariant only holds in the server library */
-	  assert (!db_on_server);
+	  /* only a thread holding a session bracket owns a workspace; its server half
+	   * may get here with a MOP from an in-process call, as SA does */
+	  assert (!db_on_server || csc_bracket_is_active ());
 #endif
 	  DB_OBJECT *obj = db_get_object (val);
 	  if (obj != NULL && OBJECT_HAS_TEMP_OID (obj))

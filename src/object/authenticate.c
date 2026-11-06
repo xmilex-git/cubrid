@@ -50,6 +50,9 @@
 #include "class_object.h"
 #include "schema_manager.h"
 #include "authenticate.h"
+#if defined (SERVER_MODE)
+#include "client_session_context.hpp"
+#endif
 #include "object_accessor.h"
 #include "encryption.h"
 #include "crypt_opfunc.h"
@@ -84,7 +87,9 @@
  *
  * 
  */
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL authenticate_context *au_ctx_obj = nullptr;
+#endif
 
 int
 au_login (const char *name, const char *password, bool ignore_dba_privilege)
@@ -95,11 +100,17 @@ au_login (const char *name, const char *password, bool ignore_dba_privilege)
 authenticate_context *
 au_ctx (void)
 {
+#if defined (SERVER_MODE)
+  /* the server has no process-wide authorization: it belongs to the session
+   * whose bracket the calling thread holds */
+  return &csc_current ()->au_context;
+#else
   if (au_ctx_obj == nullptr)
     {
       au_ctx_obj = new authenticate_context ();
     }
   return au_ctx_obj;
+#endif
 }
 
 #if defined(CS_MODE) && defined(MULTI_CONN_TO_A_SERVER)

@@ -54,6 +54,7 @@
 #include "string_buffer.hpp"
 #include "db_value_printer.hpp"
 
+#include "client_session_context.hpp"
 /* workspace/object client semantics are compiled in SERVER_MODE too
  * (the server library links them); runtime discrimination is db_on_server (thread_local) */
 #include "work_space.h"
@@ -1156,9 +1157,9 @@ tp_domain_construct (DB_TYPE domain_type, DB_OBJECT * class_obj, int precision, 
 	    {
 	      /* reached only with a real MOP (client context) */
 #if defined (SERVER_MODE)
-	      /* SA executes these client bodies with db_on_server toggled; the
-	       * context-discipline invariant only holds in the server library */
-	      assert (!db_on_server);
+	      /* only a thread holding a session bracket owns a workspace; its server half
+	       * may get here with a MOP from an in-process call, as SA does */
+	      assert (!db_on_server || csc_bracket_is_active ());
 #endif
 	      new_dm->class_oid = class_obj->oid_info.oid;
 	    }
@@ -2897,9 +2898,9 @@ tp_domain_find_object (DB_TYPE type, OID * class_oid, struct db_object * class_m
 	{
 	  /* class_mop is only non-NULL in client context. */
 #if defined (SERVER_MODE)
-	  /* SA executes these client bodies with db_on_server toggled; the
-	   * context-discipline invariant only holds in the server library */
-	  assert (!db_on_server);
+	  /* only a thread holding a session bracket owns a workspace; its server half
+	   * may get here with a MOP from an in-process call, as SA does */
+	  assert (!db_on_server || csc_bracket_is_active ());
 #endif
 	  /*
 	   * We have a mixture of OID & MOPS, it probably isn't necessary to be
@@ -3415,9 +3416,9 @@ tp_domain_resolve_value (const DB_VALUE * val, TP_DOMAIN * dbuf)
 	    DB_OBJECT *mop;
 
 #if defined (SERVER_MODE)
-	    /* SA executes these client bodies with db_on_server toggled; the
-	     * context-discipline invariant only holds in the server library */
-	    assert (!db_on_server);
+	    /* only a thread holding a session bracket owns a workspace; its server half
+	     * may get here with a MOP from an in-process call, as SA does */
+	    assert (!db_on_server || csc_bracket_is_active ());
 #endif
 
 	    domain = &tp_Object_domain;
@@ -3963,8 +3964,13 @@ tp_domain_check_class (TP_DOMAIN * domain, int *change)
       *change = 0;
     }
 
-  /* a server thread has no workspace: only the client half downgrades a deleted class to the "object" domain */
-  if (!db_on_server)
+  /* a server thread has no workspace: only the client half of a session downgrades a deleted class to the "object"
+   * domain */
+  if (!db_on_server
+#if defined (SERVER_MODE)
+      && csc_bracket_is_active ()
+#endif /* SERVER_MODE */
+    )
     {
       if (domain != NULL && domain->type == tp_Type_object && domain->class_mop != NULL)
 	{
@@ -4360,8 +4366,8 @@ tp_domain_select (const TP_DOMAIN * domain_list, const DB_VALUE * value, int all
   else if (vtype == DB_TYPE_POINTER)
     {
 #if defined (SERVER_MODE)
-      /* an object template exists only on the client half */
-      assert (!db_on_server);
+      /* an object template exists only on a thread holding a session bracket */
+      assert (!db_on_server || csc_bracket_is_active ());
 #endif
       /*
        * This is necessary in order to correctly choose an object domain from
@@ -6595,9 +6601,9 @@ tp_value_compare_with_error (const DB_VALUE * value1, const DB_VALUE * value2, i
 	  if (vtype1 == DB_TYPE_OBJECT)
 	    {
 #if defined (SERVER_MODE)
-	      /* SA executes these client bodies with db_on_server toggled; the
-	       * context-discipline invariant only holds in the server library */
-	      assert (!db_on_server);
+	      /* only a thread holding a session bracket owns a workspace; its server half
+	       * may get here with a MOP from an in-process call, as SA does */
+	      assert (!db_on_server || csc_bracket_is_active ());
 #endif
 	      if (vtype2 == DB_TYPE_OID)
 		{
@@ -6617,9 +6623,9 @@ tp_value_compare_with_error (const DB_VALUE * value1, const DB_VALUE * value2, i
 	  else if (vtype2 == DB_TYPE_OBJECT)
 	    {
 #if defined (SERVER_MODE)
-	      /* SA executes these client bodies with db_on_server toggled; the
-	       * context-discipline invariant only holds in the server library */
-	      assert (!db_on_server);
+	      /* only a thread holding a session bracket owns a workspace; its server half
+	       * may get here with a MOP from an in-process call, as SA does */
+	      assert (!db_on_server || csc_bracket_is_active ());
 #endif
 	      if (vtype1 == DB_TYPE_OID)
 		{
