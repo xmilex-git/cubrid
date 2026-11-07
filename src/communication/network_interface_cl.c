@@ -50,6 +50,11 @@
 #include "pl_sr.h"
 #include "vacuum.h"
 #include "serial.h"
+#if defined (SERVER_MODE)
+#include "network_interface_sr.h"
+#include "log_impl.h"
+#include "schema_manager.h"
+#endif /* SERVER_MODE */
 #endif /* defined (SA_MODE) */
 #include "oid.h"
 #include "error_manager.h"
@@ -163,7 +168,19 @@ static THREAD_ENTRY *
 enter_server ()
 {
   enter_server_no_thread_entry ();
+#if defined (SERVER_MODE)
+  THREAD_ENTRY *thread_p = thread_get_thread_entry_info ();
+
+  /* a CS client asks this of its next request with NET_HEADER_FLAG_INVALIDATE_SNAPSHOT (see net_server_request) */
+  if (tm_Tran_invalidate_snapshot)
+    {
+      (void) logtb_invalidate_snapshot_data (thread_p);
+      tm_Tran_invalidate_snapshot = 0;
+    }
+  return thread_p;
+#else
   return thread_get_thread_entry_info ();
+#endif
 }
 
 //
@@ -190,7 +207,18 @@ exit_server_no_thread_entry (void)
 static void
 exit_server (const THREAD_ENTRY & thread_ref)
 {
+#if defined (SERVER_MODE)
+  /* a CS client gets a failed request's error through return_error_to_client, which first rolls back a transaction
+   * the request left to be aborted */
+  if (er_errid () != NO_ERROR)
+    {
+      int errid;
+
+      (void) abort_tran_on_error (const_cast < THREAD_ENTRY * >(&thread_ref), TRAN_UNACTIVE_UNKNOWN, &errid);
+    }
+#else
   (void) thread_ref;		// not really used; just to force caller declare obtain thread entry
+#endif
 
   exit_server_no_thread_entry ();
 }
@@ -1568,6 +1596,19 @@ locator_find_lockhint_class_oids (int num_classes, const char **many_classnames,
 				       many_flags, guessed_class_oids, guessed_class_chns, quit_on_errors, lockhint,
 				       fetch_copyarea);
 
+#if defined (SERVER_MODE)
+  /* the RR transaction lock rides this request on the wire path (see slocator_find_lockhint_class_oids), which rolls
+   * a deadlock victim back before it; here exit_server does, so a victim must not take (and wait for) the lock */
+  if (lock_rr_tran != NULL_LOCK && er_errid () != ER_LK_UNILATERALLY_ABORTED
+      && LOG_FIND_CURRENT_TDES (thread_p)->tran_abort_reason == TRAN_NORMAL
+      && xtran_lock_rep_read (thread_p, lock_rr_tran) != NO_ERROR)
+    {
+      allfind = LC_CLASSNAME_ERROR;
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
+    }
+  tm_Tran_rep_read_lock = lock_rr_tran;
+#endif /* SERVER_MODE */
+
   exit_server (*thread_p);
 
   return allfind;
@@ -2928,8 +2969,17 @@ log_supplement_statement (int ddl_type, int objtype, OID * classoid, OID * objoi
   free_and_init (request);
 
   return rep_error;
-#endif // CS_MODE
+#elif defined (SERVER_MODE)
+  THREAD_ENTRY *thread_p = enter_server ();
+
+  int error = xlog_supplement_statement (thread_p, ddl_type, objtype, classoid, objoid, stmt_text);
+
+  exit_server (*thread_p);
+
+  return error;
+#else
   return ER_NOT_IN_STANDALONE;
+#endif
 }
 
 /*
@@ -3004,6 +3054,11 @@ tran_server_commit (bool retain_lock)
   TRAN_STATE tran_state = TRAN_UNACTIVE_UNKNOWN;
 
   THREAD_ENTRY *thread_p = enter_server ();
+
+#if defined (SERVER_MODE)
+  /* the row count rides the commit request on the wire path (see stran_server_commit) */
+  (void) xsession_set_row_count (thread_p, db_get_row_count_cache ());
+#endif /* SERVER_MODE */
 
   tran_state = xtran_server_commit (thread_p, retain_lock);
 
@@ -6301,7 +6356,17 @@ stats_log_update_progress (MOP classop, int phase, int state, int seq, int total
   (void) net_client_request (NET_SERVER_QST_LOG_STATS_PROGRESS, request, OR_ALIGNED_BUF_SIZE (a_request), reply,
 			     OR_ALIGNED_BUF_SIZE (a_reply), NULL, 0, NULL, 0);
   er_stack_pop ();
-#endif /* CS_MODE */
+#elif defined (SERVER_MODE)
+  INT64 now = stats_progress_clock_msec ();
+  int class_ms = (int) std::min (now - class_start_msec, (INT64) INT_MAX);
+  int elapsed_ms = (int) std::min (now - run_start_msec, (INT64) INT_MAX);
+
+  THREAD_ENTRY *thread_p = enter_server ();
+
+  xqst_log_stats_progress (thread_p, WS_OID (classop), phase, state, seq, total, class_ms, elapsed_ms, error);
+
+  exit_server (*thread_p);
+#endif /* SERVER_MODE */
   /* SA_MODE has no server event log */
 }
 
@@ -6800,15 +6865,29 @@ btree_load_index (BTID * btid, const char *bt_name, TP_DOMAIN * key_type, OID * 
 #else /* CS_MODE */
   int error = NO_ERROR;
 
+#if defined (SERVER_MODE)
+  /* the values the CS client sends with the request */
+  const int ib_thread_count = ib_get_thread_count ();
+  const bool no_logging_index = btree_Load_no_logging_index;
+#else
+  const int ib_thread_count = 1;
+  const bool no_logging_index = false;
+#endif
+
   THREAD_ENTRY *thread_p = enter_server ();
 
   if (index_status == SM_ONLINE_INDEX_BUILDING_IN_PROGRESS)
     {
-      btid =
-	xbtree_load_online_index (thread_p, btid, bt_name, key_type, class_oids, n_classes, n_attrs, attr_ids,
-				  attrs_prefix_length, hfids, unique_pk, not_null_flag, fk_refcls_oid,
-				  fk_refcls_pk_btid, fk_name, pred_stream, pred_stream_size, expr_stream,
-				  expr_stream_size, func_col_id, func_attr_index_start, 1);
+      /* the online loader rewrites its btid for each class in turn; like the CS path, keep the caller's btid */
+      BTID local_btid = *btid;
+
+      if (xbtree_load_online_index (thread_p, &local_btid, bt_name, key_type, class_oids, n_classes, n_attrs,
+				    attr_ids, attrs_prefix_length, hfids, unique_pk, not_null_flag, fk_refcls_oid,
+				    fk_refcls_pk_btid, fk_name, pred_stream, pred_stream_size, expr_stream,
+				    expr_stream_size, func_col_id, func_attr_index_start, ib_thread_count) == NULL)
+	{
+	  btid = NULL;
+	}
     }
   else
     {
@@ -6816,7 +6895,7 @@ btree_load_index (BTID * btid, const char *bt_name, TP_DOMAIN * key_type, OID * 
 	xbtree_load_index (thread_p, btid, bt_name, key_type, class_oids, n_classes, n_attrs, attr_ids,
 			   attrs_prefix_length, hfids, unique_pk, not_null_flag, fk_refcls_oid, fk_refcls_pk_btid,
 			   fk_name, pred_stream, pred_stream_size, expr_stream, expr_stream_size, func_col_id,
-			   func_attr_index_start, false);
+			   func_attr_index_start, no_logging_index);
     }
 
   if (btid == NULL)
@@ -7626,43 +7705,6 @@ qmgr_server_db_values (THREAD_ENTRY * thread_p, int dbval_cnt, const DB_VALUE * 
   return server_db_values;
 }
 
-#if defined (SERVER_MODE)
-/*
- * qmgr_pack_server_db_values () - the values packed as the CS client sends them: the SERVER_MODE build of
- *   xqmgr_execute_query and xqmgr_prepare_and_execute_query unpacks its value argument off the wire
- *   return: the malloc'ed buffer, NULL without values or on error (when *error is set)
- */
-static char *
-qmgr_pack_server_db_values (int dbval_cnt, DB_VALUE * server_db_values, bool * error)
-{
-  char *packed_values, *ptr;
-  int i, size = 0;
-
-  *error = false;
-  for (i = 0; i < dbval_cnt; i++)
-    {
-      size += OR_VALUE_ALIGNED_SIZE (&server_db_values[i]);
-    }
-  if (size <= 0)
-    {
-      return NULL;
-    }
-
-  packed_values = (char *) malloc (size);
-  if (packed_values == NULL)
-    {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, (size_t) size);
-      *error = true;
-      return NULL;
-    }
-  ptr = packed_values;
-  for (i = 0; i < dbval_cnt; i++)
-    {
-      ptr = or_pack_db_value (ptr, &server_db_values[i]);
-    }
-  return packed_values;
-}
-#endif /* SERVER_MODE */
 #endif /* !CS_MODE */
 
 /*
@@ -7880,21 +7922,10 @@ qmgr_execute_query (const XASL_ID * xasl_id, QUERY_ID * query_idp, int dbval_cnt
   DB_VALUE *server_db_values = qmgr_server_db_values (thread_p, dbval_cnt, dbvals, &error);
   if (!error)
     {
-#if defined (SERVER_MODE)
-      char *packed_values = qmgr_pack_server_db_values (dbval_cnt, server_db_values, &error);
-      if (!error)
-	{
-	  list_id =
-	    xqmgr_execute_query (thread_p, xasl_id, query_idp, dbval_cnt, packed_values, &flag, clt_cache_time,
-				 srv_cache_time, query_timeout, NULL);
-	}
-      free_and_init (packed_values);
-#else /* !SERVER_MODE */
       /* call the server routine of query execute */
       list_id =
 	xqmgr_execute_query (thread_p, xasl_id, query_idp, dbval_cnt, server_db_values, &flag, clt_cache_time,
 			     srv_cache_time, query_timeout, NULL);
-#endif /* !SERVER_MODE */
     }
   qmgr_free_server_db_values (thread_p, dbval_cnt, server_db_values);
 
@@ -8013,20 +8044,9 @@ qmgr_prepare_and_execute_query (char *xasl_stream, int xasl_stream_size, QUERY_I
   DB_VALUE *server_db_values = qmgr_server_db_values (thread_p, dbval_cnt, dbval_ptr, &error);
   if (!error)
     {
-#if defined (SERVER_MODE)
-      char *packed_values = qmgr_pack_server_db_values (dbval_cnt, server_db_values, &error);
-      if (!error)
-	{
-	  regu_result =
-	    xqmgr_prepare_and_execute_query (thread_p, xasl_stream, xasl_stream_size, query_idp, dbval_cnt,
-					     packed_values, &flag, query_timeout);
-	}
-      free_and_init (packed_values);
-#else /* !SERVER_MODE */
       regu_result =
 	xqmgr_prepare_and_execute_query (thread_p, xasl_stream, xasl_stream_size, query_idp, dbval_cnt,
 					 server_db_values, &flag, query_timeout);
-#endif /* !SERVER_MODE */
     }
   qmgr_free_server_db_values (thread_p, dbval_cnt, server_db_values);
 
@@ -9022,10 +9042,36 @@ thread_kill_or_interrupt_tran (int *tran_index_list, int num_tran_index, bool is
   free_and_init (request);
 
   return success;
-#else /* CS_MODE */
+#elif defined (SERVER_MODE)
+  /* the loop of sthread_kill_or_interrupt_tran; the victims' errors land on this thread, not on a request worker */
+  int success = NO_ERROR;
+  int i;
+
+  THREAD_ENTRY *thread_p = enter_server ();
+
+  *num_killed = 0;
+  for (i = 0; i < num_tran_index; i++)
+    {
+      int error = xlogtb_kill_or_interrupt_tran (thread_p, tran_index_list[i], is_dba_group_member, interrupt_only);
+      if (error == ER_KILL_TR_NOT_ALLOWED)
+	{
+	  success = error;
+	  break;
+	}
+      if (error == NO_ERROR)
+	{
+	  (*num_killed)++;
+	}
+      er_clear ();
+    }
+
+  exit_server (*thread_p);
+
+  return success;
+#else /* SA_MODE */
   er_log_debug (ARG_FILE_LINE, "thread_kill_or_interrupt_tran: THIS IS ONLY a C/S function");
   return ER_FAILED;
-#endif /* !CS_MODE */
+#endif /* SA_MODE */
 }
 
 /*
@@ -11033,9 +11079,22 @@ tran_lock_rep_read (LOCK lock_rr_tran)
       tm_Tran_rep_read_lock = lock_rr_tran;
     }
   return req_error;
-#else /* CS_MODE */
+#elif defined (SERVER_MODE)
+  /* other sessions share the lock space, so the lock is really taken */
+  THREAD_ENTRY *thread_p = enter_server ();
+
+  int req_error = xtran_lock_rep_read (thread_p, lock_rr_tran);
+
+  exit_server (*thread_p);
+
+  if (req_error == NO_ERROR)
+    {
+      tm_Tran_rep_read_lock = lock_rr_tran;
+    }
+  return req_error;
+#else /* SA_MODE */
   return NO_ERROR;		/* No need to lock */
-#endif /* !CS_MODE */
+#endif /* SA_MODE */
 }
 
 /*
@@ -11218,12 +11277,19 @@ log_does_active_user_exist (const char *user_name, bool * existed)
   free_and_init (request);
 
   return error;
-#else /* CS_MODE */
+#elif defined (SERVER_MODE)
+  THREAD_ENTRY *thread_p = enter_server ();
 
+  *existed = xlogtb_does_active_user_exist (thread_p, user_name);
+
+  exit_server (*thread_p);
+
+  return NO_ERROR;
+#else /* SA_MODE */
   /* in SA_MODE, no other active user */
   *existed = false;
   return NO_ERROR;
-#endif /* !CS_MODE */
+#endif /* SA_MODE */
 }
 
 /*
@@ -12265,7 +12331,13 @@ tdes_set_query_start_info (char *sql_user_text)
   net_client_request (NET_SERVER_TDES_SET_QUERY_START_INFO, request, request_len, NULL, 0, NULL, 0, NULL, 0);
 
   free_and_init (request);
-#endif /* !CS_MODE */
+#elif defined (SERVER_MODE)
+  THREAD_ENTRY *thread_p = enter_server ();
+
+  xtdes_set_query_start_info (thread_p, sql_user_text);
+
+  exit_server (*thread_p);
+#endif
 }
 
 /*
@@ -12280,6 +12352,15 @@ tdes_reset_query_start_info (PT_NODE * node)
   if (pt_is_ddl_statement (node))
     {
       net_client_request (NET_SERVER_TDES_RESET_QUERY_START_INFO, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    }
+#elif defined (SERVER_MODE)
+  if (pt_is_ddl_statement (node))
+    {
+      THREAD_ENTRY *thread_p = enter_server ();
+
+      xtdes_reset_query_start_info (thread_p);
+
+      exit_server (*thread_p);
     }
 #endif
 }

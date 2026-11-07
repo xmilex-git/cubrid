@@ -225,11 +225,11 @@ extern int xqfile_get_list_file_page (THREAD_ENTRY * thread_p, QUERY_ID query_id
 extern int xqmgr_prepare_query (THREAD_ENTRY * thrd, compile_context * ctx, xasl_stream * stream);
 
 extern QFILE_LIST_ID *xqmgr_execute_query (THREAD_ENTRY * thrd, const XASL_ID * xasl_id, QUERY_ID * query_idp,
-					   int dbval_cnt, void *data, QUERY_FLAG * flagp, CACHE_TIME * clt_cache_time,
-					   CACHE_TIME * srv_cache_time, int query_timeout,
-					   xasl_cache_ent ** ret_cache_entry_p);
+					   int dbval_cnt, DB_VALUE * dbvals, QUERY_FLAG * flagp,
+					   CACHE_TIME * clt_cache_time, CACHE_TIME * srv_cache_time,
+					   int query_timeout, xasl_cache_ent ** ret_cache_entry_p);
 extern QFILE_LIST_ID *xqmgr_prepare_and_execute_query (THREAD_ENTRY * thrd, char *xasl_stream, int xasl_stream_size,
-						       QUERY_ID * query_id, int dbval_cnt, void *data,
+						       QUERY_ID * query_id, int dbval_cnt, DB_VALUE * dbvals,
 						       QUERY_FLAG * flag, int query_timeout);
 extern int xqmgr_end_query (THREAD_ENTRY * thrd, QUERY_ID query_id);
 extern int xqmgr_drop_all_query_plans (THREAD_ENTRY * thread_p);
@@ -295,6 +295,12 @@ extern int xsession_clear_query_entry_info (THREAD_ENTRY * thread_p, const QUERY
 extern int xchksum_insert_repl_log_and_demote_table_lock (THREAD_ENTRY * thread_p, REPL_INFO * repl_info,
 							  const OID * class_oidp);
 extern bool xlogtb_does_active_user_exist (THREAD_ENTRY * thread_p, const char *user_name);
+extern int xlog_supplement_statement (THREAD_ENTRY * thread_p, int ddl_type, int obj_type, const OID * classoid,
+				      const OID * oid, const char *stmt_text);
+extern void xtdes_set_query_start_info (THREAD_ENTRY * thread_p, const char *sql_user_text);
+extern void xtdes_reset_query_start_info (THREAD_ENTRY * thread_p);
+extern void xqst_log_stats_progress (THREAD_ENTRY * thread_p, const OID * classoid, int phase, int state, int seq,
+				     int total, int class_ms, int elapsed_ms, int error);
 extern int xlocator_demote_class_lock (THREAD_ENTRY * thread_p, const OID * class_oid, LOCK lock, LOCK * ex_lock);
 extern bool xtran_should_connection_reset (THREAD_ENTRY * thread_p, bool has_updated);
 extern int xsession_set_tran_auto_commit (THREAD_ENTRY * thread_p, bool auto_commit);

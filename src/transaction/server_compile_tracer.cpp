@@ -25,6 +25,8 @@
  *
  * Gate: env CUBRID_M0_TRACER_SQL is set when cub_server boots.  Output goes to
  * the file named by CUBRID_M0_TRACER_OUT (default: m0_tracer.out in cwd).
+ * Optional: CUBRID_M0_TRACER_ISOLATION=RR, CUBRID_M0_TRACER_PRE (statements run
+ * first) and CUBRID_M0_TRACER_BIND (integers bound to the case's host variables).
  *
  * Known limits (deliberate):
  * - single tracer thread, single in-process client context
@@ -192,6 +194,53 @@ tracer_main (char *server_name, char *sql, char *out_path)
   registered = true;
   tracer_log (fp, "M0_TRACER: in-process client registered (0-hop)");
 
+  /* CUBRID_M0_TRACER_ISOLATION=RR: compile under REPEATABLE READ, which takes the RR transaction lock */
+  if (const char *iso_env = std::getenv ("CUBRID_M0_TRACER_ISOLATION"))
+    {
+      if (strcmp (iso_env, "RR") != 0 || db_set_isolation (TRAN_REPEATABLE_READ) != NO_ERROR)
+	{
+	  tracer_log (fp, "M0_TRACER: FAIL isolation [%s] msg=[%s]", iso_env, er_msg () ? er_msg () : "");
+	  goto retire;
+	}
+      tracer_log (fp, "M0_TRACER: isolation set to REPEATABLE READ");
+    }
+
+  /* CUBRID_M0_TRACER_PRE: statements (';'-separated) run in the same transaction before the case, each must succeed */
+  if (const char *pre_env = std::getenv ("CUBRID_M0_TRACER_PRE"))
+    {
+      DB_SESSION *pre = db_open_buffer (pre_env);
+      int pre_id;
+
+      if (pre == NULL)
+	{
+	  tracer_log (fp, "M0_TRACER: FAIL pre db_open_buffer msg=[%s]", er_msg () ? er_msg () : "");
+	  goto retire;
+	}
+      while ((pre_id = db_compile_statement (pre)) > 0)
+	{
+	  DB_QUERY_RESULT *pre_result = NULL;
+
+	  err = db_execute_statement (pre, pre_id, &pre_result);
+	  if (pre_result != NULL)
+	    {
+	      db_query_end (pre_result);
+	    }
+	  if (err < 0)
+	    {
+	      break;
+	    }
+	  tracer_log (fp, "M0_TRACER: pre statement %d executed, result=%d", pre_id, err);
+	}
+      if (pre_id < 0 || err < 0)
+	{
+	  tracer_log (fp, "M0_TRACER: FAIL pre statement err=%d msg=[%s]", pre_id < 0 ? pre_id : err,
+		      er_msg () ? er_msg () : "");
+	  db_close_session (pre);
+	  goto retire;
+	}
+      db_close_session (pre);
+    }
+
   {
     DB_SESSION *session = db_open_buffer (sql);
     if (session == NULL)
@@ -208,6 +257,37 @@ tracer_main (char *server_name, char *sql, char *out_path)
 	goto retire;
       }
     tracer_log (fp, "M0_TRACER: compiled in server address space, stmt_id=%d", stmt_id);
+
+    /* CUBRID_M0_TRACER_BIND: comma-separated integers bound to the case's host variables */
+    if (const char *bind_env = std::getenv ("CUBRID_M0_TRACER_BIND"))
+      {
+	DB_VALUE bind_vals[16];
+	int bind_cnt = 0;
+	const char *p = bind_env;
+	char *endp = NULL;
+
+	while (bind_cnt < 16)
+	  {
+	    long v = strtol (p, &endp, 10);
+	    if (endp == p)
+	      {
+		break;
+	      }
+	    db_make_int (&bind_vals[bind_cnt++], (int) v);
+	    if (*endp != ',')
+	      {
+		break;
+	      }
+	    p = endp + 1;
+	  }
+	if (db_push_values (session, bind_cnt, bind_vals) != NO_ERROR)
+	  {
+	    tracer_log (fp, "M0_TRACER: FAIL db_push_values msg=[%s]", er_msg () ? er_msg () : "");
+	    db_close_session (session);
+	    goto retire;
+	  }
+	tracer_log (fp, "M0_TRACER: bound %d host variable(s)", bind_cnt);
+      }
 
     DB_QUERY_RESULT *result = NULL;
     err = db_execute_statement (session, stmt_id, &result);

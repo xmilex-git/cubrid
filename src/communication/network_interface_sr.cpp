@@ -365,6 +365,44 @@ need_to_abort_tran (THREAD_ENTRY *thread_p, int *errid)
 }
 
 /*
+ * abort_tran_on_error - before a failed request's error reaches its caller, roll back the transaction the request
+ *                       left to be aborted and clear its abort reason
+ *
+ * return: the transaction state after the rollback, or tran_state when nothing was rolled back
+ *
+ *   thread_p(in): thread entry
+ *   tran_state(in): the transaction state to return when nothing is rolled back
+ *   errid(out): the latest error code
+ */
+TRAN_STATE
+abort_tran_on_error (THREAD_ENTRY *thread_p, TRAN_STATE tran_state, int *errid)
+{
+  LOG_TDES *tdes = LOG_FIND_CURRENT_TDES (thread_p);
+
+  /*
+   * ER_LK_UNILATERALLY_ABORTED may have occurred due to deadlock.
+   * If it happened, do server-side rollback of the transaction.
+   * If ER_DB_NO_MODIFICATIONS error is occurred in server-side,
+   * it means that the user tried to update the database
+   * when the server was disabled to modify. (aka standby mode)
+   */
+  if (need_to_abort_tran (thread_p, errid) == true)
+    {
+      /* need to hide the previous error, ER_LK_UNILATERALLY_ABORTED to rollback the current transaction. */
+      er_stack_push ();
+      tran_state = tran_server_unilaterally_abort_tran (thread_p);
+      er_stack_pop ();
+    }
+
+  if (tdes != NULL)
+    {
+      tdes->tran_abort_reason = TRAN_NORMAL;
+    }
+
+  return tran_state;
+}
+
+/*
  * return_error_to_client -
  *
  * return: state of operation
@@ -378,7 +416,6 @@ return_error_to_client (THREAD_ENTRY *thread_p, unsigned int rid)
 {
   LOG_TDES *tdes;
   int errid;
-  bool flag_abort = false;
   char *area;
   OR_ALIGNED_BUF (1024) a_buffer;
   char *buffer;
@@ -397,23 +434,7 @@ return_error_to_client (THREAD_ENTRY *thread_p, unsigned int rid)
     {
       tran_state = tdes->state;
     }
-  flag_abort = need_to_abort_tran (thread_p, &errid);
-
-  /* check some errors which require special actions */
-  /*
-   * ER_LK_UNILATERALLY_ABORTED may have occurred due to deadlock.
-   * If it happened, do server-side rollback of the transaction.
-   * If ER_DB_NO_MODIFICATIONS error is occurred in server-side,
-   * it means that the user tried to update the database
-   * when the server was disabled to modify. (aka standby mode)
-   */
-  if (flag_abort == true)
-    {
-      /* need to hide the previous error, ER_LK_UNILATERALLY_ABORTED to rollback the current transaction. */
-      er_stack_push ();
-      tran_state = tran_server_unilaterally_abort_tran (thread_p);
-      er_stack_pop ();
-    }
+  tran_state = abort_tran_on_error (thread_p, tran_state, &errid);
 
   if (errid == ER_DB_NO_MODIFICATIONS)
     {
@@ -427,11 +448,6 @@ return_error_to_client (THREAD_ENTRY *thread_p, unsigned int rid)
       conn->db_error = errid;
       css_send_error_to_client (conn, rid, area, length);
       conn->db_error = 0;
-    }
-
-  if (tdes != NULL)
-    {
-      tdes->tran_abort_reason = TRAN_NORMAL;
     }
 
   return tran_state;
@@ -2700,20 +2716,16 @@ slog_drop_lob_locator (THREAD_ENTRY *thread_p, unsigned int rid, char *request, 
   css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
 }
 
-void
-slog_supplement_statement (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+/*
+ * xlog_supplement_statement - append the supplemental log record of a DDL statement
+ *
+ * return: error code
+ */
+int
+xlog_supplement_statement (THREAD_ENTRY *thread_p, int ddl_type, int obj_type, const OID *classoid, const OID *oid,
+			   const char *stmt_text)
 {
-  int success = NO_ERROR;
-  OR_ALIGNED_BUF (OR_INT_SIZE) a_reply;
-  char *reply = OR_ALIGNED_BUF_START (a_reply);
   char *ptr, *start_ptr;
-
-  int ddl_type;
-  int obj_type;
-  OID classoid;
-  OID oid;
-  char *stmt_text;
-
   char *supplemental_data;
   int data_len;
   LOG_TDES *tdes;
@@ -2721,14 +2733,6 @@ slog_supplement_statement (THREAD_ENTRY *thread_p, unsigned int rid, char *reque
   /* CAS and Server are able to have different parameter value, when broker restarted with changed parameter value */
   if (prm_get_integer_value (PRM_ID_SUPPLEMENTAL_LOG) == 1)
     {
-      ptr = or_unpack_int (request, &ddl_type);
-      ptr = or_unpack_int (ptr, &obj_type);
-
-      ptr = or_unpack_oid (ptr, &classoid);
-      ptr = or_unpack_oid (ptr, &oid);
-
-      or_unpack_string_nocopy (ptr, &stmt_text);
-
       /* ddl_type | obj_type | class OID | OID | stmt_text len | stmt_text */
       data_len =
 	      OR_INT_SIZE + OR_INT_SIZE + OR_OID_SIZE + OR_OID_SIZE + OR_INT_SIZE + or_packed_string_length (stmt_text, NULL);
@@ -2736,16 +2740,15 @@ slog_supplement_statement (THREAD_ENTRY *thread_p, unsigned int rid, char *reque
       supplemental_data = (char *) malloc (data_len + MAX_ALIGNMENT);
       if (supplemental_data == NULL)
 	{
-	  success = ER_OUT_OF_VIRTUAL_MEMORY;
-	  goto end;
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
 	}
 
       ptr = start_ptr = supplemental_data;
 
       ptr = or_pack_int (ptr, ddl_type);
       ptr = or_pack_int (ptr, obj_type);
-      ptr = or_pack_oid (ptr, &classoid);
-      ptr = or_pack_oid (ptr, &oid);
+      ptr = or_pack_oid (ptr, classoid);
+      ptr = or_pack_oid (ptr, oid);
       ptr = or_pack_int (ptr, strlen (stmt_text));
       ptr = or_pack_string (ptr, stmt_text);
 
@@ -2765,7 +2768,36 @@ slog_supplement_statement (THREAD_ENTRY *thread_p, unsigned int rid, char *reque
       free_and_init (supplemental_data);
     }
 
-end:
+  return NO_ERROR;
+}
+
+void
+slog_supplement_statement (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+{
+  int success = NO_ERROR;
+  OR_ALIGNED_BUF (OR_INT_SIZE) a_reply;
+  char *reply = OR_ALIGNED_BUF_START (a_reply);
+  char *ptr;
+
+  int ddl_type;
+  int obj_type;
+  OID classoid;
+  OID oid;
+  char *stmt_text;
+
+  if (prm_get_integer_value (PRM_ID_SUPPLEMENTAL_LOG) == 1)
+    {
+      ptr = or_unpack_int (request, &ddl_type);
+      ptr = or_unpack_int (ptr, &obj_type);
+
+      ptr = or_unpack_oid (ptr, &classoid);
+      ptr = or_unpack_oid (ptr, &oid);
+
+      or_unpack_string_nocopy (ptr, &stmt_text);
+
+      success = xlog_supplement_statement (thread_p, ddl_type, obj_type, &classoid, &oid, stmt_text);
+    }
+
   (void) or_pack_int (reply, success);
 
   css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
@@ -4578,13 +4610,53 @@ send:
  *       production. Nothing here may fail the run: a failure to log is dropped.
  */
 void
+xqst_log_stats_progress (THREAD_ENTRY *thread_p, const OID *classoid, int phase, int state, int seq, int total,
+			 int class_ms, int elapsed_ms, int error)
+{
+  char *class_name = NULL;
+  FILE *log_fp;
+  int indent = 2;
+
+  /* keep whatever the logging sets (e.g. the event log file cannot be reopened) away from the caller */
+  er_stack_push ();
+
+  if (heap_get_class_name (thread_p, classoid, &class_name) != NO_ERROR)
+    {
+      class_name = NULL;
+    }
+
+  log_fp = event_log_start (thread_p, "UPDATE_STATISTICS");
+  if (log_fp != NULL)
+    {
+      event_log_print_client_info (LOG_FIND_THREAD_TRAN_INDEX (thread_p), indent);
+      fprintf (log_fp, "%*cclass: %s\n", indent, ' ', class_name ? class_name : "*UNKNOWN-CLASS*");
+      if (state == STATS_PROGRESS_STARTED)
+	{
+	  fprintf (log_fp, "%*cprogress: %s started %d/%d, elapsed: %.3f sec\n\n", indent, ' ',
+		   phase == STATS_PROGRESS_HISTOGRAM ? "histogram" : "statistics", seq, total, elapsed_ms / 1000.0);
+	}
+      else
+	{
+	  fprintf (log_fp, "%*cprogress: %s finished %d/%d, error: %d, time: %.3f sec, elapsed: %.3f sec\n\n",
+		   indent, ' ', phase == STATS_PROGRESS_HISTOGRAM ? "histogram" : "statistics", seq, total, error,
+		   class_ms / 1000.0, elapsed_ms / 1000.0);
+	}
+      event_log_end (thread_p);
+    }
+
+  if (class_name != NULL)
+    {
+      free_and_init (class_name);
+    }
+
+  er_stack_pop ();
+}
+
+void
 sqst_log_stats_progress (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
 {
   OID classoid;
   int phase, state, seq, total, class_ms, elapsed_ms, error;
-  char *class_name = NULL;
-  FILE *log_fp;
-  int indent = 2;
   char *ptr;
   OR_ALIGNED_BUF (OR_INT_SIZE) a_reply;
   char *reply = OR_ALIGNED_BUF_START (a_reply);
@@ -4600,39 +4672,7 @@ sqst_log_stats_progress (THREAD_ENTRY *thread_p, unsigned int rid, char *request
       ptr = or_unpack_int (ptr, &elapsed_ms);
       ptr = or_unpack_int (ptr, &error);
 
-      /* keep whatever the logging sets (e.g. the event log file cannot be reopened) away from the caller */
-      er_stack_push ();
-
-      if (heap_get_class_name (thread_p, &classoid, &class_name) != NO_ERROR)
-	{
-	  class_name = NULL;
-	}
-
-      log_fp = event_log_start (thread_p, "UPDATE_STATISTICS");
-      if (log_fp != NULL)
-	{
-	  event_log_print_client_info (LOG_FIND_THREAD_TRAN_INDEX (thread_p), indent);
-	  fprintf (log_fp, "%*cclass: %s\n", indent, ' ', class_name ? class_name : "*UNKNOWN-CLASS*");
-	  if (state == STATS_PROGRESS_STARTED)
-	    {
-	      fprintf (log_fp, "%*cprogress: %s started %d/%d, elapsed: %.3f sec\n\n", indent, ' ',
-		       phase == STATS_PROGRESS_HISTOGRAM ? "histogram" : "statistics", seq, total, elapsed_ms / 1000.0);
-	    }
-	  else
-	    {
-	      fprintf (log_fp, "%*cprogress: %s finished %d/%d, error: %d, time: %.3f sec, elapsed: %.3f sec\n\n",
-		       indent, ' ', phase == STATS_PROGRESS_HISTOGRAM ? "histogram" : "statistics", seq, total, error,
-		       class_ms / 1000.0, elapsed_ms / 1000.0);
-	    }
-	  event_log_end (thread_p);
-	}
-
-      if (class_name != NULL)
-	{
-	  free_and_init (class_name);
-	}
-
-      er_stack_pop ();
+      xqst_log_stats_progress (thread_p, &classoid, phase, state, seq, total, class_ms, elapsed_ms, error);
     }
 
   (void) or_pack_int (reply, NO_ERROR);
@@ -5778,6 +5818,44 @@ stran_can_end_after_query_execution (THREAD_ENTRY *thread_p, int query_flag, QFI
   return NO_ERROR;
 }
 
+/* the bound values a request carries, unpacked into this thread's private heap; NULL without values or on error */
+static DB_VALUE *
+sqmgr_unpack_db_values (THREAD_ENTRY *thread_p, int dbval_cnt, char *data)
+{
+  DB_VALUE *dbvals;
+  char *ptr = data;
+
+  if (dbval_cnt <= 0)
+    {
+      return NULL;
+    }
+  assert (data != NULL);
+
+  dbvals = (DB_VALUE *) db_private_alloc (thread_p, sizeof (DB_VALUE) * dbval_cnt);
+  if (dbvals == NULL)
+    {
+      return NULL;
+    }
+  for (int i = 0; i < dbval_cnt; i++)
+    {
+      ptr = or_unpack_db_value (ptr, &dbvals[i]);
+    }
+  return dbvals;
+}
+
+static void
+sqmgr_free_db_values (THREAD_ENTRY *thread_p, int dbval_cnt, DB_VALUE *dbvals)
+{
+  if (dbvals != NULL)
+    {
+      for (int i = 0; i < dbval_cnt; i++)
+	{
+	  pr_clear_value (&dbvals[i]);
+	}
+      db_private_free (thread_p, dbvals);
+    }
+}
+
 /*
  * sqmgr_execute_query - Process a SERVER_QM_EXECUTE request
  *
@@ -5803,6 +5881,7 @@ sqmgr_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char *request, in
   int csserror, dbval_cnt, data_size, replydata_size, page_size;
   QUERY_ID query_id = NULL_QUERY_ID;
   char *ptr, *data = NULL, *reply, *replydata = NULL;
+  DB_VALUE *dbvals;
   PAGE_PTR page_ptr;
   char *aligned_page_buf;
   QUERY_FLAG query_flag;
@@ -5931,8 +6010,17 @@ sqmgr_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char *request, in
   CACHE_TIME_RESET (&srv_cache_time);
 
   /* call the server routine of query execute */
-  list_id = xqmgr_execute_query (thread_p, &xasl_id, &query_id, dbval_cnt, data, &query_flag, &clt_cache_time,
-				 &srv_cache_time, query_timeout, &xasl_cache_entry_p);
+  dbvals = sqmgr_unpack_db_values (thread_p, dbval_cnt, data);
+  if (dbval_cnt > 0 && dbvals == NULL)
+    {
+      list_id = NULL;
+    }
+  else
+    {
+      list_id = xqmgr_execute_query (thread_p, &xasl_id, &query_id, dbval_cnt, dbvals, &query_flag, &clt_cache_time,
+				     &srv_cache_time, query_timeout, &xasl_cache_entry_p);
+    }
+  sqmgr_free_db_values (thread_p, dbval_cnt, dbvals);
 
   if (data != NULL && data != aligned_data_buf)
     {
@@ -6432,6 +6520,7 @@ sqmgr_prepare_and_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char 
   char *xasl_stream;
   int xasl_stream_size;
   char *ptr, *var_data, *list_data;
+  DB_VALUE *dbvals;
   OR_ALIGNED_BUF (OR_INT_SIZE * 4 + OR_PTR_ALIGNED_SIZE) a_reply;
   char *reply = OR_ALIGNED_BUF_START (a_reply);
   PAGE_PTR page_ptr;
@@ -6483,9 +6572,19 @@ sqmgr_prepare_and_execute_query (THREAD_ENTRY *thread_p, unsigned int rid, char 
    * After this point, xqmgr_prepare_and_execute_query has assumed
    * responsibility for freeing xasl_stream...
    */
-  q_result =
-	  xqmgr_prepare_and_execute_query (thread_p, xasl_stream, xasl_stream_size, &query_id, var_count, var_data, &flag,
-	      query_timeout);
+  dbvals = sqmgr_unpack_db_values (thread_p, var_count, var_data);
+  if (var_count > 0 && dbvals == NULL)
+    {
+      query_id = NULL_QUERY_ID;
+      q_result = NULL;
+    }
+  else
+    {
+      q_result =
+	      xqmgr_prepare_and_execute_query (thread_p, xasl_stream, xasl_stream_size, &query_id, var_count, dbvals, &flag,
+		  query_timeout);
+    }
+  sqmgr_free_db_values (thread_p, var_count, dbvals);
   if (var_data)
     {
       thread_p->release_packet (var_data);
@@ -13181,13 +13280,11 @@ smmon_disable_force (THREAD_ENTRY *thread_p, unsigned int rid, char *request, in
  *   reqlen(in): the request length
  */
 void
-stdes_set_query_start_info (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+xtdes_set_query_start_info (THREAD_ENTRY *thread_p, const char *sql_user_text)
 {
-  char *sql_user_text = NULL;
   int tran_index = -1;
   LOG_TDES *tdes_p;
 
-  or_unpack_string_nocopy (request, &sql_user_text);
   tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
 
   tdes_p = LOG_FIND_TDES (tran_index);
@@ -13206,6 +13303,15 @@ stdes_set_query_start_info (THREAD_ENTRY *thread_p, unsigned int rid, char *requ
 	  tdes_p->ddl_sql_user_text = strdup (sql_user_text);
 	}
     }
+}
+
+void
+stdes_set_query_start_info (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+{
+  char *sql_user_text = NULL;
+
+  or_unpack_string_nocopy (request, &sql_user_text);
+  xtdes_set_query_start_info (thread_p, sql_user_text);
 
   css_send_data_to_client (thread_p->conn_entry, rid, NULL, 0);
 }
@@ -13218,7 +13324,7 @@ stdes_set_query_start_info (THREAD_ENTRY *thread_p, unsigned int rid, char *requ
  *   reqlen(in): the request length
  */
 void
-stdes_reset_query_start_info (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+xtdes_reset_query_start_info (THREAD_ENTRY *thread_p)
 {
   int tran_index = -1;
   LOG_TDES *tdes_p;
@@ -13236,6 +13342,12 @@ stdes_reset_query_start_info (THREAD_ENTRY *thread_p, unsigned int rid, char *re
 	  free_and_init (tdes_p->ddl_sql_user_text);
 	}
     }
+}
+
+void
+stdes_reset_query_start_info (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+{
+  xtdes_reset_query_start_info (thread_p);
 
   css_send_data_to_client (thread_p->conn_entry, rid, NULL, 0);
 }

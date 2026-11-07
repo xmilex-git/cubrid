@@ -39,6 +39,7 @@
 // forward definitions
 struct qfile_list_id;
 
+extern TRAN_STATE abort_tran_on_error (THREAD_ENTRY * thread_p, TRAN_STATE tran_state, int *errid);
 extern TRAN_STATE return_error_to_client (THREAD_ENTRY * thread_p, unsigned int rid);
 extern int server_ping_with_handshake (THREAD_ENTRY * thread_p, unsigned int rid, char *request, int reqlen);
 extern void server_ping (THREAD_ENTRY * thread_p, unsigned int rid, char *request, int reqlen);
