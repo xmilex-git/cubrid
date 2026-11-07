@@ -29,6 +29,10 @@
  * first), CUBRID_M0_TRACER_BIND (integers bound to the case's host variables),
  * CUBRID_M0_TRACER_SESSIONS (concurrent sessions, each with its own client
  * context) and CUBRID_M0_TRACER_END=1 (end the session from inside it).
+ * CUBRID_M0_TRACER_SQL_S<n> / CUBRID_M0_TRACER_PRE_S<n> replace the statement /
+ * the statements run first for session n only; CUBRID_M0_TRACER_USER logs in as
+ * another user (no password), CUBRID_M0_TRACER_START_DELAY[_S<n>] sleeps that many
+ * seconds before the boot.
  *
  * Known limit (deliberate): a session never shuts its client down
  * (boot_shutdown_client would finalize modules shared with the server half);
@@ -116,8 +120,16 @@ boot_tracer_start_if_requested (const char *server_name)
     }
 }
 
-/* client boot and unregistration are not reentrant yet: one session in them at a time */
-static std::mutex tracer_Boot_mutex;
+/* the session's own value of a tracer knob: <name>_S<sid> overrides <name> */
+static const char *
+tracer_getenv (const char *name, int sid)
+{
+  char session_name[64];
+
+  snprintf (session_name, sizeof (session_name), "%s_S%d", name, sid);
+  const char *value = std::getenv (session_name);
+  return value != NULL ? value : std::getenv (name);
+}
 
 static FILE *tracer_Fp = NULL;
 static std::mutex tracer_Log_mutex;
@@ -185,9 +197,15 @@ tracer_session (int sid, const char *server_name, const char *sql)
    * enter_server/exit_server (network_interface_cl.c) toggle it per x-call */
   db_on_server = 0;
 
+  if (const char *delay_env = tracer_getenv ("CUBRID_M0_TRACER_START_DELAY", sid))
+    {
+      std::this_thread::sleep_for (std::chrono::seconds (atoi (delay_env)));
+    }
+
+  /* sessions boot concurrently: the server boot initialized the client modules they share */
   {
-    std::lock_guard<std::mutex> boot_guard (tracer_Boot_mutex);
-    err = db_restart_ex ("m0_tracer", server_name, "DBA", "", NULL, DB_CLIENT_TYPE_DEFAULT);
+    const char *user = tracer_getenv ("CUBRID_M0_TRACER_USER", sid);
+    err = db_restart_ex ("m0_tracer", server_name, user != NULL ? user : "DBA", "", NULL, DB_CLIENT_TYPE_DEFAULT);
   }
   if (err != NO_ERROR)
     {
@@ -216,7 +234,7 @@ tracer_session (int sid, const char *server_name, const char *sql)
     }
 
   /* CUBRID_M0_TRACER_PRE: statements (';'-separated) run in the same transaction before the case, each must succeed */
-  if (const char *pre_env = std::getenv ("CUBRID_M0_TRACER_PRE"))
+  if (const char *pre_env = tracer_getenv ("CUBRID_M0_TRACER_PRE", sid))
     {
       DB_SESSION *pre = db_open_buffer (pre_env);
       int pre_id;
@@ -252,6 +270,10 @@ tracer_session (int sid, const char *server_name, const char *sql)
     }
 
   {
+    if (const char *sql_env = tracer_getenv ("CUBRID_M0_TRACER_SQL", sid))
+      {
+	sql = sql_env;
+      }
     DB_SESSION *session = db_open_buffer (sql);
     if (session == NULL)
       {
@@ -389,7 +411,6 @@ retire:
        * shutdown makes log_abort_all_active_transaction push its abort task
        * inline onto the main thread, whose execute() stamps Main_entry_p
        * with TS_FREE — the shutdown checkpoint's DWB wait then asserts. */
-      std::lock_guard<std::mutex> boot_guard (tracer_Boot_mutex);
       (void) boot_unregister_client (tm_Tran_index);
       tm_Tran_index = NULL_TRAN_INDEX;
     }

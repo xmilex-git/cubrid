@@ -24,6 +24,8 @@
 #include "client_session_context.hpp"
 
 #include "parser.h"		// pt_free_label_table
+#include "authenticate.h"	// au_final
+#include "db_query.h"		// db_final_client_query_result
 
 #include <cassert>
 #include <cstddef>
@@ -176,6 +178,15 @@ csc_teardown (client_session_context *ctx)
 
   if (ctx->ws.mop_table != NULL)
     {
+      /* the session's client state in the order a sub-client's shutdown frees it (boot_finalize_client_sub):
+       * the modules that refer to the workspace's MOPs go before ws_final frees them */
+      tran_free_savepoint_list ();
+      tr_final ();
+      au_final ();
+      sm_final ();
+      db_final_client_query_result ();
+      db_prepared_tree_free_all ();
+
       /* the MOP table, classname cache, resident classes and the session's
        * lea heap; the process-shared areas stay */
       ws_final (false);

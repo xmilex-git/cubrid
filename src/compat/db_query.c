@@ -1429,7 +1429,7 @@ db_clear_client_query_result (int notify_server, bool end_holdable)
     }
 }
 
-#if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
+#if (defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)) || defined (SERVER_MODE)
 /*
  * db_final_client_query_result () - end the remaining query results and free the query result table of the
  *				     connection of this thread

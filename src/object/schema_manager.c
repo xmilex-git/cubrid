@@ -2012,6 +2012,18 @@ sm_get_method_source_file (MOP obj, const char *name)
  *   rootclass_hfid(in): heap file of root class
  */
 
+static void
+sm_init_root_class (const HFID * rootclass_hfid)
+{
+  OID_SET_NULL (&(sm_Root_class.header.ch_rep_dir));	/* is dummy */
+
+  sm_Root_class.header.ch_heap.vfid.volid = rootclass_hfid->vfid.volid;
+  sm_Root_class.header.ch_heap.vfid.fileid = rootclass_hfid->vfid.fileid;
+  sm_Root_class.header.ch_heap.hpgid = rootclass_hfid->hpgid;
+
+  sm_Root_class_hfid = &sm_Root_class.header.ch_heap;
+}
+
 void
 sm_init (OID * rootclass_oid, HFID * rootclass_hfid, bool is_sub)
 {
@@ -2022,13 +2034,13 @@ sm_init (OID * rootclass_oid, HFID * rootclass_hfid, bool is_sub)
       COPY_OID (oid_Root_class_oid, ws_oid (sm_Root_class_mop));
     }
 
-  OID_SET_NULL (&(sm_Root_class.header.ch_rep_dir));	/* is dummy */
-
-  sm_Root_class.header.ch_heap.vfid.volid = rootclass_hfid->vfid.volid;
-  sm_Root_class.header.ch_heap.vfid.fileid = rootclass_hfid->vfid.fileid;
-  sm_Root_class.header.ch_heap.hpgid = rootclass_hfid->hpgid;
-
-  sm_Root_class_hfid = &sm_Root_class.header.ch_heap;
+#if defined (SERVER_MODE)
+  /* the root class is process state, the same for every session: the first session's boot writes it */
+  static bool root_class_initialized = (sm_init_root_class (rootclass_hfid), true);
+  (void) root_class_initialized;
+#else
+  sm_init_root_class (rootclass_hfid);
+#endif
 
   sm_Descriptors = NULL;
 }

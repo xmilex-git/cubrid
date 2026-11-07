@@ -128,6 +128,9 @@
 /* the credential carries per-session state (server_session_key feeds
  * csession_find_or_create_session): the session's own copy */
 #include "client_session_context.hpp"
+#include "object_template.h"
+#include "class_object.h"
+extern thread_local unsigned int db_on_server;
 #define boot_Server_credential (csc_current ()->boot_server_credential)
 #else /* SERVER_MODE */
 static CUB_THREAD_LOCAL BOOT_SERVER_CREDENTIAL boot_Server_credential = {
@@ -174,6 +177,7 @@ static CUB_THREAD_LOCAL bool boot_Is_sub_client = false;
 static bool boot_Set_client_at_exit = false;
 static int boot_Process_id = -1;
 
+static void boot_initialize_ip (void);
 static int boot_client (int tran_index, int lock_wait, TRAN_ISOLATION tran_isolation);
 static int install_system_metadata (void);
 #if !defined (SERVER_MODE)
@@ -228,6 +232,9 @@ boot_client (int tran_index, int lock_wait, TRAN_ISOLATION tran_isolation)
 {
   tran_cache_tran_settings (tran_index, lock_wait, tran_isolation);
 
+#if !defined (SERVER_MODE)
+  /* the in-process client plants no exit-time shutdown: the server process's exit is owned by
+   * boot_shutdown_server_at_exit, and the flags below are process state the sessions would share */
   if (boot_Set_client_at_exit)
     {
       return NO_ERROR;
@@ -235,13 +242,6 @@ boot_client (int tran_index, int lock_wait, TRAN_ISOLATION tran_isolation)
 
   boot_Set_client_at_exit = true;
   boot_Process_id = getpid ();
-#if !defined (SERVER_MODE)
-  /* the in-process client must not plant the CS client's exit-time
-   * shutdown inside cub_server — the client context is deliberately never
-   * shut down (see server_compile_tracer.cpp), and this handler would free
-   * client state after the thread manager's own teardown (tl_Entry_p
-   * already NULL -> assert in thread_get_thread_entry_info at exit). The
-   * server process's exit is owned by boot_shutdown_server_at_exit. */
   atexit (boot_shutdown_client_at_exit);
 #endif
 
@@ -285,8 +285,8 @@ boot_client_common (BOOT_CLIENT_CREDENTIAL * client_credential, const char *lang
 {
 #if !defined (SERVER_MODE)
   int error_code;
-#endif
   const char *conf_file = NULL;
+#endif
 
   /* If the client is restarted, shutdown the client */
   if (BOOT_IS_CLIENT_RESTARTED ())
@@ -294,14 +294,19 @@ boot_client_common (BOOT_CLIENT_CREDENTIAL * client_credential, const char *lang
       (void) boot_shutdown_client (true);
     }
 
-#if !defined (SERVER_MODE)
-  /* same contract as boot_shutdown_client — an in-process (re)boot
-   * must never finalize the client modules shared with the running server */
+#if defined (SERVER_MODE)
+  /* the modules every in-process session shares (language, time zone, message catalogs, parameters, areas, tsc)
+   * are the server's: its boot initialized them before it accepted a session */
+  if (client_credential->db_name.empty ())
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_BO_UNKNOWN_DATABASE, 1, "(null)");
+      return ER_BO_UNKNOWN_DATABASE;
+    }
+#else /* SERVER_MODE */
   if (!boot_Is_client_all_final)
     {
       boot_client_all_finalize (ALL_FINALIZATION);
     }
-#endif
 
 #if defined(WINDOWS)
 /* set up the WINDOWS stream emulations */
@@ -366,20 +371,13 @@ boot_client_common (BOOT_CLIENT_CREDENTIAL * client_credential, const char *lang
     }
 #endif
 
-/* initialize system parameters.
- * skipped for the in-process client (SERVER_MODE) — the server's
- * already-loaded parameter state is authoritative; re-loading here would
- * both clobber live server parameters and hit prm_set_default's
- * session-parameter path on a thread that has no session yet. */
-#if !defined (SERVER_MODE)
+/* initialize system parameters */
   if (sysprm_load_and_init_client (client_credential->get_db_name (), conf_file) != NO_ERROR)
     {
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_BO_CANT_LOAD_SYSPRM, 0);
       return ER_BO_CANT_LOAD_SYSPRM;
     }
-#endif
 
-#if !defined (SERVER_MODE)
   if (!is_createdb)
     {
       // reload with update file name
@@ -397,17 +395,11 @@ boot_client_common (BOOT_CLIENT_CREDENTIAL * client_credential, const char *lang
 	}
 #endif
     }
-#endif /* !SERVER_MODE — keep the server's er state */
 
   /* initialize the "areas" memory manager, requires prm_ */
   area_init ();
   locator_initialize_areas ();
 
-#if !defined (SERVER_MODE)
-  /* in-process boot must not re-run perfmon_initialize — the server
-   * already initialized pstat_Global for MAX_NTRANS at boot, and re-running
-   * it would leak those arrays and reallocate tran_stats for 1 transaction
-   * while server workers keep indexing by their real tran_index (OOB). */
   if (is_createdb)
     {
       error_code = perfmon_initialize (MAX_NTRANS);
@@ -425,10 +417,10 @@ boot_client_common (BOOT_CLIENT_CREDENTIAL * client_credential, const char *lang
       ASSERT_ERROR ();
       return error_code;
     }
-#endif /* !SERVER_MODE */
 
   /* Initialize tsc-timer */
   tsc_init ();
+#endif /* !SERVER_MODE */
 
   return NO_ERROR;
 }
@@ -562,6 +554,10 @@ boot_check_and_fill_connection_info (BOOT_CLIENT_CREDENTIAL * client_credential,
 /* Get the login name, host, and process identifier */
   if (client_credential->login_name.empty ())
     {
+#if defined (SERVER_MODE)
+      /* the server's login name, read once by its boot (boot_initialize_client_modules) */
+      client_credential->login_name = boot_Client_id_buffer;
+#else
       if (getuserid (boot_Client_id_buffer, L_cuserid) != (char *) NULL)
 	{
 	  client_credential->login_name = boot_Client_id_buffer;
@@ -570,6 +566,7 @@ boot_check_and_fill_connection_info (BOOT_CLIENT_CREDENTIAL * client_credential,
 	{
 	  client_credential->login_name = boot_Client_id_unknown_string;
 	}
+#endif
     }
   if (client_credential->host_name.empty ())
     {
@@ -1181,6 +1178,95 @@ error_exit:
  *       by the main client. A sub-client shares them with the main client and initializes only its own modules.
  *       On failure, the caller is responsible for the cleanup.
  */
+#if defined (SERVER_MODE)
+/* the client context of the client-half modules every session shares: the SHOW metadata lives in its workspace heap
+ * for the server's lifetime (a session's heap goes with the session) */
+static client_session_context *boot_Shared_client_context = NULL;
+
+/*
+ * boot_initialize_client_modules () - the server boot initializes the client-half modules every in-process session
+ *				       shares, before the server accepts a session
+ *
+ * return : error code
+ */
+int
+boot_initialize_client_modules (void)
+{
+  int error_code;
+
+  boot_initialize_ip ();
+  if (getuserid (boot_Client_id_buffer, L_cuserid) == NULL)
+    {
+      snprintf (boot_Client_id_buffer, sizeof (boot_Client_id_buffer), "%s", boot_Client_id_unknown_string);
+    }
+
+  error_code = ws_area_init ();	/* object lists */
+  if (error_code != NO_ERROR)
+    {
+      return error_code;
+    }
+  error_code = obt_area_init ();	/* object templates, assignment templates */
+  if (error_code != NO_ERROR)
+    {
+      return error_code;
+    }
+  error_code = classobj_area_init ();	/* schema templates */
+  if (error_code != NO_ERROR)
+    {
+      return error_code;
+    }
+
+  db_install_static_methods ();
+#if !defined(WINDOWS)
+  /* don't care about failures: methods fail when they are invoked */
+  (void) dl_initiate_module ();
+  er_clear ();
+#endif /* !WINDOWS */
+
+  boot_Shared_client_context = new client_session_context ();
+  csc_activate (boot_Shared_client_context);
+  unsigned int save_on_server = db_on_server;
+  db_on_server = 0;
+  error_code = showstmt_metadata_init ();
+  db_on_server = save_on_server;
+  csc_deactivate ();
+
+  return error_code;
+}
+
+/*
+ * boot_finalize_client_modules () - the server shutdown finalizes the shared client-half modules after every
+ *				     session was retired
+ */
+void
+boot_finalize_client_modules (void)
+{
+  if (boot_Shared_client_context != NULL)
+    {
+      csc_activate (boot_Shared_client_context);
+      unsigned int save_on_server = db_on_server;
+      db_on_server = 0;
+      showstmt_metadata_final ();
+      db_on_server = save_on_server;
+      csc_deactivate ();
+      csc_retire_and_delete (boot_Shared_client_context);
+      boot_Shared_client_context = NULL;
+    }
+  sm_flush_static_methods ();
+#if !defined(WINDOWS)
+  (void) dl_destroy_module ();
+#endif /* !WINDOWS */
+}
+#endif /* SERVER_MODE */
+
+/* does this boot initialize the client modules the process shares?  A sub-client shares the main client's; every
+ * in-process session of the folded server shares the server boot's (boot_initialize_client_modules) */
+#if defined (SERVER_MODE)
+#define BOOT_INIT_SHARED_MODULES(is_sub_client) false
+#else
+#define BOOT_INIT_SHARED_MODULES(is_sub_client) (!(is_sub_client))
+#endif
+
 static int
 boot_register_and_init_client (BOOT_CLIENT_CREDENTIAL * client_credential, bool is_sub_client)
 {
@@ -1190,7 +1276,7 @@ boot_register_and_init_client (BOOT_CLIENT_CREDENTIAL * client_credential, bool 
   TRAN_STATE transtate;
   int error_code = NO_ERROR;
 
-  if (!is_sub_client)
+  if (BOOT_INIT_SHARED_MODULES (is_sub_client))
     {
       /* this must be done before the register_client because recovery steps may need domains. */
       error_code = tp_init ();
@@ -1266,7 +1352,7 @@ boot_register_and_init_client (BOOT_CLIENT_CREDENTIAL * client_credential, bool 
 	  rel_set_disk_compatible (boot_Server_credential.disk_compatibility);
 	}
 #endif /* CS_MODE */
-      if (sysprm_init_intl_param () != NO_ERROR)
+      if (BOOT_INIT_SHARED_MODULES (is_sub_client) && sysprm_init_intl_param () != NO_ERROR)
 	{
 	  error_code = er_errid ();
 	  goto error;
@@ -1276,13 +1362,14 @@ boot_register_and_init_client (BOOT_CLIENT_CREDENTIAL * client_credential, bool 
   /* Initialize client modules for execution */
   boot_client (tran_index, tran_lock_wait_msecs, tran_isolation);
 
-  if (!is_sub_client)
+  if (BOOT_INIT_SHARED_MODULES (is_sub_client))
     {
       oid_set_root (&boot_Server_credential.root_class_oid);
     }
   OID_INIT_TEMPID ();
 
-  sm_init (&boot_Server_credential.root_class_oid, &boot_Server_credential.root_class_hfid, is_sub_client);
+  sm_init (&boot_Server_credential.root_class_oid, &boot_Server_credential.root_class_hfid,
+	   !BOOT_INIT_SHARED_MODULES (is_sub_client));
   au_init ();			/* initialize authorization globals */
 
   /* start authorization and make sure the logged in user has access */
@@ -1292,7 +1379,7 @@ boot_register_and_init_client (BOOT_CLIENT_CREDENTIAL * client_credential, bool 
       return error_code;
     }
 
-  if (!is_sub_client)
+  if (BOOT_INIT_SHARED_MODULES (is_sub_client))
     {
       error_code = boot_client_find_and_cache_class_oids ();
       if (error_code != NO_ERROR)
@@ -1327,7 +1414,7 @@ boot_register_and_init_client (BOOT_CLIENT_CREDENTIAL * client_credential, bool 
 
   tr_init ();			/* initialize trigger manager */
 
-  if (!is_sub_client)
+  if (BOOT_INIT_SHARED_MODULES (is_sub_client))
     {
       /* TODO: how about to call es_init() only for normal client? */
       if (boot_Server_credential.lob_path[0] != '\0')
@@ -1353,7 +1440,7 @@ boot_register_and_init_client (BOOT_CLIENT_CREDENTIAL * client_credential, bool 
       return error_code;
     }
 
-  if (!is_sub_client)
+  if (BOOT_INIT_SHARED_MODULES (is_sub_client))
     {
       error_code = showstmt_metadata_init ();
       if (error_code != NO_ERROR)
@@ -1423,7 +1510,10 @@ boot_restart_client (BOOT_CLIENT_CREDENTIAL * client_credential)
       goto error;
     }
 
+#if !defined (SERVER_MODE)
+  /* the folded server's boot set it */
   pr_Enable_string_compression = prm_get_bool_value (PRM_ID_ENABLE_STRING_COMPRESSION);
+#endif
 
   // build db info
   db = boot_build_db_info (client_credential, NULL, &error_code);
@@ -1439,16 +1529,16 @@ boot_restart_client (BOOT_CLIENT_CREDENTIAL * client_credential)
 
   /*
    * Initialize the dynamic loader. Don't care about failures. If dynamic
-   * loader fails, methods will fail when they are invoked
+   * loader fails, methods will fail when they are invoked; the folded server's boot initialized its one loader
    */
-#if !defined(WINDOWS)
+#if !defined(WINDOWS) && !defined (SERVER_MODE)
 #if !defined (SOLARIS) && !defined(LINUX) && !defined(AIX)
   (void) dl_initiate_module (client_credential->get_program_name ());
 #else /* !SOLARIS && !LINUX && !AIX */
   (void) dl_initiate_module ();
 #endif /* !SOLARIS && !LINUX && !AIX */
   dl_initialized = true;
-#endif /* !WINDOWS */
+#endif /* !WINDOWS && !SERVER_MODE */
 
   /* read only mode? */
   if (prm_get_bool_value (PRM_ID_READ_ONLY_MODE) || BOOT_READ_ONLY_CLIENT_TYPE (client_credential->client_type))
@@ -2214,8 +2304,8 @@ boot_get_host_name (void)
   return boot_Host_name;
 }
 
-char *
-boot_get_ip (void)
+static void
+boot_initialize_ip (void)
 {
   struct hostent *hp = NULL;
   if (boot_Host_name[0] == '\0')
@@ -2228,6 +2318,15 @@ boot_get_ip (void)
       char *ip = inet_ntoa (*(struct in_addr *) *hp->h_addr_list);
       memcpy (boot_Ip_address, ip, 15);
     }
+}
+
+char *
+boot_get_ip (void)
+{
+#if !defined (SERVER_MODE)
+  /* the folded server resolved it once at its boot (boot_initialize_client_modules) */
+  boot_initialize_ip ();
+#endif
 
   return boot_Ip_address;
 }

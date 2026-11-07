@@ -89,6 +89,9 @@
 #if defined (SERVER_MODE)
 #include "thread_worker_pool.hpp"	// for cubthread::system_core_count
 #include "thread_manager.hpp"	// for thread_get_thread_entry_info
+#include "client_session_context.hpp"	// for csc_bracket_is_active
+
+extern thread_local unsigned int db_on_server;
 #endif // SERVER_MODE
 #include "string_regex.hpp"
 #if !defined (SERVER_MODE)
@@ -962,6 +965,15 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 #define PRM_TEST_CHANGE_ONLY(x)    ((x)->static_flag & PRM_TEST_CHANGE)
 #define PRM_IS_FOR_HA(x)           ((x)->static_flag & PRM_FOR_HA)
 #define PRM_IS_FOR_SESSION(x)	   ((x)->static_flag & PRM_FOR_SESSION)
+#define PRM_IS_CLIENT_COMPILE(x)   ((x)->static_flag & PRM_CLIENT_COMPILE)
+
+/* a change requested by the client half: the CS client's scope and value rules apply (in the folded server, a
+ * bracket in the client hat; its server half keeps the server's rules) */
+#if defined (SERVER_MODE)
+#define SYSPRM_IS_CLIENT_HALF()    (csc_bracket_is_active () && !db_on_server)
+#else
+#define SYSPRM_IS_CLIENT_HALF()    true
+#endif
 #define PRM_GET_FROM_SERVER(x)	   ((x)->static_flag & PRM_FORCE_SERVER)
 #define PRM_IS_FOR_QRY_STRING(x)   ((x)->static_flag & PRM_FOR_QRY_STRING)
 #define PRM_CLIENT_SESSION_ONLY(x) ((x)->static_flag & PRM_CLIENT_SESSION)
@@ -1551,7 +1563,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_WS_MEMORY_REPORT,
    PRM_NAME_WS_MEMORY_REPORT,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -1606,7 +1618,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_QO_DUMP,
    PRM_NAME_QO_DUMP,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -1652,7 +1664,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_RESET_TR_PARSER,
    PRM_NAME_RESET_TR_PARSER,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 10}},
@@ -1782,7 +1794,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_INSERT_MODE,
    PRM_NAME_INSERT_MODE,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 1 + 2}},
@@ -1806,7 +1818,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_HOSTVAR_LATE_BINDING,
    PRM_NAME_HOSTVAR_LATE_BINDING,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -1954,7 +1966,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_ORACLE_STYLE_OUTERJOIN,
    PRM_NAME_ORACLE_STYLE_OUTERJOIN,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -1966,7 +1978,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_ANSI_QUOTES,
    PRM_NAME_ANSI_QUOTES,
-   (PRM_FOR_CLIENT | PRM_TEST_CHANGE),
+   (PRM_FOR_CLIENT | PRM_TEST_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = true}},
@@ -2012,7 +2024,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_PIPES_AS_CONCAT,
    PRM_NAME_PIPES_AS_CONCAT,
-   (PRM_FOR_CLIENT | PRM_TEST_CHANGE),
+   (PRM_FOR_CLIENT | PRM_TEST_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = true}},
@@ -2023,7 +2035,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_MYSQL_TRIGGER_CORRELATION_NAMES,
    PRM_NAME_MYSQL_TRIGGER_CORRELATION_NAMES,
-   (PRM_FOR_CLIENT | PRM_TEST_CHANGE),
+   (PRM_FOR_CLIENT | PRM_TEST_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -2035,7 +2047,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_REQUIRE_LIKE_ESCAPE_CHARACTER,
    PRM_NAME_REQUIRE_LIKE_ESCAPE_CHARACTER,
-   (PRM_FOR_CLIENT | PRM_TEST_CHANGE | PRM_FOR_QRY_STRING),
+   (PRM_FOR_CLIENT | PRM_TEST_CHANGE | PRM_FOR_QRY_STRING | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -2138,7 +2150,7 @@ SYSPRM_PARAM prm_Def[] = {
 
   {PRM_ID_LIKE_TERM_SELECTIVITY,
    PRM_NAME_LIKE_TERM_SELECTIVITY,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_FLOAT,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.f = 0.1f}},
@@ -3038,7 +3050,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_XASL_DEBUG_DUMP,
    PRM_NAME_XASL_DEBUG_DUMP,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -3330,7 +3342,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_UNICODE_INPUT_NORMALIZATION,
    PRM_NAME_UNICODE_INPUT_NORMALIZATION,
-   (PRM_FOR_CLIENT | PRM_TEST_CHANGE),
+   (PRM_FOR_CLIENT | PRM_TEST_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -3341,7 +3353,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_UNICODE_OUTPUT_NORMALIZATION,
    PRM_NAME_UNICODE_OUTPUT_NORMALIZATION,
-   (PRM_FOR_CLIENT | PRM_TEST_CHANGE),
+   (PRM_FOR_CLIENT | PRM_TEST_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -3560,7 +3572,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_OPTIMIZER_ENABLE_MERGE_JOIN,
    PRM_NAME_OPTIMIZER_ENABLE_MERGE_JOIN,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -3899,7 +3911,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_OBJECT_PRINT_FORMAT_OID,
    PRM_NAME_OBJECT_PRINT_FORMAT_OID,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -5472,7 +5484,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_HOSTVAR_PEEKING,
    PRM_NAME_HOSTVAR_PEEKING,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -5484,7 +5496,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_DEFAULT_HISTOGRAM_BUCKET_COUNT,
    PRM_NAME_DEFAULT_HISTOGRAM_BUCKET_COUNT,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 300}},
@@ -5616,7 +5628,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_PLAN_CACHE_BIND_SENSITIVITY,
    PRM_NAME_PLAN_CACHE_BIND_SENSITIVITY,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -5646,7 +5658,7 @@ SYSPRM_PARAM prm_Def[] = {
    * equals the former 32768 on every page size. */
   {PRM_ID_COST_SEQ_PAGE,
    PRM_NAME_COST_SEQ_PAGE,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_FLOAT,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.f = 1.0f}},
@@ -5658,7 +5670,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_COST_RANDOM_PAGE,
    PRM_NAME_COST_RANDOM_PAGE,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_FLOAT,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.f = 1.0f}},
@@ -5670,7 +5682,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_COST_CPU_TUPLES_PER_PAGE,
    PRM_NAME_COST_CPU_TUPLES_PER_PAGE,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 400}},
@@ -5682,7 +5694,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_COST_EFFECTIVE_CACHE_PAGES,
    PRM_NAME_COST_EFFECTIVE_CACHE_PAGES,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 32768}},
@@ -5694,7 +5706,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_COST_HEAP_FETCH_PER_OID,
    PRM_NAME_COST_HEAP_FETCH_PER_OID,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 5}},
@@ -5708,7 +5720,7 @@ SYSPRM_PARAM prm_Def[] = {
    * bind values; 0 turns the feature off. The client-side compile chooses among them. */
   {PRM_ID_PLAN_CACHE_BIND_VARIANTS,
    PRM_NAME_PLAN_CACHE_BIND_VARIANTS,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 5}},
@@ -5738,7 +5750,7 @@ SYSPRM_PARAM prm_Def[] = {
    * PRM_FOR_QRY_STRING parameter. */
   {PRM_ID_ROW_SNAPSHOT_MAX_ROWS,
    PRM_NAME_ROW_SNAPSHOT_MAX_ROWS,
-   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING),
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_FOR_QRY_STRING | PRM_FOR_SESSION | PRM_CLIENT_COMPILE),
    PRM_INTEGER,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.i = 0}},
@@ -6700,14 +6712,22 @@ sysprm_load_and_init_internal (const char *db_name, const char *conf_file, bool 
   for (i = 0; i < MAX_SYSTEM_PARAMS; i++)
     {
       SYSPRM_PARAM *prm = GET_PRM (i);
-      if (PRM_IS_FOR_SESSION (prm) && (!PRM_IS_FOR_CLIENT (prm) || !PRM_USER_CAN_CHANGE (prm)))
+      if (PRM_IS_FOR_SESSION (prm)
+	  && (!PRM_IS_FOR_CLIENT (prm) || (!PRM_USER_CAN_CHANGE (prm) && !PRM_IS_CLIENT_COMPILE (prm))))
 	{
 	  /* session parameters can only be parameters for client that are changeable on-line */
 	  assert (0);
 	}
-      if (PRM_IS_FOR_SESSION (prm) && PRM_IS_HIDDEN (prm))
+      if (PRM_IS_FOR_SESSION (prm) && PRM_IS_HIDDEN (prm) && !PRM_IS_CLIENT_COMPILE (prm))
 	{
 	  /* hidden parameters are not allowed to use PRM_FOR_SESSION flag */
+	  assert (0);
+	}
+      if (PRM_IS_CLIENT_COMPILE (prm)
+	  && (!PRM_IS_FOR_SESSION (prm) || !PRM_IS_FOR_CLIENT (prm) || PRM_IS_FOR_SERVER (prm)
+	      || (!PRM_USER_CAN_CHANGE (prm) && !PRM_TEST_CHANGE_ONLY (prm))))
+	{
+	  /* a client-compile parameter is a client-only session parameter changeable on-line (or in test mode) */
 	  assert (0);
 	}
       if (PRM_CLIENT_SESSION_ONLY (prm) && (!PRM_IS_FOR_SERVER (prm) || !PRM_IS_FOR_SESSION (prm)))
@@ -6870,13 +6890,8 @@ prm_load_by_section (INI_TABLE * ini, const char *section, bool ignore_section, 
 	}
 #endif /* CS_MODE */
 
-#if defined (SERVER_MODE)
-      if (PRM_IS_FOR_CLIENT (prm) && !PRM_IS_FOR_SERVER (prm))
-	{
-	  /* prm for only client */
-	  continue;
-	}
-#endif /* SERVER_MODE */
+      /* SERVER_MODE loads the client-only parameters too: the folded client half reads them, with the values a
+       * client reading this file had (session parameters seed every session's copy) */
 
       if (reload && !PRM_IS_RELOADABLE (prm))
 	{
@@ -7594,7 +7609,6 @@ prm_check_environment (void)
 static SYSPRM_ERR
 sysprm_validate_escape_char_parameters (const SYSPRM_ASSIGN_VALUE * assignment_list)
 {
-  SYSPRM_PARAM *prm = NULL;
   const SYSPRM_ASSIGN_VALUE *assignment = NULL;
   bool set_require_like_escape, set_no_backslash_escape;
   bool is_require_like_escape = false, is_no_backslash_escape = false;
@@ -7619,16 +7633,15 @@ sysprm_validate_escape_char_parameters (const SYSPRM_ASSIGN_VALUE * assignment_l
       return PRM_ERR_NO_ERROR;
     }
 
+  /* the current values of this session (the folded client half's are its session's copies) */
   if (!set_no_backslash_escape)
     {
-      prm = GET_PRM (PRM_ID_NO_BACKSLASH_ESCAPES);
-      is_no_backslash_escape = PRM_GET_BOOL (prm->value);
+      is_no_backslash_escape = prm_get_bool_value (PRM_ID_NO_BACKSLASH_ESCAPES);
     }
 
   if (!set_require_like_escape)
     {
-      prm = GET_PRM (PRM_ID_REQUIRE_LIKE_ESCAPE_CHARACTER);
-      is_require_like_escape = PRM_GET_BOOL (prm->value);
+      is_require_like_escape = prm_get_bool_value (PRM_ID_REQUIRE_LIKE_ESCAPE_CHARACTER);
     }
 
   if (is_require_like_escape == true && is_no_backslash_escape == true)
@@ -7868,8 +7881,8 @@ sysprm_change_parameter_values (const SYSPRM_ASSIGN_VALUE * assignments, bool ch
   for (; assignments != NULL; assignments = assignments->next)
     {
       prm = GET_PRM (assignments->prm_id);
-#if defined (CS_MODE)
-      if (check)
+#if defined (CS_MODE) || defined (SERVER_MODE)
+      if (check && SYSPRM_IS_CLIENT_HALF ())
 	{
 	  if (!PRM_IS_FOR_CLIENT (prm))
 	    {
@@ -7879,7 +7892,7 @@ sysprm_change_parameter_values (const SYSPRM_ASSIGN_VALUE * assignments, bool ch
 	}
 #endif
 #if defined (SERVER_MODE)
-      if (check)
+      else if (check)
 	{
 	  if (!PRM_IS_FOR_SERVER (prm) && !PRM_IS_FOR_SESSION (prm))
 	    {
@@ -9081,8 +9094,8 @@ sysprm_generate_new_value (SYSPRM_PARAM * prm, const char *value, bool check, SY
       assert (prm->set_dup != NULL);
     }
 
-#if defined (CS_MODE)
-  if (check)
+#if defined (CS_MODE) || defined (SERVER_MODE)
+  if (check && SYSPRM_IS_CLIENT_HALF ())
     {
       /* check the scope of parameter */
       if (PRM_IS_FOR_CLIENT (prm))
@@ -9112,10 +9125,9 @@ sysprm_generate_new_value (SYSPRM_PARAM * prm, const char *value, bool check, SY
 	    }
 	}
     }
-#endif /* CS_MODE */
-
+#endif /* CS_MODE || SERVER_MODE */
 #if defined (SERVER_MODE)
-  if (check)
+  else if (check)
     {
       if (!PRM_IS_FOR_SERVER (prm) && !PRM_IS_FOR_SESSION (prm))
 	{
@@ -9136,8 +9148,8 @@ sysprm_generate_new_value (SYSPRM_PARAM * prm, const char *value, bool check, SY
     {
       set_min = true;
     }
-#if defined(CS_MODE)
-  if (!set_default)
+#if defined (CS_MODE) || defined (SERVER_MODE)
+  if (!set_default && SYSPRM_IS_CLIENT_HALF ())
     {
       if (prm->id == PRM_ID_INTL_NUMBER_LANG || prm->id == PRM_ID_INTL_DATE_LANG)
 	{
@@ -10988,22 +11000,50 @@ prm_get_name (PARAM_ID prm_id)
  *	 conn_entry->session_parameters is returned instead of the value
  *	 from prm_Def array.
  */
+#if defined (SERVER_MODE)
+/*
+ * sysprm_get_session_value () - the session's copy of a session parameter, or NULL for the process value
+ *
+ * return		 : session parameter or NULL
+ * prm_id (in)		 : parameter id
+ * client_half_only (in) : the session copy belongs to the folded client half only (a bracket in the client hat);
+ *			   the server half keeps the process value
+ */
+static SESSION_PARAM *
+sysprm_get_session_value (PARAM_ID prm_id, bool client_half_only)
+{
+  if (!PRM_SESSION_READTHROUGH (prm_id) || !BO_IS_SERVER_RESTARTED ())
+    {
+      return NULL;
+    }
+
+  THREAD_ENTRY *thread_p = thread_get_thread_entry_info ();
+  if (client_half_only)
+    {
+      if (!csc_bracket_is_active () || db_on_server)
+	{
+	  return NULL;
+	}
+      if (thread_p->conn_entry == NULL || thread_p->conn_entry->session_p == NULL)
+	{
+	  /* a client boot before its session exists reads the process value, as the CS client did before it
+	   * received its session parameters */
+	  return NULL;
+	}
+    }
+  return session_get_session_parameter (thread_p, prm_id);
+}
+#endif /* SERVER_MODE */
+
 SYSPRM_VALUE *
 prm_get_value (PARAM_ID prm_id)
 {
   assert (prm_id <= PRM_LAST_ID);
 #if defined (SERVER_MODE)
-  THREAD_ENTRY *thread_p;
-
-  if (PRM_SERVER_SESSION (prm_id) && BO_IS_SERVER_RESTARTED ())
+  SESSION_PARAM *sprm = sysprm_get_session_value (prm_id, PRM_CLIENT_ONLY_SESSION (prm_id));
+  if (sprm != NULL)
     {
-      SESSION_PARAM *sprm;
-      thread_p = thread_get_thread_entry_info ();
-      sprm = session_get_session_parameter (thread_p, prm_id);
-      if (sprm)
-	{
-	  return &(sprm->value);
-	}
+      return &(sprm->value);
     }
 #endif
 #if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
@@ -11083,6 +11123,17 @@ prm_set_integer_value (PARAM_ID prm_id, int value)
       }
   }
 #endif
+#if defined (SERVER_MODE)
+  {
+    /* the folded client half writes where it reads: its session's copy */
+    SESSION_PARAM *sprm = sysprm_get_session_value (prm_id, true);
+    if (sprm != NULL)
+      {
+	sprm->value.i = value;
+	return;
+      }
+  }
+#endif
 
   PRM_GET_INT (GET_PRM (prm_id)->value) = value;
 
@@ -11113,6 +11164,17 @@ prm_set_bool_value (PARAM_ID prm_id, bool value)
       }
   }
 #endif
+#if defined (SERVER_MODE)
+  {
+    /* the folded client half writes where it reads: its session's copy */
+    SESSION_PARAM *sprm = sysprm_get_session_value (prm_id, true);
+    if (sprm != NULL)
+      {
+	sprm->value.b = value;
+	return;
+      }
+  }
+#endif
 
   PRM_GET_BOOL (GET_PRM (prm_id)->value) = value;
 
@@ -11139,6 +11201,17 @@ prm_set_float_value (PARAM_ID prm_id, float value)
     sub_client_value.f = value;
     if (sysprm_set_sub_client_session_value (prm_id, sub_client_value))
       {
+	return;
+      }
+  }
+#endif
+#if defined (SERVER_MODE)
+  {
+    /* the folded client half writes where it reads: its session's copy */
+    SESSION_PARAM *sprm = sysprm_get_session_value (prm_id, true);
+    if (sprm != NULL)
+      {
+	sprm->value.f = value;
 	return;
       }
   }
@@ -12663,6 +12736,28 @@ sysprm_print_parameters_for_qry_string (void)
 	  if (PRM_IS_FOR_QRY_STRING (&sub_client_prm) && sysprm_compare_values (&sub_client_prm) != 0)
 	    {
 	      n = prm_print (&sub_client_prm, ptr, len, PRM_PRINT_ID, PRM_PRINT_CURR_VAL);
+	      ptr += n;
+	      len -= n;
+
+	      *ptr++ = ';';
+	      len--;
+	      assert (len > 0);
+	    }
+	  continue;
+	}
+#endif
+#if defined (SERVER_MODE)
+      SESSION_PARAM *sprm = sysprm_get_session_value ((PARAM_ID) i, true);
+      if (sprm != NULL)
+	{
+	  /* the folded client half: print the value of this thread's session, if it differs from the default value
+	   * (the process value is another session's or nobody's) */
+	  SYSPRM_PARAM session_prm = *GET_PRM (i);
+
+	  session_prm.value.v = sprm->value;
+	  if (PRM_IS_FOR_QRY_STRING (&session_prm) && sysprm_compare_values (&session_prm) != 0)
+	    {
+	      n = prm_print (&session_prm, ptr, len, PRM_PRINT_ID, PRM_PRINT_CURR_VAL);
 	      ptr += n;
 	      len -= n;
 

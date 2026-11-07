@@ -57,6 +57,10 @@
 #include "memory_hash.h"	/* MHT_HLS_ENTRY for hash-join spill cost */
 #include "histogram_cl.hpp"
 #include "jsp_cl.h"		/* jsp_is_sp_parallel_eligible () */
+#if defined (SERVER_MODE)
+#include <climits>
+#include "client_session_context.hpp"
+#endif
 
 #define TEST_DUMP_PLAN_SCAN_COST 0
 #define TEST_DUMP_PLAN_SORT_COST 0
@@ -605,6 +609,37 @@ QO_PLAN_VTBL *all_vtbls[] = {
   &qo_set_follow_plan_vtbl,
   &qo_worst_plan_vtbl
 };
+
+#if defined (SERVER_MODE)
+/* the folded client half: SET OPTIMIZATION COST belongs to the session, two bits per all_vtbls entry in its client
+ * context (0 default, 1 zero, 2 worst); the vtables stay shared and immutable */
+static_assert (DIM (all_vtbls) * 2 <= sizeof (unsigned int) * CHAR_BIT, "the cost policy must fit its session word");
+
+typedef void (*QO_PLAN_COST_FUNC) (QO_PLAN *);
+
+static QO_PLAN_COST_FUNC
+qo_plan_cost_fn (const QO_PLAN_VTBL * vtbl)
+{
+  unsigned int overrides = csc_bracket_is_active ()? csc_current ()->qo_cost_overrides : 0;
+
+  if (overrides != 0)
+    {
+      for (int i = 0; i < (int) DIM (all_vtbls); i++)
+	{
+	  if (all_vtbls[i] == vtbl)
+	    {
+	      unsigned int cost = (overrides >> (2 * i)) & 3u;
+	      return cost == 1 ? &qo_zero_cost : (cost == 2 ? &qo_worst_cost : vtbl->cost_fn);
+	    }
+	}
+    }
+  return vtbl->cost_fn;
+}
+
+#define QO_PLAN_COST_FN(vtbl) (qo_plan_cost_fn (vtbl))
+#else /* SERVER_MODE */
+#define QO_PLAN_COST_FN(vtbl) ((vtbl)->cost_fn)
+#endif /* SERVER_MODE */
 
 static double qo_or_selectivity (QO_ENV * env, double lhs_sel, double rhs_sel);
 
@@ -1620,7 +1655,7 @@ qo_plan_compute_cost (QO_PLAN * plan)
   BITSET_ITERATOR iter;
 
   /* This computes the specific cost characteristics for each plan. */
-  (*(plan->vtbl)->cost_fn) (plan);
+  (*QO_PLAN_COST_FN (plan->vtbl)) (plan);
 
   /* When computing the cost for a WORST_PLAN, we'll get in here without a backing info node; just work around it. */
   if (plan->info == NULL)
@@ -4219,7 +4254,7 @@ qo_sort_cost (QO_PLAN * planp)
 	{
 	  double save_ncard = QO_NODE_NCARD (subplanp->plan_un.scan.node);
 	  QO_NODE_NCARD (subplanp->plan_un.scan.node) = (double) db_get_bigint (&QO_ENV_LIMIT_VALUE (planp->info->env));
-	  (*(subplanp->vtbl)->cost_fn) (subplanp);
+	  (*QO_PLAN_COST_FN (subplanp->vtbl)) (subplanp);
 	  QO_NODE_NCARD (subplanp->plan_un.scan.node) = save_ncard;
 	}
 
@@ -8921,8 +8956,8 @@ qo_plan_dump_cost_params (FILE * output)
     {
       const SYSPRM_PARAM *prm = GET_PRM (cost_prm[i]);
 
-      if (PRM_IS_FLOAT (prm) ? (PRM_GET_FLOAT (prm->value) != PRM_GET_FLOAT (prm->default_value))
-	  : (PRM_GET_INT (prm->value) != PRM_GET_INT (prm->default_value)))
+      if (PRM_IS_FLOAT (prm) ? (prm_get_float_value (cost_prm[i]) != PRM_GET_FLOAT (prm->default_value))
+	  : (prm_get_integer_value (cost_prm[i]) != PRM_GET_INT (prm->default_value)))
 	{
 	  tuned = true;
 	  break;
@@ -9002,11 +9037,11 @@ qo_plan_get_cost_fn (const char *plan_name)
     {
       if (intl_mbs_ncasecmp (plan_name, all_vtbls[i]->plan_string, strlen (all_vtbls[i]->plan_string)) == 0)
 	{
-	  if (all_vtbls[i]->cost_fn == &qo_zero_cost)
+	  if (QO_PLAN_COST_FN (all_vtbls[i]) == &qo_zero_cost)
 	    {
 	      cost = '0';
 	    }
-	  else if (all_vtbls[i]->cost_fn == &qo_worst_cost)
+	  else if (QO_PLAN_COST_FN (all_vtbls[i]) == &qo_worst_cost)
 	    {
 	      cost = 'i';
 	    }
@@ -9041,6 +9076,8 @@ qo_plan_set_cost_fn (const char *plan_name, int fn)
     {
       if (intl_mbs_ncasecmp (plan_name, all_vtbls[i]->plan_string, strlen (all_vtbls[i]->plan_string)) == 0)
 	{
+	  void (*new_cost_fn) (QO_PLAN *) = all_vtbls[i]->default_cost;
+
 	  switch (fn)
 	    {
 	    case 0:
@@ -9049,7 +9086,7 @@ qo_plan_set_cost_fn (const char *plan_name, int fn)
 	    case 'B':		/* BEST */
 	    case 'z':		/* zero */
 	    case 'Z':		/* ZERO */
-	      all_vtbls[i]->cost_fn = &qo_zero_cost;
+	      new_cost_fn = &qo_zero_cost;
 	      break;
 
 	    case 1:
@@ -9058,13 +9095,23 @@ qo_plan_set_cost_fn (const char *plan_name, int fn)
 	    case 'I':		/* INFINITE */
 	    case 'w':		/* worst */
 	    case 'W':		/* WORST */
-	      all_vtbls[i]->cost_fn = &qo_worst_cost;
+	      new_cost_fn = &qo_worst_cost;
 	      break;
 
 	    default:
-	      all_vtbls[i]->cost_fn = all_vtbls[i]->default_cost;
 	      break;
 	    }
+#if defined (SERVER_MODE)
+	  if (!csc_bracket_is_active ())
+	    {
+	      return NULL;
+	    }
+	  unsigned int cost = new_cost_fn == &qo_zero_cost ? 1u : (new_cost_fn == &qo_worst_cost ? 2u : 0u);
+	  unsigned int &overrides = csc_current ()->qo_cost_overrides;
+	  overrides = (overrides & ~(3u << (2 * i))) | (cost << (2 * i));
+#else /* SERVER_MODE */
+	  all_vtbls[i]->cost_fn = new_cost_fn;
+#endif /* SERVER_MODE */
 	  return all_vtbls[i]->plan_string;
 	}
     }

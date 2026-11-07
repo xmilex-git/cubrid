@@ -168,15 +168,6 @@ static int classobj_partition_info_size (SM_PARTITION * partition_info);
 int
 classobj_area_init (void)
 {
-#if defined (SERVER_MODE)
-  if (Template_area != NULL)
-    {
-      /* process-shared in the folded server: the first session (or the server
-       * boot) creates it, later sessions reuse it */
-      return NO_ERROR;
-    }
-#endif
-
   Template_area = area_create ("Schema templates", sizeof (SM_TEMPLATE), 4);
   if (Template_area == NULL)
     {

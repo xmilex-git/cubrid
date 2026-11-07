@@ -141,7 +141,9 @@ static int db_Client_type = DB_CLIENT_TYPE_DEFAULT;
 static CUBRID_STMT_TYPE db_Client_statement_type = CUBRID_STMT_NONE;
 #endif
 
+#if !defined (SERVER_MODE)
 static void install_static_methods (void);
+#endif
 static int fetch_set_internal (DB_SET * set, DB_FETCH_MODE purpose, int quit_on_error);
 #if !defined(WINDOWS)
 void sigfpe_handler (int sig);
@@ -289,11 +291,13 @@ db_check_no_sub_client_and_block (const char *api_name)
  * return  : none
  *
  */
+#if !defined (SERVER_MODE)
 static void
 install_static_methods (void)
 {
   db_install_static_methods ();	/* Authorization classes */
 }
+#endif /* !SERVER_MODE */
 
 #if defined(SA_MODE)
 /*
@@ -1129,6 +1133,8 @@ db_restart (const char *program, int print_version, const char *volume)
 	{
 	  db_Connect_status = DB_CONNECTION_STATUS_CONNECTED;
 	  strncpy (db_Database_name, volume, DB_MAX_IDENTIFIER_LENGTH);
+#if !defined (SERVER_MODE)
+	  /* the folded server installed its static methods once at its boot, and its signal handlers are its own */
 	  install_static_methods ();
 #if !defined(WINDOWS)
 #if defined(SA_MODE) && (defined(LINUX) || defined(x86_SOLARIS))
@@ -1137,6 +1143,7 @@ db_restart (const char *program, int print_version, const char *volume)
 	  prev_sigfpe_handler = os_set_signal_handler (SIGFPE, sigfpe_handler);
 #endif /* SA_MODE && (LINUX||X86_SOLARIS) */
 #endif /* !WINDOWS */
+#endif /* !SERVER_MODE */
 #if defined(CS_MODE) && defined(MULTI_CONN_TO_A_SERVER)
 	  {
 	    std::lock_guard < std::mutex > lock (g_sub_client_mutex);
@@ -1322,7 +1329,7 @@ db_shutdown (void)
   db_Database_name[0] = '\0';
   db_Connect_status = DB_CONNECTION_STATUS_NOT_CONNECTED;
   db_Program_name[0] = '\0';
-#if !defined(WINDOWS)
+#if !defined(WINDOWS) && !defined (SERVER_MODE)
   (void) os_set_signal_handler (SIGFPE, prev_sigfpe_handler);
 #endif
   db_Disable_modifications = 0;

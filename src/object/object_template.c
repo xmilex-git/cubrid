@@ -169,15 +169,6 @@ static void free_temp_object (MOP obj);
 int
 obt_area_init (void)
 {
-#if defined (SERVER_MODE)
-  if (Template_area != NULL)
-    {
-      /* process-shared in the folded server: the first session (or the server
-       * boot) creates it, later sessions reuse it */
-      return NO_ERROR;
-    }
-#endif
-
   Template_area = area_create ("Object templates", sizeof (OBJ_TEMPLATE), 32);
   if (Template_area == NULL)
     {

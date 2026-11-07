@@ -682,6 +682,10 @@ extern "C"
 
 #define PRM_FOR_PL_CONTEXT  0x00020000	/* is for PL parameter */
 
+#define PRM_CLIENT_COMPILE  0x00040000	/* client-only parameter the client half reads while compiling or rendering;
+					 * a session parameter so that the folded server keeps one value per session,
+					 * hidden and test-only ones included */
+
 #define PRM_DEPRECATED      0x40000000	/* is deprecated */
 #define PRM_OBSOLETED       0x80000000	/* is obsoleted */
 
@@ -733,6 +737,13 @@ extern "C"
 #define SERVER_SESSION_MASK  ((PRM_FOR_SESSION | PRM_FOR_SERVER) | PRM_CLIENT_SESSION)	// 0x00000904
 #define SERVER_SESSION_CHCK  ((PRM_FOR_SESSION | PRM_FOR_SERVER) & ~PRM_CLIENT_SESSION)	// 0x00000104
 #define PRM_SERVER_SESSION(id)  (((GET_PRM (id))->static_flag & SERVER_SESSION_MASK) == SERVER_SESSION_CHCK)
+
+/* client-only session parameters: the folded server's client half reads them from the session (the CS client read
+ * its own copy); its server half keeps reading the process value, as a server always did */
+#define CLIENT_ONLY_SESSION_MASK  (PRM_FOR_SESSION | PRM_FOR_CLIENT | PRM_FOR_SERVER)
+#define CLIENT_ONLY_SESSION_CHCK  (PRM_FOR_SESSION | PRM_FOR_CLIENT)
+#define PRM_CLIENT_ONLY_SESSION(id)  (((GET_PRM (id))->static_flag & CLIENT_ONLY_SESSION_MASK) == CLIENT_ONLY_SESSION_CHCK)
+#define PRM_SESSION_READTHROUGH(id)  (PRM_SERVER_SESSION (id) || PRM_CLIENT_ONLY_SESSION (id))
 
 /*
  * for PRM_ID_PARALLELISM
@@ -895,7 +906,7 @@ extern "C"
     assert (PRM_IS_INTEGER (GET_PRM (prm_id)) || PRM_IS_KEYWORD (GET_PRM (prm_id)));
 
 #if defined (SERVER_MODE)
-    if (PRM_SERVER_SESSION (prm_id))
+    if (PRM_SESSION_READTHROUGH (prm_id))
       {
 	return PRM_GET_INT_P (prm_get_value (prm_id));
       }
@@ -921,7 +932,7 @@ extern "C"
     assert (PRM_IS_BOOLEAN (GET_PRM (prm_id)));
 
 #if defined (SERVER_MODE)
-    if (PRM_SERVER_SESSION (prm_id))
+    if (PRM_SESSION_READTHROUGH (prm_id))
       {
 	return PRM_GET_BOOL_P (prm_get_value (prm_id));
       }
@@ -947,7 +958,7 @@ extern "C"
     assert (PRM_IS_FLOAT (GET_PRM (prm_id)));
 
 #if defined (SERVER_MODE)
-    if (PRM_SERVER_SESSION (prm_id))
+    if (PRM_SESSION_READTHROUGH (prm_id))
       {
 	return PRM_GET_FLOAT_P (prm_get_value (prm_id));
       }
@@ -973,7 +984,7 @@ extern "C"
     assert (PRM_IS_STRING (GET_PRM (prm_id)));
 
 #if defined (SERVER_MODE)
-    if (PRM_SERVER_SESSION (prm_id))
+    if (PRM_SESSION_READTHROUGH (prm_id))
       {
 	return PRM_GET_STRING_P (prm_get_value (prm_id));
       }
@@ -1000,7 +1011,7 @@ extern "C"
     assert (PRM_IS_INTEGER_LIST (GET_PRM (prm_id)));
 
 #if defined (SERVER_MODE)
-    if (PRM_SERVER_SESSION (prm_id))
+    if (PRM_SESSION_READTHROUGH (prm_id))
       {
 	return PRM_GET_INTEGER_LIST_P (prm_get_value (prm_id));
       }
@@ -1026,7 +1037,7 @@ extern "C"
     assert (PRM_IS_BIGINT (GET_PRM (prm_id)));
 
 #if defined (SERVER_MODE)
-    if (PRM_SERVER_SESSION (prm_id))
+    if (PRM_SESSION_READTHROUGH (prm_id))
       {
 	return PRM_GET_BIGINT_P (prm_get_value (prm_id));
       }

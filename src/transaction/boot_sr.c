@@ -87,6 +87,7 @@
 #include "system_metadata_version.h"
 
 #if defined(SERVER_MODE)
+#include "boot_cl.h"
 #include "connection_sr.h"
 #include "server_support.h"
 #include "pl_sr.h"
@@ -2690,6 +2691,15 @@ boot_restart_server (THREAD_ENTRY * thread_p, bool print_restart, const char *db
       goto error;
     }
 
+#if defined (SERVER_MODE)
+  /* the client-half modules every in-process session shares, before the server accepts a session */
+  error_code = boot_initialize_client_modules ();
+  if (error_code != NO_ERROR)
+    {
+      goto error;
+    }
+#endif /* SERVER_MODE */
+
   error_code = session_states_init (thread_p);
   if (error_code != NO_ERROR)
     {
@@ -3925,6 +3935,9 @@ boot_server_all_finalize (THREAD_ENTRY * thread_p, ER_FINAL_CODE is_er_final,
 
   if (shutdown_common_modules == BOOT_SHUTDOWN_ALL_MODULES)
     {
+#if defined (SERVER_MODE)
+      boot_finalize_client_modules ();
+#endif /* SERVER_MODE */
       es_final ();
       /* the key pair table's string targets are cached domains */
       domain_type_pair_table_final ();

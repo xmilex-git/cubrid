@@ -91,6 +91,9 @@ class client_session_context
     /* the plan dump file the session's requests name (db_query_plan_dump_file) */
     char *plan_dump_filename = nullptr;
 
+    /* query_planner.c: SET OPTIMIZATION COST, two bits per plan kind (0 = every plan at its default cost) */
+    unsigned int qo_cost_overrides = 0;
+
     /* set when the session ended from inside this very context (its last
      * reference was dropped by the bracket's own thread): the bracket exit
      * tears it down and deletes it */

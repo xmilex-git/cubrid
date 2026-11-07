@@ -2409,9 +2409,11 @@ ws_init (bool is_sub)
 	}
     }
 
+#if !defined (SERVER_MODE)
   /*
    * area_init() must have been called earlier.
    * These need to all be returning errors !
+   * The folded server's boot created them for every session (boot_initialize_client_modules).
    */
   error_code = ws_area_init ();	/* object lists */
   if (error_code != NO_ERROR)
@@ -2438,6 +2440,7 @@ ws_init (bool is_sub)
     {
       goto error;
     }
+#endif /* !SERVER_MODE */
 
   /* build the MOP table */
   ws_Mop_table_size = prm_get_integer_value (PRM_ID_WS_HASHTABLE_SIZE);
@@ -4101,15 +4104,6 @@ ws_need_flush (void)
 int
 ws_area_init (void)
 {
-#if defined (SERVER_MODE)
-  if (Objlist_area != NULL)
-    {
-      /* process-shared in the folded server: the first session (or the server
-       * boot) creates it, later sessions reuse it */
-      return NO_ERROR;
-    }
-#endif
-
   Objlist_area = area_create ("Object list links", sizeof (DB_OBJLIST), OBJLIST_AREA_COUNT);
   if (Objlist_area == NULL)
     {

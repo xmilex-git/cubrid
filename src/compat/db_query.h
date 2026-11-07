@@ -238,7 +238,7 @@ extern "C"
   extern int db_query_end_internal (DB_QUERY_RESULT * result, bool notify_server);
 
   extern void db_clear_client_query_result (int notify_server, bool end_holdable);
-#if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
+#if (defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)) || defined (SERVER_MODE)
   extern void db_final_client_query_result (void);
 #endif
   extern void db_init_prepare_info (DB_PREPARE_INFO * info);

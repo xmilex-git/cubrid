@@ -1772,15 +1772,6 @@ const PR_TYPE *tp_Type_resultset = &tp_ResultSet;
 int
 pr_area_init (void)
 {
-#if defined (SERVER_MODE)
-  if (Value_area != NULL)
-    {
-      /* process-shared in the folded server: the first session (or the server
-       * boot) creates it, later sessions reuse it */
-      return NO_ERROR;
-    }
-#endif
-
   Value_area = area_create ("Value containers", sizeof (DB_VALUE), VALUE_AREA_COUNT);
   if (Value_area == NULL)
     {
