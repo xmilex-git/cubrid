@@ -84,7 +84,59 @@ extern CUB_THREAD_LOCAL ROOT_CLASS sm_Root_class;
 
 extern const char TEXT_CONSTRAINT_PREFIX[];
 
+/*
+ * SCHEMA_DEFINITION
+ *
+ * description:
+ *    Maintains information about an SQL schema.
+ */
+
+/*
+   NOTE: This is simple-minded implementation for now since we don't yet
+         support CREATE SCHEMA, SET SCHEMA, and associated statements.
+ */
+
+typedef struct schema_def
+{
+
+  /* This is the default qualifier for class/vclass names */
+  char name[DB_MAX_SCHEMA_LENGTH * INTL_UTF8_MAX_CHAR_SIZE + 4];
+
+  /* The only user who can delete this schema. */
+  /* But, note that entry level doesn't support DROP SCHEMA anyway */
+  MOP owner;
+
+  /* The next three items are currently not used at all. They are simply a reminder of future TODOs. Although entry
+   * level SQL leaves out many schema management functions, entry level SQL does include specification of tables,
+   * views, and grants as part of CREATE SCHEMA statements. */
+
+  void *tables;			/* unused dummy */
+  void *views;			/* unused dummy */
+  void *grants;			/* unused dummy */
+
+} SCHEMA_DEF;
+
+#if defined (SERVER_MODE)
+/* The folded server keeps the schema manager's session state per session
+ * (client_session_context).  sm_Root_class and sm_Root_class_hfid stay process
+ * wide: sm_init writes them with the same database constants. */
+// *INDENT-OFF*
+struct sm_context
+{
+  MOP root_class_mop = NULL;
+  struct sm_descriptor *descriptors = NULL;
+  unsigned int local_schema_version = 0;
+  unsigned int global_schema_version = 0;
+  SCHEMA_DEF current_schema = {};
+};
+// *INDENT-ON*
+
+extern struct sm_context *csc_sm (void);
+
+#define sm_Root_class_mop (csc_sm ()->root_class_mop)
+#else /* SERVER_MODE */
 extern CUB_THREAD_LOCAL MOP sm_Root_class_mop;
+#endif /* !SERVER_MODE */
 extern CUB_THREAD_LOCAL HFID *sm_Root_class_hfid;
 extern const char *sm_Root_class_name;
 

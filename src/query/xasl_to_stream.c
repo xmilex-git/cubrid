@@ -66,31 +66,34 @@ struct xts_visited_ptr
   int offset;			/* offset where the node pointed by 'ptr' is stored */
 };
 
+/* the packing state lives for one xts_map_*_to_stream call on one thread */
+#include "csql_parser_tls.h"
+
 /* linear byte stream to store the given XASL tree */
-static char *xts_Stream_buffer = NULL;	/* pointer to the stream */
-static int xts_Stream_size = 0;	/* # of bytes allocated */
-static int xts_Free_offset_in_stream = 0;
-static int xts_id_serial = 0;
+static CSQL_PARSER_TLS char *xts_Stream_buffer = NULL;	/* pointer to the stream */
+static CSQL_PARSER_TLS int xts_Stream_size = 0;	/* # of bytes allocated */
+static CSQL_PARSER_TLS int xts_Free_offset_in_stream = 0;
+static CSQL_PARSER_TLS int xts_id_serial = 0;
 
 /* blocks of visited pointer constants */
-static XTS_VISITED_PTR *xts_Ptr_blocks[MAX_PTR_BLOCKS] = { 0 };
+static CSQL_PARSER_TLS XTS_VISITED_PTR *xts_Ptr_blocks[MAX_PTR_BLOCKS] = { 0 };
 
 /* low-water-mark of visited pointers */
-static int xts_Ptr_lwm[MAX_PTR_BLOCKS] = { 0 };
-static int xts_Ptr_max[MAX_PTR_BLOCKS] = { 0 };
+static CSQL_PARSER_TLS int xts_Ptr_lwm[MAX_PTR_BLOCKS] = { 0 };
+static CSQL_PARSER_TLS int xts_Ptr_max[MAX_PTR_BLOCKS] = { 0 };
 
 /* error code specific to this file */
-static int xts_Xasl_errcode = NO_ERROR;
+static CSQL_PARSER_TLS int xts_Xasl_errcode = NO_ERROR;
 
 /* CBRD-27583: a filter index predicate, a function index or a partition expression stream is being packed - it
  * carries no comparison decision (its unpack decides, stx_decide_stream_compare) */
-static bool xts_Index_stream = false;
+static CSQL_PARSER_TLS bool xts_Index_stream = false;
 
 /* CBRD-27361: while a node's outptr list is packed, the node's single heap scan whose data filter the list's program
  * may read (qexec_set_expr_share_spec ()) */
-static const ACCESS_SPEC_TYPE *xts_Outptr_share_spec = NULL;
+static CSQL_PARSER_TLS const ACCESS_SPEC_TYPE *xts_Outptr_share_spec = NULL;
 /* CBRD-27361: likewise while a BUILDVALUE node's proc is packed, for its aggregate list's operand program */
-static const ACCESS_SPEC_TYPE *xts_Agg_share_spec = NULL;
+static CSQL_PARSER_TLS const ACCESS_SPEC_TYPE *xts_Agg_share_spec = NULL;
 
 static int xts_save_aggregate_type (const AGGREGATE_TYPE * aggregate);
 static int xts_save_function_type (const FUNCTION_TYPE * function);

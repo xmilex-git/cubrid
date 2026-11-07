@@ -62,6 +62,9 @@
 
 #include <openssl/crypto.h>
 
+#if defined (SERVER_MODE)
+#include "client_session_context.hpp"
+#endif
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -147,6 +150,11 @@ struct session_state
 
   load_session *load_session_p;
   PL_SESSION *pl_session_p;
+#if defined (SERVER_MODE)
+  /* the folded client half's context of this session: the session owns it,
+   * threads reach it only through activation brackets */
+  client_session_context *csc_p;
+#endif
 
   // *INDENT-OFF*
   session_state ();
@@ -330,6 +338,9 @@ session_state_init (void *st)
   session_p->auto_commit = false;
   session_p->load_session_p = NULL;
   session_p->pl_session_p = NULL;
+#if defined (SERVER_MODE)
+  session_p->csc_p = NULL;
+#endif
   memset (session_p->secret, 0, SESSION_SECRET_SIZE);
 
   return NO_ERROR;
@@ -360,6 +371,18 @@ session_state_uninit (void *st)
 #endif /* SESSION_DEBUG */
 
   session_stop_attached_threads (thread_p, session);
+
+#if defined (SERVER_MODE)
+  if (session->csc_p != NULL)
+    {
+      /* the last reference is gone: no other thread can reach the context
+       * through this session; a thread still inside it (its last client, or
+       * this very thread ending its own session) is waited for or left the
+       * teardown (csc_retire_and_delete) */
+      csc_retire_and_delete (session->csc_p);
+      session->csc_p = NULL;
+    }
+#endif
 
   if (session->pl_session_p)
     {
@@ -2197,22 +2220,27 @@ session_get_variable (THREAD_ENTRY * thread_p, const DB_VALUE * name, DB_VALUE *
  * name (in)	 : name of the variable
  * value (in/out): variable value
  * Note: This function gets a reference to a session variable from the session
- * state object. Because it gets the actual pointer, it is not thread safe
- * and it should only be called in the stand alone mode
+ * state object. Because it gets the actual pointer, it is only safe where the
+ * session belongs to the calling thread: the stand alone mode, or the folded
+ * client half under its activation bracket
  */
 int
 session_get_variable_no_copy (THREAD_ENTRY * thread_p, const DB_VALUE * name, DB_VALUE ** result)
 {
-  SESSION_ID id;
   SESSION_STATE *state_p = NULL;
   size_t name_len;
   const char *name_str;
   SESSION_VARIABLE *var;
 
 #if defined (SERVER_MODE)
-  /* do not call this function in a multi-threaded context */
-  assert (false);
-  return ER_FAILED;
+  /* the folded client half takes the reference under its activation bracket,
+   * where the session belongs to the requesting thread (the SA shape); any
+   * other multi-threaded caller is a bug */
+  if (!csc_bracket_is_active ())
+    {
+      assert (false);
+      return ER_FAILED;
+    }
 #endif
 
   assert (name != NULL);
@@ -2222,15 +2250,10 @@ session_get_variable_no_copy (THREAD_ENTRY * thread_p, const DB_VALUE * name, DB
   name_str = db_get_string (name);
   name_len = (name_str != NULL) ? strlen (name_str) : 0;
 
-  if (session_get_session_id (thread_p, &id) != NO_ERROR)
-    {
-      return ER_FAILED;
-    }
-
-  state_p = sessions.states_hashmap.find (thread_p, id);
+  /* SERVER_MODE: the conn_entry's session, without the hashmap entry mutex find () would return held */
+  state_p = session_get_session_state (thread_p);
   if (state_p == NULL)
     {
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_SES_SESSION_EXPIRED, 0);
       return ER_FAILED;
     }
 
@@ -2949,6 +2972,31 @@ session_get_session_state (THREAD_ENTRY * thread_p)
   return state_p;
 #endif
 }
+
+#if defined (SERVER_MODE)
+/*
+ * session_adopt_client_context () - make the calling thread's session the
+ *				     owner of a folded client half's context
+ *   return  : NO_ERROR or ER_FAILED (no session on the connection)
+ *   thread_p(in)  :
+ *   csc(in) : the context; retired by session_state_uninit
+ */
+int
+session_adopt_client_context (THREAD_ENTRY * thread_p, client_session_context * csc)
+{
+  SESSION_STATE *state_p = session_get_session_state (thread_p);
+
+  if (state_p == NULL)
+    {
+      return ER_FAILED;
+    }
+
+  assert (state_p->csc_p == NULL || state_p->csc_p == csc);
+  state_p->csc_p = csc;
+
+  return NO_ERROR;
+}
+#endif /* SERVER_MODE */
 
 /*
  * session_get_trace_stats () - return query trace result

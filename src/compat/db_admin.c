@@ -108,9 +108,20 @@ struct db_host_status_list
  The macros for testing this variable were moved to db.h so the query
  interface functions can use them as well. */
 
+#if defined (SERVER_MODE)
+/* the session's db_cl_context (db.h) */
+#define db_Client_ip_addr (csc_db ()->client_ip_addr)
+#define db_Client_type (csc_db ()->client_type)
+#define db_Client_statement_type (csc_db ()->client_statement_type)
+#define db_Keep_session (csc_db ()->keep_session)
+#define db_Session_secret (csc_db ()->session_secret)
+#define db_Row_count (csc_db ()->row_count)
+#define is_doing_end_session (csc_db ()->is_doing_end_session)
+#else
 char db_Database_name[DB_MAX_IDENTIFIER_LENGTH + 1];
 char db_Program_name[PATH_MAX];
 char db_Client_ip_addr[16] = { 0 };
+#endif
 
 static char *db_Preferred_hosts = NULL;
 static int db_Connect_order = DB_CONNECT_ORDER_SEQ;
@@ -123,8 +134,12 @@ static DB_HOST_STATUS_LIST db_Host_status_list;
 static DB_HOST_STATUS *db_add_host_status (char *hostname, int status);
 static DB_HOST_STATUS *db_find_host_status (char *hostname);
 
+#if !defined (SERVER_MODE)
 static int db_Client_type = DB_CLIENT_TYPE_DEFAULT;
+#endif
+#if !defined (SERVER_MODE)
 static CUBRID_STMT_TYPE db_Client_statement_type = CUBRID_STMT_NONE;
+#endif
 
 static void install_static_methods (void);
 static int fetch_set_internal (DB_SET * set, DB_FETCH_MODE purpose, int quit_on_error);
@@ -134,10 +149,18 @@ void sigfpe_handler (int sig);
 
 /*  db_Keep_session is set to true only when the mode is CAS; 
  * otherwise, there is no code that resets it to false except for the initialization */
+#if !defined (SERVER_MODE)
 static bool db_Keep_session = false;
+#endif
+#if !defined (SERVER_MODE)
 CUB_THREAD_LOCAL SESSION_ID db_Session_id = DB_EMPTY_SESSION;
+#endif
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL char db_Session_secret[SESSION_SECRET_SIZE];
+#endif
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL int db_Row_count = DB_ROW_COUNT_NOT_SET;
+#endif
 
 #if defined(CS_MODE) && defined(MULTI_CONN_TO_A_SERVER)
 static BOOT_CLIENT_CREDENTIAL gv_client_credential;
@@ -1077,7 +1100,7 @@ db_restart (const char *program, int print_version, const char *volume)
     }
   else
     {
-      strncpy_bufsize (db_Program_name, program);
+      snprintf (db_Program_name, sizeof (db_Program_name), "%s", program);
       db_Database_name[0] = '\0';
 
       /* authorization will need to access the database and call some db_ functions so assume connection will be ok
@@ -1426,7 +1449,9 @@ db_enable_modification (void)
  *
  * NOTE: This function ends the session identified by 'db_Session_id'
  */
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL int is_doing_end_session = -1;
+#endif
 int
 db_end_session (void)
 {

@@ -151,6 +151,9 @@ struct db_object
 				 * loader only */
   unsigned decached:1;		/* set if mop is decached by calling ws_decache function */
   unsigned trigger_involved:1;	/* set if mop is involved in trigger, it is used only for cdc */
+#if defined (SERVER_MODE) && !defined (NDEBUG)
+  struct ws_context *owner_ws;	/* the session workspace this MOP belongs to (WS_ASSERT_OWNED) */
+#endif
   unsigned serial_restart:1;	/* a _db_serial row its DDL restarts: its current_val and started stand */
 };
 
@@ -455,10 +458,61 @@ struct ws_mop_table_entry
 /*
  * WORKSPACE GLOBALS
  */
+#if defined (SERVER_MODE)
+/* The folded server keeps one workspace per session (client_session_context):
+ * the module state below is reached through the calling thread's activation
+ * bracket, under the names the client build gives its globals. */
+// *INDENT-OFF*
+struct ws_deferred_free;
+
+struct ws_context
+{
+  WS_MOP_TABLE_ENTRY *mop_table = NULL;
+  unsigned int mop_table_size = 0;
+  DB_OBJLIST *resident_classes = NULL;
+  MOP commit_mops = NULL;
+  WS_STATISTICS stats = {};
+  int num_dirty_mop = 0;
+  int error_ignore_list[-ER_LAST_ERROR] = {};
+  int error_ignore_count = 0;
+  bool dirty = false;
+  MOP null_object = NULL;
+  struct mht_table *classname_cache = NULL;
+  unsigned int mvcc_snapshot_version = 0;
+  bool defer_free = false;
+  struct ws_deferred_free *deferred_instances = NULL;
+  struct ws_deferred_free *deferred_classes = NULL;
+
+  /* quick_fit.c: the session's lea heap behind db_ws_alloc */
+  HL_HEAPID heap_id = 0;
+
+  /* oid.c: the next temporary OID page of this workspace */
+  PAGEID next_tempid = NULL_PAGEID;
+};
+// *INDENT-ON*
+
+extern struct ws_context *csc_ws (void);
+
+#define ws_Resident_classes (csc_ws ()->resident_classes)
+#define ws_Commit_mops (csc_ws ()->commit_mops)
+#define ws_Error_ignore_list (csc_ws ()->error_ignore_list)
+#define ws_Error_ignore_count (csc_ws ()->error_ignore_count)
+
+/* a MOP never crosses the session boundary: stamped by ws_make_mop, checked
+ * where the workspace takes a MOP in */
+#if !defined (NDEBUG)
+#define WS_ASSERT_OWNED(mop) assert ((mop) == NULL || (mop)->owner_ws == csc_ws ())
+#else
+#define WS_ASSERT_OWNED(mop) ((void) 0)
+#endif
+#else /* SERVER_MODE */
 extern CUB_THREAD_LOCAL DB_OBJLIST *ws_Resident_classes;
 extern CUB_THREAD_LOCAL MOP ws_Commit_mops;
 extern int ws_Error_ignore_list[-ER_LAST_ERROR];
 extern int ws_Error_ignore_count;
+
+#define WS_ASSERT_OWNED(mop) ((void) 0)
+#endif /* !SERVER_MODE */
 
 /*
  *  WORKSPACE FUNCTIONS

@@ -211,7 +211,13 @@ extern OID *oid_Serial_class_oid;
 extern OID *oid_User_class_oid;
 extern OID *oid_Sp_code_class_oid;
 
+#if defined (SERVER_MODE)
+/* temporary OIDs number the folded server's session workspace (ws_context) */
+extern PAGEID *csc_next_tempid (void);
+#define oid_Next_tempid (*csc_next_tempid ())
+#else
 extern CUB_THREAD_LOCAL PAGEID oid_Next_tempid;
+#endif
 
 extern void oid_set_root (const OID * oid);
 extern bool oid_is_root (const OID * oid);

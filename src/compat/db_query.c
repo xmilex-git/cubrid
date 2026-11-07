@@ -62,6 +62,12 @@ struct alloc_resource
   DB_QUERY_RESULT *free_qres_list;	/* list of free query entry structures */
 };
 
+#if defined (SERVER_MODE)
+/* the session's db_cl_context (db.h): one session's commit ends only its own results */
+#define Qres_table (csc_db ()->qres_table)
+#define db_Execution_plan (csc_db ()->execution_plan)
+#define db_Execution_plan_length (csc_db ()->execution_plan_length)
+#else /* SERVER_MODE */
 /* query result table of the connection; per connection (thread-local) for multiple connections, because the
  * end of a transaction ends the results in it (db_clear_client_query_result ()) */
 static CUB_THREAD_LOCAL struct
@@ -77,6 +83,7 @@ static CUB_THREAD_LOCAL struct
   {
   0, 0, (DB_QUERY_RESULT *) NULL}
 };				/* query result table */
+#endif /* !SERVER_MODE */
 
 static const int QP_QRES_LIST_INIT_CNT = 10;
 			       /* query result list initial cnt */
@@ -84,8 +91,12 @@ static const float QP_QRES_LIST_INC_RATE = 1.25f;
 			   /* query result list increment ratio */
 
 /* execution plan of the last query of the connection */
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL char *db_Execution_plan = NULL;
+#endif
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL int db_Execution_plan_length = -1;
+#endif
 
 static DB_QUERY_RESULT *allocate_query_result (void);
 static void free_query_result (DB_QUERY_RESULT * q_res);

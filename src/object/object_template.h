@@ -191,6 +191,24 @@ typedef struct obj_template
  * State variable used when creating object template, to indicate whether enable
  * auto increment feature
  */
+#if defined (SERVER_MODE)
+/* The folded server keeps the object template state per session
+ * (client_session_context). */
+// *INDENT-OFF*
+struct obt_context
+{
+  bool enable_autoincrement = true;
+  bool last_insert_id_generated = false;
+  unsigned int template_traversal = 0;
+  unsigned int template_savepoint_count = 0;
+};
+// *INDENT-ON*
+
+extern struct obt_context *csc_obt (void);
+
+#define obt_Enable_autoincrement (csc_obt ()->enable_autoincrement)
+#define obt_Last_insert_id_generated (csc_obt ()->last_insert_id_generated)
+#else /* SERVER_MODE */
 extern bool obt_Enable_autoincrement;
 
 /*
@@ -199,6 +217,7 @@ extern bool obt_Enable_autoincrement;
  * It is only for client-side insertion.
  */
 extern CUB_THREAD_LOCAL bool obt_Last_insert_id_generated;
+#endif /* !SERVER_MODE */
 
 
 /* OBJECT TEMPLATE FUNCTIONS */

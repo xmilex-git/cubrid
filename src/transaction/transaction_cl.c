@@ -63,6 +63,13 @@
 #include "tcp.h"
 #endif /* WINDOWS */
 
+#if defined (SERVER_MODE)
+/* the session's tm_context (transaction_cl.h) */
+#define tm_Tran_latest_query_status (csc_tm ()->tran_latest_query_status)
+#define tm_Query_timeout_info (csc_tm ()->query_timeout_info)
+#define tm_libcas_depth (csc_tm ()->libcas_depth)
+#define user_savepoint_list (csc_tm ()->user_savepoint_list)
+#else /* SERVER_MODE */
 CUB_THREAD_LOCAL int tm_Tran_index = NULL_TRAN_INDEX;
 CUB_THREAD_LOCAL TRAN_ISOLATION tm_Tran_isolation = TRAN_UNKNOWN_ISOLATION;
 CUB_THREAD_LOCAL bool tm_Tran_async_ws = false;
@@ -77,6 +84,7 @@ CUB_THREAD_LOCAL LOCK tm_Tran_rep_read_lock = NULL_LOCK;	/* used in RR transacti
  */
 CUB_THREAD_LOCAL LC_FETCH_VERSION_TYPE tm_Tran_read_fetch_instance_version = LC_FETCH_MVCC_VERSION;
 static CUB_THREAD_LOCAL int tm_Tran_latest_query_status;
+#endif /* !SERVER_MODE */
 
 /* Timeout(milli seconds) for queries.
  *
@@ -88,17 +96,15 @@ static CUB_THREAD_LOCAL int tm_Tran_latest_query_status;
  *
  * tm_libcas_depth indicates the depth of callback_xxx functions called by method_callback (SP)
  */
-typedef struct
-{
-  UINT64 begin;
-  int timeout;
-} QUERY_TIMEOUT_INFO;
-
 // TODO: FIX-ME: fix me for call method 
 // When the method is called, the task must be executed by the same existing thread.
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL QUERY_TIMEOUT_INFO tm_Query_timeout_info = { 0, 0 };
+#endif
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL int tm_libcas_depth = 0;
+#endif
 
 /* this is a local list of user-defined savepoints.  It may be updated upon
  * the following calls:
@@ -107,7 +113,9 @@ static CUB_THREAD_LOCAL int tm_libcas_depth = 0;
  *    tran_abort()		-> tran_free_savepoint_list()
  *    tran_abort_upto_savepoint() -> tm_free_list_upto_savepoint()
  */
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL DB_NAMELIST *user_savepoint_list = NULL;
+#endif
 
 static int tran_add_savepoint (const char *savept_name);
 static void tran_free_list_upto_savepoint (const char *savept_name);

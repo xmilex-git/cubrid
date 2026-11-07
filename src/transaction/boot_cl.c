@@ -124,6 +124,12 @@
 #define BOOT_NO_OPT_CAP                 0
 #define BOOT_CHECK_HA_DELAY_CAP         NET_CAP_HA_REPL_DELAY
 
+#if defined (SERVER_MODE)
+/* the credential carries per-session state (server_session_key feeds
+ * csession_find_or_create_session): the session's own copy */
+#include "client_session_context.hpp"
+#define boot_Server_credential (csc_current ()->boot_server_credential)
+#else /* SERVER_MODE */
 static CUB_THREAD_LOCAL BOOT_SERVER_CREDENTIAL boot_Server_credential = {
   /* db_full_name */ NULL, /* host_name */ NULL, /* lob_path */ NULL,
   /* process_id */ -1,
@@ -137,6 +143,7 @@ static CUB_THREAD_LOCAL BOOT_SERVER_CREDENTIAL boot_Server_credential = {
   INTL_CODESET_NONE,
   NULL
 };
+#endif /* !SERVER_MODE */
 
 static const char *boot_Client_no_user_string = "(nouser)";
 static const char *boot_Client_id_unknown_string = "(unknown)";

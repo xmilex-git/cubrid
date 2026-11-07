@@ -160,7 +160,13 @@ struct qo_implied_join_pair
   QO_SEGMENT *tail_seg;
 };
 
+#if defined (SERVER_MODE)
+/* concurrent optimizations would race on a first-use store; UTIL_infinity ()
+ * is the HUGE_VAL constant */
+double QO_INFINITY = UTIL_infinity ();
+#else
 double QO_INFINITY = 0.0;
+#endif
 
 static QO_PLAN *qo_optimize_helper (QO_ENV * env);
 static QO_NODE *qo_add_node (PT_NODE * entity, QO_ENV * env);
@@ -809,7 +815,9 @@ qo_env_init (PARSER_CONTEXT * parser, PT_NODE * query)
   env->nterms = 0;
   env->neqclasses = 0;
 
+#if !defined (SERVER_MODE)
   QO_INFINITY = UTIL_infinity ();
+#endif
 
   return env;
 

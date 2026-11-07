@@ -67,12 +67,29 @@ extern unsigned int db_on_server;
  * the entire file
  */
 
+#if defined (SERVER_MODE)
+/* the workspace state lives in the session's ws_context (work_space.h) */
+#define ws_Mop_table (csc_ws ()->mop_table)
+#define ws_Mop_table_size (csc_ws ()->mop_table_size)
+#define ws_Stats (csc_ws ()->stats)
+#define ws_Num_dirty_mop (csc_ws ()->num_dirty_mop)
+#define Ws_dirty (csc_ws ()->dirty)
+#define ws_Defer_free (csc_ws ()->defer_free)
+#define ws_Deferred_instances (csc_ws ()->deferred_instances)
+#define ws_Deferred_classes (csc_ws ()->deferred_classes)
+#define Null_object (csc_ws ()->null_object)
+#define Classname_cache (csc_ws ()->classname_cache)
+#define ws_MVCC_snapshot_version (csc_ws ()->mvcc_snapshot_version)
+#endif /* SERVER_MODE */
+
 /*
  * ws_Commit_mops
  *    Linked list of mops to be reset at commit/abort.
  */
 
+#if !defined (SERVER_MODE)
 CUB_THREAD_LOCAL MOP ws_Commit_mops = NULL;
+#endif
 
 /*
  * ws_Mop_table
@@ -81,14 +98,18 @@ CUB_THREAD_LOCAL MOP ws_Commit_mops = NULL;
  *    transaction manager.
  */
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL WS_MOP_TABLE_ENTRY *ws_Mop_table = NULL;
+#endif
 
 /*
  * ws_Mop_table_size
  *    Records the current size of the OID to MOP hash table.
  */
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL unsigned int ws_Mop_table_size = 0;
+#endif
 
 /*
  * ws_Resident_classes
@@ -99,7 +120,9 @@ static CUB_THREAD_LOCAL unsigned int ws_Mop_table_size = 0;
  *    list.
  */
 
+#if !defined (SERVER_MODE)
 CUB_THREAD_LOCAL DB_OBJLIST *ws_Resident_classes = NULL;
+#endif
 
 /*
  * ws_Stats
@@ -107,9 +130,13 @@ CUB_THREAD_LOCAL DB_OBJLIST *ws_Resident_classes = NULL;
  *    This contains random information about the state of the workspace.
  */
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL WS_STATISTICS ws_Stats = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+#endif
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL int ws_Num_dirty_mop = 0;
+#endif
 
 /*
  * We used to keep a global dirty list here. But for more efficient traversals
@@ -118,7 +145,9 @@ static CUB_THREAD_LOCAL int ws_Num_dirty_mop = 0;
  * and visit each class' dirty list. The dirty flag here is consulted by
  * ws_has_updated to determine if there are dirty objects in this workspace.
  */
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL bool Ws_dirty;
+#endif
 
 /*
  * Deferred free
@@ -136,9 +165,15 @@ struct ws_deferred_free
   SM_CLASS *class_;		/* class of an instance, NULL if obj is a class */
 };
 
+#if !defined (SERVER_MODE)
 static bool ws_Defer_free = false;
+#endif
+#if !defined (SERVER_MODE)
 static WS_DEFERRED_FREE *ws_Deferred_instances = NULL;
+#endif
+#if !defined (SERVER_MODE)
 static WS_DEFERRED_FREE *ws_Deferred_classes = NULL;
+#endif
 
 /*
  * Null_object
@@ -150,7 +185,9 @@ static WS_DEFERRED_FREE *ws_Deferred_classes = NULL;
  *    avoids having to keep an extra bit in the MOP structre.
  */
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL MOP Null_object;
+#endif
 
 /*
  * Classname_cache
@@ -159,7 +196,9 @@ static CUB_THREAD_LOCAL MOP Null_object;
  *    find class OIDs.
  */
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL MHT_TABLE *Classname_cache = NULL;
+#endif
 
 
 /*
@@ -174,7 +213,9 @@ static CUB_THREAD_LOCAL AREA *Objlist_area = NULL;
  * checking on server, mark fetched object with the snapshot version and
  * don't re-fetch until snapshot version is changed.
  */
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL unsigned int ws_MVCC_snapshot_version = 0;
+#endif
 
 /*
  * ws_area_init
@@ -182,8 +223,12 @@ static CUB_THREAD_LOCAL unsigned int ws_MVCC_snapshot_version = 0;
  *
  */
 
+#if !defined (SERVER_MODE)
 int ws_Error_ignore_list[-ER_LAST_ERROR];
+#endif
+#if !defined (SERVER_MODE)
 int ws_Error_ignore_count = 0;
+#endif
 
 #define OBJLIST_AREA_COUNT 4096
 
@@ -289,6 +334,9 @@ ws_make_mop (const OID * oid)
       op->mvcc_snapshot_version = ws_get_mvcc_snapshot_version () - 1;
 
       op->trigger_involved = 0;
+#if defined (SERVER_MODE) && !defined (NDEBUG)
+      op->owner_ws = csc_ws ();
+#endif
       op->serial_restart = 0;
 
       /* this is NULL only for the Null_object hack */
@@ -1654,6 +1702,8 @@ ws_release_user_instance (MOP mop)
 void
 ws_dirty (MOP op)
 {
+  WS_ASSERT_OWNED (op);
+
   /*
    * don't add the root class to any dirty list. otherwise, later traversals
    * of that dirty list will loop forever.
@@ -1719,6 +1769,8 @@ ws_dirty (MOP op)
 void
 ws_clean (MOP op)
 {
+  WS_ASSERT_OWNED (op);
+
   /*
    * because pinned objects can be in a state of direct modification, we
    * can't reset the dirty bit after a workspace panic flush because this
@@ -2389,6 +2441,19 @@ ws_init (bool is_sub)
 
   /* build the MOP table */
   ws_Mop_table_size = prm_get_integer_value (PRM_ID_WS_HASHTABLE_SIZE);
+#if defined (SERVER_MODE)
+  /* every session pays for its own table: unless the parameter was set,
+   * start at the bottom of its range */
+  if (!sysprm_param_is_set (PRM_ID_WS_HASHTABLE_SIZE))
+    {
+      int ws_table_min = 0, ws_table_max = 0;
+
+      if (sysprm_get_range (PRM_ID_WS_HASHTABLE_SIZE, &ws_table_min, &ws_table_max) == NO_ERROR)
+	{
+	  ws_Mop_table_size = ws_table_min;
+	}
+    }
+#endif
   allocsize = sizeof (WS_MOP_TABLE_ENTRY) * ws_Mop_table_size;
   ws_Mop_table = (WS_MOP_TABLE_ENTRY *) malloc (allocsize);
 
@@ -2437,11 +2502,15 @@ error:
       db_destroy_workspace_heap ();
     }
 
+#if !defined (SERVER_MODE)
+  /* the folded server shares these areas between sessions: a failed session
+   * boot must not destroy allocators other sessions use */
   ws_area_final ();
   pr_area_final ();
   set_area_final ();
   obt_area_final ();
   classobj_area_final ();
+#endif
 
   if (ws_Mop_table != NULL)
     {
@@ -2774,6 +2843,8 @@ ws_cache_with_oid (MOBJ obj, OID * oid, MOP class_mop)
 void
 ws_decache (MOP mop)
 {
+  WS_ASSERT_OWNED (mop);
+
   /* these should be caught before we get here, issue a warning message */
 #if 0
   if (mop->pinned)
@@ -4030,6 +4101,15 @@ ws_need_flush (void)
 int
 ws_area_init (void)
 {
+#if defined (SERVER_MODE)
+  if (Objlist_area != NULL)
+    {
+      /* process-shared in the folded server: the first session (or the server
+       * boot) creates it, later sessions reuse it */
+      return NO_ERROR;
+    }
+#endif
+
   Objlist_area = area_create ("Object list links", sizeof (DB_OBJLIST), OBJLIST_AREA_COUNT);
   if (Objlist_area == NULL)
     {

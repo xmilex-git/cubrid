@@ -28,6 +28,7 @@
 
 #include "config.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include "error_manager.h"
 #include "intl_support.h"
@@ -45,16 +46,70 @@
 #define DB_CONNECTION_STATUS_NOT_CONNECTED      0
 #define DB_CONNECTION_STATUS_CONNECTED          1
 #define DB_CONNECTION_STATUS_RESET              -1
+#if defined (SERVER_MODE)
+/* The folded server keeps the client half's connection state per session
+ * (client_session_context), reached through the calling thread's bracket. */
+// *INDENT-OFF*
+struct db_qres_alloc_resource
+{
+  int free_qres_cnt = 0;
+  int max_qres_cnt = 0;
+  DB_QUERY_RESULT *free_qres_list = NULL;
+};
+
+/* db_query.c: the query results of the session (its commit ends them) */
+struct db_qres_table
+{
+  int qres_cnt = 0;
+  int qres_closed_cnt = 0;
+  int entry_cnt = 0;
+  DB_QUERY_RESULT **qres_list = NULL;
+  db_qres_alloc_resource alloc_res;
+};
+
+struct db_cl_context
+{
+  int connect_status = DB_CONNECTION_STATUS_NOT_CONNECTED;
+  SESSION_ID session_id = DB_EMPTY_SESSION;
+  char session_secret[SESSION_SECRET_SIZE] = {};
+  bool keep_session = false;
+  int row_count = DB_ROW_COUNT_NOT_SET;
+  char database_name[DB_MAX_IDENTIFIER_LENGTH + 1] = {};
+  char program_name[PATH_MAX] = {};
+  char client_ip_addr[16] = {};
+  int client_type = 1;		/* DB_CLIENT_TYPE_DEFAULT (db_client_type.hpp) */
+  CUBRID_STMT_TYPE client_statement_type = CUBRID_STMT_NONE;
+  int is_doing_end_session = -1;
+  db_qres_table qres_table;
+  char *execution_plan = NULL;
+  int execution_plan_length = -1;
+  struct db_session *kept_trees = NULL;
+};
+// *INDENT-ON*
+
+extern struct db_cl_context *csc_db (void);
+/* db_Connect_status outside a bracket (a server thread) is the server's own */
+extern int *csc_db_connect_status (void);
+
+#define db_Connect_status (*csc_db_connect_status ())
+#define db_Session_id (csc_db ()->session_id)
+#else /* SERVER_MODE */
 extern CUB_THREAD_LOCAL int db_Connect_status;
 extern CUB_THREAD_LOCAL SESSION_ID db_Session_id;
+#endif /* !SERVER_MODE */
 
 #if !defined(_DB_DISABLE_MODIFICATIONS_)
 #define _DB_DISABLE_MODIFICATIONS_
 extern CUB_THREAD_LOCAL int db_Disable_modifications;
 #endif /* _DB_DISABLE_MODIFICATIONS_ */
 
+#if defined (SERVER_MODE)
+#define db_Database_name (csc_db ()->database_name)
+#define db_Program_name (csc_db ()->program_name)
+#else
 extern char db_Database_name[];
 extern char db_Program_name[];
+#endif
 
 /* MACROS FOR ERROR CHECKING */
 /* These should be used at the start of every db_ function so we can check

@@ -516,7 +516,11 @@ row_snapshot_read (MOP classop, SM_CLASS *class_, const ROW_SNAPSHOT *columns, c
 {
   /* the read is a statement on the same class with the same filters: planning it must not read
    * again. The client runs one statement at a time, so a plain flag will do. */
+#if defined (SERVER_MODE)
+  static thread_local bool in_read = false;
+#else
   static bool in_read = false;
+#endif
   std::string query;
   std::vector<DB_VALUE> binds;
   DB_SESSION *session = NULL;

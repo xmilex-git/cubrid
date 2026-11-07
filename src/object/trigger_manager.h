@@ -223,6 +223,45 @@ extern const char *TR_ATT_COMMENT;
 extern const char *TR_ATT_CREATED_TIME;
 extern const char *TR_ATT_UPDATED_TIME;
 
+#if defined (SERVER_MODE)
+/* The folded server keeps the trigger manager state per session
+ * (client_session_context): its caches hold the session's MOPs. */
+// *INDENT-OFF*
+struct tr_context
+{
+  int current_depth = 0;
+  int maximum_depth = TR_MAX_RECURSION_LEVEL;
+  OID stack[TR_MAX_RECURSION_LEVEL + 1] = {};
+  bool invalid_transaction = false;
+  char invalid_transaction_trigger[SM_MAX_IDENTIFIER_LENGTH + 2] = {};
+  bool trace = true;
+  TR_DEFERRED_CONTEXT *deferred_activities = NULL;
+  TR_DEFERRED_CONTEXT *deferred_activities_tail = NULL;
+  int user_triggers_valid = 0;
+  int user_triggers_modified = 0;
+  TR_TRIGLIST *user_triggers = NULL;
+  TR_TRIGLIST *uncommitted_triggers = NULL;
+  TR_SCHEMA_CACHE *schema_caches = NULL;
+  /* one session's db_disable_trigger () must not reach the others */
+  bool execution_enabled = true;
+  struct mht_table *object_map = NULL;
+
+  /* execute_statement.c */
+  bool do_trigger_involved = false;
+  bool cdc_trigger_involved = false;
+};
+// *INDENT-ON*
+
+extern struct tr_context *csc_tr (void);
+
+#define tr_Current_depth (csc_tr ()->current_depth)
+#define tr_Maximum_depth (csc_tr ()->maximum_depth)
+#define tr_Invalid_transaction (csc_tr ()->invalid_transaction)
+#define tr_Invalid_transaction_trigger (csc_tr ()->invalid_transaction_trigger)
+#define tr_Trace (csc_tr ()->trace)
+#define tr_Deferred_activities (csc_tr ()->deferred_activities)
+#define tr_Deferred_activities_tail (csc_tr ()->deferred_activities_tail)
+#else /* SERVER_MODE */
 extern CUB_THREAD_LOCAL int tr_Current_depth;
 extern CUB_THREAD_LOCAL int tr_Maximum_depth;
 extern CUB_THREAD_LOCAL bool tr_Invalid_transaction;
@@ -232,6 +271,8 @@ extern CUB_THREAD_LOCAL bool tr_Trace;
 
 extern CUB_THREAD_LOCAL TR_DEFERRED_CONTEXT *tr_Deferred_activities;
 extern CUB_THREAD_LOCAL TR_DEFERRED_CONTEXT *tr_Deferred_activities_tail;
+
+#endif /* !SERVER_MODE */
 
 extern int tr_Recursion_level;
 extern int tr_Recursion_level_max;

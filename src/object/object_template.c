@@ -83,14 +83,18 @@ static const bool obt_Check_uniques = true;
  * State variable used when creating object template, to indicate whether enable
  * auto increment feature
  */
+#if !defined (SERVER_MODE)
 bool obt_Enable_autoincrement = true;
+#endif
 
 /*
  * State variable used when generating AUTO_INCREMENT value,
  * to set the first generated AUTO_INCREMENT value as LAST_INSERT_ID.
  * It is only for client-side insertion.
  */
+#if !defined (SERVER_MODE)
 CUB_THREAD_LOCAL bool obt_Last_insert_id_generated = false;
+#endif
 
 /*
  *                            OBJECT MANAGER AREAS
@@ -117,12 +121,18 @@ static CUB_THREAD_LOCAL AREA *Assignment_area = NULL;
  *
  */
 
+#if defined (SERVER_MODE)
+/* the session's obt_context (object_template.h) */
+#define obj_Template_traversal (csc_obt ()->template_traversal)
+#define template_savepoint_count (csc_obt ()->template_savepoint_count)
+#else
 static CUB_THREAD_LOCAL unsigned int obj_Template_traversal = 0;
 /*
  * Must make sure template savepoints have unique names to allow for concurrent
  * or nested updates.  Could be resetting this at db_restart() time.
  */
 static CUB_THREAD_LOCAL unsigned int template_savepoint_count = 0;
+#endif
 
 
 static DB_VALUE *check_att_domain (SM_ATTRIBUTE * att, DB_VALUE * proposed_value);
@@ -159,6 +169,15 @@ static void free_temp_object (MOP obj);
 int
 obt_area_init (void)
 {
+#if defined (SERVER_MODE)
+  if (Template_area != NULL)
+    {
+      /* process-shared in the folded server: the first session (or the server
+       * boot) creates it, later sessions reuse it */
+      return NO_ERROR;
+    }
+#endif
+
   Template_area = area_create ("Object templates", sizeof (OBJ_TEMPLATE), 32);
   if (Template_area == NULL)
     {

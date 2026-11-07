@@ -50,6 +50,47 @@ typedef enum savepoint_type
   SYSTEM_SAVEPOINT = 2
 } SAVEPOINT_TYPE;
 
+/* the timeout of the running query (transaction_cl.c) */
+typedef struct
+{
+  UINT64 begin;
+  int timeout;
+} QUERY_TIMEOUT_INFO;
+
+#if defined (SERVER_MODE)
+/* The folded server keeps the client transaction state per session
+ * (client_session_context), reached through the calling thread's bracket. */
+// *INDENT-OFF*
+struct tm_context
+{
+  int tran_index = NULL_TRAN_INDEX;
+  TRAN_ISOLATION tran_isolation = TRAN_UNKNOWN_ISOLATION;
+  bool tran_async_ws = false;
+  int tran_wait_msecs = TRAN_LOCK_INFINITE_WAIT;
+  bool tran_check_interrupt = true;
+  int tran_id = -1;
+  int tran_invalidate_snapshot = 1;
+  LOCK tran_rep_read_lock = NULL_LOCK;
+  LC_FETCH_VERSION_TYPE tran_read_fetch_instance_version = LC_FETCH_MVCC_VERSION;
+  int tran_latest_query_status = 0;
+  QUERY_TIMEOUT_INFO query_timeout_info = { 0, 0 };
+  int libcas_depth = 0;
+  struct db_namelist *user_savepoint_list = NULL;
+};
+// *INDENT-ON*
+
+extern struct tm_context *csc_tm (void);
+
+#define tm_Tran_index (csc_tm ()->tran_index)
+#define tm_Tran_isolation (csc_tm ()->tran_isolation)
+#define tm_Tran_async_ws (csc_tm ()->tran_async_ws)
+#define tm_Tran_wait_msecs (csc_tm ()->tran_wait_msecs)
+#define tm_Tran_ID (csc_tm ()->tran_id)
+#define tm_Tran_check_interrupt (csc_tm ()->tran_check_interrupt)
+#define tm_Tran_rep_read_lock (csc_tm ()->tran_rep_read_lock)
+#define tm_Tran_read_fetch_instance_version (csc_tm ()->tran_read_fetch_instance_version)
+#define tm_Tran_invalidate_snapshot (csc_tm ()->tran_invalidate_snapshot)
+#else /* SERVER_MODE */
 extern CUB_THREAD_LOCAL int tm_Tran_index;
 extern CUB_THREAD_LOCAL TRAN_ISOLATION tm_Tran_isolation;
 extern CUB_THREAD_LOCAL bool tm_Tran_async_ws;
@@ -62,6 +103,8 @@ extern bool tm_Use_OID_preflush;
 extern CUB_THREAD_LOCAL LOCK tm_Tran_rep_read_lock;
 extern CUB_THREAD_LOCAL LC_FETCH_VERSION_TYPE tm_Tran_read_fetch_instance_version;
 extern CUB_THREAD_LOCAL int tm_Tran_invalidate_snapshot;
+
+#endif /* !SERVER_MODE */
 
 extern void tran_cache_tran_settings (int tran_index, int lock_timeout, TRAN_ISOLATION tran_isolation);
 extern void tran_get_tran_settings (int *lock_timeout_in_msecs, TRAN_ISOLATION * tran_isolation, bool * async_ws);

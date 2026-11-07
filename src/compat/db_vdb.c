@@ -765,7 +765,11 @@ db_bind_variant_step (PARSER_CONTEXT * parser, PT_NODE * statement)
     }
 }
 
+#if defined (SERVER_MODE)
+thread_local int g_open_buffer_control_flags = 0;
+#else
 int g_open_buffer_control_flags = 0;
+#endif
 
 /* Registry of the compiled subsessions of SQL-level prepared statements
  * (PREPARE name FROM '...'). Keeping the post-transform tree between EXECUTE requests
@@ -792,7 +796,11 @@ int g_open_buffer_control_flags = 0;
  * sub-client thread of a multi-connection client, so it takes no lock and a sub-client sees
  * only its own entries.
  */
+#if defined (SERVER_MODE)
+#define db_Kept_trees (csc_db ()->kept_trees)
+#else
 static CUB_THREAD_LOCAL DB_SESSION *db_Kept_trees = NULL;
+#endif
 
 /*
  * db_prepared_tree_unlink() - detach the subsession kept under a prepared name from the
@@ -1616,7 +1624,11 @@ db_compile_statement_local (DB_SESSION * session)
   DB_QUERY_TYPE *qtype, *q;
   CUBRID_STMT_TYPE cmd_type;
   int err;
+#if defined (SERVER_MODE)
+  static thread_local long seed = 0;
+#else
   static long seed = 0;
+#endif
 
   /* obvious error checking - invalid parameter */
   if (!session || !session->parser)

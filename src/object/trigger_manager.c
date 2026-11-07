@@ -135,6 +135,17 @@ const char *TR_ATT_UPDATED_TIME = "updated_time";
  * The trigger manager state below is per connection (thread-local for multiple connections), because it refers to
  * the objects in the workspace of each connection. It is initialized and freed by tr_init () and tr_final ().
  */
+#if defined (SERVER_MODE)
+/* the session's tr_context (trigger_manager.h) */
+#define tr_Stack (csc_tr ()->stack)
+#define tr_User_triggers_valid (csc_tr ()->user_triggers_valid)
+#define tr_User_triggers_modified (csc_tr ()->user_triggers_modified)
+#define tr_User_triggers (csc_tr ()->user_triggers)
+#define tr_Uncommitted_triggers (csc_tr ()->uncommitted_triggers)
+#define tr_Schema_caches (csc_tr ()->schema_caches)
+#define tr_Execution_enabled (csc_tr ()->execution_enabled)
+#define tr_object_map (csc_tr ()->object_map)
+#else /* SERVER_MODE */
 CUB_THREAD_LOCAL int tr_Current_depth = 0;
 CUB_THREAD_LOCAL int tr_Maximum_depth = TR_MAX_RECURSION_LEVEL;
 CUB_THREAD_LOCAL OID tr_Stack[TR_MAX_RECURSION_LEVEL + 1];
@@ -154,13 +165,17 @@ static CUB_THREAD_LOCAL TR_TRIGLIST *tr_User_triggers = NULL;
 static CUB_THREAD_LOCAL TR_TRIGLIST *tr_Uncommitted_triggers = NULL;
 static CUB_THREAD_LOCAL TR_SCHEMA_CACHE *tr_Schema_caches = NULL;
 
+#endif /* !SERVER_MODE */
+
 /*
  * Global trigger firing state flag, used to determine if triggers are fired.
  * This can be modified using tr_set_execution_enabled().
  * It is intentionally process-wide, so db_disable_trigger () of the main client (e.g., applylogdb) applies to
  * the sub-clients too.
  */
+#if !defined (SERVER_MODE)
 static bool tr_Execution_enabled = true;
+#endif
 
 /*
  * tr_object_map
@@ -172,7 +187,9 @@ static bool tr_Execution_enabled = true;
  *
  */
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL MHT_TABLE *tr_object_map = NULL;
+#endif
 
 static const char *time_as_string (DB_TRIGGER_TIME tr_time);
 static char *tr_process_name (const char *name_string);

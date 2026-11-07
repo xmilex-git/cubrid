@@ -161,7 +161,13 @@ public:
   int locator_repl_flush_all (void);
 };
 
+#if defined (SERVER_MODE)
+/* flush scratch of one call on one thread (applylogdb's replication objects
+ * never reach the folded server) */
+extern thread_local class locator_repl __gv_locator_repl;
+#else
 extern CUB_THREAD_LOCAL class locator_repl __gv_locator_repl;
+#endif
 #define __gv_loc_repl (__gv_locator_repl)
 
 #endif /* _LOCATOR_CL_H_ */

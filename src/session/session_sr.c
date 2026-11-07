@@ -286,17 +286,14 @@ xsession_get_session_variable (THREAD_ENTRY * thread_p, const DB_VALUE * name, D
  * name (in)	 : name of the variable
  * value (in/out): variable value
  * Note: This function gets a reference to a session variable from the session
- * state object. Because it gets the actual pointer, it is not thread safe
- * and it should only be called in the stand alone mode
+ * state object. Because it gets the actual pointer, it is only safe where the
+ * session belongs to the calling thread: the stand alone mode, or the folded
+ * client half under its activation bracket
  */
 int
 xsession_get_session_variable_no_copy (THREAD_ENTRY * thread_p, const DB_VALUE * name, DB_VALUE ** value)
 {
-#if defined (SERVER_MODE)
-  /* do not call this function in a multi-threaded context */
-  assert (false);
-  return ER_FAILED;
-#endif
+  /* the callee gates the multi-threaded server (activation bracket) */
   return session_get_variable_no_copy (thread_p, name, value);
 }
 

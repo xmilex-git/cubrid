@@ -20,7 +20,8 @@
  *                              compiled into cub_server
  *
  * One instance holds what the client half keeps in process-wide globals in a
- * client process, for one session.  Authorization is the first tenant.
+ * client process, for one session.  The session owns it (session_state csc_p)
+ * and retires it when the session ends.
  *
  * A worker thread reaches a context only through an explicit activation
  * bracket around the work it does for that session.  The thread_local carries
@@ -34,6 +35,15 @@
 #if defined (SERVER_MODE)
 
 #include "authenticate_context.hpp"
+#include "boot.h"
+#include "db.h"
+#include "object_template.h"
+#include "schema_manager.h"
+#include "transaction_cl.h"
+#include "trigger_manager.h"
+#include "work_space.h"
+
+#include <mutex>
 
 // *INDENT-OFF*
 struct mht_table;
@@ -41,7 +51,38 @@ struct mht_table;
 class client_session_context
 {
   public:
+    /* worker threads are pooled per request with no session affinity: every
+     * bracket holds this for its whole extent, so the client-half work of one
+     * session is serialized, and a retirement waits for the bracket inside */
+    std::mutex bracket_mutex;
+
     authenticate_context au_context;
+
+    /* the module state of the client half, one per session */
+    ws_context ws;
+    tm_context tm;
+    sm_context sm;
+    tr_context tr;
+    obt_context obt;
+    db_cl_context db;
+
+    /* boot_cl.c: the credential of this session's registration
+     * (server_session_key must not be shared between sessions) */
+    BOOT_SERVER_CREDENTIAL boot_server_credential;
+
+    /* object_accessor.c: method invocation nesting and the last method error */
+    int obj_method_call_level = 0;
+    char *obj_method_error_msg = nullptr;
+
+    /* execute_schema.c: online-index thread count of the running DDL */
+    int ib_thread_count = 0;
+
+    /* execute_statement.c: savepoint name counters */
+    int insert_savepoint_number = 0;
+    int update_savepoint_number = 0;
+    int delete_savepoint_number = 0;
+    int merge_savepoint_number = 0;
+    int tr_savepoint_number = 0;
 
     /* interpreter labels are session data; created lazily by
      * pt_associate_label_with_value, released by pt_free_label_table */
@@ -49,10 +90,18 @@ class client_session_context
 
     /* the plan dump file the session's requests name (db_query_plan_dump_file) */
     char *plan_dump_filename = nullptr;
+
+    /* set when the session ended from inside this very context (its last
+     * reference was dropped by the bracket's own thread): the bracket exit
+     * tears it down and deletes it */
+    bool orphaned = false;
+
+    client_session_context ();
 };
 // *INDENT-ON*
 
-/* activation bracket; brackets do not nest */
+/* activation bracket; brackets do not nest (a nested activation aborts).
+ * Holds the context's bracket_mutex for the bracket's extent. */
 extern void csc_activate (client_session_context *ctx);
 extern void csc_deactivate (void);
 
@@ -63,6 +112,11 @@ extern client_session_context *csc_current (void);
 /* does the calling thread hold a bracket, i.e. own a session workspace?  (no
  * assert: shared server paths probe it on threads that never hold one) */
 extern bool csc_bracket_is_active (void);
+
+/* tear the context down and delete it; called by its owner (session_state_uninit,
+ * or the creator of a context no session adopted).  A caller inside the context
+ * only marks it orphaned: its csc_deactivate does the rest. */
+extern void csc_retire_and_delete (client_session_context *ctx);
 
 #else /* SERVER_MODE */
 

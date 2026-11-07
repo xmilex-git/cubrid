@@ -91,37 +91,7 @@
 #define SM_DROP_CLASS_MOP_SAVEPOINT_NAME "dELETEcLASSmOP"
 #define SM_TRUNCATE_SAVEPOINT_NAME "SmtRUnCATE"
 
-/*
- * SCHEMA_DEFINITION
- *
- * description:
- *    Maintains information about an SQL schema.
- */
-
-/*
-   NOTE: This is simple-minded implementation for now since we don't yet
-         support CREATE SCHEMA, SET SCHEMA, and associated statements.
- */
-
-typedef struct schema_def
-{
-
-  /* This is the default qualifier for class/vclass names */
-  char name[DB_MAX_SCHEMA_LENGTH * INTL_UTF8_MAX_CHAR_SIZE + 4];
-
-  /* The only user who can delete this schema. */
-  /* But, note that entry level doesn't support DROP SCHEMA anyway */
-  MOP owner;
-
-  /* The next three items are currently not used at all. They are simply a reminder of future TODOs. Although entry
-   * level SQL leaves out many schema management functions, entry level SQL does include specification of tables,
-   * views, and grants as part of CREATE SCHEMA statements. */
-
-  void *tables;			/* unused dummy */
-  void *views;			/* unused dummy */
-  void *grants;			/* unused dummy */
-
-} SCHEMA_DEF;
+/* SCHEMA_DEF lives in schema_manager.h: the folded server keeps one per session */
 
 /*
  * Current_schema
@@ -134,7 +104,15 @@ typedef struct schema_def
  *    currently is called only from AU_SET_USER
  */
 
+#if defined (SERVER_MODE)
+/* the session's sm_context (schema_manager.h) */
+#define Current_Schema (csc_sm ()->current_schema)
+#define sm_Descriptors (csc_sm ()->descriptors)
+#define local_schema_version (csc_sm ()->local_schema_version)
+#define global_schema_version (csc_sm ()->global_schema_version)
+#else
 static CUB_THREAD_LOCAL SCHEMA_DEF Current_Schema = { {'\0'}, NULL, NULL, NULL, NULL };
+#endif
 
 #define WC_PERIOD L'.'
 
@@ -244,14 +222,18 @@ const char TEXT_CONSTRAINT_PREFIX[] = "#text_";
  *    doubly linked list for faster removal.
 */
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL SM_DESCRIPTOR *sm_Descriptors = NULL;
+#endif
 
 /* ROOT_CLASS GLOBALS */
 /* Global root class structure */
 CUB_THREAD_LOCAL ROOT_CLASS sm_Root_class;
 
 /* Global MOP for the root class object.  Used by the locator */
+#if !defined (SERVER_MODE)
 CUB_THREAD_LOCAL MOP sm_Root_class_mop = NULL;
+#endif
 
 /* Name of the root class */
 const char *sm_Root_class_name = ROOTCLASS_NAME;
@@ -264,8 +246,12 @@ HFID *sm_Root_class_hfid = &sm_Root_class.header.ch_heap;
 #endif
 
 
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL unsigned int local_schema_version = 0;
+#endif
+#if !defined (SERVER_MODE)
 static CUB_THREAD_LOCAL unsigned int global_schema_version = 0;
+#endif
 
 static int domain_search (MOP dclass_mop, MOP class_mop);
 static int annotate_method_files (MOP classmop, SM_CLASS * class_);

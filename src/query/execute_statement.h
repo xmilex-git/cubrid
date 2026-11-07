@@ -83,9 +83,15 @@ extern int get_dblink_owner_name_from_dbserver (PARSER_CONTEXT * parser, PT_NODE
 
 typedef int (PT_DO_FUNC) (PARSER_CONTEXT *, PT_NODE *);
 
+#if defined (SERVER_MODE)
+#include "trigger_manager.h"	/* csc_tr: per-session trigger involvement */
+#define do_Trigger_involved (csc_tr ()->do_trigger_involved)
+#define cdc_Trigger_involved (csc_tr ()->cdc_trigger_involved)
+#else
 extern CUB_THREAD_LOCAL bool do_Trigger_involved;
 
 extern CUB_THREAD_LOCAL bool cdc_Trigger_involved;
+#endif
 
 extern int do_alter (PARSER_CONTEXT * parser, PT_NODE * statement);
 
