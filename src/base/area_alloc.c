@@ -91,6 +91,20 @@ static int area_insert_block (AREA * area, AREA_BLOCK * new_block);
 static AREA_BLOCK *area_find_block (AREA * area, const void *ptr);
 
 /*
+ * area_call_failure_function - run the area's allocation-failure callback.
+ *   Must be called with area_mutex NOT held: the callback aborts the
+ *   current transaction, and the abort path may allocate from this area.
+ */
+static void
+area_call_failure_function (AREA * area)
+{
+  if (area->failure_function != NULL)
+    {
+      (*(area->failure_function)) ();
+    }
+}
+
+/*
  * area_init - Initialize the area manager
  *   return: none
  *
@@ -196,21 +210,23 @@ area_create (const char *name, size_t element_size, size_t alloc_count)
 
   area->n_allocs = 0;
   area->n_frees = 0;
-#if defined (SERVER_MODE)
-  area->failure_function = NULL;
-#else
+  /* exhaustion aborts the transaction of the client that ran out (in the
+   * server only the client half of a session's bracket has one, see
+   * ws_abort_transaction); elsewhere the caller just sees NULL with
+   * ER_OUT_OF_VIRTUAL_MEMORY set */
   area->failure_function = ws_abort_transaction;
-#endif
 
   area->blockset_list = area_alloc_blockset (area);
   if (area->blockset_list == NULL)
     {
+      area_call_failure_function (area);
       goto error;
     }
 
   area->hint_block = area_alloc_block (area);
   if (area->hint_block == NULL)
     {
+      area_call_failure_function (area);
       goto error;
     }
   area->blockset_list->items[0] = area->hint_block;
@@ -302,12 +318,10 @@ area_alloc_block (AREA * area)
   new_block = (AREA_BLOCK *) malloc (total);
   if (new_block == NULL)
     {
+      /* the failure_function is NOT called here: the caller may hold
+       * area_mutex, and the callback aborts the transaction, which can
+       * allocate from this same area - callers invoke it lock-free */
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, total);
-      if (area->failure_function != NULL)
-	{
-	  (*(area->failure_function)) ();
-	}
-
       return NULL;
     }
 
@@ -333,12 +347,9 @@ area_alloc_blockset (AREA * area)
   new_blockset = (AREA_BLOCKSET_LIST *) malloc (sizeof (AREA_BLOCKSET_LIST));
   if (new_blockset == NULL)
     {
+      /* no failure_function call under the caller's area_mutex - see
+       * area_alloc_block */
       er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (AREA_BLOCKSET_LIST));
-      if (area->failure_function != NULL)
-	{
-	  (*(area->failure_function)) ();
-	}
-
       return NULL;
     }
 
@@ -427,7 +438,9 @@ area_alloc (AREA * area)
   if (block == NULL)
     {
       pthread_mutex_unlock (&area->area_mutex);
-      /* error has been set */
+      /* error has been set; the callback runs only after area_mutex is
+       * released - aborting the transaction can allocate from this area */
+      area_call_failure_function (area);
       return NULL;
     }
 
@@ -442,6 +455,7 @@ area_alloc (AREA * area)
 
       pthread_mutex_unlock (&area->area_mutex);
       /* error has been set */
+      area_call_failure_function (area);
       return NULL;
     }
 

@@ -52,6 +52,7 @@
 #include "view_transform.h"
 #include "dbtype.h"
 #include "execute_statement.h"
+#include "client_session_context.hpp"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -272,6 +273,29 @@ static void ws_examine_no_mop_has_cached_lock (void);
 void
 ws_abort_transaction (void)
 {
+  /* the abort below may itself run out of memory and re-enter this callback;
+   * a second entry just leaves the already-set error and returns instead of
+   * recursing into another abort */
+  static thread_local bool ws_abort_in_progress = false;
+
+#if defined (SERVER_MODE)
+  /* only the client half of a registered session's bracket has a client transaction to abort.  A thread with no
+   * bracket, a bracket with no registered client (the server boot's shared context, a session retired after its
+   * logout), and the server half a bracket thread runs (its executor holds page fixes and the query in progress,
+   * which the abort would release under it) fail just the allocation with ER_OUT_OF_VIRTUAL_MEMORY set, as the
+   * server always did */
+  if (!csc_bracket_is_active () || tm_Tran_index == NULL_TRAN_INDEX || db_on_server != 0)
+    {
+      return;
+    }
+#endif /* SERVER_MODE */
+
+  if (ws_abort_in_progress)
+    {
+      return;
+    }
+  ws_abort_in_progress = true;
+
   if (db_Disable_modifications)
     {
       if (er_errid () != ER_OUT_OF_VIRTUAL_MEMORY)
@@ -286,11 +310,16 @@ ws_abort_transaction (void)
 
       (void) tran_unilaterally_abort ();
 
-      /* couldn't get to the catalog, use hard coded strings */
+#if !defined (SERVER_MODE)
+      /* couldn't get to the catalog, use hard coded strings; the server has no
+       * console for this banner, and its session lives on with the transaction aborted */
       fprintf (stdout, "CUBRID cannot allocate main memory and must halt execution.\n");
       fprintf (stdout, "The current transaction has been aborted.\n");
       fprintf (stdout, "Data integrity has been preserved.\n");
+#endif /* !SERVER_MODE */
     }
+
+  ws_abort_in_progress = false;
 }
 
 /*
