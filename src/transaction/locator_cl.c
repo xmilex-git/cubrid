@@ -1900,7 +1900,9 @@ locator_lock_and_doesexist (MOP mop, LOCK lock, LC_OBJTYPE isclass)
   cache_lock.oid = oid;
   cache_lock.lock = lock;
   cache_lock.isolation = TM_TRAN_ISOLATION ();
-  cache_lock.fetch_version_type = LC_FETCH_DIRTY_VERSION;
+  /* a committed read takes no lock on the server, so none is cached either */
+  cache_lock.fetch_version_type =
+    (TM_TRAN_READ_FETCH_VERSION () == LC_FETCH_COMMITTED_VERSION) ? LC_FETCH_COMMITTED_VERSION : LC_FETCH_DIRTY_VERSION;
 
   /* Find the cache coherency numbers for fetching purposes */
   if (object == NULL && WS_IS_DELETED (mop))

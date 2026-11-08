@@ -14576,9 +14576,10 @@ locator_decide_operation_type (LOCK lock_mode, LC_FETCH_VERSION_TYPE fetch_versi
     }
 
   if (lock_mode > NULL_LOCK && lock_mode <= S_LOCK
-      && (fetch_version_type == LC_FETCH_MVCC_VERSION || fetch_version_type == LC_FETCH_CURRENT_VERSION))
+      && (fetch_version_type == LC_FETCH_MVCC_VERSION || fetch_version_type == LC_FETCH_CURRENT_VERSION
+	  || fetch_version_type == LC_FETCH_COMMITTED_VERSION))
     {
-      /* In this situation, the operation type must be changed to S_SELECT.
+      /* In this situation, the operation type must be changed to S_SELECT (a committed read takes no lock either).
        * The final lock mode will be decided when class type will be known */
       assert (op_type == S_SELECT_WITH_LOCK);
       op_type = S_SELECT;

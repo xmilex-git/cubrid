@@ -698,6 +698,15 @@ au_revoke_class (MOP user, MOP class_mop, DB_AUTH type, MOP drop_user)
 		       * This may not be necessary.
 		       */
 		      sm_bump_local_schema_version ();
+
+#if defined (SERVER_MODE)
+		      /* the bump above reaches only this session's parse trees: touching the class removes the XASL cache
+		       * entries of other sessions' prepared statements, whose recompile checks the authorization again */
+		      if (error == NO_ERROR)
+			{
+			  error = sm_touch_class (class_mop);
+			}
+#endif /* SERVER_MODE */
 		    }
 		  free_grant_list (grant_list);
 		}

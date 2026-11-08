@@ -13894,22 +13894,8 @@ sm_delete_class_mop (MOP op, bool is_cascade_constraints)
    * comment. */
   /* ml_remove(&ws_Resident_classes, op); */
 
-  /* free any indexes, unique btids, or other associated disk structures */
-  error = transfer_disk_structures (op, class_, NULL);
-  if (error != NO_ERROR)
-    {
-      goto end;
-    }
-
-  /* now that the class is gone, physically delete all the triggers. Note that this does not just invalidate the
-   * triggers, it deletes them forever. */
-  error = remove_class_triggers (op, class_);
-  if (error != NO_ERROR)
-    {
-      goto end;
-    }
-
-  /* before deleting an object, all permissions are revoked. */
+  /* before deleting an object, all permissions are revoked, and before its disk structures are freed: the revoke
+   * touches the class (au_revoke_class), which rebuilds the representation through transfer_disk_structures */
   owner = au_get_class_owner (op);
   if (owner == NULL)
     {
@@ -13930,6 +13916,21 @@ sm_delete_class_mop (MOP op, bool is_cascade_constraints)
     }
 
   AU_SET_USER (save_user);
+
+  /* free any indexes, unique btids, or other associated disk structures */
+  error = transfer_disk_structures (op, class_, NULL);
+  if (error != NO_ERROR)
+    {
+      goto end;
+    }
+
+  /* now that the class is gone, physically delete all the triggers. Note that this does not just invalidate the
+   * triggers, it deletes them forever. */
+  error = remove_class_triggers (op, class_);
+  if (error != NO_ERROR)
+    {
+      goto end;
+    }
 
   /* now delete _db_auth tuples refers to the table */
   error = au_delete_auth_of_dropping_database_object (DB_OBJECT_CLASS, table_name);

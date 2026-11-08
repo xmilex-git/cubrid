@@ -30,9 +30,7 @@
 #include <assert.h>
 
 #include "area_alloc.h"
-#if !defined (SERVER_MODE)
 #include "authenticate.h"
-#endif // not SERVER_MODE
 #include "db_value_printer.hpp"
 #include "dbtype.h"
 #include "error_manager.h"
@@ -48,14 +46,11 @@
 /* WS_OID/OBJECT_HAS_TEMP_OID below are used in SERVER_MODE too */
 #include "work_space.h"
 
-#if !defined(SERVER_MODE)
 #include "locator_cl.h"
 #include "object_accessor.h"
 #include "transaction_cl.h"
 #include "virtual_object.h"
 #include "parser.h"
-#else /* !SERVER_MODE */
-#endif
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -139,9 +134,7 @@ static int col_is_all_null (COL * col);
 #endif
 static void free_set_reference (DB_COLLECTION * ref);
 
-#if !defined(SERVER_MODE)
 static void merge_set_references (COL * set, DB_COLLECTION * ref);
-#endif
 
 static int set_op (DB_COLLECTION * collection1, DB_COLLECTION * collection2, DB_COLLECTION ** result,
 		   DB_DOMAIN * domain, SETOBJ_OP op);
@@ -1785,7 +1778,6 @@ int
 col_permanent_oids (COL * col)
 {
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int tcount, i;
   LC_OIDSET *oidset;
   LC_OIDMAP *oidmap;
@@ -1850,7 +1842,6 @@ col_permanent_oids (COL * col)
 	  col->may_have_temporary_oids = 0;
 	}
     }
-#endif
 
   return error;
 }
@@ -2055,7 +2046,6 @@ free_set_reference (DB_COLLECTION * ref)
   (void) area_free (Set_Ref_Area, ref);
 }
 
-#if !defined(SERVER_MODE)
 
 /*
  * merge_set_references() - Merges two set reference chains
@@ -2110,7 +2100,6 @@ merge_set_references (COL * set, DB_COLLECTION * ref)
 	}
     }
 }
-#endif
 
 /*
  * set_tform_disk_set() - This gets the set object associated with a set reference
@@ -2193,7 +2182,6 @@ set_get_setobj (DB_COLLECTION * ref, COL ** setptr, int for_write)
 	  assert (er_errid () != NO_ERROR);
 	  return er_errid ();
 	}
-#if !defined(SERVER_MODE)
       {
 	char *mem;
 	if (set == NULL && ref->owner != NULL)
@@ -2207,7 +2195,6 @@ set_get_setobj (DB_COLLECTION * ref, COL ** setptr, int for_write)
 	      }
 	  }
       }
-#endif
     }
   *setptr = set;
   return (error);
@@ -2237,6 +2224,13 @@ int
 set_connect (DB_COLLECTION * ref, MOP owner, int attid, TP_DOMAIN * domain)
 {
   DB_COLLECTION *r;
+
+  /* the single choke point where a collection becomes workspace-owned: every
+   * un-gated owner branch downstream (set shells, set_get_setobj reload,
+   * col_permanent_oids) trusts that owned sets exist only in client contexts */
+#if defined (SERVER_MODE)
+  assert (owner == NULL || !db_on_server);
+#endif
 
   if (ref == NULL)
     {
@@ -2314,9 +2308,17 @@ DB_COLLECTION *
 set_change_owner (DB_COLLECTION * ref, MOP owner, int attid, TP_DOMAIN * domain)
 {
   DB_COLLECTION *new_ = NULL;
-#if !defined(SERVER_MODE)
   COL *current, *newset;
   int pin;
+
+  /* client body kept — set ownership binds a collection to a workspace MOP,
+   * which only happens on client-context threads; the old compile-time guard
+   * left this a NULL-returning stub that broke its callers' error contract */
+#if defined (SERVER_MODE)
+  /* SA executes these client bodies with db_on_server toggled; the
+   * context-discipline invariant only holds in the merged server binary */
+  assert (!db_on_server);
+#endif
 
   /* fetch set of interest */
   if (set_get_setobj (ref, &current, 0) != NO_ERROR)
@@ -2358,7 +2360,6 @@ set_change_owner (DB_COLLECTION * ref, MOP owner, int attid, TP_DOMAIN * domain)
 
       (void) ws_pin (ref->owner, pin);
     }
-#endif
   return (new_);
 }
 
@@ -2480,9 +2481,7 @@ set_copy (DB_COLLECTION * set)
 {
   COL *srcobj, *newobj;
   DB_COLLECTION *new_;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   new_ = NULL;
   if (set_get_setobj (set, &srcobj, 0) != NO_ERROR)
@@ -2492,9 +2491,7 @@ set_copy (DB_COLLECTION * set)
 
   if (set != NULL && srcobj != NULL)
     {
-#if !defined(SERVER_MODE)
       pin = ws_pin (set->owner, 1);
-#endif
       newobj = setobj_copy (srcobj);
       if (newobj != NULL)
 	{
@@ -2509,9 +2506,7 @@ set_copy (DB_COLLECTION * set)
 	      setobj_free (newobj);
 	    }
 	}
-#if !defined(SERVER_MODE)
       (void) ws_pin (set->owner, pin);
-#endif
     }
   return (new_);
 }
@@ -2529,9 +2524,7 @@ set_clear (DB_COLLECTION * set)
 {
   int error;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 1);
   if (error != NO_ERROR)
@@ -2544,13 +2537,9 @@ set_clear (DB_COLLECTION * set)
       return error;
     }
 
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   setobj_clear (obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (error);
 }
 #endif /* ENABLE_UNUSED_FUNCTION */
@@ -2582,9 +2571,7 @@ set_get_element (DB_COLLECTION * set, int index, DB_VALUE * value)
 {
   int error;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -2596,13 +2583,9 @@ set_get_element (DB_COLLECTION * set, int index, DB_VALUE * value)
     {
       return error;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   error = setobj_get_element (obj, index, value);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (error);
 }
 
@@ -2648,24 +2631,19 @@ set_add_element (DB_COLLECTION * set, DB_VALUE * value)
 {
   int error;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 1);
   if (error == NO_ERROR)
     {
       if (set != NULL && obj != NULL)
 	{
-#if !defined(SERVER_MODE)
 	  pin = ws_pin (set->owner, 1);
-#endif
 	  if (set->owner == NULL)
 	    {
 	      error = setobj_add_element (obj, value);
 	    }
 
-#if !defined(SERVER_MODE)
 	  /* get write lock on owner and mark as dirty */
 	  else
 	    {
@@ -2684,11 +2662,8 @@ set_add_element (DB_COLLECTION * set, DB_VALUE * value)
 		  error = setobj_add_element (obj, value);
 		}
 	    }
-#endif
 
-#if !defined(SERVER_MODE)
 	  (void) ws_pin (set->owner, pin);
-#endif
 	}
     }
   return (error);
@@ -2726,9 +2701,7 @@ set_put_element (DB_COLLECTION * set, int index, DB_VALUE * value)
 {
   int error;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
   error = set_get_setobj (set, &obj, 1);
   if (error != NO_ERROR)
     {
@@ -2737,15 +2710,12 @@ set_put_element (DB_COLLECTION * set, int index, DB_VALUE * value)
 
   if (set != NULL && obj != NULL)
     {
-#if !defined(SERVER_MODE)
       pin = ws_pin (set->owner, 1);
-#endif
       if (set->owner == NULL)
 	{
 	  error = setobj_put_element (obj, index, value);
 	}
 
-#if !defined(SERVER_MODE)
       /* get write lock on owner and mark as dirty */
       else
 	{
@@ -2764,11 +2734,8 @@ set_put_element (DB_COLLECTION * set, int index, DB_VALUE * value)
 	      error = setobj_put_element (obj, index, value);
 	    }
 	}
-#endif
 
-#if !defined(SERVER_MODE)
       (void) ws_pin (set->owner, pin);
-#endif
     }
 
   return (error);
@@ -2788,9 +2755,7 @@ set_insert_element (DB_COLLECTION * set, int index, DB_VALUE * value)
 {
   int error;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 1);
   if (error != NO_ERROR)
@@ -2800,15 +2765,12 @@ set_insert_element (DB_COLLECTION * set, int index, DB_VALUE * value)
 
   if (set != NULL && obj != NULL)
     {
-#if !defined(SERVER_MODE)
       pin = ws_pin (set->owner, 1);
-#endif
       if (set->owner == NULL)
 	{
 	  error = setobj_insert_element (obj, index, value);
 	}
 
-#if !defined(SERVER_MODE)
       else
 	{
 #if !defined (NDEBUG)
@@ -2826,11 +2788,8 @@ set_insert_element (DB_COLLECTION * set, int index, DB_VALUE * value)
 	      error = setobj_insert_element (obj, index, value);
 	    }
 	}
-#endif
 
-#if !defined(SERVER_MODE)
       (void) ws_pin (set->owner, pin);
-#endif
     }
   return (error);
 }
@@ -2849,9 +2808,7 @@ set_drop_element (DB_COLLECTION * set, DB_VALUE * value, bool match_nulls)
 {
   int error;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 1);
   if (error != NO_ERROR)
@@ -2860,15 +2817,12 @@ set_drop_element (DB_COLLECTION * set, DB_VALUE * value, bool match_nulls)
     }
   if (set != NULL && obj != NULL)
     {
-#if !defined(SERVER_MODE)
       pin = ws_pin (set->owner, 1);
-#endif
       if (set->owner == NULL)
 	{
 	  error = setobj_drop_element (obj, value, match_nulls);
 	}
 
-#if !defined(SERVER_MODE)
       else
 	{
 #if !defined (NDEBUG)
@@ -2886,11 +2840,8 @@ set_drop_element (DB_COLLECTION * set, DB_VALUE * value, bool match_nulls)
 	      error = setobj_drop_element (obj, value, match_nulls);
 	    }
 	}
-#endif
 
-#if !defined(SERVER_MODE)
       (void) ws_pin (set->owner, pin);
-#endif
     }
   return (error);
 }
@@ -2909,9 +2860,7 @@ set_drop_seq_element (DB_COLLECTION * set, int index)
 {
   int error = NO_ERROR;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 1);
   if (error != NO_ERROR)
@@ -2920,15 +2869,12 @@ set_drop_seq_element (DB_COLLECTION * set, int index)
     }
   if (set != NULL && obj != NULL)
     {
-#if !defined(SERVER_MODE)
       pin = ws_pin (set->owner, 1);
-#endif
       if (set->owner == NULL)
 	{
 	  error = setobj_drop_seq_element (obj, index);
 	}
 
-#if !defined(SERVER_MODE)
       else
 	{
 #if !defined (NDEBUG)
@@ -2946,11 +2892,8 @@ set_drop_seq_element (DB_COLLECTION * set, int index)
 	      error = setobj_drop_seq_element (obj, index);
 	    }
 	}
-#endif
 
-#if !defined(SERVER_MODE)
       (void) ws_pin (set->owner, pin);
-#endif
     }
   return (error);
 }
@@ -2970,9 +2913,7 @@ set_find_seq_element (DB_COLLECTION * set, DB_VALUE * value, int index)
   COL *obj;
   int psn = -1;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 1);
   if (error != NO_ERROR)
@@ -2982,13 +2923,9 @@ set_find_seq_element (DB_COLLECTION * set, DB_VALUE * value, int index)
 
   if (set != NULL && obj != NULL)
     {
-#if !defined(SERVER_MODE)
       pin = ws_pin (set->owner, 1);
-#endif
       psn = setobj_find_seq_element (obj, value, index);
-#if !defined(SERVER_MODE)
       (void) ws_pin (set->owner, pin);
-#endif
     }
 
   return (psn);
@@ -3007,9 +2944,7 @@ set_cardinality (DB_COLLECTION * set)
   COL *obj;
   int length;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
     {
@@ -3021,13 +2956,9 @@ set_cardinality (DB_COLLECTION * set)
       return 0;
     }
 
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   length = setobj_cardinality (obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (length);
 }
 
@@ -3044,9 +2975,7 @@ set_size (DB_COLLECTION * set)
   COL *obj;
   int length;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3059,13 +2988,9 @@ set_size (DB_COLLECTION * set)
       return 0;
     }
 
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   length = setobj_size (obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (length);
 }
 
@@ -3082,9 +3007,7 @@ set_isempty (DB_COLLECTION * set)
   COL *obj;
   bool isempty = true;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3096,13 +3019,9 @@ set_isempty (DB_COLLECTION * set)
     {
       return isempty;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   isempty = setobj_isempty (obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
 
   return (isempty);
 }
@@ -3128,9 +3047,7 @@ set_is_all_null (DB_COLLECTION * set)
   COL *obj;
   bool isallnull = true;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3143,13 +3060,9 @@ set_is_all_null (DB_COLLECTION * set)
       return isallnull;
     }
 
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   isallnull = col_is_all_null (obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
 
   return (isallnull);
 }
@@ -3168,9 +3081,7 @@ set_has_null (DB_COLLECTION * set)
   COL *obj;
   bool hasnull = true;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3183,13 +3094,9 @@ set_has_null (DB_COLLECTION * set)
       return hasnull;
     }
 
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   hasnull = col_has_null (obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (hasnull);
 }
 
@@ -3207,9 +3114,7 @@ set_ismember (DB_COLLECTION * set, DB_VALUE * value)
   COL *obj;
   bool ismember = false;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3222,13 +3127,9 @@ set_ismember (DB_COLLECTION * set, DB_VALUE * value)
       return ismember;
     }
 
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   ismember = setobj_ismember (obj, value, 0);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (ismember);
 }
 
@@ -3278,9 +3179,7 @@ set_convert_oids_to_objects (DB_COLLECTION * set)
 {
   int error = NO_ERROR;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 1);
   if (error != NO_ERROR)
@@ -3290,23 +3189,17 @@ set_convert_oids_to_objects (DB_COLLECTION * set)
 
   if (set != NULL && obj != NULL)
     {
-#if !defined(SERVER_MODE)
       pin = ws_pin (set->owner, 1);
-#endif
       if (set->owner == NULL)
 	{
 	  error = setobj_convert_oids_to_objects (obj);
 	}
-#if !defined(SERVER_MODE)
       else if ((error = obj_lock (set->owner, 1)) == NO_ERROR)
 	{
 	  error = setobj_convert_oids_to_objects (obj);
 	}
-#endif
 
-#if !defined(SERVER_MODE)
       (void) ws_pin (set->owner, pin);
-#endif
     }
 
   return (error);
@@ -3325,9 +3218,7 @@ set_get_domain (DB_COLLECTION * set)
   COL *obj;
   TP_DOMAIN *domain = NULL;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3340,13 +3231,9 @@ set_get_domain (DB_COLLECTION * set)
       return domain;
     }
 
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   domain = setobj_get_domain (obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (domain);
 }
 
@@ -3365,9 +3252,7 @@ set_compare_order (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion, 
   COL *obj1, *obj2;
   DB_VALUE_COMPARE_RESULT status = DB_UNK;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin1, pin2;
-#endif
 
   error = set_get_setobj (set1, &obj1, 0);
   if (error != NO_ERROR)
@@ -3379,27 +3264,19 @@ set_compare_order (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion, 
     {
       return status;
     }
-#if !defined(SERVER_MODE)
   pin1 = ws_pin (set1->owner, 1);
-#endif
   if (set_get_setobj (set2, &obj2, 0) == NO_ERROR)
     {
       if (set2 != NULL && obj2 != NULL)
 	{
-#if !defined(SERVER_MODE)
 	  pin2 = ws_pin (set2->owner, 1);
-#endif
 
 	  status = setobj_compare_order (obj1, obj2, do_coercion, total_order);
 
-#if !defined(SERVER_MODE)
 	  (void) ws_pin (set2->owner, pin2);
-#endif
 	}
     }
-#if !defined(SERVER_MODE)
   (void) ws_pin (set1->owner, pin1);
-#endif
   return (status);
 }
 
@@ -3417,9 +3294,7 @@ set_compare (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion)
   COL *obj1, *obj2;
   DB_VALUE_COMPARE_RESULT status = DB_UNK;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin1, pin2;
-#endif
 
   error = set_get_setobj (set1, &obj1, 0);
   if (error != NO_ERROR)
@@ -3431,27 +3306,19 @@ set_compare (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion)
     {
       return status;
     }
-#if !defined(SERVER_MODE)
   pin1 = ws_pin (set1->owner, 1);
-#endif
   if (set_get_setobj (set2, &obj2, 0) == NO_ERROR)
     {
       if (set2 != NULL && obj2 != NULL)
 	{
-#if !defined(SERVER_MODE)
 	  pin2 = ws_pin (set2->owner, 1);
-#endif
 
 	  status = setobj_compare (obj1, obj2, do_coercion);
 
-#if !defined(SERVER_MODE)
 	  (void) ws_pin (set2->owner, pin2);
-#endif
 	}
     }
-#if !defined(SERVER_MODE)
   (void) ws_pin (set1->owner, pin1);
-#endif
   return (status);
 }
 
@@ -3470,9 +3337,7 @@ set_seq_compare (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion, in
   COL *obj1, *obj2;
   DB_VALUE_COMPARE_RESULT status = DB_UNK;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin1, pin2;
-#endif
 
   error = set_get_setobj (set1, &obj1, 0);
 
@@ -3484,26 +3349,18 @@ set_seq_compare (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion, in
     {
       return status;
     }
-#if !defined(SERVER_MODE)
   pin1 = ws_pin (set1->owner, 1);
-#endif
   if (set_get_setobj (set2, &obj2, 0) == NO_ERROR)
     {
       if (set2 != NULL && obj2 != NULL)
 	{
-#if !defined(SERVER_MODE)
 	  pin2 = ws_pin (set2->owner, 1);
-#endif
 	  status = setobj_compare_order (obj1, obj2, do_coercion, total_order);
 
-#if !defined(SERVER_MODE)
 	  (void) ws_pin (set2->owner, pin2);
-#endif
 	}
     }
-#if !defined(SERVER_MODE)
   (void) ws_pin (set1->owner, pin1);
-#endif
   return (status);
 }
 
@@ -3524,9 +3381,7 @@ vobj_compare (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion, int t
   DB_VALUE_COMPARE_RESULT status = DB_UNK;
   int error = NO_ERROR;
 
-#if !defined(SERVER_MODE)
   int pin1, pin2;
-#endif
 
   error = set_get_setobj (set1, &obj1, 0);
   if (error != NO_ERROR)
@@ -3537,25 +3392,17 @@ vobj_compare (DB_COLLECTION * set1, DB_COLLECTION * set2, int do_coercion, int t
     {
       return status;
     }
-#if !defined(SERVER_MODE)
   pin1 = ws_pin (set1->owner, 1);
-#endif
   if (set_get_setobj (set2, &obj2, 0) == NO_ERROR)
     {
       if (set2 != NULL && obj2 != NULL)
 	{
-#if !defined(SERVER_MODE)
 	  pin2 = ws_pin (set2->owner, 1);
-#endif
 	  status = setvobj_compare (obj1, obj2, do_coercion, total_order);
-#if !defined(SERVER_MODE)
 	  (void) ws_pin (set2->owner, pin2);
-#endif
 	}
     }
-#if !defined(SERVER_MODE)
   (void) ws_pin (set1->owner, pin1);
-#endif
   return (status);
 }
 
@@ -3573,9 +3420,7 @@ set_get_type (DB_COLLECTION * set)
   DB_TYPE stype = DB_TYPE_NULL;
   int error = NO_ERROR;
 
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3586,13 +3431,9 @@ set_get_type (DB_COLLECTION * set)
     {
       return stype;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   stype = obj->coltype;
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (stype);
 }
 
@@ -3611,9 +3452,7 @@ set_check_domain (DB_COLLECTION * set, TP_DOMAIN * domain)
   COL *obj;
   int error = NO_ERROR;
 
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3626,13 +3465,9 @@ set_check_domain (DB_COLLECTION * set, TP_DOMAIN * domain)
       status = DOMAIN_INCOMPATIBLE;
       return status;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   status = setobj_check_domain (obj, domain);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (status);
 }
 
@@ -3651,9 +3486,7 @@ set_coerce (DB_COLLECTION * set, TP_DOMAIN * domain, bool implicit_coercion)
   COL *srcobj, *newobj;
   DB_COLLECTION *new_;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   new_ = NULL;
   error = set_get_setobj (set, &srcobj, 0);
@@ -3665,9 +3498,7 @@ set_coerce (DB_COLLECTION * set, TP_DOMAIN * domain, bool implicit_coercion)
     {
       return new_;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   newobj = setobj_coerce (srcobj, domain, implicit_coercion);
   if (newobj != NULL)
     {
@@ -3682,9 +3513,7 @@ set_coerce (DB_COLLECTION * set, TP_DOMAIN * domain, bool implicit_coercion)
 	  setobj_free (newobj);
 	}
     }
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (new_);
 }
 
@@ -3702,9 +3531,7 @@ set_fprint (FILE * fp, DB_COLLECTION * set)
   COL *obj;
   int error = NO_ERROR;
 
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3715,13 +3542,9 @@ set_fprint (FILE * fp, DB_COLLECTION * set)
     {
       return;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   setobj_print (fp, obj);
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
 }
 
 /*
@@ -3749,9 +3572,7 @@ set_filter (DB_COLLECTION * set)
 {
   int error;
   COL *obj;
-#if !defined(SERVER_MODE)
   int pin;
-#endif
 
   error = set_get_setobj (set, &obj, 0);
   if (error != NO_ERROR)
@@ -3763,14 +3584,10 @@ set_filter (DB_COLLECTION * set)
     {
       return error;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (set->owner, 1);
-#endif
   error = setobj_filter (obj, 1, NULL);
 
-#if !defined(SERVER_MODE)
   (void) ws_pin (set->owner, pin);
-#endif
   return (error);
 }
 
@@ -3798,9 +3615,7 @@ set_op (DB_COLLECTION * collection1, DB_COLLECTION * collection2, DB_COLLECTION 
 {
   COL *col1, *col2;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin1, pin2;
-#endif
 
   CHECKNULL_ERR (collection1);
   CHECKNULL_ERR (collection2);
@@ -3819,10 +3634,8 @@ set_op (DB_COLLECTION * collection1, DB_COLLECTION * collection2, DB_COLLECTION 
       return ER_FAILED;
     }
 
-#if !defined(SERVER_MODE)
   pin1 = ws_pin (collection1->owner, 1);
   pin2 = ws_pin (collection2->owner, 1);
-#endif
 
   /* build result in the correct domain */
   *result = set_create_with_domain (domain, 0);
@@ -3865,10 +3678,8 @@ set_op (DB_COLLECTION * collection1, DB_COLLECTION * collection2, DB_COLLECTION 
   error = (*op) (col1, col2, (*result)->set);
 
 error_exit:
-#if !defined(SERVER_MODE)
   (void) ws_pin (collection1->owner, pin1);
   (void) ws_pin (collection2->owner, pin2);
-#endif
 
   /* check to see if we had to coerce (copy) the input argumanets. If so, free them. */
   if (col1 != collection1->set)
@@ -4006,9 +3817,7 @@ set_new_element (DB_COLLECTION * ref)
 {
   COL *col;
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   int pin;
-#endif /* !SERVER_MODE */
   DB_VALUE *new_ = NULL;
 
   error = set_get_setobj (ref, &col, 1);
@@ -4020,16 +3829,12 @@ set_new_element (DB_COLLECTION * ref)
     {
       return new_;
     }
-#if !defined(SERVER_MODE)
   pin = ws_pin (ref->owner, 1);
-#endif
   /* adds one element to collection by expanding to new index */
   /* note: indexes run from 0 to size - 1 */
   col_expand (col, col->size);
   new_ = INDEX (col, col->size - 1);
-#if !defined(SERVER_MODE)
   (void) ws_pin (ref->owner, pin);
-#endif
 
   return new_;
 }
@@ -4683,7 +4488,6 @@ swizzle_value (DB_VALUE * val, int input)
     }
   else
     {
-#if !defined(SERVER_MODE)
       /* If we're on the client, and this is a value being extracted, convert it to a DB_OBJECT* reference. We could do
        * this on input too in order to get better type checking.  Since this only happens in the internal functions for
        * building VOBJ sequences and those sequences have the wildcard domain, we don't really need to swizzle the OIDs
@@ -4695,7 +4499,6 @@ swizzle_value (DB_VALUE * val, int input)
 	  db_value_domain_init (val, DB_TYPE_OBJECT, DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE);
 	  db_make_object (val, mop);
 	}
-#endif /* !SERVER_MODE */
     }
 }
 
@@ -4719,9 +4522,7 @@ swizzle_value (DB_VALUE * val, int input)
 static int
 assign_set_value (COL * set, DB_VALUE * src, DB_VALUE * dest, bool implicit_coercion)
 {
-#if !defined (SERVER_MODE)
   int is_ref = 0;
-#endif /* !SERVER_MODE */
   int error = NO_ERROR;
   TP_DOMAIN_STATUS status;
   TP_DOMAIN *domain;
@@ -4734,18 +4535,21 @@ assign_set_value (COL * set, DB_VALUE * src, DB_VALUE * dest, bool implicit_coer
   temp = *src;
   swizzle_value (&temp, 1);
 
-#if !defined(SERVER_MODE)
-  is_ref = pt_is_reference_to_reusable_oid (&temp);
-  if (is_ref < 0)
+  /* client-context semantic check; server threads keep trusting the OID
+   * (see the swizzle comment above), so gate at runtime, not compile time */
+  if (!db_on_server)
     {
-      return is_ref;
+      is_ref = pt_is_reference_to_reusable_oid (&temp);
+      if (is_ref < 0)
+	{
+	  return is_ref;
+	}
+      if (is_ref > 0)
+	{
+	  er_set (ER_WARNING_SEVERITY, ARG_FILE_LINE, ER_REFERENCE_TO_NON_REFERABLE_NOT_ALLOWED, 0);
+	  return ER_REFERENCE_TO_NON_REFERABLE_NOT_ALLOWED;
+	}
     }
-  if (is_ref > 0)
-    {
-      er_set (ER_WARNING_SEVERITY, ARG_FILE_LINE, ER_REFERENCE_TO_NON_REFERABLE_NOT_ALLOWED, 0);
-      return ER_REFERENCE_TO_NON_REFERABLE_NOT_ALLOWED;
-    }
-#endif
 
   domain = setobj_get_domain (set);
 
@@ -4800,7 +4604,6 @@ check_set_object (DB_VALUE * var, int *removed_ptr)
 {
   int error = NO_ERROR;
   int removed = 0;
-#if !defined(SERVER_MODE)
   MOP mop;
   int status;
 
@@ -4849,7 +4652,6 @@ check_set_object (DB_VALUE * var, int *removed_ptr)
   db_make_null (var);
 
 end:
-#endif /* !SERVER_MODE */
 
   if (error == NO_ERROR && removed_ptr != NULL)
     {
@@ -5651,7 +5453,6 @@ int
 setobj_convert_oids_to_objects (COL * col)
 {
   int error = NO_ERROR;
-#if !defined(SERVER_MODE)
   DB_VALUE *var;
   int i;
   DB_TYPE typ;
@@ -5689,7 +5490,6 @@ setobj_convert_oids_to_objects (COL * col)
 	  break;
 	}
     }
-#endif
 
   return (error);
 }

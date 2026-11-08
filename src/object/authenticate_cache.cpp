@@ -28,6 +28,11 @@
 #include "message_catalog.h"
 #include "schema_manager.h"
 #include "set_object.h"
+#if defined (SERVER_MODE)
+#include "dbi.h"		/* db_set_read_fetch_instance_version */
+#include "transaction_cl.h"	/* TM_TRAN_READ_FETCH_VERSION */
+#include "work_space.h"
+#endif
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
@@ -139,6 +144,10 @@ authenticate_cache::update (DB_OBJECT_TYPE obj_type, MOP mop, void *ptr)
    */
   AU_SAVE_AND_DISABLE (save);
 
+#if defined (SERVER_MODE)
+  LC_FETCH_VERSION_TYPE save_fetch_version = TM_TRAN_READ_FETCH_VERSION ();
+#endif
+
   er_stack_push ();
 
   need_pop_er_stack = true;
@@ -194,6 +203,15 @@ authenticate_cache::update (DB_OBJECT_TYPE obj_type, MOP mop, void *ptr)
       *bits = FULL_AUTH;
       goto end;
     }
+
+#if defined (SERVER_MODE)
+  /* read the groups and grants at their latest committed version, not through the transaction's snapshot: a
+   * transaction that began before a REVOKE committed would otherwise compile a plan the REVOKE took away, and the
+   * plan would serve prepared statements of later transactions. The snapshot version is bumped so the workspace
+   * fetches them again; they stay cached at that version. */
+  db_set_read_fetch_instance_version (LC_FETCH_COMMITTED_VERSION);
+  ws_increment_mvcc_snapshot_version ();
+#endif
 
   if (au_get_set (Au_user, "groups", &groups) != NO_ERROR)
     {
@@ -280,6 +298,10 @@ end:
     {
       set_free (groups);
     }
+
+#if defined (SERVER_MODE)
+  db_set_read_fetch_instance_version (save_fetch_version);
+#endif
 
   if (need_pop_er_stack)
     {

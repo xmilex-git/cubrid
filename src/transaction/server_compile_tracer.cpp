@@ -25,14 +25,16 @@
  *
  * Gate: env CUBRID_M0_TRACER_SQL is set when cub_server boots.  Output goes to
  * the file named by CUBRID_M0_TRACER_OUT (default: m0_tracer.out in cwd).
- * Optional: CUBRID_M0_TRACER_ISOLATION=RR, CUBRID_M0_TRACER_PRE (statements run
+ * Optional: CUBRID_M0_TRACER_ISOLATION[_S<n>]=RR, CUBRID_M0_TRACER_PRE (statements run
  * first), CUBRID_M0_TRACER_BIND (integers bound to the case's host variables),
  * CUBRID_M0_TRACER_SESSIONS (concurrent sessions, each with its own client
  * context) and CUBRID_M0_TRACER_END=1 (end the session from inside it).
  * CUBRID_M0_TRACER_SQL_S<n> / CUBRID_M0_TRACER_PRE_S<n> replace the statement /
  * the statements run first for session n only; CUBRID_M0_TRACER_USER logs in as
  * another user (no password), CUBRID_M0_TRACER_START_DELAY[_S<n>] sleeps that many
- * seconds before the boot.
+ * seconds before the boot.  CUBRID_M0_TRACER_REEXEC_DELAY[_S<n>] keeps the case's
+ * prepared statement: that many seconds after the commit it runs again in a new
+ * transaction, and when that fails the statement is compiled once more.
  *
  * Known limit (deliberate): a session never shuts its client down
  * (boot_shutdown_client would finalize modules shared with the server half);
@@ -223,7 +225,7 @@ tracer_session (int sid, const char *server_name, const char *sql)
   adopted = true;
 
   /* CUBRID_M0_TRACER_ISOLATION=RR: compile under REPEATABLE READ, which takes the RR transaction lock */
-  if (const char *iso_env = std::getenv ("CUBRID_M0_TRACER_ISOLATION"))
+  if (const char *iso_env = tracer_getenv ("CUBRID_M0_TRACER_ISOLATION", sid))
     {
       if (strcmp (iso_env, "RR") != 0 || db_set_isolation (TRAN_REPEATABLE_READ) != NO_ERROR)
 	{
@@ -322,8 +324,11 @@ tracer_session (int sid, const char *server_name, const char *sql)
 	tracer_log ("M0_TRACER: S%d bound %d host variable(s)", sid, bind_cnt);
       }
 
+    /* a statement run again later is kept, as the CAS keeps its prepared handles */
+    const char *reexec_env = tracer_getenv ("CUBRID_M0_TRACER_REEXEC_DELAY", sid);
     DB_QUERY_RESULT *result = NULL;
-    err = db_execute_statement (session, stmt_id, &result);
+    err = reexec_env != NULL ? db_execute_and_keep_statement (session, stmt_id, &result)
+	  : db_execute_statement (session, stmt_id, &result);
     if (err < 0)
       {
 	tracer_log ("M0_TRACER: S%d FAIL db_execute_statement err=%d msg=[%s]", sid, err, er_msg () ? er_msg () : "");
@@ -367,14 +372,57 @@ tracer_session (int sid, const char *server_name, const char *sql)
     }
     db_value_clear (&value);
     db_query_end (result);
-    db_close_session (session);
 
     err = db_commit_transaction ();
     if (err != NO_ERROR)
       {
 	tracer_log ("M0_TRACER: S%d FAIL db_commit_transaction err=%d msg=[%s]", sid, err, er_msg () ? er_msg () : "");
+	db_close_session (session);
 	goto retire;
       }
+
+    /* the kept statement skips the compile (and its authorization check): only an invalidated plan recompiles */
+    if (reexec_env != NULL)
+      {
+	std::this_thread::sleep_for (std::chrono::seconds (atoi (reexec_env)));
+	result = NULL;
+	err = db_execute_and_keep_statement (session, stmt_id, &result);
+	if (err < 0)
+	  {
+	    tracer_log ("M0_TRACER: S%d kept re-execute err=%d", sid, er_errid ());
+	    DB_SESSION *again = db_open_buffer (sql);
+	    int again_id = again != NULL ? db_compile_statement (again) : -1;
+	    tracer_log ("M0_TRACER: S%d recompile %s err=%d", sid, again_id > 0 ? "succeeded" : "failed",
+			again_id > 0 ? NO_ERROR : er_errid ());
+	    if (again != NULL)
+	      {
+		db_close_session (again);
+	      }
+	  }
+	else
+	  {
+	    if (result != NULL && db_query_first_tuple (result) == DB_CURSOR_SUCCESS
+		&& db_query_get_tuple_value (result, 0, &value) == NO_ERROR)
+	      {
+		std::lock_guard<std::mutex> guard (tracer_Log_mutex);
+		fprintf (tracer_Fp, "M0_TRACER: S%d kept re-execute value = ", sid);
+		db_fprint_value (tracer_Fp, &value);
+		fputc ('\n', tracer_Fp);
+		fflush (tracer_Fp);
+		db_value_clear (&value);
+	      }
+	    else
+	      {
+		tracer_log ("M0_TRACER: S%d kept re-execute succeeded", sid);
+	      }
+	  }
+	if (result != NULL)
+	  {
+	    db_query_end (result);
+	  }
+	(void) db_commit_transaction ();
+      }
+    db_close_session (session);
 
     /* CUBRID_M0_TRACER_END=1: end the server session from inside the bracket (db_end_session), so the context is
      * retired by its own bracket exit */
