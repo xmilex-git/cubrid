@@ -167,6 +167,9 @@ namespace cubpl
     , result_type {0}
   {
     is_parallel_enabled = false;
+#if defined (CS_MODE) || defined (SERVER_MODE)
+    is_deterministic = false;
+#endif
     memset (&ext, 0, sizeof (pl_ext));
 
 #if defined (SERVER_MODE)

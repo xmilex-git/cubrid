@@ -91,7 +91,8 @@ namespace cubpl
     char *auth;
     int result_type; // DB_TYPE
 
-#if defined (CS_MODE)
+#if defined (CS_MODE) || defined (SERVER_MODE)
+    /* compile side only, not packed: the folded server compiles as a CS client does */
     bool is_deterministic; // DETERMINISTIC
 #endif
     /* PARALLEL_ENABLE. Unlike is_deterministic this one is packed, because the server has to
