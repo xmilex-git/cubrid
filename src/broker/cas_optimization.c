@@ -27,8 +27,10 @@
 
 #include "system_parameter.h"
 #include "cas_optimization.h"
+#include "cas_common_vars.h"	/* CAS_TLS */
 
-static int saved_Optimization_level = -1;
+/* per session in the folded server: concurrent query-plan-only executes must not swap their saved levels */
+static CAS_TLS int saved_Optimization_level = -1;
 
 void
 set_optimization_level (int level)

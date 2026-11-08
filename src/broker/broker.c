@@ -68,6 +68,9 @@
 #include "broker_filename.h"
 #include "broker_er_html.h"
 #include "broker_send_fd.h"
+#if !defined(WINDOWS)
+#include "broker_direct.h"
+#endif
 #include "error_manager.h"
 #include "shard_shm.h"
 #include "shard_metadata.h"
@@ -312,6 +315,8 @@ static T_SHM_PROXY *shm_proxy_p = NULL;
 
 static int br_index = -1;
 static int br_shard_flag = OFF;
+/* stage B1 (#117): dispatch to the DB server's adoption socket, no CAS pool */
+static int br_direct_flag = OFF;
 
 #if defined(WIN_FW)
 static int num_thr;
@@ -491,6 +496,9 @@ main (int argc, char *argv[])
     }
 
   br_shard_flag = br_info_p->shard_flag;
+#if !defined(WINDOWS)
+  br_direct_flag = br_info_p->direct_handoff;
+#endif
 
   signal (SIGTERM, cleanup);
   signal (SIGINT, cleanup);
@@ -574,6 +582,20 @@ main (int argc, char *argv[])
       SLEEP_MILISEC (0, 200);
     }
 
+#if !defined(WINDOWS)
+  if (br_direct_flag == ON)
+    {
+      /* channel manager + db_info peek engine; the job queue plumbing stays
+       * the receiver/dispatch pair's own (#117 D3) */
+      if (brd_init (shm_br->br_info[br_index].name, shm_br->br_info[br_index].appl_server_max_num,
+		    shm_appl->statement_pooling, shm_appl->cci_pconnect, shm_appl->job_queue,
+		    shm_appl->job_queue_size, &clt_table_mutex, &clt_table_cond) < 0)
+	{
+	  goto error1;
+	}
+    }
+#endif
+
   THREAD_BEGIN (receiver_thread, receiver_thr_f, NULL);
 
   if (br_shard_flag == ON)
@@ -584,9 +606,13 @@ main (int argc, char *argv[])
     {
       THREAD_BEGIN (dispatch_thread, dispatch_thr_f, NULL);
     }
-  THREAD_BEGIN (psize_check_thread, psize_check_thr_f, NULL);
-  THREAD_BEGIN (cas_monitor_thread, cas_monitor_thr_f, NULL);
-  THREAD_BEGIN (server_monitor_thread, server_monitor_thr_f, NULL);
+  if (br_direct_flag == OFF)
+    {
+      /* CAS pool janitors: no CAS processes exist in direct mode */
+      THREAD_BEGIN (psize_check_thread, psize_check_thr_f, NULL);
+      THREAD_BEGIN (cas_monitor_thread, cas_monitor_thr_f, NULL);
+      THREAD_BEGIN (server_monitor_thread, server_monitor_thr_f, NULL);
+    }
 
   if (br_shard_flag == ON)
     {
@@ -596,7 +622,7 @@ main (int argc, char *argv[])
 #endif /* !WINDOWS */
     }
 
-  if (shm_br->br_info[br_index].monitor_hang_flag)
+  if (shm_br->br_info[br_index].monitor_hang_flag && br_direct_flag == OFF)
     {
       THREAD_BEGIN (hang_check_thread, hang_check_thr_f, NULL);
     }
@@ -633,7 +659,7 @@ main (int argc, char *argv[])
 	{
 	  SLEEP_MILISEC (0, 100);
 
-	  if (shm_br->br_info[br_index].auto_add_appl_server == OFF)
+	  if (br_direct_flag == ON || shm_br->br_info[br_index].auto_add_appl_server == OFF)
 	    {
 	      continue;
 	    }
@@ -896,6 +922,17 @@ receiver_thr_f (void *arg)
 	    {
 	      status = FN_STATUS_BUSY;
 	    }
+#if !defined(WINDOWS)
+	  else if (br_direct_flag == ON)
+	    {
+	      /* the pid slot carries the server-issued token (#117 D4); the
+	       * control-channel wait happens off the receiver thread and the
+	       * helper owns the socket from here on */
+	      brd_status_reply_async (clt_sock_fd, (unsigned int) pid);
+	      clt_sock_fd = INVALID_SOCKET;
+	      continue;
+	    }
+#endif
 	  else
 	    {
 	      for (i = 0; i < shm_br->br_info[br_index].appl_server_max_num; i++)
@@ -985,7 +1022,19 @@ receiver_thr_f (void *arg)
 	    }
 
 	  ret_code = CAS_ER_QUERY_CANCEL;
-	  if (shm_br->br_info[br_index].shard_flag == OFF)
+	  if (br_direct_flag == ON)
+	    {
+	      /* pid slot = token; same ip/port anti-spoof, forwarded over
+	       * the control channel instead of SIGUSR1 (#117 D4).  The dial /
+	       * reply wait runs off the receiver thread; the helper replies
+	       * and closes the socket. */
+	      brd_cancel_reply_async (clt_sock_fd, (unsigned int) pid, (const unsigned char *) &clt_sock_addr.sin_addr,
+				      cas_req_header[0] == 'Q' ? client_port : 0, cas_req_header[0] == 'X',
+				      cas_req_header);
+	      clt_sock_fd = INVALID_SOCKET;
+	      continue;
+	    }
+	  else if (shm_br->br_info[br_index].shard_flag == OFF)
 	    {
 
 	      for (i = 0; i < shm_br->br_info[br_index].appl_server_max_num; i++)
@@ -1105,6 +1154,16 @@ receiver_thr_f (void *arg)
 	    }
 	}
 
+      if (br_direct_flag == ON && !(driver_version & CAS_PROTO_INDICATOR))
+	{
+	  /* pre-9.0 dialects send a smaller db_info the peek engine cannot
+	   * frame; the V12-single wire starts at the protocol indicator
+	   * (#116 D3) */
+	  send_error_to_driver (clt_sock_fd, CAS_ER_COMMUNICATION, cas_req_header);
+	  CLOSE_SOCKET (clt_sock_fd);
+	  continue;
+	}
+
       if (job_queue[0].id == job_queue_size)
 	{
 	  send_error_to_driver (clt_sock_fd, CAS_ER_FREE_SERVER, cas_req_header);
@@ -1129,6 +1188,16 @@ receiver_thr_f (void *arg)
       strcpy (new_job.prg_name, cas_client_type_str[(int) cas_client_type]);
       new_job.clt_version = client_version;
       memcpy (new_job.driver_info, cas_req_header, SRV_CON_CLIENT_INFO_SIZE);
+
+#if !defined(WINDOWS)
+      if (br_direct_flag == ON)
+	{
+	  /* ack + non-blocking db_info peek; the peek engine enqueues the
+	   * job once the packet is complete (#117 D2) */
+	  brd_park_client (clt_sock_fd, &new_job);
+	  continue;
+	}
+#endif
 
       while (1)
 	{
@@ -1281,6 +1350,17 @@ dispatch_thr_f (void *arg)
       hold_job = 1;
       max_heap_incr_priority (job_queue);
       pthread_mutex_unlock (&clt_table_mutex);
+
+#if !defined(WINDOWS)
+      if (br_direct_flag == ON)
+	{
+	  /* slot wait + dbname-routed handoff to the server (#117 D1/D3);
+	   * owns the fd on every path */
+	  brd_dispatch_job (&cur_job);
+	  hold_job = 0;
+	  continue;
+	}
+#endif
 
 #if !defined (WINDOWS)
     retry:

@@ -216,6 +216,8 @@ set(CONNECTION_SOURCES
   ${CONNECTION_DIR}/host_lookup.c
   ${CONNECTION_DIR}/connection_context.cpp
   ${CONNECTION_DIR}/master_connector.cpp
+  ${CONNECTION_DIR}/adoption.cpp
+  ${CONNECTION_DIR}/driver_session.cpp
   ${CONNECTION_DIR}/connection_pool.cpp
   ${CONNECTION_DIR}/connection_worker.cpp
   ${CONNECTION_DIR}/coordinator.cpp
@@ -228,6 +230,8 @@ set(CONNECTION_HEADERS
   ${CONNECTION_DIR}/connection_support.hpp
   ${CONNECTION_DIR}/connection_context.hpp
   ${CONNECTION_DIR}/master_connector.hpp
+  ${CONNECTION_DIR}/adoption.hpp
+  ${CONNECTION_DIR}/driver_session.hpp
   ${CONNECTION_DIR}/connection_pool.hpp
   ${CONNECTION_DIR}/connection_worker.hpp
   ${CONNECTION_DIR}/coordinator.hpp
@@ -762,6 +766,44 @@ if(UNIX)
   set_source_files_properties(${COMPAT_DIR}/db_json_types_internal.cpp PROPERTIES COMPILE_FLAGS -Wno-unknown-pragmas)
 endif(UNIX)
 
+# stage B1 (#117): the CAS speaker folded into the server so an adopted
+# driver connection's session thread can run the CAS request loop in-process
+# (driver_session.cpp).  The per-CAS-process globals in these files are
+# thread-local under SERVER_MODE (CAS_TLS, cas_common_vars.h); shm reads are
+# served by the stub in cas_server_support.cpp.  cas_sql_log2.c (dup2 on fd 1)
+# and cas_ssl.c (B2) are deliberately NOT folded — cas_server_support.cpp
+# carries their no-op/assert stubs.
+set(CAS_SPEAKER_SOURCES
+  ${BROKER_DIR}/cas_dispatch.c
+  ${BROKER_DIR}/cas_conn_helpers.c
+  ${BROKER_DIR}/cas_function.c
+  ${BROKER_DIR}/cas_execute.c
+  ${BROKER_DIR}/cas_common_execute.c
+  ${BROKER_DIR}/cas_common_function.c
+  ${BROKER_DIR}/cas_common_vars.c
+  ${BROKER_DIR}/cas_net_buf.c
+  ${BROKER_DIR}/cas_network.c
+  ${BROKER_DIR}/cas_handle.c
+  ${BROKER_DIR}/cas_error.c
+  ${BROKER_DIR}/cas_util.c
+  ${BROKER_DIR}/cas_str_like.c
+  ${BROKER_DIR}/cas_schema_info.c
+  ${BROKER_DIR}/cas_meta.c
+  ${BROKER_DIR}/cas_optimization.c
+  ${BROKER_DIR}/cas_xa.c
+  ${BROKER_DIR}/cas_log.c
+  ${BROKER_DIR}/query_replace.c
+  ${BROKER_DIR}/cas_server_support.cpp
+  ${BROKER_DIR}/broker_filename.c
+  ${BROKER_DIR}/broker_util.c
+  )
+# ASYNC_MODE is load-bearing: without it cas_network.c loses every poll()
+# timeout; CAS_CUBRID selects the CUBRID branches in cas_net_buf.c
+SET_SOURCE_FILES_PROPERTIES(
+  ${CAS_SPEAKER_SOURCES}
+  PROPERTIES COMPILE_DEFINITIONS "ASYNC_MODE;CAS_CUBRID"
+  )
+
 SET_SOURCE_FILES_PROPERTIES(
   ${BASE_SOURCES}
   ${COMMUNICATION_SOURCES}
@@ -786,6 +828,7 @@ SET_SOURCE_FILES_PROPERTIES(
   ${XASL_SOURCES}
   ${PARALLEL_QUERY_SOURCES}
   ${CLIENT_HALF_SOURCES}
+  ${CAS_SPEAKER_SOURCES}
   PROPERTIES LANGUAGE CXX
   )
 
@@ -844,6 +887,8 @@ list(APPEND CUBRID_LIB_SOURCES
   ${OPTIMIZER_HISTOGRAM_DIR}/histogram_reader.cpp
   ${OPTIMIZER_HISTOGRAM_DIR}/histogram_sampler_sr.cpp
   )
+
+list(APPEND CUBRID_LIB_SOURCES ${CAS_SPEAKER_SOURCES})
 
 set (CUBRID_LIB_HEADERS
   ${BASE_HEADERS}

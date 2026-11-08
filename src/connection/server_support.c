@@ -32,6 +32,7 @@
 #include "thread_entry_task.hpp"
 #include "thread_entry.hpp"
 #include "thread_manager.hpp"
+#include "adoption.hpp"
 #include "master_connector.hpp"
 #include "connection_pool.hpp"
 #include "connection_worker.hpp"
@@ -691,10 +692,35 @@ css_init (THREAD_ENTRY * thread_p, char *server_name, int name_length, int port_
   connector.attach (*thread_p);
   /* attach pool */
   connector.attach (connections);
+
+  /* broker->server connection adoption endpoint (stage B1, #117): the packed
+   * name starts with '#' when HA is enabled — the adoption socket is keyed by
+   * the bare database name the broker routes on */
+  {
+    const char *adoption_db_name = server_name;
+    if (adoption_db_name[0] == '#')
+      {
+	adoption_db_name++;
+      }
+    if (cubconn::adoption::start (adoption_db_name) != NO_ERROR)
+      {
+	/* the adoption socket is the only driver data path (B4): a server
+	 * without it is alive but unreachable — refuse to come up half-dead
+	 * (reviewed: PR 7837) */
+	er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 1,
+		"the driver adoption endpoint failed to start; check the socket directory and stale sockets");
+	goto shutdown;
+      }
+  }
+
   /* handshake and dispatch connection */
   connector.run (port_id, name);
 
 shutdown:
+  /* adopted sessions unregister their transactions in their teardown; stop
+   * them while the server infrastructure is still fully up */
+  cubconn::adoption::stop ();
+
   /*
    * start to shutdown server
    */

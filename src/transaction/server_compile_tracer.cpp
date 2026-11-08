@@ -467,6 +467,9 @@ retire:
       /* drops the conn's session reference: from here the session can expire and retire the context, which waits
        * for this bracket */
       entry_p->conn_entry = NULL;
+      /* refund the css_Num_current_client slot taken by css_make_conn
+       * (wf171 — css_free_conn alone never refunds it) */
+      css_prepare_shutdown_conn (conn);
       css_free_conn (conn);
     }
   entry_p->tran_index = NULL_TRAN_INDEX;
@@ -477,6 +480,10 @@ retire:
       /* no session owns it: the creator retires it */
       csc_retire_and_delete (ctx);
     }
+  /* Raw retirement returns the entry as-is; match entry_manager::retire_context
+   * before another worker claims this former session entry. */
+  entry_p->private_lru_index = -1;
+  entry_p->m_is_private_lru_enabled = false;
   entry_p->get_error_context ().deregister_thread_local ();
   entry_p->unregister_id ();
   cubthread::get_manager ()->retire_entry (*entry_p);
