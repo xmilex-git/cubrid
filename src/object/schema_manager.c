@@ -211,6 +211,9 @@ static const char *method_file_extension = ".o";
 #include <nlist.h>
 #endif /* !WINDOWS */
 
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
+
 #if defined (ENABLE_UNUSED_FUNCTION)	/* to disable TEXT */
 const char TEXT_CONSTRAINT_PREFIX[] = "#text_";
 #endif /* ENABLE_UNUSED_FUNCTION */
@@ -1546,6 +1549,14 @@ sm_dynamic_link_class (SM_CLASS * class_, METHOD_LINK * links)
     {
       return error;
     }
+
+#if defined (SERVER_MODE)
+  /* user-defined native C methods are not supported in the server: a loaded library would run with the server's
+   * threads, statics, exit/abort and heap. Built-in (static) methods and Java and PL/CSQL routines are not linked
+   * here */
+  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_SM_DYNAMIC_LINK_PROBLEMS, 0);
+  return ER_SM_DYNAMIC_LINK_PROBLEMS;
+#endif
 
   files = class_->method_files;
   nfiles = ws_list_length ((DB_LIST *) files);

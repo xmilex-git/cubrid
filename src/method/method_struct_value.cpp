@@ -29,8 +29,15 @@
 
 #include "memory_private_allocator.hpp" /* cubmem::PRIVATE_BLOCK_ALLOCATOR */
 
-#if !defined (SERVER_MODE)
 #include "work_space.h" /* WS_OID */
+
+#if defined (SERVER_MODE)
+#include "client_session_context.hpp"
+
+/* the folded server: a thread holding a session's bracket owns that session's workspace, and its server half also
+ * meets MOP values (an SP argument the client half passed), so OBJECT values take the client convention there; a
+ * server thread without a bracket keeps the OID convention */
+#define VALUE_IS_CLIENT_HALF() (csc_bracket_is_active ())
 #endif
 
 #include <cstring>
@@ -214,7 +221,14 @@ namespace cubmethod
 
       case DB_TYPE_OBJECT:
       {
-#if !defined (SERVER_MODE)
+#if defined (SERVER_MODE)
+	if (!VALUE_IS_CLIENT_HALF ())
+	  {
+	    // TODO: Implement a way to pack DB_TYPE_OBJECT value on Server
+	    assert (false);
+	    break;
+	  }
+#endif
 	OID *oid = (OID *) (&oid_Null_oid);
 	MOP mop = db_get_object (&v);
 	if (mop != NULL)
@@ -222,10 +236,6 @@ namespace cubmethod
 	    oid = WS_OID (mop);
 	  }
 	serializator.pack_oid (*oid);
-#else
-	// TODO: Implement a way to pack DB_TYPE_OBJECT value on Server
-	assert (false);
-#endif
       }
       break;
 
@@ -347,13 +357,15 @@ namespace cubmethod
       break;
 
       case DB_TYPE_OBJECT:
-#if !defined (SERVER_MODE)
-
-	size += serializator.get_packed_oid_size (size);
-#else
-	// TODO: Implement a way to pack DB_TYPE_OBJECT value on Server
-	assert (false);
+#if defined (SERVER_MODE)
+	if (!VALUE_IS_CLIENT_HALF ())
+	  {
+	    // TODO: Implement a way to pack DB_TYPE_OBJECT value on Server
+	    assert (false);
+	    break;
+	  }
 #endif
+	size += serializator.get_packed_oid_size (size);
 	break;
 
       case DB_TYPE_DATE:
@@ -498,10 +510,10 @@ namespace cubmethod
 	deserializator.unpack_string (numeric_str);
 
 	INTL_CODESET codeset;
-#if !defined (SERVER_MODE)
-	codeset = lang_get_client_charset ();
+#if defined (SERVER_MODE)
+	codeset = VALUE_IS_CLIENT_HALF ()? lang_get_client_charset () : LANG_SYS_CODESET;
 #else
-	codeset = LANG_SYS_CODESET;
+	codeset = lang_get_client_charset ();
 #endif
 	db_make_null (v);
 	if (numeric_coerce_string_to_num (numeric_str.c_str (), numeric_str.size (), codeset, v) != NO_ERROR)
@@ -683,13 +695,16 @@ namespace cubmethod
       {
 	OID oid;
 	deserializator.unpack_oid (oid);
-#if !defined (SERVER_MODE)
+#if defined (SERVER_MODE)
+	if (!VALUE_IS_CLIENT_HALF ())
+	  {
+	    // TODO: Implement a way to pack DB_TYPE_OBJECT value on Server?
+	    db_make_oid (v, &oid);
+	    break;
+	  }
+#endif
 	MOP obj = ws_mop (&oid, NULL);
 	db_make_object (v, obj);
-#else
-	// TODO: Implement a way to pack DB_TYPE_OBJECT value on Server?
-	db_make_oid (v, &oid);
-#endif
       }
       break;
 

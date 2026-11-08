@@ -27,6 +27,8 @@
 #include "method_struct_invoke.hpp"
 #include "object_primitive.h"
 #include "object_representation.h"	/* OR_ */
+#include "set_object.h"		/* set_get_element, set_put_element */
+#include "work_space.h"		/* ws_identifier */
 #include "packer.hpp"
 #include "pl_connection.hpp"
 #include "session.h"
@@ -37,11 +39,71 @@
 #if defined (SA_MODE)
 #include "query_method.hpp"
 #endif
+#if defined (SERVER_MODE)
+#include "client_session_context.hpp"
+#endif
+
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 
 namespace cubmethod
 {
+  void
+  method_result_to_server_semantics (DB_VALUE &value)
+  {
+#if defined (SERVER_MODE)
+    if (!csc_bracket_is_active ())
+      {
+	return;
+      }
+
+    switch (DB_VALUE_DOMAIN_TYPE (&value))
+      {
+      case DB_TYPE_OBJECT:
+      {
+	/* a virtual MOP has no OID and stays */
+	OID *oid = ws_identifier (db_get_object (&value));
+	if (oid != NULL)
+	  {
+	    db_make_oid (&value, oid);
+	  }
+	break;
+      }
+      case DB_TYPE_SET:
+      case DB_TYPE_MULTISET:
+      case DB_TYPE_SEQUENCE:
+      {
+	DB_SET *set = db_get_set (&value);
+	int size = set ? set_size (set) : 0;
+	for (int i = 0; i < size; i++)
+	  {
+	    DB_VALUE elem;
+	    if (set_get_element (set, i, &elem) != NO_ERROR)
+	      {
+		continue;
+	      }
+	    if (DB_VALUE_DOMAIN_TYPE (&elem) == DB_TYPE_OBJECT)
+	      {
+		OID *oid = ws_identifier (db_get_object (&elem));
+		if (oid != NULL)
+		  {
+		    DB_VALUE oid_val;
+		    db_make_oid (&oid_val, oid);
+		    set_put_element (set, i, &oid_val);
+		  }
+	      }
+	    db_value_clear (&elem);
+	  }
+	break;
+      }
+      default:
+	break;
+      }
+#else
+    (void) value;
+#endif
+  }
+
 //////////////////////////////////////////////////////////////////////////
 // Method Group to invoke together
 //////////////////////////////////////////////////////////////////////////
@@ -148,6 +210,7 @@ namespace cubmethod
 	  if (status == METHOD_SUCCESS)
 	    {
 	      unpacker.unpack_db_value (result);
+	      method_result_to_server_semantics (result);
 	    }
 	  else
 	    {

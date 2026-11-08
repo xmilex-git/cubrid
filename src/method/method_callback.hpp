@@ -74,6 +74,7 @@ namespace cubmethod
       {
 	return !m_deferred_query_free_handler.empty ();
       }
+      bool has_retained_resources () const;
 
       void clear_all_query_handlers ();
 
@@ -137,5 +138,8 @@ namespace cubmethod
 
 // C declarations
 extern void method_callback_final (void);
+#if defined (SERVER_MODE)
+extern void method_callback_session_final (void);
+#endif
 
 #endif // _METHOD_CALLBACK_HPP_

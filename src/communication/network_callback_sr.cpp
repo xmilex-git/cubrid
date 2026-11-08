@@ -18,14 +18,17 @@
 
 #include "network_callback_sr.hpp"
 
+#include "error_manager.h" /* er_errid() */
 #include "network.h" /* METHOD_CALL */
 #include "network_interface_sr.h" /* xs_receive_data_from_client() */
 #include "object_representation.h" /* OR_ */
 #include "server_support.h"	/* css_send_reply_and_data_to_client(), css_get_comm_request_id() */
 
-#if !defined (SERVER_MODE)
 #include "query_method.hpp"
 #include "method_callback.hpp"
+
+#if defined (SERVER_MODE)
+#include "client_session_context.hpp"
 #endif
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -52,6 +55,21 @@ xs_callback_end_wait (cubthread::entry *thread_p)
 
 int xs_callback_send (cubthread::entry *thread_p, const cubmem::extensible_block &mem)
 {
+  /* a folded session: the client half is this very thread's (its bracket is thread-local), so the callback
+   * ends here, the SA shape; a thread without a bracket serves a CAS over the wire */
+  if (csc_bracket_is_active ())
+    {
+      packing_unpacker unpacker (mem.get_read_ptr (), mem.get_size ());
+      int error = method_dispatch (unpacker);
+      if (error != NO_ERROR && er_errid () != NO_ERROR)
+	{
+	  /* CS sent er_errid (), not the dispatch status, back in METHOD_ERROR (network_cl.c); the invoke loop
+	   * passes ER_SM_INVALID_METHOD_ENV through by that id */
+	  error = er_errid ();
+	}
+      return error;
+    }
+
   OR_ALIGNED_BUF (OR_INT_SIZE * 2) a_reply;
   char *reply = OR_ALIGNED_BUF_START (a_reply);
 
@@ -77,6 +95,21 @@ int xs_callback_send (cubthread::entry *thread_p, const cubmem::extensible_block
 
 int xs_callback_receive (cubthread::entry *thread_p, const xs_callback_func &func)
 {
+  if (csc_bracket_is_active ())
+    {
+      /* the in-process dispatch above queued its response on the session's handler */
+      std::queue <cubmem::extensible_block> &queue = cubmethod::get_callback_handler ()->get_data_queue ();
+
+      assert (!queue.empty ());
+
+      cubmem::extensible_block &blk = queue.front ();
+      cubmem::block in_proc_buffer (blk.get_size (), blk.get_ptr ());
+      int in_proc_error = func (in_proc_buffer);
+
+      queue.pop ();
+      return in_proc_error;
+    }
+
   cubmem::block buffer (0, nullptr);
 
   int error = xs_receive_data_from_client (thread_p, &buffer.ptr, (int *) &buffer.dim);

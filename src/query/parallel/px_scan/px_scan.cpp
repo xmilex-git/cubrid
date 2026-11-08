@@ -1675,12 +1675,9 @@ namespace parallel_scan
       {
 	m_uses_xasl_clone = false;
 
-	THREAD_ENTRY *main_thread_p = thread_get_main_thread (m_thread_p);
-	if (main_thread_p->xasl_unpack_info_ptr)
-	  {
-	    /* use unpack info ptr for execute. */
-	  }
-	else
+	/* the workers unpack their copies from this query's own stream: the main thread's unpack info can belong
+	 * to a query a method callback runs nested on it meanwhile */
+	if (m_query_entry->xasl_buf_info == nullptr)
 	  {
 	    assert (false);
 	    return ER_FAILED;

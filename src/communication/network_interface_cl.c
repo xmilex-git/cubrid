@@ -54,6 +54,7 @@
 #include "network_interface_sr.h"
 #include "log_impl.h"
 #include "schema_manager.h"
+#include "list_file.h"
 #endif /* SERVER_MODE */
 #endif /* defined (SA_MODE) */
 #include "oid.h"
@@ -134,6 +135,8 @@ static void enter_server_no_thread_entry (void);
 static THREAD_ENTRY *enter_server (void);
 static void exit_server_no_thread_entry (void);
 static void exit_server (const THREAD_ENTRY & thread_ref);
+static DB_VALUE *qmgr_server_db_values (THREAD_ENTRY * thread_p, int dbval_cnt, const DB_VALUE * dbvals, bool * error);
+static void qmgr_free_server_db_values (THREAD_ENTRY * thread_p, int dbval_cnt, DB_VALUE * server_db_values);
 #endif /* !CS_MODE */
 static int is_top_level_class (MOBJ mobj);
 
@@ -5526,10 +5529,22 @@ cleanup:
   return err;
 #else
   int err = 0;
+  bool error;
 
   THREAD_ENTRY *thread_p = enter_server ();
 
-  err = xsession_set_session_variables (thread_p, variables, count);
+  /* the session keeps an object as its OID, as the client's packing sends it in CS mode: a later read in the
+   * server cannot take a MOP */
+  DB_VALUE *server_values = qmgr_server_db_values (thread_p, count, variables, &error);
+  if (error)
+    {
+      err = er_errid () != NO_ERROR ? er_errid () : ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  else
+    {
+      err = xsession_set_session_variables (thread_p, server_values, count);
+    }
+  qmgr_free_server_db_values (thread_p, count, server_values);
 
   exit_server (*thread_p);
 
@@ -7929,6 +7944,12 @@ qmgr_execute_query (const XASL_ID * xasl_id, QUERY_ID * query_idp, int dbval_cnt
     }
   qmgr_free_server_db_values (thread_p, dbval_cnt, server_db_values);
 
+#if defined (SERVER_MODE)
+  /* the client half frees this clone without qfile_clear_list_id (cursor_free_list_id), as it frees a list it
+   * unpacked from the wire: the server's count of it ends here */
+  qfile_update_qlist_count (thread_p, list_id, -1);
+#endif
+
   exit_server (*thread_p);
 
   return list_id;
@@ -8049,6 +8070,11 @@ qmgr_prepare_and_execute_query (char *xasl_stream, int xasl_stream_size, QUERY_I
 					 server_db_values, &flag, query_timeout);
     }
   qmgr_free_server_db_values (thread_p, dbval_cnt, server_db_values);
+
+#if defined (SERVER_MODE)
+  /* freed by the client half without qfile_clear_list_id, as qmgr_execute_query's */
+  qfile_update_qlist_count (thread_p, regu_result, -1);
+#endif
 
   exit_server (*thread_p);
 
@@ -11811,6 +11837,10 @@ error:
 
   {
     DB_VALUE ret_value;
+
+    /* the error path skips execute () and still clears it */
+    db_make_null (&ret_value);
+
     cubpl::executor executor ((cubpl::pl_signature &) sig);
     req_error = executor.fetch_args_peek (args);
     if (req_error == NO_ERROR)

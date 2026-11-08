@@ -63,6 +63,17 @@
 #include "tcp.h"
 #endif /* WINDOWS */
 
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
+
+#if defined (SERVER_MODE)
+/* the error-stack floor of the innermost method dispatch (client_session_context.cpp): the client half's
+ * clear-all keeps the frames of the server executor that raised the callback */
+extern int csc_er_stack_floor (void);
+#else
+#define csc_er_stack_floor() 0
+#endif
+
 #if defined (SERVER_MODE)
 /* the session's tm_context (transaction_cl.h) */
 #define tm_Tran_latest_query_status (csc_tm ()->tran_latest_query_status)
@@ -396,7 +407,7 @@ tran_commit (bool retain_lock)
   if (error_code == NO_ERROR || BOOT_IS_CLIENT_RESTARTED ())
     {
       ws_clear_all_hints (retain_lock);
-      er_stack_clearall ();
+      er_stack_clear_above (csc_er_stack_floor ());
     }
 
   /* allow triggers AFTER the commit */
@@ -518,7 +529,7 @@ tran_abort (void)
   /* Increment snapshot version in work space */
   ws_increment_mvcc_snapshot_version ();
 
-  er_stack_clearall ();
+  er_stack_clear_above (csc_er_stack_floor ());
 
   /* can these do anything useful ? */
   tr_check_rollback_triggers (TR_TIME_AFTER);
@@ -830,7 +841,7 @@ tran_2pc_prepare (void)
     {
       db_clear_client_query_result (true, true);
       ws_clear_all_hints (false);
-      er_stack_clearall ();
+      er_stack_clear_above (csc_er_stack_floor ());
     }
 
 end:
@@ -989,7 +1000,7 @@ tran_2pc_prepare_global_tran (int gtrid)
     {
       db_clear_client_query_result (true, true);
       ws_clear_all_hints (false);
-      er_stack_clearall ();
+      er_stack_clear_above (csc_er_stack_floor ());
     }
 
   return error_code;

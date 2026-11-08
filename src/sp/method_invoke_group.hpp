@@ -63,6 +63,10 @@ namespace cubmethod
   // forward declarations
   class method_invoke;
 
+  /* a value a folded session's bracket thread unpacked carries MOPs (the client convention); the server executor
+   * reads OIDs, which the wire gave it in CS mode: objects and set elements become OIDs */
+  void method_result_to_server_semantics (DB_VALUE &value);
+
   class method_invoke_group
   {
     public:

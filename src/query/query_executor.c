@@ -22932,6 +22932,12 @@ qexec_bind_checksum (int count, const DB_VALUE * values)
 }
 #endif
 
+#if defined (SERVER_MODE)
+/* a folded session whose method callbacks keep query handles: their queries ran nested on this thread and keep
+ * their list files past the outer query's end (client_session_context.cpp) */
+extern bool csc_has_method_callback_state (void);
+#endif
+
 /*
  * qexec_execute_query () -
  *   return: Query result list file identifier, or NULL
@@ -23243,13 +23249,13 @@ end:
 	{
 	  dependent_cnt++;
 	}
-      assert (thread_p->m_qlist_count.load () == qlist_enter_count + dependent_cnt);
+      assert (csc_has_method_callback_state () || thread_p->m_qlist_count.load () == qlist_enter_count + dependent_cnt);
 #endif
     }
   else
     {
       // no new list files
-      assert (thread_p->m_qlist_count.load () == qlist_enter_count);
+      assert (csc_has_method_callback_state () || thread_p->m_qlist_count.load () == qlist_enter_count);
     }
 #endif // SERVER_MODE
 

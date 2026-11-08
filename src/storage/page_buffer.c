@@ -3224,6 +3224,10 @@ pgbuf_unfix (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
  *       our system must be corrected to prevent above situation from
  *	 occurring.
  */
+#if defined (SERVER_MODE)
+extern bool csc_in_method_dispatch (void);	/* client_session_context.cpp */
+#endif
+
 void
 pgbuf_unfix_all (THREAD_ENTRY * thread_p)
 {
@@ -3231,6 +3235,16 @@ pgbuf_unfix_all (THREAD_ENTRY * thread_p)
   PAGE_PTR pgptr;
   PGBUF_HOLDER_ANCHOR *thrd_holder_info;
   PGBUF_HOLDER *holder;
+
+#if defined (SERVER_MODE)
+  /* a folded session's method callback ends its transaction on the thread whose outer executor is suspended
+   * holding its fixes; in CS the callback ran in the CAS process and this sweep never saw them. The callback's
+   * own queries release their fixes before they return */
+  if (csc_in_method_dispatch ())
+    {
+      return;
+    }
+#endif
 #if defined(NDEBUG)
 #else /* NDEBUG */
   PGBUF_BCB *bufptr;

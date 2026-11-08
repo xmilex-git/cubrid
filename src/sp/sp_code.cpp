@@ -37,28 +37,23 @@ ATTR_ID spcode_Attrs_id[NUM_SP_CODE_ATTR];
 int spcode_Num_attrs = -1;
 
 static int sp_load_sp_code_attribute_info (THREAD_ENTRY *thread_p);
-static void sp_code_attr_init ();
 static int sp_get_attrid (THREAD_ENTRY *thread_p, int attr_index, ATTR_ID &attrid);
 static int sp_get_attr_idx (const std::string &attr_name);
 
 using sp_code_attr_map_type = std::unordered_map <std::string, int>;
-static sp_code_attr_map_type attr_idx_map;
-
-static void
-sp_code_attr_init ()
-{
-#define MAP_LIST_ITEM(item)     attr_idx_map [SP_CODE_ATTR_##item] = INDEX_SP_CODE_ATTR_##item;
-  SP_CODE_ATTR_LIST
-#undef MAP_LIST_ITEM
-}
 
 static int
 sp_get_attr_idx (const std::string &attr_name)
 {
-  if (attr_idx_map.size () == 0)
-    {
-      sp_code_attr_init ();
-    }
+  /* built once, by the first caller (sessions call it concurrently) */
+  static const sp_code_attr_map_type attr_idx_map = []
+  {
+    sp_code_attr_map_type map;
+#define MAP_LIST_ITEM(item)     map [SP_CODE_ATTR_##item] = INDEX_SP_CODE_ATTR_##item;
+    SP_CODE_ATTR_LIST
+#undef MAP_LIST_ITEM
+    return map;
+  } ();
 
   auto idx_it = attr_idx_map.find (attr_name);
   if (idx_it == attr_idx_map.end ())

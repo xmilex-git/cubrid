@@ -44,9 +44,16 @@
 #include "work_space.h"
 
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 // *INDENT-OFF*
 struct mht_table;
+
+namespace cubmethod
+{
+  class callback_handler;
+}
 
 class client_session_context
 {
@@ -94,6 +101,18 @@ class client_session_context
     /* query_planner.c: SET OPTIMIZATION COST, two bits per plan kind (0 = every plan at its default cost) */
     unsigned int qo_cost_overrides = 0;
 
+    /* method_callback.cpp: the query handles a PL routine keeps refer to this session's workspace, so the
+     * callback handler is the session's (one CAS served one session); created on first use, retired by the
+     * teardown before ws_final, in the bracket */
+    cubmethod::callback_handler *method_callback_handler = nullptr;
+
+    /* query_method.cpp: builtin C method runtime arguments, keyed by invoke group id */
+    std::unordered_map<UINT64, std::vector<DB_VALUE>> method_runtime_args;
+
+    /* query_method.cpp: error-stack depth at the innermost method dispatch; the client half's clear-all
+     * (transaction_cl.c) stops there, the frames below belong to the server executor that raised the callback */
+    int er_dispatch_floor = 0;
+
     /* set when the session ended from inside this very context (its last
      * reference was dropped by the bracket's own thread): the bracket exit
      * tears it down and deletes it */
@@ -121,10 +140,21 @@ extern bool csc_bracket_is_active (void);
  * only marks it orphaned: its csc_deactivate does the rest. */
 extern void csc_retire_and_delete (client_session_context *ctx);
 
+/* the error-stack floor of the innermost method dispatch; 0 (a plain clear-all) outside a bracket */
+extern int csc_er_stack_floor (void);
+
+/* is the calling thread inside an in-process method dispatch (the client half of a callback)? */
+extern bool csc_in_method_dispatch (void);
+
+/* does the session keep callback resources (query handles, deferred handles, replies) past a query's end? */
+extern bool csc_has_method_callback_state (void);
+
 #else /* SERVER_MODE */
 
 /* a client process has one workspace and no bracket */
 #define csc_bracket_is_active() false
+#define csc_er_stack_floor() 0
+#define csc_in_method_dispatch() false
 
 #endif /* SERVER_MODE */
 

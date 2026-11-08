@@ -26,6 +26,7 @@
 #include "parser.h"		// pt_free_label_table
 #include "authenticate.h"	// au_final
 #include "db_query.h"		// db_final_client_query_result
+#include "method_callback.hpp"	// cubmethod::callback_handler
 
 #include <cassert>
 #include <cstddef>
@@ -36,6 +37,9 @@
 
 /* client/server boundary flag (network_interface_sr.cpp) */
 extern thread_local unsigned int db_on_server;
+
+/* the builtin methods' runtime arguments of the session (query_method.cpp) */
+extern void method_runtime_args_session_final (void);
 
 static thread_local client_session_context *tl_Csc_active = NULL;
 
@@ -104,6 +108,25 @@ bool
 csc_bracket_is_active (void)
 {
   return tl_Csc_active != NULL;
+}
+
+int
+csc_er_stack_floor (void)
+{
+  return tl_Csc_active != NULL ? tl_Csc_active->er_dispatch_floor : 0;
+}
+
+bool
+csc_in_method_dispatch (void)
+{
+  return tl_Csc_active != NULL && tl_Csc_active->tm.libcas_depth > 0;
+}
+
+bool
+csc_has_method_callback_state (void)
+{
+  return tl_Csc_active != NULL && tl_Csc_active->method_callback_handler != nullptr
+	 && tl_Csc_active->method_callback_handler->has_retained_resources ();
 }
 
 ws_context *
@@ -184,6 +207,10 @@ csc_teardown (client_session_context *ctx)
       tr_final ();
       au_final ();
       sm_final ();
+      /* before the query results (a query handle ends its own) and ws_final (its host variables and the runtime
+       * arguments are workspace values), as boot_finalize_client_sub does */
+      method_callback_session_final ();
+      method_runtime_args_session_final ();
       db_final_client_query_result ();
       db_prepared_tree_free_all ();
 

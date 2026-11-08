@@ -58,6 +58,7 @@
 #include "thread_entry.hpp"
 #include "subquery_cache.h"
 #include "pl_executor.hpp"
+#include "method_invoke_group.hpp"	/* method_result_to_server_semantics */
 
 #include "dbtype.h"
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -1921,6 +1922,9 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 		    executor.get_stack ()? executor.get_stack ()->get_error_message ().c_str () : "");
 	    goto exit_on_error;
 	  }
+
+	/* a folded session unpacked an object result as a MOP */
+	cubmethod::method_result_to_server_semantics (*regu_var->value.sp_ptr->value);
 
 	if (thread_is_on_trace (thread_p))
 	  {

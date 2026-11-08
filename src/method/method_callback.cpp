@@ -43,6 +43,10 @@
 #include "schema_manager.h"
 #include "network_callback_cl.hpp"
 
+#if defined (SERVER_MODE)
+#include "client_session_context.hpp"
+#endif
+
 using namespace cubpl;
 
 /*
@@ -1324,6 +1328,20 @@ exit:
   //////////////////////////////////////////////////////////////////////////
   // Global method callback handler interface
   //////////////////////////////////////////////////////////////////////////
+#if defined (SERVER_MODE)
+  /* the folded server: the handler is the session's (one CAS served one session); its query handles refer to the
+   * session's workspace */
+  callback_handler *
+  get_callback_handler (void)
+  {
+    client_session_context *ctx = csc_current ();
+    if (ctx->method_callback_handler == nullptr)
+      {
+	ctx->method_callback_handler = new callback_handler (100);
+      }
+    return ctx->method_callback_handler;
+  }
+#else
   /*
    * per-thread handler for multiple connections: the query handlers belong to the workspace of each thread.
    * It is allocated on first use and released by method_callback_final (). A thread_local object is not used,
@@ -1351,11 +1369,54 @@ exit:
 	handler = nullptr;
       }
   }
+#endif
+
+  bool
+  callback_handler::has_retained_resources () const
+  {
+    if (!m_deferred_query_free_handler.empty () || !m_data_queue.empty ())
+      {
+	return true;
+      }
+    for (const query_handler *h : m_query_handlers)
+      {
+	if (h != nullptr)
+	  {
+	    return true;
+	  }
+      }
+    return false;
+  }
 }
 
+#if defined (SERVER_MODE)
+/* csc_teardown, in the session's bracket, before ws_final */
+void
+method_callback_session_final (void)
+{
+  client_session_context *ctx = csc_current ();
+  if (ctx->method_callback_handler != nullptr)
+    {
+      ctx->method_callback_handler->clear_all_query_handlers ();
+      delete ctx->method_callback_handler;
+      ctx->method_callback_handler = nullptr;
+    }
+}
+
+/* boot_client_all_finalize () / boot_finalize_client_sub (): the bracket's session, if any */
+void
+method_callback_final (void)
+{
+  if (csc_bracket_is_active ())
+    {
+      method_callback_session_final ();
+    }
+}
+#else
 /* called from boot_client_all_finalize() and boot_finalize_client_sub () before ws_final() */
 void
 method_callback_final (void)
 {
   cubmethod::destroy_callback_handler ();
 }
+#endif

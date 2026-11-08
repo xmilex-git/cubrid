@@ -224,8 +224,9 @@ namespace cubscan
 //	      session->set_local_error_for_interrupt ();
 //	    }
 //	  else
-	  if (error !=
-	      ER_SM_INVALID_METHOD_ENV) /* FIXME: error possibly occured in builtin method, It should be handled at CAS */
+	  /* FIXME: error possibly occured in builtin method, It should be handled at CAS.
+	   * The folded server refuses user-defined native methods before linking: that id reaches the client too */
+	  if (error != ER_SM_INVALID_METHOD_ENV && error != ER_SM_DYNAMIC_LINK_PROBLEMS)
 	    {
 	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_SP_EXECUTE_ERROR, 1, m_method_group->get_error_msg ().c_str ());
 	    }

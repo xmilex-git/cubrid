@@ -36,6 +36,8 @@
 #include "sp_code.hpp"
 #include "xserver_interface.h"
 
+#include "client_session_context.hpp"	/* csc_bracket_is_active */
+
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
 namespace cubpl
@@ -742,8 +744,12 @@ exit:
 		    {
 		      // Since the list was not created in this thread,
 		      // incrementing the count of the list (m_qlist_count) is required
-		      // to make the assertion on m_qlist_count in qexec_execute_query() hold
-		      qfile_update_qlist_count (&thread_ref, query_entry->list_id, 1);
+		      // to make the assertion on m_qlist_count in qexec_execute_query() hold.
+		      // A folded session's callback created it on this very thread, which counts it already.
+		      if (!csc_bracket_is_active ())
+			{
+			  qfile_update_qlist_count (&thread_ref, query_entry->list_id, 1);
+			}
 		      qfile_close_list (&thread_ref, query_entry->list_id);
 		    }
 

@@ -64,6 +64,13 @@
 extern int method_Num_method_jsp_calls;
 #define IS_IN_METHOD_OR_JSP_CALL() (method_Num_method_jsp_calls > 0)
 
+#else
+
+/* a folded session's callback is dispatched on the thread whose outer query raised it, so its queries nest on
+ * that thread, as in SA_MODE */
+extern bool csc_in_method_dispatch (void);	/* client_session_context.cpp */
+#define IS_IN_METHOD_OR_JSP_CALL() (csc_in_method_dispatch ())
+
 #endif
 
 #define QMGR_TEMP_FILE_FREE_LIST_SIZE   100
@@ -368,6 +375,7 @@ qmgr_allocate_query_entry (THREAD_ENTRY * thread_p, QMGR_TRAN_ENTRY * tran_entry
   query_p->query_flag = 0;
   query_p->is_holdable = false;
   query_p->includes_tde_class = false;
+  query_p->xasl_buf_info = NULL;
 
 #if defined (NDEBUG)
   /* just a safe guard for a release build. I don't expect it will be hit. */
@@ -1185,6 +1193,8 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
 {
   XASL_NODE *xasl_p;
   XASL_UNPACK_INFO *xasl_buf_info;
+  /* a query a method callback runs nests on this thread while the outer one executes */
+  XASL_UNPACK_INFO *outer_unpack_info = get_xasl_unpack_info_ptr (thread_p);
   QFILE_LIST_ID *list_id;
 
   assert (query_p != NULL);
@@ -1223,6 +1233,7 @@ qmgr_process_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl_tree, char *xasl_s
     }
 
   set_xasl_unpack_info_ptr (thread_p, xasl_buf_info);
+  query_p->xasl_buf_info = xasl_buf_info;
 
   query_p->includes_tde_class = XASL_IS_FLAGED (xasl_p, XASL_INCLUDES_TDE_CLASS);
 
@@ -1281,8 +1292,10 @@ end:
 	  (void) qexec_clear_xasl (thread_p, xasl_p, true, false);
 	}
       /* free the XASL tree */
+      query_p->xasl_buf_info = NULL;
       free_xasl_unpack_info (thread_p, xasl_buf_info);
     }
+  set_xasl_unpack_info_ptr (thread_p, outer_unpack_info);
 
   return list_id;
 
@@ -1342,11 +1355,7 @@ xqmgr_execute_query (THREAD_ENTRY * thread_p, const XASL_ID * xasl_id_p, QUERY_I
   xasl_cache_entry_p = NULL;
   list_cache_entry_p = NULL;
 
-#if defined (SERVER_MODE)
-  assert (thread_get_recursion_depth (thread_p) == 0);
-#elif defined (SA_MODE)
   assert (thread_get_recursion_depth (thread_p) == 0 || IS_IN_METHOD_OR_JSP_CALL ());
-#endif
 
   tran_index = LOG_FIND_THREAD_TRAN_INDEX (thread_p);
 
@@ -1836,11 +1845,7 @@ xqmgr_prepare_and_execute_query (THREAD_ENTRY * thread_p, char *xasl_stream, int
   *query_id_p = -1;
   list_id_p = NULL;
 
-#if defined (SERVER_MODE)
-  assert (thread_get_recursion_depth (thread_p) == 0);
-#elif defined (SA_MODE)
   assert (thread_get_recursion_depth (thread_p) == 0 || IS_IN_METHOD_OR_JSP_CALL ());
-#endif
 
   saved_is_stats_on = perfmon_server_is_stats_on (thread_p);
   xasl_trace = IS_XASL_TRACE_TEXT (*flag_p) || IS_XASL_TRACE_JSON (*flag_p);

@@ -2387,6 +2387,36 @@ er_stack_clearall (void)
     }
 }
 
+/*
+ * er_stack_depth - the number of saved error frames of this thread
+ */
+int
+er_stack_depth (void)
+{
+  // *INDENT-OFF*
+  context &tl_context = context::get_thread_local_context ();
+  // *INDENT-ON*
+
+  return (int) tl_context.get_stack_depth ();
+}
+
+/*
+ * er_stack_clear_above - er_stack_clearall down to a floor: the frames at or below floor stay
+ *   floor(in): an er_stack_depth () value; 0 is er_stack_clearall
+ */
+void
+er_stack_clear_above (int floor)
+{
+  // *INDENT-OFF*
+  context &tl_context = context::get_thread_local_context ();
+  // *INDENT-ON*
+
+  while ((int) tl_context.get_stack_depth () > floor)
+    {
+      er_stack_pop_and_keep_error ();
+    }
+}
+
 
 /*
  * er_study_spec -

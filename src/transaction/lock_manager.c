@@ -81,6 +81,12 @@
 #include "memory_wrapper.hpp"
 
 #if defined (SERVER_MODE)
+extern bool csc_in_method_dispatch (void);	/* client_session_context.cpp */
+#else
+#define csc_in_method_dispatch() false
+#endif
+
+#if defined (SERVER_MODE)
 /* object lock hash function */
 #define LK_OBJ_LOCK_HASH(oid,htsize)    \
   ((OID_ISTEMP(oid)) ? (unsigned int)(-((oid)->pageid) % htsize) :\
@@ -2399,8 +2405,12 @@ lock_suspend (THREAD_ENTRY * thread_p, LK_ENTRY * entry_ptr, int wait_msecs)
   int client_id;
   LOG_TDES *tdes;
 
-  /* The threads must not hold a page latch to be blocked on a lock request. */
-  assert (lock_is_safe_lock_with_page (thread_p, entry_ptr) || !pgbuf_has_perm_pages_fixed (thread_p));
+  /* The threads must not hold a page latch to be blocked on a lock request.
+   * shortcut: inside a folded session's method callback the fixes belong to the suspended outer executor (in CS the
+   * callback ran on another thread, which held none), so the check is skipped there; scope it to the fixes taken
+   * after the dispatch began if a nested executor needs it. */
+  assert (lock_is_safe_lock_with_page (thread_p, entry_ptr) || !pgbuf_has_perm_pages_fixed (thread_p)
+	  || csc_in_method_dispatch ());
 
   /* The caller is holding the thread entry mutex */
 
