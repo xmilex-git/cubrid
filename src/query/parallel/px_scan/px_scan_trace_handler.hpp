@@ -52,6 +52,7 @@ namespace parallel_scan
     struct timeval elapsed_lookup;
     bool covered_index;
     bool multi_range_opt;
+    int bitmap_heap;
     bool index_skip_scan;
     bool loose_index_scan;
     bool need_count_only;

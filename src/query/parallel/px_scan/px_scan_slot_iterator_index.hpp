@@ -29,6 +29,8 @@
 #include "scan_manager.h"
 #include "storage_common.h"
 
+#include <cstdint>
+
 namespace parallel_scan
 {
   class input_handler_index;
@@ -68,6 +70,21 @@ namespace parallel_scan
 	m_slot_walker.set_input_handler (handler);
       }
 
+      /* whole-range batch: from here on the walker marks OIDs in the handler's bitmap (index phase) ... */
+      void set_bitmap_index_phase (bool on)
+      {
+	m_slot_walker.set_bitmap_index_phase (on);
+      }
+      /* ... the index phase is over: the last leaf is let go before any heap page is read */
+      void end_bitmap_index_phase (THREAD_ENTRY *thread_p)
+      {
+	m_drain_fsm.cleanup_on_reset (thread_p);
+	m_slot_walker.cleanup_on_reset (thread_p);
+	m_slot_walker.set_bitmap_index_phase (false);
+      }
+      /* ... heap phase: the marked rows of one heap page become the rows next_qualified_slot_with_peek returns */
+      int set_bitmap_page (THREAD_ENTRY *thread_p, int sector_idx, int page_offset);
+
       /* Sole resetter of walker's m_current_range_idx — called by task wiring only when fetch returns range_idx >= 0 (descent branch). */
       void set_range_idx (int idx)
       {
@@ -75,9 +92,21 @@ namespace parallel_scan
       }
 
     private:
+      SCAN_CODE next_bitmap_row (THREAD_ENTRY *thread_p);
+
       input_handler_index *m_input_handler;
       parallel_index_scan::leaf_slot_walker      m_slot_walker;   /* (D) per-page slot loop + process_oid. */
       parallel_index_scan::overflow_drain_fsm    m_drain_fsm;     /* (E) drain state machine; pokes walker via friend. */
+
+      /* whole-range batch, heap phase: the page being read */
+      bool m_bm_heap_phase;	/* set_bitmap_page was called: the leaf walk is over */
+      bool m_bm_page_on;
+      bool m_bm_page_whole;
+      int m_bm_sector_idx;
+      int m_bm_page_offset;
+      int m_bm_next_slot;	/* the page's row bits before this slot are looked up */
+      VPID m_bm_vpid;
+      OID m_bm_oid;			/* last row of a page read as a whole */
   };
 }
 

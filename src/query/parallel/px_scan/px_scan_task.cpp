@@ -40,6 +40,8 @@
 #include "query_hash_join.h"
 #include "query_opfunc.h"
 #include "scope_exit.hpp"
+#include "page_buffer.h"
+#include "system_parameter.h"
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -1195,10 +1197,13 @@ namespace parallel_scan
     };
     worker_scope_guard worker_guard;
     worker_guard.handler = nullptr;
+    bool bitmap_left_index_phase = false;
     if constexpr (ST == SCAN_TYPE::INDEX)
       {
 	m_input_handler->enter_worker ();
 	worker_guard.handler = m_input_handler;
+	m_slot_iterator.set_bitmap_index_phase (m_input_handler->bitmap_on ());
+	m_scan_id->scan_stats.bitmap_heap = m_input_handler->bitmap_on () ? 1 + m_input_handler->bitmap_row_bits () : 0;
       }
 
     while (!stop)
@@ -1260,6 +1265,12 @@ namespace parallel_scan
 		/* drain_late_joiner_chains calls leave_worker itself; disarm the RAII guard first. */
 		worker_guard.handler = nullptr;
 		drain_late_joiner_chains (thread_ref, stop);
+		if (m_input_handler->bitmap_on ())
+		  {
+		    /* every OID this worker found is marked: read the marked heap pages once the other workers are there too */
+		    bitmap_left_index_phase = true;
+		    bitmap_heap_phase (thread_ref, stop);
+		  }
 	      }
 	    m_xasl->curr_spec->s_id.position = S_AFTER;
 	    break;
@@ -1316,6 +1327,93 @@ namespace parallel_scan
 	  }
 	/* drain_slot_oids returns S_END at completion or S_ERROR with stop=true on terminal failure. */
 	(void) drain_slot_oids (thread_ref, stop);
+      }
+
+    if constexpr (ST == SCAN_TYPE::INDEX)
+      {
+	if (m_input_handler->bitmap_on () && !bitmap_left_index_phase)
+	  {
+	    /* stopped inside the index phase: the interrupt is raised, the others only need the count */
+	    m_input_handler->bitmap_leave_index_phase ();
+	  }
+      }
+  }
+
+  /* INDEX-only, whole-range batch: the heap phase of one worker. It starts when no worker marks any more, takes the
+   * heap's sectors one by one and reads the marked pages of each; the rows leave through drain_slot_oids. */
+  template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  void task<result_type, ST>::bitmap_heap_phase (cubthread::entry &thread_ref, bool &stop)
+  {
+    if constexpr (ST == SCAN_TYPE::INDEX)
+      {
+	const bool read_ahead = prm_get_bool_value (PRM_ID_READ_AHEAD_HINT);
+	bool dummy = false;
+	int sector_idx;
+
+	m_slot_iterator.end_bitmap_index_phase (&thread_ref);
+	m_input_handler->bitmap_leave_index_phase ();
+	if (stop || !m_input_handler->bitmap_wait_index_phase ())
+	  {
+	    return;
+	  }
+
+	while (!stop && m_input_handler->bitmap_take_sector (&sector_idx))
+	  {
+	    std::uint64_t pages = m_input_handler->bitmap_touched (sector_idx);
+
+	    if (pages == 0)
+	      {
+		continue;
+	      }
+	    if (m_interrupt->get_code () != parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+	      {
+		break;
+	      }
+	    if (logtb_get_check_interrupt (&thread_ref)
+		&& logtb_is_interrupted_tran (&thread_ref, true, &dummy, thread_ref.tran_index))
+	      {
+		er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_INTERRUPTED, 0);
+		m_err_messages->move_top_error_message_to_this ();
+		m_interrupt->set_code (parallel_query::interrupt::interrupt_code::USER_INTERRUPTED_FROM_WORKER_THREAD);
+		break;
+	      }
+
+	    const FILE_PARTIAL_SECTOR &sector = m_input_handler->bitmap_sector (sector_idx);
+
+	    if (read_ahead && pages != sector.page_bitmap)
+	      {
+		/* pages with gaps between them: the OS reads them together. A sector marked on every page is a
+		 * sequential read, which the OS recognizes by itself. */
+		VPID vpids[DISK_SECTOR_NPAGES];
+		int count = 0;
+
+		for (std::uint64_t rest = pages; rest != 0; rest &= rest - 1)
+		  {
+		    vpids[count].volid = sector.vsid.volid;
+		    vpids[count].pageid = SECTOR_FIRST_PAGEID (sector.vsid.sectid) + __builtin_ctzll (rest);
+		    count++;
+		  }
+		(void) pgbuf_read_ahead (&thread_ref, vpids, count);
+	      }
+
+	    for (; pages != 0 && !stop; pages &= pages - 1)
+	      {
+		if (m_slot_iterator.set_bitmap_page (&thread_ref, sector_idx, __builtin_ctzll (pages)) != NO_ERROR)
+		  {
+		    if (m_interrupt->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+		      {
+			int err_code = m_err_messages->move_top_error_message_to_this ();
+
+			m_interrupt->set_code (err_code == ER_INTERRUPTED
+					       ? parallel_query::interrupt::interrupt_code::USER_INTERRUPTED_FROM_WORKER_THREAD
+					       : parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		      }
+		    stop = true;
+		    break;
+		  }
+		(void) drain_slot_oids (thread_ref, stop);
+	      }
+	  }
       }
   }
 

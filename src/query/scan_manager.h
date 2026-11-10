@@ -387,6 +387,9 @@ struct indx_scan_id
   bool check_not_vacuumed;	/* if true then during index scan, the entries will be checked if they should've been
 				 * vacuumed. Used in checkdb. */
   DISK_ISVALID not_vacuumed_res;	/* The result of not vacuumed checking operation */
+  int ahead_next;		/* first OID of the buffer whose heap page the OS was not told about; INT_MAX: none */
+  int ahead_skip;		/* OIDs of the following buffers to pass without telling the OS */
+  int ahead_backoff;		/* OIDs to pass after a hint that found every page in the buffer */
   /* Parallel index scan pending state. Set in scan_open_parallel_index_scan when the spec is
    * parallel-eligible; consumed by scan_start_scan to attempt the promotion after
    * qexec_evaluate_aggregates_optimize has had a chance to set need_count_only. NULL means
@@ -441,6 +444,9 @@ struct parallel_index_scan_id
   bool check_not_vacuumed;	/* if true then during index scan, the entries will be checked if they should've been
 				 * vacuumed. Used in checkdb. */
   DISK_ISVALID not_vacuumed_res;	/* The result of not vacuumed checking operation */
+  int ahead_next;		/* mirror of INDX_SCAN_ID::ahead_next */
+  int ahead_skip;		/* mirror of INDX_SCAN_ID::ahead_skip */
+  int ahead_backoff;		/* mirror of INDX_SCAN_ID::ahead_backoff */
   void *parallel_pending;	/* mirror of INDX_SCAN_ID::parallel_pending */
   INDX_GBY_SKIP *gby_skip;	/* mirror of INDX_SCAN_ID::gby_skip */
   /* parallel-only fields (must follow all isid fields) */
@@ -570,6 +576,8 @@ struct scan_stats
   UINT64 data_qualified_rows;	/* # of rows qualified by data filter */
   struct timeval elapsed_lookup;
   bool covered_index;
+  int bitmap_heap;		/* the heap was read through a bitmap of the rows the index found: 1 + row bits of a page
+				 * (1: pages only); 0: no bitmap */
   bool multi_range_opt;
   bool index_skip_scan;
   bool loose_index_scan;

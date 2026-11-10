@@ -9277,6 +9277,66 @@ pgbuf_claim_bcb_for_fix (THREAD_ENTRY * thread_p, const VPID * vpid, PAGE_FETCH_
 }
 
 /*
+ * pgbuf_read_ahead () - tell the OS which pages the caller is going to fix soon
+ *   return: number of pages handed to the OS (0: every page is in the buffer)
+ *   vpids(in): pages of permanent volumes; consecutive pages in ascending order are handed over as one range
+ *   count(in): number of pages
+ *
+ * Note: A hint. Pages already in the buffer are left out: hinting them would make the device read what the
+ *       buffer holds. Runs of consecutive pages go to the OS as one range. The pages are not fixed and no state
+ *       is kept: the caller fixes each page as usual, and that read finds the page in the OS cache or on its way.
+ */
+int
+pgbuf_read_ahead (THREAD_ENTRY * thread_p, const VPID * vpids, int count)
+{
+  PGBUF_BUFFER_HASH *hash_anchor;
+  PGBUF_BCB *bufptr;
+  VPID run_vpid = VPID_INITIALIZER;
+  int run_length = 0;
+  int num_hinted = 0;
+  int i;
+
+  for (i = 0; i <= count; i++)
+    {
+      bufptr = NULL;
+      if (i < count && !pgbuf_is_temporary_volume (vpids[i].volid))
+	{
+	  hash_anchor = &pgbuf_Pool.buf_hash_table[PGBUF_HASH_VALUE (&vpids[i])];
+	  pthread_mutex_lock (&hash_anchor->hash_mutex);
+	  for (bufptr = hash_anchor->hash_next; bufptr != NULL; bufptr = bufptr->hash_next)
+	    {
+	      if (VPID_EQ (&bufptr->vpid, &vpids[i]))
+		{
+		  break;
+		}
+	    }
+	  pthread_mutex_unlock (&hash_anchor->hash_mutex);
+	  if (bufptr == NULL && run_length > 0 && vpids[i].volid == run_vpid.volid
+	      && vpids[i].pageid == run_vpid.pageid + run_length)
+	    {
+	      run_length++;
+	      continue;
+	    }
+	}
+      /* the run ends here: at the last page, at a page in the buffer or of a temporary volume, or at a gap */
+      if (run_length > 0)
+	{
+	  fileio_read_ahead_hint (fileio_get_volume_descriptor (run_vpid.volid), run_vpid.pageid, run_length,
+				  IO_PAGESIZE);
+	  num_hinted += run_length;
+	  run_length = 0;
+	}
+      if (i < count && bufptr == NULL && !pgbuf_is_temporary_volume (vpids[i].volid))
+	{
+	  run_vpid = vpids[i];
+	  run_length = 1;
+	}
+    }
+
+  return num_hinted;
+}
+
+/*
  * pgbuf_victimize_bcb () - Victimize given buffer page
  *   return: NO_ERROR, or ER_code
  *   bufptr(in): pointer to buffer page

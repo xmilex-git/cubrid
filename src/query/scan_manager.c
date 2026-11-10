@@ -83,6 +83,9 @@ static int rv;
 
 #define GET_NTH_OID(oid_setp, n) ((OID *)((OID *)(oid_setp) + (n)))
 
+/* OIDs of an index scan's buffer whose heap pages the OS is told about ahead of the lookup */
+#define SCAN_INDEX_READ_AHEAD_DISTANCE 64
+
 /* ISS_RANGE_DETAILS stores information about the two ranges we use
  * interchangeably in Index Skip Scan mode: along with the real range, we
  * use a "fake" one to obtain the next value for the index's first column.
@@ -3195,6 +3198,9 @@ scan_open_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
     }
 
   isidp->iscan_oid_order = iscan_oid_order;
+  isidp->ahead_next = INT_MAX;
+  isidp->ahead_skip = 0;
+  isidp->ahead_backoff = 0;
 
   if (scan_init_indx_coverage (thread_p, coverage_enabled, output_val_list, regu_val_list, vd, query_id,
 			       root_header->node.max_key_len, func_index_col_id, &(isidp->indx_cov)) != NO_ERROR)
@@ -3414,6 +3420,9 @@ scan_open_index_key_info_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
   scan_init_scan_pred (&isidp->scan_pred, NULL, pr, ((pr) ? eval_fnc (thread_p, pr, &single_node_type) : NULL));
 
   isidp->iscan_oid_order = iscan_oid_order;
+  isidp->ahead_next = INT_MAX;
+  isidp->ahead_skip = 0;
+  isidp->ahead_backoff = 0;
 
   if (scan_init_indx_coverage (thread_p, false, NULL, NULL, vd, query_id, root_header->node.max_key_len,
 			       func_index_col_id, &(isidp->indx_cov)) != NO_ERROR)
@@ -5149,7 +5158,75 @@ call_get_next_index_oidset (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCA
       break;
     }
 
+  /* heap pages of the new buffer: the lookups tell the OS about them a window ahead */
+  isidp->ahead_next = INT_MAX;
+  if (oids_cnt > 1 && isidp->oid_list != NULL && !isidp->multi_range_opt.use && !isidp->need_count_only
+      && !SCAN_IS_INDEX_COVERED (isidp) && !scan_id->grouped && prm_get_bool_value (PRM_ID_READ_AHEAD_HINT))
+    {
+      if (isidp->ahead_skip >= oids_cnt)
+	{
+	  isidp->ahead_skip -= oids_cnt;
+	}
+      else
+	{
+	  isidp->ahead_next = isidp->ahead_skip;
+	  isidp->ahead_skip = 0;
+	}
+    }
+
   return S_SUCCESS;
+}
+
+/*
+ * scan_index_read_ahead () - tell the OS which heap pages the next OIDs of the buffer are on
+ *   thread_p(in):
+ *   isidp(in/out): index scan; curr_oidno is the OID about to be looked up
+ *
+ * Note: The lookups stay in the order of the buffer and read one page at a time; the OS reads the pages of the
+ *       window together, so a lookup finds its page read or on its way. When every page of a window is in the
+ *       buffer already, the following OIDs are passed without asking, twice as many each time.
+ */
+static void
+scan_index_read_ahead (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp)
+{
+  VPID vpids[SCAN_INDEX_READ_AHEAD_DISTANCE];
+  const OID *oidp = isidp->oid_list->oidp;
+  int end = MIN (isidp->oids_count, isidp->curr_oidno + SCAN_INDEX_READ_AHEAD_DISTANCE);
+  int count = 0;
+  int i;
+
+  for (i = MAX (isidp->ahead_next, isidp->curr_oidno); i < end; i++)
+    {
+      if (count == 0 || vpids[count - 1].pageid != oidp[i].pageid || vpids[count - 1].volid != oidp[i].volid)
+	{
+	  vpids[count].pageid = oidp[i].pageid;
+	  vpids[count].volid = oidp[i].volid;
+	  count++;
+	}
+    }
+  isidp->ahead_next = (end == isidp->oids_count) ? INT_MAX : end;
+
+  if (count <= 1)
+    {
+      /* one page: the lookup reads it right now */
+      return;
+    }
+  if (pgbuf_read_ahead (thread_p, vpids, count) > 0)
+    {
+      isidp->ahead_backoff = 0;
+      return;
+    }
+
+  isidp->ahead_backoff = MIN (MAX (isidp->ahead_backoff * 2, SCAN_INDEX_READ_AHEAD_DISTANCE), 65536);
+  if (isidp->curr_oidno + isidp->ahead_backoff >= isidp->oids_count)
+    {
+      isidp->ahead_skip = isidp->curr_oidno + isidp->ahead_backoff - isidp->oids_count;
+      isidp->ahead_next = INT_MAX;
+    }
+  else
+    {
+      isidp->ahead_next = isidp->curr_oidno + isidp->ahead_backoff;
+    }
 }
 
 /*
@@ -6266,6 +6343,11 @@ scan_next_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	  if (thread_is_on_trace (thread_p))
 	    {
 	      tsc_getticks (&start_tick);
+	    }
+
+	  if (isidp->curr_oidno + SCAN_INDEX_READ_AHEAD_DISTANCE / 2 >= isidp->ahead_next)
+	    {
+	      scan_index_read_ahead (thread_p, isidp);
 	    }
 
 	  lookup_status = scan_next_index_lookup_heap (thread_p, scan_id, isidp, &data_filter, isolation);
@@ -9025,6 +9107,11 @@ scan_print_stats_json (SCAN_ID * scan_id, trace_json_t * scan_stats)
 	  trace_json_object_set_new (scan_stats, "mro", trace_json_true ());
 	}
 
+      if (scan_id->scan_stats.bitmap_heap != 0)
+	{
+	  trace_json_object_set_new (scan_stats, "bitmap", trace_json_integer (scan_id->scan_stats.bitmap_heap - 1));
+	}
+
       if (scan_id->scan_stats.index_skip_scan == true)
 	{
 	  trace_json_object_set_new (scan_stats, "iss", trace_json_true ());
@@ -9229,6 +9316,11 @@ scan_print_stats_text (FILE * fp, SCAN_ID * scan_id)
       if (scan_id->scan_stats.multi_range_opt == true)
 	{
 	  fprintf (fp, ", mro: true");
+	}
+
+      if (scan_id->scan_stats.bitmap_heap != 0)
+	{
+	  fprintf (fp, ", bitmap: %d", scan_id->scan_stats.bitmap_heap - 1);
 	}
 
       if (scan_id->scan_stats.index_skip_scan == true)

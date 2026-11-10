@@ -830,6 +830,9 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 #define PRM_NAME_COST_HEAP_FETCH_PER_OID "cost_heap_fetch_per_oid"
 #define PRM_NAME_PLAN_CACHE_BIND_VARIANTS "plan_cache_bind_variants"
 #define PRM_NAME_ROW_SNAPSHOT_MAX_ROWS "row_snapshot_max_rows"
+#define PRM_NAME_READ_AHEAD_HINT "read_ahead_hint"
+#define PRM_NAME_BITMAP_HEAP_SCAN "bitmap_heap_scan"
+#define PRM_NAME_INDEX_SCAN_OID_BITMAP_SIZE "index_scan_oid_bitmap_size"
 
 #define PRM_NAME_HASH_JOIN_RUNTIME_FILTER "hash_join_runtime_filter"
 
@@ -5745,6 +5748,48 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.i = 0}},
    {false, {.i = 10000}},
    {false, {.i = 0}},
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  /* a scan tells the OS which pages it is about to read (posix_fadvise WILLNEED), so the device reads them
+   * together while the scan still reads one page at a time (CBRD-28005) */
+  {PRM_ID_READ_AHEAD_HINT,
+   PRM_NAME_READ_AHEAD_HINT,
+   (PRM_FOR_SERVER),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE,
+   NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  /* a parallel index scan that reads the heap marks the rows it finds in a bitmap in heap file order first and
+   * reads the marked heap pages afterwards, each page once (CBRD-28005) */
+  {PRM_ID_BITMAP_HEAP_SCAN,
+   PRM_NAME_BITMAP_HEAP_SCAN,
+   (PRM_FOR_SERVER),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE,
+   NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  /* memory of the bitmap one such scan marks the OIDs of its key range in; a table too large for it is marked by
+   * page instead of by row */
+  {PRM_ID_INDEX_SCAN_OID_BITMAP_SIZE,
+   PRM_NAME_INDEX_SCAN_OID_BITMAP_SIZE,
+   (PRM_USER_CHANGE | PRM_FOR_CLIENT | PRM_FOR_SERVER | PRM_FOR_SESSION | PRM_SIZE_UNIT),
+   PRM_BIGINT,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.bi = 16 * 1024 * 1024 /* 16 MB */ }},
+   {false, {.bi = 16 * 1024 * 1024 /* 16 MB */ }},
+   {false, {.bi = 1024 * 1024 * 1024 /* 1 GB */ }},
+   {false, {.bi = 0}},
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},

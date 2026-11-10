@@ -30,7 +30,14 @@
 #include "px_scan_index_key_range_list.hpp"
 #include "px_scan_index_leaf_page_dispatcher.hpp"
 #include "px_scan_index_overflow_chain_pool.hpp"
+#include "file_manager.h"
 #include "scan_manager.h"
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <mutex>
+#include <vector>
 
 namespace parallel_scan
 {
@@ -44,9 +51,17 @@ namespace parallel_scan
 	  m_err_messages_p (err_messages_p),
 	  m_ranges (),
 	  m_leaf (),
-	  m_ovf ()
+	  m_ovf (),
+	  m_bm_on (false),
+	  m_bm_row_bits (0),
+	  m_bm_touched (nullptr),
+	  m_bm_whole (nullptr),
+	  m_bm_rows (nullptr),
+	  m_bm_next_sector (0),
+	  m_bm_index_pending (0)
       {
       }
+      ~input_handler_index ();
       int init_on_main (THREAD_ENTRY *thread_p, INDX_INFO *indx_info, SCAN_ID *scan_id, val_descr *vd, int parallelism);
 
       /* get_next_page_with_fix: worker_scan_id MUST be per-task; held_leaf = caller's current leaf (see leaf_page_dispatcher);
@@ -131,6 +146,63 @@ namespace parallel_scan
 	m_ovf.signal_no_more_leaves ();
       }
 
+      /* --- whole-range batch (bitmap heap scan): the index phase marks the rows it finds in a bitmap laid out in
+       * the order of the heap's sectors, the heap phase reads the marked pages, each once. --- */
+      bool bitmap_on () const
+      {
+	return m_bm_on;
+      }
+      /* index phase, any worker: one atomic OR per mark. sector_hint: the caller's last sector, kept by the caller. */
+      void bitmap_mark (const OID *oid, int *sector_hint);
+      /* a worker's index phase is over (its last leaf and its last overflow page are processed) */
+      void bitmap_leave_index_phase ();
+      /* wait until every worker's index phase is over; false: the query was interrupted meanwhile */
+      bool bitmap_wait_index_phase ();
+      /* heap phase: the next sector nobody took; false: none left */
+      bool bitmap_take_sector (int *sector_idx)
+      {
+	*sector_idx = m_bm_next_sector.fetch_add (1, std::memory_order_relaxed);
+	return *sector_idx < (int) m_bm_sectors.size ();
+      }
+      const FILE_PARTIAL_SECTOR &bitmap_sector (int sector_idx) const
+      {
+	return m_bm_sectors[sector_idx];
+      }
+      /* pages of the sector with a mark of either kind */
+      std::uint64_t bitmap_touched (int sector_idx) const
+      {
+	return m_bm_touched[sector_idx].load (std::memory_order_relaxed);
+      }
+      /* pages of the sector marked as a whole: every row is read and the index condition checked again */
+      std::uint64_t bitmap_whole (int sector_idx) const
+      {
+	return m_bm_whole[sector_idx].load (std::memory_order_relaxed);
+      }
+      int bitmap_row_bits () const
+      {
+	return m_bm_row_bits;
+      }
+      /* the first marked slot of the page at or after from_slot; -1: none */
+      int bitmap_next_row (int sector_idx, int page_offset, int from_slot) const
+      {
+	const std::uint64_t base = ((std::uint64_t) sector_idx * DISK_SECTOR_NPAGES + page_offset) * m_bm_row_bits;
+	const std::uint64_t end = base + m_bm_row_bits;
+	std::uint64_t bit = base + from_slot;
+
+	while (bit < end)
+	  {
+	    const std::uint64_t word = m_bm_rows[bit / 64].load (std::memory_order_relaxed) >> (bit % 64);
+
+	    if (word != 0)
+	      {
+		bit += __builtin_ctzll (word);
+		return bit < end ? (int) (bit - base) : -1;
+	      }
+	    bit = (bit / 64 + 1) * 64;
+	  }
+	return -1;
+      }
+
     private:
       interrupt *m_interrupt_p;
       err_messages_with_lock *m_err_messages_p;
@@ -141,6 +213,21 @@ namespace parallel_scan
       parallel_index_scan::leaf_page_dispatcher m_leaf;
       /* (A) shared overflow pool: per-slot active-chains vector + helpers/wait. */
       parallel_index_scan::overflow_chain_pool m_ovf;
+
+      int bitmap_init_on_main (THREAD_ENTRY *thread_p, SCAN_ID *scan_id, int parallelism);
+
+      /* whole-range batch. Written by the main thread before the workers start, except the three bit arrays (atomic OR
+       * by the index phase, plain reads by the heap phase after bitmap_wait_index_phase) and the two counters. */
+      bool m_bm_on;
+      std::vector<FILE_PARTIAL_SECTOR> m_bm_sectors;	/* the heap's sectors when the scan started, by volume and sector */
+      int m_bm_row_bits;		/* row bits per page; 0: pages are marked as a whole only */
+      std::atomic<std::uint64_t> *m_bm_touched;	/* per sector */
+      std::atomic<std::uint64_t> *m_bm_whole;	/* per sector */
+      std::atomic<std::uint64_t> *m_bm_rows;	/* m_bm_row_bits per page, page after page */
+      std::atomic<int> m_bm_next_sector;
+      std::mutex m_bm_mutex;
+      std::condition_variable m_bm_cv;
+      int m_bm_index_pending;	/* workers whose index phase is not over; under m_bm_mutex */
   };
 }
 

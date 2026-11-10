@@ -38,6 +38,8 @@
 #include "slotted_page.h"
 #include "storage_common.h"
 
+#include <algorithm>
+#include <climits>
 #include <vector>
 
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
@@ -68,7 +70,11 @@ namespace parallel_index_scan
       m_use_desc_index (false),
       m_slot_key_valid (false),
       m_slot_clear_key (false),
-      m_key_values_ready (false)
+      m_key_values_ready (false),
+      m_bm_index_phase (false),
+      m_bm_sector_hint (-1),
+      m_ahead_skip (0),
+      m_ahead_backoff (0)
   {
     db_make_null (&m_slot_key);
   }
@@ -396,6 +402,48 @@ namespace parallel_index_scan
     return NO_ERROR;
   }
 
+  /* The heap pages of one key's OIDs go to the OS together before they are looked up one by one. When every page
+   * was in the buffer already, the following keys are passed without asking, twice as many each time. */
+  void
+  leaf_slot_walker::read_ahead_key_oids (THREAD_ENTRY *thread_p, const std::vector<OID> &oids)
+  {
+    VPID vpids[64];
+    int count = 0;
+
+    if (m_ahead_skip > 0)
+      {
+	m_ahead_skip--;
+	return;
+      }
+    if (!prm_get_bool_value (PRM_ID_READ_AHEAD_HINT))
+      {
+	m_ahead_skip = INT_MAX;
+	return;
+      }
+    for (size_t i = 0; i < oids.size () && count < 64; i++)
+      {
+	if (count == 0 || vpids[count - 1].pageid != oids[i].pageid || vpids[count - 1].volid != oids[i].volid)
+	  {
+	    vpids[count].pageid = oids[i].pageid;
+	    vpids[count].volid = oids[i].volid;
+	    count++;
+	  }
+      }
+    if (count <= 1)
+      {
+	return;
+      }
+    if (pgbuf_read_ahead (thread_p, vpids, count) > 0)
+      {
+	m_ahead_backoff = 0;
+      }
+    else
+      {
+	m_ahead_backoff = std::min (std::max (m_ahead_backoff * 2, 1), 1024);
+	m_ahead_skip = m_ahead_backoff;
+      }
+  }
+
   SCAN_CODE
   leaf_slot_walker::process_oid (THREAD_ENTRY *thread_p, OID *oid)
   {
@@ -461,6 +509,13 @@ namespace parallel_index_scan
 	return S_SUCCESS;
       }
 
+    if (m_bm_index_phase)
+      {
+	/* the heap phase looks it up */
+	m_input_handler->bitmap_mark (oid, &m_bm_sector_hint);
+	return S_END;
+      }
+
     /* Non-covering index path: read values from heap record */
     RECDES heap_recdes = RECDES_INITIALIZER;
     if (m_scan_id->fixed == false)
@@ -484,6 +539,14 @@ namespace parallel_index_scan
 	return S_ERROR;
       }
 
+    return finish_heap_row (thread_p, oid, &heap_recdes);
+  }
+
+  SCAN_CODE
+  leaf_slot_walker::finish_heap_row (THREAD_ENTRY *thread_p, OID *oid, RECDES *heap_recdes)
+  {
+    INDX_SCAN_ID *isidp = &m_scan_id->s.isid;
+
     if (isidp->scan_pred.pr_eval_fnc != nullptr && isidp->scan_pred.pred_expr != nullptr)
       {
 	FILTER_INFO data_filter;
@@ -494,7 +557,7 @@ namespace parallel_index_scan
 	data_filter.val_descr = m_vd;
 	data_filter.class_oid = &isidp->cls_oid;
 
-	DB_LOGICAL ev_res = eval_data_filter (thread_p, oid, &heap_recdes, &isidp->scan_cache, &data_filter);
+	DB_LOGICAL ev_res = eval_data_filter (thread_p, oid, heap_recdes, &isidp->scan_cache, &data_filter);
 	ev_res = update_logical_result (thread_p, ev_res, (int *) &m_scan_id->qualification);
 	if (ev_res != V_TRUE)
 	  {
@@ -511,7 +574,7 @@ namespace parallel_index_scan
 
     if (isidp->rest_regu_list != nullptr)
       {
-	if (heap_attrinfo_read_dbvalues (thread_p, oid, &heap_recdes, isidp->rest_attrs.attr_cache) != NO_ERROR)
+	if (heap_attrinfo_read_dbvalues (thread_p, oid, heap_recdes, isidp->rest_attrs.attr_cache) != NO_ERROR)
 	  {
 	    return S_ERROR;
 	  }
@@ -527,6 +590,115 @@ namespace parallel_index_scan
       }
 
     return S_SUCCESS;
+  }
+
+  int
+  leaf_slot_walker::fix_bitmap_page (THREAD_ENTRY *thread_p, const VPID *vpid, bool *is_fixed)
+  {
+    HEAP_SCANCACHE *scan_cache = &m_scan_id->s.isid.scan_cache;
+    int error_code;
+
+    *is_fixed = false;
+    /* release the page of the previous lookup first: two heap pages are never held together here */
+    if (scan_cache->page_watcher.pgptr != NULL)
+      {
+	pgbuf_ordered_unfix (thread_p, &scan_cache->page_watcher);
+      }
+    /* the page was in the heap when the scan started; vacuum may have emptied and deallocated it since. A row
+     * lookup fixes its page as one that must exist, so the page is fixed here first and kept until its last row. */
+    error_code = pgbuf_ordered_fix (thread_p, vpid, OLD_PAGE_MAYBE_DEALLOCATED, PGBUF_LATCH_READ,
+				    &scan_cache->page_watcher);
+    if (scan_cache->page_watcher.pgptr == NULL)
+      {
+	if (error_code != NO_ERROR && error_code != ER_PB_BAD_PAGEID)
+	  {
+	    return error_code;
+	  }
+	er_clear ();
+	return NO_ERROR;
+      }
+    if (error_code != NO_ERROR)
+      {
+	pgbuf_ordered_unfix (thread_p, &scan_cache->page_watcher);
+	return error_code;
+      }
+    *is_fixed = true;
+    return NO_ERROR;
+  }
+
+  SCAN_CODE
+  leaf_slot_walker::process_bitmap_row (THREAD_ENTRY *thread_p, OID *oid)
+  {
+    HEAP_SCANCACHE *scan_cache = &m_scan_id->s.isid.scan_cache;
+    const auto keep_page_save = scan_cache->cache_last_fix_page;
+    SCAN_CODE scan;
+
+    /* the lookup takes the page fix_bitmap_page holds from the scan cache and hands it back */
+    scan_cache->cache_last_fix_page = true;
+    scan = process_oid (thread_p, oid);
+    scan_cache->cache_last_fix_page = keep_page_save;
+    return scan;
+  }
+
+  void
+  leaf_slot_walker::release_bitmap_page (THREAD_ENTRY *thread_p)
+  {
+    HEAP_SCANCACHE *scan_cache = &m_scan_id->s.isid.scan_cache;
+
+    if (scan_cache->page_watcher.pgptr != NULL)
+      {
+	pgbuf_ordered_unfix (thread_p, &scan_cache->page_watcher);
+      }
+  }
+
+  SCAN_CODE
+  leaf_slot_walker::next_whole_page_row (THREAD_ENTRY *thread_p, const VPID *vpid, OID *cur_oid)
+  {
+    INDX_SCAN_ID *isidp = &m_scan_id->s.isid;
+    SCAN_PRED *const index_preds[2] = { &isidp->range_pred, &isidp->key_pred };
+    SCAN_ATTRS *const index_attrs[2] = { &isidp->range_attrs, &isidp->key_attrs };
+
+    while (true)
+      {
+	RECDES heap_recdes = RECDES_INITIALIZER;
+	SCAN_CODE scan = heap_next_1page (thread_p, &isidp->hfid, vpid, &isidp->cls_oid, cur_oid, &heap_recdes,
+					  &isidp->scan_cache, m_scan_id->fixed);
+	if (scan != S_SUCCESS)
+	  {
+	    return scan == S_END ? S_END : S_ERROR;
+	  }
+	m_scan_id->scan_stats.read_rows++;
+
+	/* the page was marked, not this row: the range condition and the key filter, read from the heap row as a
+	 * re-evaluation after a lock wait reads them (locator_mvcc_reevaluate_filters), say whether the index found it */
+	DB_LOGICAL ev_res = V_TRUE;
+
+	for (int i = 0; i < 2 && ev_res == V_TRUE; i++)
+	  {
+	    if (index_preds[i]->pred_expr == nullptr)
+	      {
+		continue;
+	      }
+	    if (heap_attrinfo_read_dbvalues (thread_p, cur_oid, &heap_recdes, index_attrs[i]->attr_cache) != NO_ERROR)
+	      {
+		return S_ERROR;
+	      }
+	    ev_res = (*index_preds[i]->pr_eval_fnc) (thread_p, index_preds[i]->pred_expr, m_vd, cur_oid);
+	  }
+	if (ev_res == V_ERROR)
+	  {
+	    return S_ERROR;
+	  }
+	if (ev_res != V_TRUE)
+	  {
+	    continue;
+	  }
+	scan = finish_heap_row (thread_p, cur_oid, &heap_recdes);
+	if (scan != S_END)
+	  {
+	    return scan;
+	  }
+      }
   }
 
   /* Walk remaining slots on m_page until a row qualifies (delegates OID drain to FSM). */
@@ -714,6 +886,11 @@ namespace parallel_index_scan
 	m_slot_key_valid = true;
 	m_slot_clear_key = clear_key;
 	begin_key_record ();
+
+	if (leaf_oids.size () > 1 && !m_is_covering && !m_bm_index_phase)
+	  {
+	    read_ahead_key_oids (thread_p, leaf_oids);
+	  }
 
 	/* Hand the OID buffer + pending overflow chain head to the FSM; try_publish happens after leaf-OID drain. */
 	m_drain_fsm->begin_leaf_drain (std::move (leaf_oids), leaf_rec_info.ovfl);

@@ -152,6 +152,8 @@ namespace parallel_scan
       void add_scan_fixes (cubthread::entry &thread_ref, const scan_fixes &since);
       /* INDEX-only: after leaf supply exhausted, help drain remaining shared overflow chains. No-op otherwise. */
       void drain_late_joiner_chains (cubthread::entry &thread_ref, bool &stop);
+      /* INDEX-only, whole-range batch: read the heap pages the index phase marked. No-op otherwise. */
+      void bitmap_heap_phase (cubthread::entry &thread_ref, bool &stop);
   };
 }
 

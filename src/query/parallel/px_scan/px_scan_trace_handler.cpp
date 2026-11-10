@@ -53,6 +53,7 @@ namespace parallel_scan
 	cs.elapsed_lookup = scan_id->scan_stats.elapsed_lookup;
 	cs.covered_index = scan_id->scan_stats.covered_index;
 	cs.multi_range_opt = scan_id->scan_stats.multi_range_opt;
+	cs.bitmap_heap = scan_id->scan_stats.bitmap_heap;
 	cs.index_skip_scan = scan_id->scan_stats.index_skip_scan;
 	cs.loose_index_scan = scan_id->scan_stats.loose_index_scan;
 	cs.need_count_only = scan_id->s.isid.need_count_only;
@@ -114,6 +115,7 @@ namespace parallel_scan
 	TSC_ADD_TIMEVAL (scan_stats->elapsed_lookup, stat.elapsed_lookup);
 	scan_stats->covered_index = scan_stats->covered_index || stat.covered_index;
 	scan_stats->multi_range_opt = scan_stats->multi_range_opt || stat.multi_range_opt;
+	scan_stats->bitmap_heap = MAX (scan_stats->bitmap_heap, stat.bitmap_heap);
 	scan_stats->index_skip_scan = scan_stats->index_skip_scan || stat.index_skip_scan;
 	scan_stats->loose_index_scan = scan_stats->loose_index_scan || stat.loose_index_scan;
       }
@@ -208,6 +210,7 @@ namespace parallel_scan
 	    m_stats_last.data_qualified_rows+=trace_handler.m_stats[i].data_qualified_rows;
 	    m_stats_last.covered_index = m_stats_last.covered_index || trace_handler.m_stats[i].covered_index;
 	    m_stats_last.multi_range_opt = m_stats_last.multi_range_opt || trace_handler.m_stats[i].multi_range_opt;
+	    m_stats_last.bitmap_heap = MAX (m_stats_last.bitmap_heap, trace_handler.m_stats[i].bitmap_heap);
 	    m_stats_last.index_skip_scan = m_stats_last.index_skip_scan || trace_handler.m_stats[i].index_skip_scan;
 	    m_stats_last.loose_index_scan = m_stats_last.loose_index_scan || trace_handler.m_stats[i].loose_index_scan;
 	    m_stats_last.need_count_only = m_stats_last.need_count_only || trace_handler.m_stats[i].need_count_only;
@@ -242,6 +245,7 @@ namespace parallel_scan
 	    TSC_ADD_TIMEVAL (m_stats[i].elapsed_lookup, trace_handler.m_stats[i].elapsed_lookup);
 	    m_stats[i].covered_index = m_stats[i].covered_index || trace_handler.m_stats[i].covered_index;
 	    m_stats[i].multi_range_opt = m_stats[i].multi_range_opt || trace_handler.m_stats[i].multi_range_opt;
+	    m_stats[i].bitmap_heap = MAX (m_stats[i].bitmap_heap, trace_handler.m_stats[i].bitmap_heap);
 	    m_stats[i].index_skip_scan = m_stats[i].index_skip_scan || trace_handler.m_stats[i].index_skip_scan;
 	    m_stats[i].loose_index_scan = m_stats[i].loose_index_scan || trace_handler.m_stats[i].loose_index_scan;
 	    m_stats[i].need_count_only = m_stats[i].need_count_only || trace_handler.m_stats[i].need_count_only;
@@ -255,6 +259,7 @@ namespace parallel_scan
 	    m_stats_last.data_qualified_rows+=trace_handler.m_stats[i].data_qualified_rows;
 	    m_stats_last.covered_index = m_stats_last.covered_index || trace_handler.m_stats[i].covered_index;
 	    m_stats_last.multi_range_opt = m_stats_last.multi_range_opt || trace_handler.m_stats[i].multi_range_opt;
+	    m_stats_last.bitmap_heap = MAX (m_stats_last.bitmap_heap, trace_handler.m_stats[i].bitmap_heap);
 	    m_stats_last.index_skip_scan = m_stats_last.index_skip_scan || trace_handler.m_stats[i].index_skip_scan;
 	    m_stats_last.loose_index_scan = m_stats_last.loose_index_scan || trace_handler.m_stats[i].loose_index_scan;
 	    m_stats_last.need_count_only = m_stats_last.need_count_only || trace_handler.m_stats[i].need_count_only;
@@ -327,6 +332,7 @@ namespace parallel_scan
     UINT64 max_lookup = 0;
     UINT64 min_data_qualified_rows = std::numeric_limits<UINT64>::max();
     UINT64 max_data_qualified_rows = 0;
+    int any_bitmap = 0;
     bool any_covered = false, any_mro = false, any_iss = false, any_lis = false, any_count_only = false;
     for (size_t i = 0; i < m_stats.size(); i++)
       {
@@ -348,6 +354,7 @@ namespace parallel_scan
 	max_data_qualified_rows = std::max (max_data_qualified_rows, m_stats[i].data_qualified_rows);
 	any_covered = any_covered || m_stats[i].covered_index;
 	any_mro = any_mro || m_stats[i].multi_range_opt;
+	any_bitmap = MAX (any_bitmap, m_stats[i].bitmap_heap);
 	any_iss = any_iss || m_stats[i].index_skip_scan;
 	any_lis = any_lis || m_stats[i].loose_index_scan;
 	any_count_only = any_count_only || m_stats[i].need_count_only;
@@ -370,6 +377,10 @@ namespace parallel_scan
 	if (any_mro)
 	  {
 	    fprintf (fp, ", mro: true");
+	  }
+	if (any_bitmap != 0)
+	  {
+	    fprintf (fp, ", bitmap: %d", any_bitmap - 1);
 	  }
 	if (any_iss)
 	  {
@@ -466,6 +477,7 @@ namespace parallel_scan
     UINT64 max_lookup = 0;
     UINT64 min_data_qualified_rows = std::numeric_limits<UINT64>::max();
     UINT64 max_data_qualified_rows = 0;
+    int any_bitmap = 0;
     bool any_covered = false, any_mro = false, any_iss = false, any_lis = false, any_count_only = false;
     for (size_t i = 0; i < m_stats.size(); i++)
       {
@@ -487,6 +499,7 @@ namespace parallel_scan
 	max_data_qualified_rows = std::max (max_data_qualified_rows, m_stats[i].data_qualified_rows);
 	any_covered = any_covered || m_stats[i].covered_index;
 	any_mro = any_mro || m_stats[i].multi_range_opt;
+	any_bitmap = MAX (any_bitmap, m_stats[i].bitmap_heap);
 	any_iss = any_iss || m_stats[i].index_skip_scan;
 	any_lis = any_lis || m_stats[i].loose_index_scan;
 	any_count_only = any_count_only || m_stats[i].need_count_only;
@@ -527,6 +540,10 @@ namespace parallel_scan
 	if (any_mro)
 	  {
 	    trace_json_object_set_new (parallel_obj, "mro", trace_json_true ());
+	  }
+	if (any_bitmap != 0)
+	  {
+	    trace_json_object_set_new (parallel_obj, "bitmap", trace_json_integer (any_bitmap - 1));
 	  }
 	if (any_iss)
 	  {

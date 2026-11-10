@@ -27,6 +27,8 @@
 #include "dbtype.h"
 #include "query_evaluator.h"
 #include "scan_manager.h"
+
+#include <vector>
 #include "storage_common.h"
 
 namespace parallel_scan
@@ -92,6 +94,22 @@ namespace parallel_index_scan
       /* Process a single OID (covering / non-covering paths). Used by FSM during drain. */
       SCAN_CODE process_oid (THREAD_ENTRY *thread_p, OID *oid);
 
+      /* whole-range batch: while on, process_oid marks the OID in the handler's bitmap instead of reading the heap */
+      void set_bitmap_index_phase (bool on)
+      {
+	m_bm_index_phase = on;
+      }
+
+      /* whole-range batch, heap phase: fix a marked page before its rows are read; false: the page is gone */
+      int fix_bitmap_page (THREAD_ENTRY *thread_p, const VPID *vpid, bool *is_fixed);
+      /* ... a row marked on that page: process_oid on the page held, without one more fix of it per row */
+      SCAN_CODE process_bitmap_row (THREAD_ENTRY *thread_p, OID *oid);
+      /* ... a page marked as a whole: its next row that passes the index condition (checked on the heap row) and the data filter.
+       * cur_oid: null OID before the first call. Returns S_SUCCESS, S_END (page exhausted) or S_ERROR. */
+      SCAN_CODE next_whole_page_row (THREAD_ENTRY *thread_p, const VPID *vpid, OID *cur_oid);
+      /* ... and let the page go: a scan that does not keep its last page fixed ends with none */
+      void release_bitmap_page (THREAD_ENTRY *thread_p);
+
       /* a key record starts (a new slot, or a helper session on another key's overflow chain): a group by skip scan
        * compares its group key only here (CBRD-27664), and the covered key is decoded again */
       void begin_key_record ()
@@ -107,6 +125,11 @@ namespace parallel_index_scan
 
     private:
       int check_key_in_range (DB_VALUE *key, bool *in_range, bool *past_upper, int *matched_range_idx);
+
+      void read_ahead_key_oids (THREAD_ENTRY *thread_p, const std::vector<OID> &oids);
+
+      /* data filter and the rest of the columns of a heap row the snapshot sees; S_END: filtered out */
+      SCAN_CODE finish_heap_row (THREAD_ENTRY *thread_p, OID *oid, RECDES *heap_recdes);
 
       /* btree_key_process_objects callback (leaf-side gather). */
       static int collect_oid_callback (THREAD_ENTRY *thread_p, BTID_INT *btid_int, RECDES *record,
@@ -130,6 +153,10 @@ namespace parallel_index_scan
       bool m_slot_key_valid;
       bool m_slot_clear_key;                          /* needs pr_clear_value. */
       bool m_key_values_ready;                        /* the scan values hold this key record's covered key. */
+      bool m_bm_index_phase;                          /* whole-range batch: OIDs are marked, not looked up. */
+      int m_bm_sector_hint;                           /* sector of the last mark. */
+      int m_ahead_skip;                               /* keys left to pass without a read-ahead hint. */
+      int m_ahead_backoff;                            /* keys to pass after a hint that found every page in the buffer. */
   };
 }
 
