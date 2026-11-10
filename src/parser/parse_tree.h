@@ -3848,6 +3848,7 @@ struct parser_node
   int buffer_pos;		/* position in the parse buffer of the string originating this */
   int nesting_depth;		/* expression nesting depth, maintained by parser_make_expression (); guards the
 				 * recursive tree walkers against stack exhaustion from user input */
+  int stmt_start_line;		/* the user line number where the statement starts (top-level statements only) */
   char *sql_user_text;		/* user input sql string */
   int sql_user_text_len;	/* user input sql string length (one statement) */
 
