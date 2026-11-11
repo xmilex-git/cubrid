@@ -830,7 +830,6 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 #define PRM_NAME_COST_HEAP_FETCH_PER_OID "cost_heap_fetch_per_oid"
 #define PRM_NAME_PLAN_CACHE_BIND_VARIANTS "plan_cache_bind_variants"
 #define PRM_NAME_ROW_SNAPSHOT_MAX_ROWS "row_snapshot_max_rows"
-#define PRM_NAME_READ_AHEAD_HINT "read_ahead_hint"
 #define PRM_NAME_BITMAP_HEAP_SCAN "bitmap_heap_scan"
 #define PRM_NAME_INDEX_SCAN_OID_BITMAP_SIZE "index_scan_oid_bitmap_size"
 #define PRM_NAME_NL_JOIN_BATCH "nl_join_batch"
@@ -5749,20 +5748,6 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.i = 0}},
    {false, {.i = 10000}},
    {false, {.i = 0}},
-   (char *) NULL,
-   (DUP_PRM_FUNC) NULL,
-   (DUP_PRM_FUNC) NULL},
-  /* a scan tells the OS which pages it is about to read (posix_fadvise WILLNEED), so the device reads them
-   * together while the scan still reads one page at a time (CBRD-28005) */
-  {PRM_ID_READ_AHEAD_HINT,
-   PRM_NAME_READ_AHEAD_HINT,
-   (PRM_FOR_SERVER),
-   PRM_BOOLEAN,
-   PRM_CLEAR_DYNAMIC_FLAG,
-   {false, {.b = false}},
-   {false, {.b = false}},
-   NULL_SYSPRM_PARAM_VALUE,
-   NULL_SYSPRM_PARAM_VALUE,
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},

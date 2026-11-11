@@ -988,10 +988,50 @@ namespace parallel_scan
 
   /* the row loop's work for one row the scan qualified, its values in the value list: S_SUCCESS (written, or
    * dropped by a join or if predicate), or S_ERROR with stop set and the error reported */
+  /* the join rows of the following scans for the current row (or, after the last row, for the rows a batched join
+   * still holds): each goes to the result handler */
+  template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  SCAN_CODE task<result_type, ST>::join_rows (cubthread::entry &thread_ref, bool &stop)
+  {
+    SCAN_CODE xs_scan;
+    result_handler<result_type> *result_handler_p = m_result_handler;
+
+    while ((xs_scan = qexec_execute_scan_ptr (&thread_ref, m_xasl->scan_ptr, m_xasl_state, m_scan_func_ptr)) == S_SUCCESS)
+      {
+	if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
+	  {
+	    result_handler_p->write (&thread_ref, m_xasl->outptr_list);
+	  }
+	else if constexpr (result_type == RESULT_TYPE::BUILDVALUE_OPT)
+	  {
+	    if (!result_handler_p->write (&thread_ref))
+	      {
+		/* write()'s return is otherwise ignored; a per-row error would be silently
+		 * skipped and diverge from serial. Stop the worker like the S_ERROR path.
+		 * Some write() paths already raise the interrupt; avoid a double move. */
+		if (m_interrupt->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
+		  {
+		    m_err_messages->move_top_error_message_to_this ();
+		    m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+		  }
+		stop = true;
+		return S_ERROR;
+	      }
+	  }
+      }
+    if (xs_scan == S_ERROR)
+      {
+	m_err_messages->move_top_error_message_to_this();
+	m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
+	stop = true;
+	return S_ERROR;
+      }
+    return S_END;
+  }
+
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
   SCAN_CODE task<result_type, ST>::row_body (cubthread::entry &thread_ref, bool &stop)
   {
-    SCAN_CODE xs_scan;
     DB_LOGICAL ev_res;
     result_handler<result_type> *result_handler_p = m_result_handler;
 
@@ -1072,6 +1112,12 @@ namespace parallel_scan
 	  {
 	    m_xasl->curr_spec->s_id.qualified_block = true;
 
+	    if (m_xasl->scan_ptr->nl_batch == NULL)
+	      {
+		/* nl_join_batch: the following scan may keep this worker's rows and join them a batch at a time */
+		qexec_nl_batch_arm_worker (&thread_ref, m_xasl);
+	      }
+
 	    /* handle the scan procedure */
 	    m_xasl->scan_ptr->next_scan_on = false;
 	    /* as qexec_intprt_fnc: rewind a partitioned SEMI / ANTI inner to its first partition (its
@@ -1089,34 +1135,8 @@ namespace parallel_scan
 	      {
 		m_xasl->scan_ptr->memoize_storage->set_key_changed ();
 	      }
-	    while ((xs_scan = qexec_execute_scan_ptr (&thread_ref, m_xasl->scan_ptr, m_xasl_state, m_scan_func_ptr)) == S_SUCCESS)
+	    if (join_rows (thread_ref, stop) == S_ERROR)
 	      {
-		if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
-		  {
-		    result_handler_p->write (&thread_ref, m_xasl->outptr_list);
-		  }
-		else if constexpr (result_type == RESULT_TYPE::BUILDVALUE_OPT)
-		  {
-		    if (!result_handler_p->write (&thread_ref))
-		      {
-			/* write()'s return is otherwise ignored; a per-row error would be silently
-			 * skipped and diverge from serial. Stop the worker like the S_ERROR path.
-			 * Some write() paths already raise the interrupt; avoid a double move. */
-			if (m_interrupt->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT)
-			  {
-			    m_err_messages->move_top_error_message_to_this ();
-			    m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-			  }
-			stop = true;
-			return S_ERROR;
-		      }
-		  }
-	      }
-	    if (xs_scan == S_ERROR)
-	      {
-		m_err_messages->move_top_error_message_to_this();
-		m_interrupt->set_code (parallel_query::interrupt::interrupt_code::ERROR_INTERRUPTED_FROM_WORKER_THREAD);
-		stop = true;
 		return S_ERROR;
 	      }
 	    m_xasl->next_scan_on = false;
@@ -1329,6 +1349,16 @@ namespace parallel_scan
 	(void) drain_slot_oids (thread_ref, stop);
       }
 
+    if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST || result_type == RESULT_TYPE::BUILDVALUE_OPT)
+      {
+	/* nl_join_batch: the rows the following scan still holds are joined now */
+	if (!stop && m_interrupt->get_code () == parallel_query::interrupt::interrupt_code::NO_INTERRUPT
+	    && qexec_nl_batch_flush_worker (m_xasl))
+	  {
+	    (void) join_rows (thread_ref, stop);
+	  }
+      }
+
     if constexpr (ST == SCAN_TYPE::INDEX)
       {
 	if (m_input_handler->bitmap_on () && !bitmap_left_index_phase)
@@ -1346,7 +1376,6 @@ namespace parallel_scan
   {
     if constexpr (ST == SCAN_TYPE::INDEX)
       {
-	const bool read_ahead = prm_get_bool_value (PRM_ID_READ_AHEAD_HINT);
 	bool dummy = false;
 	int sector_idx;
 
@@ -1355,6 +1384,17 @@ namespace parallel_scan
 	if (stop || !m_input_handler->bitmap_wait_index_phase ())
 	  {
 	    return;
+	  }
+
+	/* the heap step is shown as a scan of its own: its time, page fixes and reads are counted apart */
+	scan_fixes since = {};
+	TSC_TICKS heap_start_tick;
+	UINT64 heap_pages = 0;
+
+	if (thread_ref.on_trace)
+	  {
+	    since = read_fixes (thread_ref);
+	    tsc_getticks (&heap_start_tick);
 	  }
 
 	while (!stop && m_input_handler->bitmap_take_sector (&sector_idx))
@@ -1380,7 +1420,7 @@ namespace parallel_scan
 
 	    const FILE_PARTIAL_SECTOR &sector = m_input_handler->bitmap_sector (sector_idx);
 
-	    if (read_ahead && pages != sector.page_bitmap)
+	    if (pages != sector.page_bitmap)
 	      {
 		/* pages with gaps between them: the OS reads them together. A sector marked on every page is a
 		 * sequential read, which the OS recognizes by itself. */
@@ -1411,8 +1451,23 @@ namespace parallel_scan
 		    stop = true;
 		    break;
 		  }
+		heap_pages++;
 		(void) drain_slot_oids (thread_ref, stop);
 	      }
+	  }
+
+	if (thread_ref.on_trace)
+	  {
+	    const scan_fixes now = read_fixes (thread_ref);
+	    TSC_TICKS heap_end_tick;
+	    TSCTIMEVAL tv_diff;
+
+	    tsc_getticks (&heap_end_tick);
+	    tsc_elapsed_time_usec (&tv_diff, heap_end_tick, heap_start_tick);
+	    TSC_ADD_TIMEVAL (m_scan_id->scan_stats.bitmap_heap_time, tv_diff);
+	    m_scan_id->scan_stats.bitmap_heap_fetches += now.fetches - since.fetches;
+	    m_scan_id->scan_stats.bitmap_heap_ioreads += now.ioreads - since.ioreads;
+	    m_scan_id->scan_stats.bitmap_heap_pages += heap_pages;
 	  }
       }
   }

@@ -583,6 +583,10 @@ struct scan_stats
   bool covered_index;
   int bitmap_heap;		/* the heap was read through a bitmap of the rows the index found: 1 + row bits of a page
 				 * (1: pages only); 0: no bitmap */
+  struct timeval bitmap_heap_time;	/* ... the heap step of that scan: the time of the worker that took longest */
+  UINT64 bitmap_heap_fetches;
+  UINT64 bitmap_heap_ioreads;
+  UINT64 bitmap_heap_pages;	/* marked pages it read */
   UINT64 nl_batch_rows;		/* outer rows whose OIDs a batched nested-loop join read ahead of their lookups */
   bool multi_range_opt;
   bool index_skip_scan;
@@ -842,6 +846,7 @@ extern int showstmt_end_scan (THREAD_ENTRY * thread_p, SCAN_ID * s_id);
 #if defined(SERVER_MODE)
 extern void scan_print_stats_json (SCAN_ID * scan_id, trace_json_t * stats);
 extern void scan_print_stats_text (FILE * fp, SCAN_ID * scan_id);
+extern void scan_print_bitmap_heap_stats_text (FILE * fp, SCAN_ID * scan_id);
 #endif /* SERVER_MODE */
 
 #endif /* _SCAN_MANAGER_H_ */

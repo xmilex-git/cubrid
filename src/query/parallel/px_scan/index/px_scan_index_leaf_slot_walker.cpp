@@ -415,11 +415,6 @@ namespace parallel_index_scan
 	m_ahead_skip--;
 	return;
       }
-    if (!prm_get_bool_value (PRM_ID_READ_AHEAD_HINT))
-      {
-	m_ahead_skip = INT_MAX;
-	return;
-      }
     for (size_t i = 0; i < oids.size () && count < 64; i++)
       {
 	if (count == 0 || vpids[count - 1].pageid != oids[i].pageid || vpids[count - 1].volid != oids[i].volid)

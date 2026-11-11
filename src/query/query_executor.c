@@ -12161,6 +12161,7 @@ struct qexec_nl_batch
   bool passing;			/* an outer row that was not held is inside the row path */
   bool flush;			/* the outer scan ended: join what is held */
   bool outer_ended;		/* ... and the outer only passes those rows on */
+  bool worker_outer;		/* the outer is the first scan of a parallel worker, which reads its rows itself */
   XASL_NODE *outer;		/* the scan whose rows are held */
   int n_vals;			/* values of an outer row (outer->val_list) */
   int n_rows;			/* outer rows held */
@@ -12226,6 +12227,47 @@ qexec_nl_batch_arm (THREAD_ENTRY * thread_p, XASL_NODE * outer, XASL_NODE * inne
 
   batch->n_vals = outer->val_list->val_cnt;
   batch->on = true;
+}
+
+/*
+ * qexec_nl_batch_arm_worker () - the first scan of a parallel worker: its following scan may batch the worker's rows
+ *   xasl(in): the worker's clone of the block
+ *
+ * Note: the worker evaluates the first scan's own predicates itself and joins the rows left at its end with
+ *	 qexec_nl_batch_flush_worker (), so the conditions on a first scan of qexec_intprt_fnc () do not apply.
+ */
+void
+qexec_nl_batch_arm_worker (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
+{
+  if (xasl->scan_ptr != NULL && xasl->scan_ptr->nl_batch == NULL)
+    {
+      qexec_nl_batch_arm (thread_p, xasl, xasl->scan_ptr, false);
+      if (xasl->scan_ptr->nl_batch != NULL)
+	{
+	  xasl->scan_ptr->nl_batch->worker_outer = true;
+	}
+    }
+}
+
+/*
+ * qexec_nl_batch_flush_worker () - a parallel worker read its last row
+ *   return: true when its following scan holds rows: the worker then calls qexec_execute_scan_ptr () for that scan
+ *	     until S_END, as it does for a row
+ *   xasl(in): the worker's clone of the block
+ */
+bool
+qexec_nl_batch_flush_worker (XASL_NODE * xasl)
+{
+  QEXEC_NL_BATCH *batch = (xasl->scan_ptr != NULL) ? xasl->scan_ptr->nl_batch : NULL;
+
+  if (batch == NULL || !batch->on || batch->n_rows == 0)
+    {
+      return false;
+    }
+  assert (!batch->replaying);
+  batch->flush = true;
+
+  return true;
 }
 
 /*
@@ -12305,8 +12347,9 @@ qexec_nl_batch_add (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QEXEC_NL_BATCH * 
   int error = NO_ERROR;
 
   scan_ok = (s_id != NULL && scan_index_nl_batch_ok (s_id) && outer->curr_spec != NULL
-	     && (outer->curr_spec->s_id.type == S_HEAP_SCAN || outer->curr_spec->s_id.type == S_INDX_SCAN
-		 || outer->curr_spec->s_id.type == S_LIST_SCAN) && !outer->curr_spec->s_id.mvcc_select_lock_needed);
+	     && (batch->worker_outer || outer->curr_spec->s_id.type == S_HEAP_SCAN
+		 || outer->curr_spec->s_id.type == S_INDX_SCAN || outer->curr_spec->s_id.type == S_LIST_SCAN)
+	     && !outer->curr_spec->s_id.mvcc_select_lock_needed);
   if ((!scan_ok || batch->skip > 0) && batch->n_rows == 0)
     {
       if (batch->skip > 0)
