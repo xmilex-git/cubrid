@@ -833,6 +833,7 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 #define PRM_NAME_READ_AHEAD_HINT "read_ahead_hint"
 #define PRM_NAME_BITMAP_HEAP_SCAN "bitmap_heap_scan"
 #define PRM_NAME_INDEX_SCAN_OID_BITMAP_SIZE "index_scan_oid_bitmap_size"
+#define PRM_NAME_NL_JOIN_BATCH "nl_join_batch"
 
 #define PRM_NAME_HASH_JOIN_RUNTIME_FILTER "hash_join_runtime_filter"
 
@@ -5790,6 +5791,20 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.bi = 16 * 1024 * 1024 /* 16 MB */ }},
    {false, {.bi = 1024 * 1024 * 1024 /* 1 GB */ }},
    {false, {.bi = 0}},
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  /* a nested-loop join keeps a batch of outer rows, reads the inner index for each, names the heap pages of all
+   * the rows found to the OS at once, and then joins the outer rows in their order (CBRD-28005) */
+  {PRM_ID_NL_JOIN_BATCH,
+   PRM_NAME_NL_JOIN_BATCH,
+   (PRM_FOR_SERVER),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE,
+   NULL_SYSPRM_PARAM_VALUE,
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL},

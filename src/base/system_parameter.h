@@ -582,9 +582,10 @@ enum param_id
   PRM_ID_READ_AHEAD_HINT,
   PRM_ID_BITMAP_HEAP_SCAN,
   PRM_ID_INDEX_SCAN_OID_BITMAP_SIZE,
+  PRM_ID_NL_JOIN_BATCH,
 
   /* change PRM_LAST_ID when adding new system parameters */
-  PRM_LAST_ID = PRM_ID_INDEX_SCAN_OID_BITMAP_SIZE
+  PRM_LAST_ID = PRM_ID_NL_JOIN_BATCH
 };
 typedef enum param_id PARAM_ID;
 
