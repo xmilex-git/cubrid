@@ -448,9 +448,10 @@ extern SCAN_CODE heap_page_collect_visible (THREAD_ENTRY * thread_p, const VPID 
 
 
 extern bool heap_page_is_bestspace (THREAD_ENTRY * thread_p, PAGE_PTR page_heap);
+extern void heap_page_list_load_sector (THREAD_ENTRY * thread_p, const HFID * hfid, const FILE_PARTIAL_SECTOR * sector);
 extern SCAN_CODE heap_page_list_fix_next (THREAD_ENTRY * thread_p, const HFID * hfid,
 					  const FILE_PARTIAL_SECTOR * sector, size_t * pgoffset,
-					  PGBUF_WATCHER * watcher, VPID * vpid_out);
+					  PGBUF_WATCHER * watcher, VPID * vpid_out, bool load_run);
 extern bool heap_page_is_not_in_heap (THREAD_ENTRY * thread_p, PAGE_PTR page_heap);
 
 extern SCAN_CODE heap_prev_record_info (THREAD_ENTRY * thread_p, const HFID * hfid, OID * class_oid, OID * next_oid,

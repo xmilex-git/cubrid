@@ -4006,6 +4006,53 @@ fileio_read (THREAD_ENTRY * thread_p, int vol_fd, void *io_page_p, PAGEID page_i
 }
 
 /*
+ * fileio_read_page_run () - read consecutive pages of a volume into separate page areas with one read
+ *   return: iov on success, NULL on failure
+ *   vol_fd(in): volume descriptor
+ *   iov(in): one area of page_size bytes per page, in page order
+ *   num_pages(in): number of pages (and of areas)
+ *   page_id(in): the first page
+ *   page_size(in): page size
+ *
+ * Note: A read the system cuts short is finished page by page.
+ */
+void *
+fileio_read_page_run (THREAD_ENTRY * thread_p, int vol_fd, const struct iovec *iov, int num_pages, PAGEID page_id,
+		      size_t page_size)
+{
+  ssize_t nbytes;
+  int done;
+
+  assert (num_pages > 0);
+
+#if defined (WINDOWS)
+  done = 0;
+#else
+  do
+    {
+      nbytes = preadv (vol_fd, iov, num_pages, FILEIO_GET_FILE_SIZE (page_size, page_id));
+    }
+  while (nbytes < 0 && errno == EINTR);
+  /* whole pages only: a page read in part is read again */
+  done = (nbytes > 0) ? (int) ((size_t) nbytes / page_size) : 0;
+  if (done > 0)
+    {
+      perfmon_inc_stat (thread_p, PSTAT_FILE_NUM_IOREADS);
+    }
+#endif
+
+  for (; done < num_pages; done++)
+    {
+      if (fileio_read (thread_p, vol_fd, iov[done].iov_base, page_id + done, page_size) == NULL)
+	{
+	  return NULL;
+	}
+    }
+
+  return (void *) iov;
+}
+
+/*
  * fileio_write_or_add_to_dwb () - Write a page to disk if DWb disabled, otherwise add it to DWB
  *   return: io_page_p on success, NULL on failure
  *   vol_fd(in): Volume descriptor

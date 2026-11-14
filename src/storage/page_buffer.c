@@ -790,6 +790,7 @@ struct pgbuf_buffer_pool
   PGBUF_BCB *BCB_table;		/* BCB table */
   PGBUF_BUFFER_HASH *buf_hash_table;	/* buffer hash table */
   PGBUF_BUFFER_LOCK *buf_lock_table;	/* buffer lock table */
+  PGBUF_BUFFER_LOCK *buf_lock_run_table;	/* buffer locks of pgbuf_load_page_run (): PGBUF_PAGE_RUN_MAX per thread */
   PGBUF_IOPAGE_BUFFER *iopage_table;	/* IO page table */
   int num_LRU_list;		/* number of shared LRU lists */
   float ratio_lru1;		/* ratio for lru 1 zone */
@@ -1654,6 +1655,7 @@ pgbuf_initialize (void)
   pgbuf_Pool.BCB_table = NULL;
   pgbuf_Pool.buf_hash_table = NULL;
   pgbuf_Pool.buf_lock_table = NULL;
+  pgbuf_Pool.buf_lock_run_table = NULL;
   pgbuf_Pool.iopage_table = NULL;
   pgbuf_Pool.num_LRU_list = 0;
   pgbuf_Pool.ratio_lru1 = 0.0f;
@@ -1952,6 +1954,10 @@ pgbuf_finalize (void)
   if (pgbuf_Pool.buf_lock_table != NULL)
     {
       free_and_init (pgbuf_Pool.buf_lock_table);
+    }
+  if (pgbuf_Pool.buf_lock_run_table != NULL)
+    {
+      free_and_init (pgbuf_Pool.buf_lock_run_table);
     }
 
   /* final task for BCB table */
@@ -6378,6 +6384,23 @@ pgbuf_initialize_lock_table (void)
 #endif /* SERVER_MODE */
     }
 
+  /* a thread that reads a run of pages holds one buffer lock per page of the run */
+  alloc_size = thrd_num_total * PGBUF_PAGE_RUN_MAX * PGBUF_BUFFER_LOCK_SIZEOF;
+  pgbuf_Pool.buf_lock_run_table = (PGBUF_BUFFER_LOCK *) malloc (alloc_size);
+  if (pgbuf_Pool.buf_lock_run_table == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, alloc_size);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  for (i = 0; i < thrd_num_total * PGBUF_PAGE_RUN_MAX; i++)
+    {
+      VPID_SET_NULL (&pgbuf_Pool.buf_lock_run_table[i].vpid);
+      pgbuf_Pool.buf_lock_run_table[i].lock_next = NULL;
+#if defined(SERVER_MODE)
+      pgbuf_Pool.buf_lock_run_table[i].next_wait_thrd = NULL;
+#endif /* SERVER_MODE */
+    }
+
   return NO_ERROR;
 }
 
@@ -9277,6 +9300,235 @@ pgbuf_claim_bcb_for_fix (THREAD_ENTRY * thread_p, const VPID * vpid, PAGE_FETCH_
     }
 
   return bufptr;
+}
+
+/*
+ * pgbuf_load_page_run () - read consecutive pages of a permanent volume into the buffer with one read
+ *   return: the pages of the run this call dealt with (0: the first page is in the buffer or being read)
+ *   vpid_first(in): the first page
+ *   count(in): pages of the run, PGBUF_PAGE_RUN_MAX at most
+ *
+ * Note: For a scan that knows the pages it is about to fix one after another. The pages enter the buffer unfixed;
+ *       the caller fixes them as usual, and a page this call did not load is read by that fix.
+ *       Each page is buffer-locked first, as pgbuf_claim_bcb_for_fix () locks the one page it reads, so nobody else
+ *       loads or waits wrongly for a page of the run; the run ends before a page that is in the buffer or that
+ *       another thread is reading (no wait while holding buffer locks). BCBs come from the invalid list and the
+ *       LRU lists only: a run is cut short rather than waiting for a victim. A page the double write buffer holds
+ *       is taken from it, before the volume is read: the volume's copy of such a page is older.
+ *       Nothing is reported: a page left out for any reason, a read error included, meets the same reason in its fix.
+ */
+int
+pgbuf_load_page_run (THREAD_ENTRY * thread_p, const VPID * vpid_first, int count)
+{
+  PGBUF_BCB *bcbs[PGBUF_PAGE_RUN_MAX];
+  bool from_dwb[PGBUF_PAGE_RUN_MAX];
+  struct iovec iov[PGBUF_PAGE_RUN_MAX];
+  PGBUF_BUFFER_HASH *hash_anchor;
+  PGBUF_BCB *bufptr;
+  PGBUF_ATOMIC_LATCH_IMPL impl;
+  PAGE_PTR pgptr;
+  TDE_ALGORITHM tde_algo;
+  VPID vpid;
+  int n_locked, n_bcbs, i, j;
+  bool read_ok = true, ok;
+#if defined (SERVER_MODE)
+  PGBUF_BUFFER_LOCK *buffer_lock;
+#endif /* SERVER_MODE */
+
+  assert (count <= PGBUF_PAGE_RUN_MAX);
+  assert (!pgbuf_is_temporary_volume (vpid_first->volid));
+
+  if (count < 2)
+    {
+      /* the fix reads one page as well */
+      return 0;
+    }
+
+#if defined (SERVER_MODE)
+  if (thread_p == NULL)
+    {
+      thread_p = thread_get_thread_entry_info ();
+    }
+#endif /* SERVER_MODE */
+
+  /* buffer-lock the pages, up to the first one that is in the buffer or being read */
+  vpid = *vpid_first;
+  for (n_locked = 0; n_locked < count; n_locked++, vpid.pageid++)
+    {
+      hash_anchor = &pgbuf_Pool.buf_hash_table[PGBUF_HASH_VALUE (&vpid)];
+      pthread_mutex_lock (&hash_anchor->hash_mutex);
+      for (bufptr = hash_anchor->hash_next; bufptr != NULL; bufptr = bufptr->hash_next)
+	{
+	  if (VPID_EQ (&bufptr->vpid, &vpid))
+	    {
+	      break;
+	    }
+	}
+#if defined (SERVER_MODE)
+      buffer_lock = NULL;
+      if (bufptr == NULL)
+	{
+	  for (buffer_lock = hash_anchor->lock_next; buffer_lock != NULL; buffer_lock = buffer_lock->lock_next)
+	    {
+	      if (VPID_EQ (&buffer_lock->vpid, &vpid))
+		{
+		  break;
+		}
+	    }
+	}
+      if (bufptr != NULL || buffer_lock != NULL)
+	{
+	  pthread_mutex_unlock (&hash_anchor->hash_mutex);
+	  break;
+	}
+      buffer_lock = &pgbuf_Pool.buf_lock_run_table[thread_p->index * PGBUF_PAGE_RUN_MAX + n_locked];
+      buffer_lock->vpid = vpid;
+      buffer_lock->next_wait_thrd = NULL;
+      buffer_lock->lock_next = hash_anchor->lock_next;
+      hash_anchor->lock_next = buffer_lock;
+#else /* !SERVER_MODE */
+      if (bufptr != NULL)
+	{
+	  pthread_mutex_unlock (&hash_anchor->hash_mutex);
+	  break;
+	}
+#endif /* !SERVER_MODE */
+      pthread_mutex_unlock (&hash_anchor->hash_mutex);
+    }
+  if (n_locked == 0)
+    {
+      return 0;
+    }
+
+  /* one BCB per page. A BCB taken here is in no list and belongs to no page, so nobody reaches it: it stays unlocked
+   * until its page is read (a thread holds one BCB mutex at a time). */
+  for (n_bcbs = 0; n_bcbs < n_locked; n_bcbs++)
+    {
+      bufptr = pgbuf_get_bcb_from_invalid_list (thread_p);
+      if (bufptr == NULL)
+	{
+	  bufptr = pgbuf_get_victim (thread_p);
+	  if (bufptr != NULL && pgbuf_victimize_bcb (thread_p, bufptr) != NO_ERROR)
+	    {
+	      bufptr = NULL;
+	    }
+	}
+      if (bufptr == NULL)
+	{
+	  break;
+	}
+      VPID_SET_NULL (&bufptr->vpid);
+      set_latch (&bufptr->atomic_latch, PGBUF_LATCH_INVALID);
+      PGBUF_BCB_UNLOCK (bufptr);
+      bcbs[n_bcbs] = bufptr;
+    }
+
+  /* the pages that got no BCB are left to their fix */
+  for (i = n_bcbs; i < n_locked; i++)
+    {
+      vpid.volid = vpid_first->volid;
+      vpid.pageid = vpid_first->pageid + i;
+      (void) pgbuf_unlock_page (thread_p, &pgbuf_Pool.buf_hash_table[PGBUF_HASH_VALUE (&vpid)], &vpid, true);
+    }
+  er_clear ();
+
+  /* the double write buffer first, then one read for each stretch it does not hold */
+  for (i = 0; i < n_bcbs; i++)
+    {
+      vpid.volid = vpid_first->volid;
+      vpid.pageid = vpid_first->pageid + i;
+      if (dwb_read_page (thread_p, &vpid, &bcbs[i]->iopage_buffer->iopage, &from_dwb[i]) != NO_ERROR)
+	{
+	  assert (false);
+	  from_dwb[i] = false;
+	  read_ok = false;
+	}
+    }
+  for (i = 0; read_ok && i < n_bcbs; i = j)
+    {
+      if (from_dwb[i])
+	{
+	  j = i + 1;
+	  continue;
+	}
+      for (j = i; j < n_bcbs && !from_dwb[j]; j++)
+	{
+	  iov[j - i].iov_base = &bcbs[j]->iopage_buffer->iopage;
+	  iov[j - i].iov_len = IO_PAGESIZE;
+	}
+      if (fileio_read_page_run (thread_p, fileio_get_volume_descriptor (vpid_first->volid), iov, j - i,
+				vpid_first->pageid + i, IO_PAGESIZE) == NULL)
+	{
+	  read_ok = false;
+	}
+    }
+
+  /* each page into its hash chain; its buffer lock goes and its waiters wake */
+  for (i = 0; i < n_bcbs; i++)
+    {
+      bufptr = bcbs[i];
+      vpid.volid = vpid_first->volid;
+      vpid.pageid = vpid_first->pageid + i;
+      hash_anchor = &pgbuf_Pool.buf_hash_table[PGBUF_HASH_VALUE (&vpid)];
+
+      PGBUF_BCB_LOCK (bufptr);
+      pgbuf_bcb_update_flags (thread_p, bufptr, 0, PGBUF_BCB_ASYNC_FLUSH_REQ);
+      pgbuf_bcb_check_and_reset_fix_and_avoid_dealloc (bufptr, ARG_FILE_LINE);
+      LSA_SET_NULL (&bufptr->oldest_unflush_lsa);
+
+      ok = read_ok;
+      if (ok)
+	{
+	  CAST_IOPGPTR_TO_PGPTR (pgptr, &bufptr->iopage_buffer->iopage);
+	  tde_algo = pgbuf_get_tde_algorithm (pgptr);
+	  if (tde_algo != TDE_ALGORITHM_NONE
+	      && tde_decrypt_data_page (&bufptr->iopage_buffer->iopage, tde_algo, false,
+					&bufptr->iopage_buffer->iopage) != NO_ERROR)
+	    {
+	      ok = false;
+	    }
+	}
+      if (ok)
+	{
+	  bufptr->vpid = vpid;
+	  impl = get_impl (&bufptr->atomic_latch);
+	  impl.impl.latch_mode = PGBUF_NO_LATCH;
+	  impl.impl.waiter_exists = false;
+	  impl.impl.fcnt = 0;
+	  bufptr->atomic_latch.store (impl.raw);
+	  /* a page never written since its allocation takes its identifier here, as in a fix */
+	  pgbuf_set_bcb_page_vpid (bufptr);
+	  ok = (bufptr->vpid.pageid == bufptr->iopage_buffer->iopage.prv.pageid
+		&& bufptr->vpid.volid == bufptr->iopage_buffer->iopage.prv.volid);
+	}
+      if (!ok)
+	{
+	  /* bufptr->mutex is released in the following function */
+	  pgbuf_put_bcb_into_invalid_list (thread_p, bufptr);
+	  (void) pgbuf_unlock_page (thread_p, hash_anchor, &vpid, true);
+	  continue;
+	}
+
+      perfmon_inc_stat_for_trace (thread_p, PSTAT_PB_NUM_IOREADS);
+
+      pgbuf_insert_into_hash_chain (thread_p, hash_anchor, bufptr);
+      /* hash_anchor->hash_mutex is held: the third argument is false */
+      (void) pgbuf_unlock_page (thread_p, hash_anchor, &vpid, false);
+
+      if (PGBUF_THREAD_HAS_PRIVATE_LRU (thread_p))
+	{
+	  pgbuf_lru_add_new_bcb_to_top (thread_p, bufptr,
+					PGBUF_LRU_INDEX_FROM_PRIVATE (PGBUF_PRIVATE_LRU_FROM_THREAD (thread_p)));
+	}
+      else
+	{
+	  pgbuf_lru_add_new_bcb_to_middle (thread_p, bufptr, pgbuf_get_shared_lru_index_for_add ());
+	}
+      PGBUF_BCB_UNLOCK (bufptr);
+    }
+  er_clear ();
+
+  return n_locked;
 }
 
 /*

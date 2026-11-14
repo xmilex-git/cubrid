@@ -194,6 +194,7 @@ struct heap_scan_id
   int page_list_sect;		/* the walk's sector in page_list */
   size_t page_list_pgoffset;	/* the walk's next page offset in that sector */
   VPID page_list_vpid;		/* the row path's page; NULL to take the next listed page */
+  void *read_ahead;		/* the serial walk's read-ahead (scan_heap_read_ahead ()); NULL when there is none */
 };				/* Regular Heap File Scan Identifier */
 
 namespace parallel_scan
@@ -244,6 +245,7 @@ struct parallel_heap_scan_id
   int page_list_sect;
   size_t page_list_pgoffset;
   VPID page_list_vpid;
+  void *read_ahead;
   // *INDENT-OFF*
   #if !WINDOWS
   parallel_scan::RESULT_TYPE result_type;
@@ -479,7 +481,8 @@ static_assert (offsetof (HEAP_SCAN_ID, page_list) == offsetof (PARALLEL_HEAP_SCA
 static_assert (offsetof (HEAP_SCAN_ID, page_list_vpid) == offsetof (PARALLEL_HEAP_SCAN_ID, page_list_vpid), "phsid mirror: page_list_vpid");
 static_assert (sizeof (HEAP_SCAN_ID) <= sizeof (PARALLEL_HEAP_SCAN_ID), "phsid mirror: heap_scan_id fits");
 #if !WINDOWS
-static_assert (offsetof (HEAP_SCAN_ID, page_list_vpid) + sizeof (VPID) <= offsetof (PARALLEL_HEAP_SCAN_ID, result_type), "phsid mirror: heap_scan_id ends before the parallel fields");
+static_assert (offsetof (HEAP_SCAN_ID, read_ahead) == offsetof (PARALLEL_HEAP_SCAN_ID, read_ahead), "phsid mirror: read_ahead");
+static_assert (offsetof (HEAP_SCAN_ID, read_ahead) + sizeof (void *) <= offsetof (PARALLEL_HEAP_SCAN_ID, result_type), "phsid mirror: heap_scan_id ends before the parallel fields");
 #endif
 #pragma GCC diagnostic pop
 

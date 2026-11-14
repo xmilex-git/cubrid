@@ -85,7 +85,7 @@ namespace parallel_scan
 	  }
 
 	SCAN_CODE code = heap_page_list_fix_next (thread_p, &m_hfid, &m_tl_ftab, &m_tl_pgoffset,
-			 &m_tl_scan_cache->page_watcher, vpid);
+			 &m_tl_scan_cache->page_watcher, vpid, false);
 	if (code == S_SUCCESS)
 	  {
 	    return S_SUCCESS;

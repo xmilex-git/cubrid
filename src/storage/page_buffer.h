@@ -489,6 +489,9 @@ extern int pgbuf_rv_dealloc_redo (THREAD_ENTRY * thread_p, LOG_RCV * rcv);
 extern int pgbuf_rv_dealloc_undo (THREAD_ENTRY * thread_p, LOG_RCV * rcv);
 extern int pgbuf_rv_dealloc_undo_compensate (THREAD_ENTRY * thread_p, LOG_RCV * rcv);
 
+/* pages of one pgbuf_load_page_run (): a sector's */
+#define PGBUF_PAGE_RUN_MAX 64
+extern int pgbuf_load_page_run (THREAD_ENTRY * thread_p, const VPID * vpid_first, int count);
 extern int pgbuf_fix_if_not_deallocated_with_caller (THREAD_ENTRY * thead_p, const VPID * vpid,
 						     PGBUF_LATCH_MODE latch_mode, PGBUF_LATCH_CONDITION latch_condition,
 						     PAGE_PTR * page

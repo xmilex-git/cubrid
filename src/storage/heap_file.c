@@ -2871,6 +2871,45 @@ heap_page_is_not_in_heap (THREAD_ENTRY * thread_p, PAGE_PTR page_heap)
 }
 
 /*
+ * heap_page_list_load_sector () - read a sector's listed pages into the buffer, one read for each stretch of them
+ *   hfid(in): the heap
+ *   sector(in): a sector of the heap's page bitmap
+ *
+ * Note: For the read-ahead of a sector-based scan: another thread loads the sectors the scan reaches next
+ *       (pgbuf_load_page_run ()), so the scan finds their pages in the buffer.
+ */
+void
+heap_page_list_load_sector (THREAD_ENTRY * thread_p, const HFID * hfid, const FILE_PARTIAL_SECTOR * sector)
+{
+  UINT64 rest = sector->page_bitmap;
+  VPID vpid;
+  int offset = 0, length;
+
+  vpid.volid = sector->vsid.volid;
+  while (rest != 0)
+    {
+      int skip = bit64_count_trailing_zeros (rest);
+
+      offset += skip;
+      rest >>= skip;
+      length = bit64_count_trailing_ones (rest);
+      vpid.pageid = SECTOR_FIRST_PAGEID (sector->vsid.sectid) + offset;
+      if (vpid.volid == hfid->vfid.volid && vpid.pageid == hfid->vfid.fileid)
+	{
+	  /* the file header page */
+	  vpid.pageid++;
+	  (void) pgbuf_load_page_run (thread_p, &vpid, length - 1);
+	}
+      else
+	{
+	  (void) pgbuf_load_page_run (thread_p, &vpid, length);
+	}
+      offset += length;
+      rest = (length < 64) ? (rest >> length) : 0;
+    }
+}
+
+/*
  * heap_page_list_fix_next () - fix the next page of one sector of a page bitmap taken at scan start
  *   return: S_SUCCESS (the page is held in watcher), S_END past the sector's last page (the held page is kept),
  *	     S_ERROR
@@ -2886,7 +2925,7 @@ heap_page_is_not_in_heap (THREAD_ENTRY * thread_p, PAGE_PTR page_heap)
  */
 SCAN_CODE
 heap_page_list_fix_next (THREAD_ENTRY * thread_p, const HFID * hfid, const FILE_PARTIAL_SECTOR * sector,
-			 size_t * pgoffset, PGBUF_WATCHER * watcher, VPID * vpid_out)
+			 size_t * pgoffset, PGBUF_WATCHER * watcher, VPID * vpid_out, bool load_run)
 {
   VPID vpid;
   int error_code;
@@ -2915,6 +2954,15 @@ heap_page_list_fix_next (THREAD_ENTRY * thread_p, const HFID * hfid, const FILE_
       if (watcher->pgptr != NULL)
 	{
 	  pgbuf_ordered_unfix (thread_p, watcher);
+	}
+
+      if (load_run
+	  && (*pgoffset == 0 || !bit64_is_set (sector->page_bitmap, (int) *pgoffset - 1)
+	      || (vpid.volid == hfid->vfid.volid && vpid.pageid - 1 == hfid->vfid.fileid)))
+	{
+	  /* the first of a stretch of listed pages: bring the stretch into the buffer with one read, when this page
+	   * is not there. The pages are fixed one at a time below all the same. */
+	  (void) pgbuf_load_page_run (thread_p, &vpid, bit64_count_trailing_ones (sector->page_bitmap >> *pgoffset));
 	}
 
       error_code = pgbuf_ordered_fix (thread_p, &vpid, OLD_PAGE_MAYBE_DEALLOCATED, PGBUF_LATCH_READ, watcher);

@@ -389,6 +389,7 @@ extern "C"
     /* no page bitmap on the serial layout until scan_heap_scan_set_page_list () */
     scan_id->s.hsid.sector_order = false;
     scan_id->s.hsid.page_list = NULL;
+    scan_id->s.hsid.read_ahead = NULL;
 
     /* Workers do not acquire row locks, including when reopening a partition. */
     if (mvcc_select_lock_needed)

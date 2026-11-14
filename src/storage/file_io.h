@@ -483,6 +483,9 @@ extern void *fileio_write_or_add_to_dwb (THREAD_ENTRY * thread_p, int vol_fd, FI
 					 size_t page_size, bool ensure_metadata);
 extern void *fileio_write (THREAD_ENTRY * thread_p, int vol_fd, void *io_page_p, PAGEID page_id, size_t page_size,
 			   FILEIO_WRITE_MODE write_mode);
+struct iovec;
+extern void *fileio_read_page_run (THREAD_ENTRY * thread_p, int vol_fd, const struct iovec *iov, int num_pages,
+				   PAGEID page_id, size_t page_size);
 extern void *fileio_read_pages (THREAD_ENTRY * thread_p, int vol_fd, char *io_pages_p, PAGEID page_id, int num_pages,
 				size_t page_size);
 extern void *fileio_write_pages (THREAD_ENTRY * thread_p, int vol_fd, char *io_pages_p, PAGEID page_id, int num_pages,

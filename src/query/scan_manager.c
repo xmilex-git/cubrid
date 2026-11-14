@@ -58,6 +58,12 @@
 #include "query_hash_scan.h"
 #include "statistics.h"
 #include "px_scan.hpp"
+#if defined (SERVER_MODE)
+#include <atomic>
+#include "px_worker_manager.hpp"
+#include "px_callable_task.hpp"
+#include "thread_manager.hpp"
+#endif /* SERVER_MODE */
 #include "bit.h"		/* bit64_count_ones */
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
@@ -183,6 +189,8 @@ static int scan_init_index_key_limit (THREAD_ENTRY * thread_p, INDX_SCAN_ID * is
 				      VAL_DESCR * vd);
 static SCAN_CODE scan_next_scan_local (THREAD_ENTRY * thread_p, SCAN_ID * scan_id);
 static SCAN_CODE scan_next_heap_scan_rows (THREAD_ENTRY * thread_p, SCAN_ID * scan_id);
+static void scan_heap_read_ahead (THREAD_ENTRY * thread_p, HEAP_SCAN_ID * hsidp);
+static void scan_heap_read_ahead_stop (HEAP_SCAN_ID * hsidp);
 static SCAN_CODE scan_heap_next_listed_page (THREAD_ENTRY * thread_p, HEAP_SCAN_ID * hsidp, VPID * vpid_out);
 static SCAN_CODE scan_heap_next_listed_row (THREAD_ENTRY * thread_p, HEAP_SCAN_ID * hsidp, RECDES * recdes,
 					    int is_peeking);
@@ -2785,6 +2793,7 @@ scan_open_heap_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 
   hsidp->sector_order = false;	/* the caller hands the page bitmap after the open (scan_heap_scan_set_page_list ()) */
   hsidp->page_list = NULL;
+  hsidp->read_ahead = NULL;
   hsidp->page_list_sect = 0;
   hsidp->page_list_pgoffset = 0;
   VPID_SET_NULL (&hsidp->page_list_vpid);
@@ -4080,6 +4089,7 @@ scan_start_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 	  hsidp->scancache_inited = true;
 
 	  /* the walk starts at the bitmap's first page */
+	  scan_heap_read_ahead_stop (hsidp);
 	  hsidp->page_list_sect = 0;
 	  hsidp->page_list_pgoffset = 0;
 	  VPID_SET_NULL (&hsidp->page_list_vpid);
@@ -4384,6 +4394,7 @@ scan_reset_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
 	      scan_batch_rewind (thread_p, s_id);
 	    }
 	  /* the next pass walks the same page bitmap from its start */
+	  scan_heap_read_ahead_stop (&s_id->s.hsid);
 	  s_id->s.hsid.page_list_sect = 0;
 	  s_id->s.hsid.page_list_pgoffset = 0;
 	  VPID_SET_NULL (&s_id->s.hsid.page_list_vpid);
@@ -4716,6 +4727,11 @@ scan_end_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
     case S_HEAP_SCAN:
     case S_HEAP_SCAN_RECORD_INFO:
       hsidp = &scan_id->s.hsid;
+      if (scan_id->type == S_HEAP_SCAN && hsidp->sector_order)
+	{
+	  /* a walk that ends before the bitmap does (a LIMIT) */
+	  scan_heap_read_ahead_stop (hsidp);
+	}
 
       /* do not free attr_cache here. xs_clear_access_spec_list() will free attr_caches. */
 
@@ -5509,6 +5525,142 @@ scan_heap_scan_page_list_free (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec)
   spec->page_list_keep.nsects = 0;
 }
 
+#if defined (SERVER_MODE)
+/* the serial walk's read-ahead: loader threads read the sectors the walk reaches next into the buffer, each sector
+ * with one read for each stretch of its listed pages, while the walk works on the sectors before them. The walk
+ * keeps its file order: a sector a loader has not finished is waited for page by page (the buffer lock), one no
+ * loader took is read by the walk itself. */
+#define SCAN_HEAP_READ_AHEAD_LOADERS 8	/* loader threads of one scan */
+#define SCAN_HEAP_READ_AHEAD_SECTORS 16	/* sectors loaded ahead of the walk at most */
+#define SCAN_HEAP_READ_AHEAD_MIN_SECTORS 16	/* a smaller heap is not read ahead */
+
+static int scan_heap_read_ahead_trial_depth = SCAN_HEAP_READ_AHEAD_SECTORS;	/* TRIAL ONLY */
+// *INDENT-OFF*
+struct scan_heap_read_ahead_state
+{
+  parallel_query::worker_manager *worker_manager;
+  const FILE_FTAB_COLLECTOR *page_list;
+  HFID hfid;
+  std::atomic<int> next_sect;	/* the next sector a loader takes */
+  std::atomic<int> walk_sect;	/* the sector the walk is in */
+  std::atomic<bool> stop;
+};
+
+static void
+scan_heap_read_ahead_loader (cubthread::entry &thread_ref, scan_heap_read_ahead_state *state)
+{
+  const int nsects = state->page_list->nsects;
+
+  while (!state->stop.load (std::memory_order_acquire))
+    {
+      int sect = state->next_sect.load (std::memory_order_acquire);
+      int walk = state->walk_sect.load (std::memory_order_acquire);
+
+      if (sect >= nsects)
+	{
+	  break;
+	}
+      if (sect <= walk)
+	{
+	  /* the walk passed it */
+	  state->next_sect.compare_exchange_weak (sect, walk + 1);
+	  continue;
+	}
+      if (sect > walk + scan_heap_read_ahead_trial_depth)
+	{
+	  /* far enough ahead */
+	  thread_sleep (0.2);
+	  continue;
+	}
+      if (!state->next_sect.compare_exchange_weak (sect, sect + 1))
+	{
+	  continue;
+	}
+      heap_page_list_load_sector (&thread_ref, &state->hfid, &state->page_list->partsect_ftab[sect]);
+    }
+}
+// *INDENT-ON*
+#endif /* SERVER_MODE */
+
+/*
+ * scan_heap_read_ahead () - the serial walk enters a sector: start its read-ahead at the first one, tell the
+ *			      loaders where the walk is after that
+ */
+static void
+scan_heap_read_ahead (THREAD_ENTRY * thread_p, HEAP_SCAN_ID * hsidp)
+{
+#if defined (SERVER_MODE)
+  scan_heap_read_ahead_state *state = (scan_heap_read_ahead_state *) hsidp->read_ahead;
+
+  if (state == NULL)
+    {
+      parallel_query::worker_manager * worker_manager;
+      int i, n_loaders;
+
+      if (hsidp->page_list_sect != 0 || hsidp->page_list->nsects < SCAN_HEAP_READ_AHEAD_MIN_SECTORS)
+	{
+	  return;
+	}
+      /* TRIAL ONLY: loader count from the environment */
+      static int trial_loaders = -1;
+      if (trial_loaders < 0)
+	{
+	  const char *e = getenv ("CBRD28043_LOADERS");
+	  trial_loaders = (e != NULL) ? atoi (e) : SCAN_HEAP_READ_AHEAD_LOADERS;
+	}
+      if (trial_loaders == 0)
+	{
+	  return;
+	}
+      scan_heap_read_ahead_trial_depth = 2 * trial_loaders;
+      worker_manager = parallel_query::worker_manager::try_reserve_workers (trial_loaders);
+      if (worker_manager == NULL)
+	{
+	  return;
+	}
+      state = new scan_heap_read_ahead_state ();
+      state->worker_manager = worker_manager;
+      state->page_list = hsidp->page_list;
+      state->hfid = hsidp->hfid;
+      state->next_sect.store (1);
+      state->walk_sect.store (0);
+      state->stop.store (false);
+      hsidp->read_ahead = state;
+
+      n_loaders = worker_manager->get_reserved_workers ();
+      for (i = 0; i < n_loaders; i++)
+	{
+	  // *INDENT-OFF*
+	  worker_manager->push_task (new parallel_query::callable_task (worker_manager,
+				     std::bind (scan_heap_read_ahead_loader, std::placeholders::_1, state)));
+	  // *INDENT-ON*
+	}
+      return;
+    }
+
+  state->walk_sect.store (hsidp->page_list_sect, std::memory_order_release);
+#endif /* SERVER_MODE */
+}
+
+/*
+ * scan_heap_read_ahead_stop () - end the serial walk's read-ahead: the loaders finish the sector they are in
+ */
+static void
+scan_heap_read_ahead_stop (HEAP_SCAN_ID * hsidp)
+{
+#if defined (SERVER_MODE)
+  scan_heap_read_ahead_state *state = (scan_heap_read_ahead_state *) hsidp->read_ahead;
+
+  if (state != NULL)
+    {
+      state->stop.store (true, std::memory_order_release);
+      state->worker_manager->release_workers ();	/* waits for the loaders */
+      delete state;
+      hsidp->read_ahead = NULL;
+    }
+#endif /* SERVER_MODE */
+}
+
 /*
  * scan_heap_next_listed_page () - the sector-based heap scan's next page: fix it, letting the held page go
  *   return: S_SUCCESS (the page is held in the scan cache's watcher), S_END past the bitmap (no page held), S_ERROR
@@ -5523,17 +5675,27 @@ scan_heap_next_listed_page (THREAD_ENTRY * thread_p, HEAP_SCAN_ID * hsidp, VPID 
 
   while (hsidp->page_list_sect < page_list->nsects)
     {
+      if (hsidp->page_list_pgoffset == 0)
+	{
+	  /* entering a sector */
+	  scan_heap_read_ahead (thread_p, hsidp);
+	}
       SCAN_CODE code = heap_page_list_fix_next (thread_p, &hsidp->hfid,
 						&page_list->partsect_ftab[hsidp->page_list_sect],
-						&hsidp->page_list_pgoffset, watcher, vpid_out);
+						&hsidp->page_list_pgoffset, watcher, vpid_out, true);
       if (code != S_END)
 	{
+	  if (code == S_ERROR)
+	    {
+	      scan_heap_read_ahead_stop (hsidp);
+	    }
 	  return code;
 	}
       hsidp->page_list_sect++;
       hsidp->page_list_pgoffset = 0;
     }
 
+  scan_heap_read_ahead_stop (hsidp);
   if (watcher->pgptr != NULL)
     {
       pgbuf_ordered_unfix (thread_p, watcher);
