@@ -8333,13 +8333,15 @@ heap_page_row_mvcc_header (const char *data, MVCC_REC_HEADER * header)
  *      reads only its first word: deleted (by a transaction every snapshot sees as finished) or of which representation
  *   C: no page judgment; a record whose first word shows no MVCC id and a known representation is taken from that
  *      word alone (the per-record part of B, to tell what the page judgment adds)
+ *   D: B on a page the judgment passes, C on any other page
  * shortcut: an environment variable read once, for measurement; a real switch would be a system parameter. */
 enum
 {
   HEAP_PAGEVIS_OFF = 0,
   HEAP_PAGEVIS_MARK,		/* A */
   HEAP_PAGEVIS_PAGE_SNAPSHOT,	/* B */
-  HEAP_PAGEVIS_ROW_WORD		/* C */
+  HEAP_PAGEVIS_ROW_WORD,		/* C */
+  HEAP_PAGEVIS_PAGE_OR_ROW	/* D */
 };
 static int heap_Pagevis_mode = -1;
 
@@ -8356,7 +8358,7 @@ heap_pagevis_mode (void)
       if (env != NULL)
 	{
 	  mode = (env[0] == 'A' ? HEAP_PAGEVIS_MARK : env[0] == 'B' ? HEAP_PAGEVIS_PAGE_SNAPSHOT
-		  : env[0] == 'C' ? HEAP_PAGEVIS_ROW_WORD : HEAP_PAGEVIS_OFF);
+		  : env[0] == 'C' ? HEAP_PAGEVIS_ROW_WORD : env[0] == 'D' ? HEAP_PAGEVIS_PAGE_OR_ROW : HEAP_PAGEVIS_OFF);
 	}
       heap_Pagevis_mode = mode;
     }
@@ -8692,15 +8694,16 @@ heap_page_collect_visible (THREAD_ENTRY * thread_p, const VPID * vpid, const OID
 		}
 	    }
 	}
-      else if (mode == HEAP_PAGEVIS_PAGE_SNAPSHOT && snapshot != NULL && snapshot->snapshot_fnc == mvcc_satisfies_snapshot
-	       && chain != NULL && MVCC_ID_PRECEDES (chain->max_mvccid, snapshot->lowest_active_mvccid))
+      else if ((mode == HEAP_PAGEVIS_PAGE_SNAPSHOT || mode == HEAP_PAGEVIS_PAGE_OR_ROW) && snapshot != NULL
+	       && snapshot->snapshot_fnc == mvcc_satisfies_snapshot && chain != NULL
+	       && MVCC_ID_PRECEDES (chain->max_mvccid, snapshot->lowest_active_mvccid))
 	{
 	  /* every MVCC id on the page is of a transaction that ended before the snapshot: inserted is visible,
 	   * deleted is not, whatever the ids */
 	  mask = delid_bit | repid_bits;
 	  skip_deleted = true;
 	}
-      else if (mode == HEAP_PAGEVIS_ROW_WORD)
+      else if (mode == HEAP_PAGEVIS_ROW_WORD || mode == HEAP_PAGEVIS_PAGE_OR_ROW)
 	{
 	  /* no MVCC id in the record: visible to every snapshot */
 	  mask = ((OR_MVCC_FLAG_VALID_INSID | OR_MVCC_FLAG_VALID_DELID) << OR_MVCC_FLAG_SHIFT_BITS) | repid_bits;
