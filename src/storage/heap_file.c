@@ -8380,18 +8380,26 @@ heap_page_peek_chain (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
 /*
  * heap_page_clear_all_visible () - drop the all-visible mark of a heap page that is being changed
  *   pgptr(in): a page of type PAGE_HEAP, write latched, whose LSA the change has just set
+ *
+ * The page may not be formatted yet -- file_init_page_type () logs a new heap page before spage_initialize () -- so
+ * its slotted header is read with bounds checks and without the slotted page module's asserts; on such a page a
+ * match can only clear two bits of bytes the initialization overwrites next.
  */
 void
 heap_page_clear_all_visible (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
 {
+  const SPAGE_HEADER *sphdr = (const SPAGE_HEADER *) pgptr;
+  const SPAGE_SLOT *slot0 = (const SPAGE_SLOT *) (pgptr + DB_PAGESIZE - sizeof (SPAGE_SLOT));
   HEAP_CHAIN *chain;
 
-  if (spage_number_of_slots (pgptr) < 1)
+  if (sphdr->num_slots < 1 || (size_t) sphdr->num_slots > DB_PAGESIZE / sizeof (SPAGE_SLOT)
+      || slot0->record_length != sizeof (HEAP_CHAIN) || slot0->offset_to_record < sizeof (SPAGE_HEADER)
+      || slot0->offset_to_record + sizeof (HEAP_CHAIN) > DB_PAGESIZE - sphdr->num_slots * sizeof (SPAGE_SLOT))
     {
       return;
     }
-  chain = heap_page_peek_chain (thread_p, pgptr);
-  if (chain != NULL && (chain->flags & HEAP_PAGE_FLAG_ALL_VISIBLE) != 0)
+  chain = (HEAP_CHAIN *) (pgptr + slot0->offset_to_record);
+  if ((chain->flags & HEAP_PAGE_FLAG_ALL_VISIBLE) != 0)
     {
       chain->flags &= ~(HEAP_PAGE_FLAG_ALL_VISIBLE | HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_MASK);
     }
