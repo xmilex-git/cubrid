@@ -5642,6 +5642,11 @@ pgbuf_set_lsa (THREAD_ENTRY * thread_p, PAGE_PTR pgptr, const LOG_LSA * lsa_ptr)
     }
 
   fileio_set_page_lsa (&bufptr->iopage_buffer->iopage, lsa_ptr, IO_PAGESIZE);
+  if (bufptr->iopage_buffer->iopage.prv.ptype == PAGE_HEAP)
+    {
+      /* the change this LSA logs may break what the mark says (heap_page_set_all_visible ()) */
+      heap_page_clear_all_visible (thread_p, pgptr);
+    }
 
   /*
    * If this is the first time the page is set dirty, record the new LSA

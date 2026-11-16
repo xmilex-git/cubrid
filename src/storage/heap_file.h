@@ -700,6 +700,8 @@ extern void heap_finalize_hfid_table (void);
 extern int heap_delete_hfid_from_cache (THREAD_ENTRY * thread_p, OID * class_oid);
 
 extern void heap_page_set_vacuum_status_none (THREAD_ENTRY * thread_p, PAGE_PTR heap_page);
+extern void heap_page_set_all_visible (THREAD_ENTRY * thread_p, PAGE_PTR pgptr);
+extern void heap_page_clear_all_visible (THREAD_ENTRY * thread_p, PAGE_PTR pgptr);
 extern MVCCID heap_page_get_max_mvccid (THREAD_ENTRY * thread_p, PAGE_PTR heap_page);
 extern HEAP_PAGE_VACUUM_STATUS heap_page_get_vacuum_status (THREAD_ENTRY * thread_p, PAGE_PTR heap_page);
 extern bool heap_remove_page_on_vacuum (THREAD_ENTRY * thread_p, PAGE_PTR * page_ptr, HFID * hfid);

@@ -1849,6 +1849,7 @@ vacuum_heap_page (THREAD_ENTRY * thread_p, VACUUM_HEAP_OBJECT * heap_objects, in
 
 	  /* Set page dirty. */
 	  pgbuf_set_dirty (thread_p, helper.home_page, DONT_FREE);
+	  heap_page_set_all_visible (thread_p, helper.home_page);
 
 	  if (spage_number_of_records (helper.home_page) <= 1 && helper.reusable)
 	    {
@@ -2596,6 +2597,7 @@ vacuum_heap_page_log_and_reset (THREAD_ENTRY * thread_p, VACUUM_HEAP_HELPER * he
       /* No logging is required. */
       if (unlatch_page == true)
 	{
+	  heap_page_set_all_visible (thread_p, helper->home_page);
 	  pgbuf_unfix_and_init (thread_p, helper->home_page);
 	}
       return;
@@ -2635,6 +2637,7 @@ vacuum_heap_page_log_and_reset (THREAD_ENTRY * thread_p, VACUUM_HEAP_HELPER * he
   pgbuf_set_dirty (thread_p, helper->home_page, DONT_FREE);
   if (unlatch_page == true)
     {
+      heap_page_set_all_visible (thread_p, helper->home_page);
       pgbuf_unfix_and_init (thread_p, helper->home_page);
     }
 

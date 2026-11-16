@@ -233,6 +233,14 @@ struct heap_hdr_stats
 #define HEAP_PAGE_FLAG_VACUUM_STATUS_MASK	  0xC0000000
 #define HEAP_PAGE_FLAG_VACUUM_ONCE		  0x80000000
 #define HEAP_PAGE_FLAG_VACUUM_UNKNOWN		  0x40000000
+/* Every REC_HOME record of the page has an MVCC header without any id (vacuumed: visible to every snapshot) and the
+ * representation kept in the bits below.  Vacuum sets it (heap_page_set_all_visible ()) and every logged change of the
+ * page clears it (pgbuf_set_lsa () -> heap_page_clear_all_visible ()); it is not logged itself: a page flushed with it
+ * is consistent, and one lost before a flush only takes the slower walk.  The all-visible bit of the PostgreSQL
+ * visibility map, kept in the page. */
+#define HEAP_PAGE_FLAG_ALL_VISIBLE		  0x20000000
+#define HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_SHIFT	  2
+#define HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_MASK	  (OR_MVCC_REPID_MASK << HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_SHIFT)
 
 #define HEAP_PAGE_IS_BESTSPACE(chain) \
   (((chain)->flags & HEAP_PAGE_FLAG_BESTSPACE) != 0)
@@ -8319,6 +8327,195 @@ heap_page_row_mvcc_header (const char *data, MVCC_REC_HEADER * header)
     }
 }
 
+/* Switch of the page-level visibility walks, CUBRID_PAGE_VISIBLE in the server's environment (unset: none):
+ *   A: a page vacuum marked all-visible (HEAP_PAGE_FLAG_ALL_VISIBLE) is walked without reading any record header
+ *   B: a page whose max MVCCID precedes the snapshot's lowest active MVCCID is judged once, and each of its records
+ *      reads only its first word: deleted (by a transaction every snapshot sees as finished) or of which representation
+ *   C: no page judgment; a record whose first word shows no MVCC id and a known representation is taken from that
+ *      word alone (the per-record part of B, to tell what the page judgment adds)
+ * shortcut: an environment variable read once, for measurement; a real switch would be a system parameter. */
+enum
+{
+  HEAP_PAGEVIS_OFF = 0,
+  HEAP_PAGEVIS_MARK,		/* A */
+  HEAP_PAGEVIS_PAGE_SNAPSHOT,	/* B */
+  HEAP_PAGEVIS_ROW_WORD		/* C */
+};
+static int heap_Pagevis_mode = -1;
+
+static int
+heap_pagevis_mode (void)
+{
+  int mode = heap_Pagevis_mode;
+
+  if (mode < 0)
+    {
+      const char *env = getenv ("CUBRID_PAGE_VISIBLE");
+
+      mode = HEAP_PAGEVIS_OFF;
+      if (env != NULL)
+	{
+	  mode = (env[0] == 'A' ? HEAP_PAGEVIS_MARK : env[0] == 'B' ? HEAP_PAGEVIS_PAGE_SNAPSHOT
+		  : env[0] == 'C' ? HEAP_PAGEVIS_ROW_WORD : HEAP_PAGEVIS_OFF);
+	}
+      heap_Pagevis_mode = mode;
+    }
+  return mode;
+}
+
+/* the page's chain, or NULL for the heap header page */
+static inline HEAP_CHAIN *
+heap_page_peek_chain (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
+{
+  RECDES chain_recdes;
+
+  if (spage_get_record (thread_p, pgptr, HEAP_HEADER_AND_CHAIN_SLOTID, &chain_recdes, PEEK) != S_SUCCESS
+      || chain_recdes.length != sizeof (HEAP_CHAIN))
+    {
+      return NULL;
+    }
+  return (HEAP_CHAIN *) chain_recdes.data;
+}
+
+/*
+ * heap_page_clear_all_visible () - drop the all-visible mark of a heap page that is being changed
+ *   pgptr(in): a page of type PAGE_HEAP, write latched, whose LSA the change has just set
+ */
+void
+heap_page_clear_all_visible (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
+{
+  HEAP_CHAIN *chain;
+
+  if (spage_number_of_slots (pgptr) < 1)
+    {
+      return;
+    }
+  chain = heap_page_peek_chain (thread_p, pgptr);
+  if (chain != NULL && (chain->flags & HEAP_PAGE_FLAG_ALL_VISIBLE) != 0)
+    {
+      chain->flags &= ~(HEAP_PAGE_FLAG_ALL_VISIBLE | HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_MASK);
+    }
+}
+
+/*
+ * heap_page_set_all_visible () - mark a heap page all-visible if each of its records is a REC_HOME record with no
+ *				  MVCC id, all of one representation (vacuum, the page write latched, its changes
+ *				  logged)
+ */
+void
+heap_page_set_all_visible (THREAD_ENTRY * thread_p, PAGE_PTR pgptr)
+{
+  HEAP_CHAIN *chain;
+  RECDES rec;
+  PGSLOTID slotid = 0;
+  int repid = -1;
+
+  if (heap_pagevis_mode () != HEAP_PAGEVIS_MARK)
+    {
+      return;
+    }
+  chain = heap_page_peek_chain (thread_p, pgptr);
+  if (chain == NULL || (chain->flags & HEAP_PAGE_FLAG_ALL_VISIBLE) != 0 || HEAP_PAGE_IS_BESTSPACE (chain))
+    {
+      return;
+    }
+  while (spage_next_record (pgptr, &slotid, &rec, PEEK) == S_SUCCESS)
+    {
+      int word;
+
+      if (rec.type == REC_NEWHOME || rec.type == REC_ASSIGN_ADDRESS || rec.type == REC_UNKNOWN)
+	{
+	  /* skipped by the walk */
+	  continue;
+	}
+      if (rec.type != REC_HOME || rec.length < OR_MVCC_REP_SIZE)
+	{
+	  return;
+	}
+      word = OR_GET_INT (rec.data);
+      if (((word >> OR_MVCC_FLAG_SHIFT_BITS) & OR_MVCC_FLAG_MASK) != 0)
+	{
+	  return;
+	}
+      if (repid < 0)
+	{
+	  repid = word & OR_MVCC_REPID_MASK;
+	}
+      else if (repid != (word & OR_MVCC_REPID_MASK))
+	{
+	  return;
+	}
+    }
+  if (repid < 0)
+    {
+      return;
+    }
+  chain->flags |= HEAP_PAGE_FLAG_ALL_VISIBLE | (repid << HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_SHIFT);
+  pgbuf_set_dirty (thread_p, pgptr, DONT_FREE);
+}
+
+/* One REC_HOME record of a page batch walk, decided as the walk below decides it: 1 a row (*hdr_size, *rec_repid
+ * set), 0 not visible (skipped), -1 the chunk ends before it (*unknown_repid set as the walk sets it) */
+static inline int
+heap_page_row_decide (THREAD_ENTRY * thread_p, const RECDES * rec, MVCC_SNAPSHOT * snapshot, const REPR_ID * repids,
+		      int n_repids, REPR_ID * unknown_repid, int *hdr_size, int *rec_repid)
+{
+  MVCC_REC_HEADER mvcc_header = MVCC_REC_HEADER_INITIALIZER;
+  REPR_ID repid;
+  int i = 0;
+
+  heap_page_row_mvcc_header (rec->data, &mvcc_header);
+  if (snapshot != NULL && !MVCC_IS_HEADER_ALL_VISIBLE (&mvcc_header))
+    {
+      MVCC_SATISFIES_SNAPSHOT_RESULT res = snapshot->snapshot_fnc (thread_p, &mvcc_header, snapshot);
+
+      if (res == TOO_OLD_FOR_SNAPSHOT)
+	{
+	  return 0;
+	}
+      if (res != SNAPSHOT_SATISFIED)
+	{
+	  return LSA_ISNULL (&MVCC_GET_PREV_VERSION_LSA (&mvcc_header)) ? 0 : -1;
+	}
+    }
+  repid = MVCC_GET_REPID (&mvcc_header);
+  if (n_repids > 0)
+    {
+      while (i < n_repids && repids[i] != repid)
+	{
+	  i++;
+	}
+      if (i == n_repids)
+	{
+	  if (unknown_repid != NULL && *unknown_repid == NULL_REPRID)
+	    {
+	      *unknown_repid = repid;
+	    }
+	  return -1;
+	}
+    }
+  *hdr_size = mvcc_header_size_lookup[MVCC_GET_FLAG (&mvcc_header)];
+  *rec_repid = repid;
+  return 1;
+}
+
+#if !defined (NDEBUG)
+/* what the walk below would answer for a record a page-level walk took (visible) or skipped (!visible) */
+static void
+heap_page_fast_row_check (THREAD_ENTRY * thread_p, const RECDES * rec, MVCC_SNAPSHOT * snapshot, bool visible)
+{
+  MVCC_REC_HEADER mvcc_header = MVCC_REC_HEADER_INITIALIZER;
+  MVCC_SATISFIES_SNAPSHOT_RESULT res = SNAPSHOT_SATISFIED;
+
+  heap_page_row_mvcc_header (rec->data, &mvcc_header);
+  if (snapshot != NULL && !MVCC_IS_HEADER_ALL_VISIBLE (&mvcc_header))
+    {
+      res = snapshot->snapshot_fnc (thread_p, &mvcc_header, snapshot);
+    }
+  assert (visible ? res == SNAPSHOT_SATISFIED : res == TOO_OLD_FOR_SNAPSHOT);
+}
+#endif
+
 /*
  * heap_page_collect_visible () - the next records heap_next_1page () would return for one page, a chunk at a time
  *   return: S_SUCCESS (the chunk ends -- cap rows, or the record after its last row is one the page does not
@@ -8413,6 +8610,175 @@ heap_page_collect_visible (THREAD_ENTRY * thread_p, const VPID * vpid, const OID
   oid.volid = vpid->volid;
   oid.pageid = vpid->pageid;
   oid.slotid = *slot;		/* 0: the walk starts at slot 1 */
+  if (heap_pagevis_mode () != HEAP_PAGEVIS_OFF)
+    {
+      /* the page-level walks (heap_pagevis_mode ()); a record they do not answer for goes to the walk below */
+      const int mode = heap_pagevis_mode ();
+      const bool root_page = (class_oid != NULL && !OID_ISNULL (class_oid) && oid.volid == oid_Root_class_oid->volid
+			      && oid.pageid == oid_Root_class_oid->pageid);
+      const HEAP_CHAIN *chain = heap_page_peek_chain (thread_p, pgptr);
+      const int delid_bit = OR_MVCC_FLAG_VALID_DELID << OR_MVCC_FLAG_SHIFT_BITS;
+      const int repid_bits = (n_repids > 0) ? OR_MVCC_REPID_MASK : 0;
+      int want = (n_repids > 0) ? repids[0] : 0;	/* a fast record's first word under mask */
+      int mask = 0;
+      bool skip_deleted = false;
+
+      if (mode == HEAP_PAGEVIS_MARK && chain != NULL && (chain->flags & HEAP_PAGE_FLAG_ALL_VISIBLE) != 0)
+	{
+	  const int mark_repid =
+	    (chain->flags & HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_MASK) >> HEAP_PAGE_FLAG_ALL_VISIBLE_REPID_SHIFT;
+	  int i = 0;
+
+	  while (i < n_repids && repids[i] != mark_repid)
+	    {
+	      i++;
+	    }
+	  if (n_repids == 0 || i < n_repids)
+	    {
+	      /* no record header read at all: every REC_HOME record is visible and of mark_repid */
+	      const int hdr_size = mvcc_header_size_lookup[0];
+
+	      while (true)
+		{
+		  scan = spage_next_record (pgptr, &oid.slotid, &rec, PEEK);
+		  if (scan == S_END)
+		    {
+		      *n_rows = n;
+		      return S_END;
+		    }
+		  if (scan != S_SUCCESS)
+		    {
+		      return S_ERROR;
+		    }
+		  assert (oid.slotid != HEAP_HEADER_AND_CHAIN_SLOTID);
+		  if (rec.type != REC_HOME)
+		    {
+		      if (rec.type == REC_NEWHOME || rec.type == REC_ASSIGN_ADDRESS || rec.type == REC_UNKNOWN)
+			{
+			  continue;
+			}
+		      /* the mark promised none: the walk below takes it */
+		      assert (false);
+		      oid.slotid--;
+		      break;
+		    }
+#if !defined (NDEBUG)
+		  assert (((OR_GET_INT (rec.data) >> OR_MVCC_FLAG_SHIFT_BITS) & OR_MVCC_FLAG_MASK) == 0
+			  && (OR_GET_INT (rec.data) & OR_MVCC_REPID_MASK) == mark_repid);
+		  heap_page_fast_row_check (thread_p, &rec, snapshot, true);
+#endif
+		  if (root_page && OID_IS_ROOTOID (&oid))
+		    {
+		      continue;
+		    }
+		  rows[n].oid = oid;
+		  rows[n].recdes = rec;
+		  rows[n].hdr_size = hdr_size;
+		  n++;
+		  if (n == cap)
+		    {
+		      *slot = oid.slotid;
+		      *n_rows = n;
+		      return S_SUCCESS;
+		    }
+		}
+	    }
+	}
+      else if (mode == HEAP_PAGEVIS_PAGE_SNAPSHOT && snapshot != NULL && snapshot->snapshot_fnc == mvcc_satisfies_snapshot
+	       && chain != NULL && MVCC_ID_PRECEDES (chain->max_mvccid, snapshot->lowest_active_mvccid))
+	{
+	  /* every MVCC id on the page is of a transaction that ended before the snapshot: inserted is visible,
+	   * deleted is not, whatever the ids */
+	  mask = delid_bit | repid_bits;
+	  skip_deleted = true;
+	}
+      else if (mode == HEAP_PAGEVIS_ROW_WORD)
+	{
+	  /* no MVCC id in the record: visible to every snapshot */
+	  mask = ((OR_MVCC_FLAG_VALID_INSID | OR_MVCC_FLAG_VALID_DELID) << OR_MVCC_FLAG_SHIFT_BITS) | repid_bits;
+	}
+
+      if (mask != 0)
+	{
+	  while (true)
+	    {
+	      int word, hdr_size = 0, rec_repid = 0;
+
+	      scan = spage_next_record (pgptr, &oid.slotid, &rec, PEEK);
+	      if (scan == S_END)
+		{
+		  *n_rows = n;
+		  return S_END;
+		}
+	      if (scan != S_SUCCESS)
+		{
+		  return S_ERROR;
+		}
+	      assert (oid.slotid != HEAP_HEADER_AND_CHAIN_SLOTID);
+	      if (rec.type != REC_HOME)
+		{
+		  if (rec.type == REC_NEWHOME || rec.type == REC_ASSIGN_ADDRESS || rec.type == REC_UNKNOWN)
+		    {
+		      continue;
+		    }
+		  /* relocated or in overflow pages: the walk below ends the chunk before it */
+		  oid.slotid--;
+		  break;
+		}
+	      assert (rec.length >= OR_MVCC_REP_SIZE);
+	      word = OR_GET_INT (rec.data);
+	      if ((word & mask) == want)
+		{
+		  hdr_size = mvcc_header_size_lookup[(word >> OR_MVCC_FLAG_SHIFT_BITS) & OR_MVCC_FLAG_MASK];
+#if !defined (NDEBUG)
+		  heap_page_fast_row_check (thread_p, &rec, snapshot, true);
+#endif
+		}
+	      else if (skip_deleted && (word & delid_bit) != 0)
+		{
+#if !defined (NDEBUG)
+		  heap_page_fast_row_check (thread_p, &rec, snapshot, false);
+#endif
+		  continue;
+		}
+	      else
+		{
+		  const int r = heap_page_row_decide (thread_p, &rec, snapshot, repids, n_repids, unknown_repid,
+						      &hdr_size, &rec_repid);
+
+		  if (r == 0)
+		    {
+		      continue;
+		    }
+		  if (r < 0 && !(root_page && OID_IS_ROOTOID (&oid)))
+		    {
+		      *slot = oid.slotid - 1;
+		      *n_rows = n;
+		      return (n > 0) ? S_SUCCESS : S_DOESNT_FIT;
+		    }
+		  if (r > 0)
+		    {
+		      /* the representation the next records likely share */
+		      want = rec_repid & repid_bits;
+		    }
+		}
+	      if (root_page && OID_IS_ROOTOID (&oid))
+		{
+		  continue;
+		}
+	      rows[n].oid = oid;
+	      rows[n].recdes = rec;
+	      rows[n].hdr_size = hdr_size;
+	      n++;
+	      if (n == cap)
+		{
+		  *slot = oid.slotid;
+		  *n_rows = n;
+		  return S_SUCCESS;
+		}
+	    }
+	}
+    }
   while (true)
     {
       MVCC_REC_HEADER mvcc_header = MVCC_REC_HEADER_INITIALIZER;
