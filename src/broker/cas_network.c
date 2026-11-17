@@ -55,6 +55,10 @@
 #include "error_code.h"
 #include "broker_util.h"
 #include "cas_ssl.h"
+#if defined (SERVER_MODE)
+#include <stdint.h>
+#include "adoption.hpp"
+#endif
 
 #if defined(WINDOWS)
 #include "broker_wsa_init.h"
@@ -596,6 +600,15 @@ retry_poll:
     {
       if (cas_shard_flag == OFF && !IS_INVALID_SOCKET (new_req_sock_fd) && (po[1].revents & POLLIN))
 	{
+#if defined (SERVER_MODE)
+	  /* the folded session's wake descriptor: a yield ends the wait as CHANGE CLIENT */
+	  uint64_t wakeups;
+	  (void) read (new_req_sock_fd, &wakeups, sizeof (wakeups));
+	  if (!cubconn::adoption::registry_auto_is_yielded ())
+	    {
+	      goto retry_poll;
+	    }
+#endif
 	  /* CHANGE CLIENT */
 	  return -1;
 	}

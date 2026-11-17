@@ -48,6 +48,9 @@
 #include "broker_process_size.h"
 #include "ddl_log.h"		/* logddl_set_start_time */
 #include "cas_db_inc.h"		/* db_set/get_connect_status */
+#if defined (SERVER_MODE)
+#include "adoption.hpp"
+#endif
 
 int
 restart_is_needed (void)
@@ -177,7 +180,13 @@ net_read_int_keep_con_auto (SOCKET clt_sock_fd, MSG_HEADER * client_msg_header, 
     }
   else
     {
+#if defined (SERVER_MODE)
+      /* a folded session has no restart to check for: a yield (srv_sock_fd is its wake descriptor) or the
+       * client ends the wait */
+      net_timeout_set (-1);
+#else
       net_timeout_set (DEFAULT_CHECK_INTERVAL);
+#endif
 
       new_req_sock_fd = srv_sock_fd;
     }
@@ -242,7 +251,17 @@ net_read_int_keep_con_auto (SOCKET clt_sock_fd, MSG_HEADER * client_msg_header, 
 
   new_req_sock_fd = INVALID_SOCKET;
 
+#if defined (SERVER_MODE)
+  /* a request that arrived after the session was yielded must not run: the connection ends as CHANGE CLIENT
+   * and the driver sends it again on its next connection */
+  if (!cubconn::adoption::registry_auto_begin_request ())
+    {
+      as_info->con_status = CON_STATUS_CLOSE_AND_CONNECT;
+    }
+  CON_STATUS_LOCK (as_info, CON_STATUS_LOCK_CAS);
+#else
   CON_STATUS_LOCK (&(shm_appl->as_info[shm_as_index]), CON_STATUS_LOCK_CAS);
+#endif
 
   if (as_info->con_status == CON_STATUS_OUT_TRAN)
     {
@@ -265,7 +284,11 @@ net_read_int_keep_con_auto (SOCKET clt_sock_fd, MSG_HEADER * client_msg_header, 
 	}
     }
 
+#if defined (SERVER_MODE)
+  CON_STATUS_UNLOCK (as_info, CON_STATUS_LOCK_CAS);
+#else
   CON_STATUS_UNLOCK (&(shm_appl->as_info[shm_as_index]), CON_STATUS_LOCK_CAS);
+#endif
 
   return ret_value;
 }

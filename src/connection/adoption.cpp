@@ -86,6 +86,18 @@ namespace cubconn
     /* what a cancel or stop() reaches of a session: pinned under its mutex,
      * so the session's cleanup (registry_begin_session_cleanup) waits until no
      * cancel still holds its transaction index before releasing it */
+    /* busy: serving a request, or waiting for one inside a transaction; idle: registry_auto_ready;
+     * yielded: taken from idle by a YIELD_TRY or a reset, the session ends its connection;
+     * closing: the connection ended */
+    enum class execution_state { busy, idle, yielded, closing };
+
+    /* what the AUTO sessions of one broker share: its dispatcher's request for an IDLE_HINT */
+    struct auto_group
+    {
+      std::atomic<bool> watch_requested { false };	/* whoever takes it sends the one IDLE_HINT */
+      std::shared_ptr<channel> watch_channel;	/* std::atomic_load/store */
+    };
+
     struct session_binding
     {
       std::mutex mutex;
@@ -94,13 +106,16 @@ namespace cubconn
       bool closing = false;
       int tran_index = NULL_TRAN_INDEX;
       int client_fd = -1;
+      int wake_fd = -1;		/* AUTO: wakes the session's wait for a request */
+      std::atomic<execution_state> state { execution_state::busy };
+      std::atomic<bool> reset_requested { false };	/* a broker reset, until the session yields */
     };
 
     class binding_pin
     {
       public:
 	explicit binding_pin (const std::shared_ptr<session_binding> &binding)
-	  : m_binding (binding), tran_index (NULL_TRAN_INDEX), client_fd (-1)
+	  : m_binding (binding), tran_index (NULL_TRAN_INDEX), client_fd (-1), wake_fd (-1)
 	{
 	  if (m_binding != nullptr)
 	    {
@@ -110,6 +125,7 @@ namespace cubconn
 		  m_binding->users++;
 		  tran_index = m_binding->tran_index;
 		  client_fd = m_binding->client_fd;
+		  wake_fd = m_binding->wake_fd;
 		  m_active = true;
 		}
 	    }
@@ -137,6 +153,7 @@ namespace cubconn
       public:
 	int tran_index;
 	int client_fd;
+	int wake_fd;
     };
 
     struct session_entry
@@ -170,6 +187,7 @@ namespace cubconn
       std::mutex registry_mutex;
       std::condition_variable registry_cv;	/* signaled when a session signs off */
       std::unordered_map<std::uint32_t, session_entry> registry;
+      std::unordered_map<std::string, std::shared_ptr<auto_group>> auto_groups;	/* per broker name */
       std::uint32_t next_token = 1;
 
       /* sign-off callbacks still touching this manager after their registry
@@ -178,6 +196,9 @@ namespace cubconn
     };
 
     static manager *adoption_Manager = NULL;
+    /* the AUTO session of this thread */
+    static thread_local std::shared_ptr<session_binding> current_binding;
+    static thread_local std::shared_ptr<auto_group> current_group;
 
     /* ------------------------------------------------------------------ */
     /* wire helpers                                                       */
@@ -357,7 +378,126 @@ namespace cubconn
 	  binding->drained.wait (guard, [&binding] { return binding->users == 0; });
 	  binding->tran_index = NULL_TRAN_INDEX;
 	  binding->client_fd = -1;
+	  binding->wake_fd = -1;
 	}
+    }
+
+    static void
+    wake_session (const std::shared_ptr<session_binding> &binding)
+    {
+      binding_pin pin (binding);
+      if (pin.wake_fd >= 0)
+	{
+	  const std::uint64_t one = 1;
+	  (void) write (pin.wake_fd, &one, sizeof (one));	/* an eventfd write does not block */
+	}
+    }
+
+    /* the caller holds registry_mutex */
+    static std::shared_ptr<auto_group>
+    auto_group_of (manager &m, const char *broker_name)
+    {
+      std::shared_ptr<auto_group> &group = m.auto_groups[broker_name];
+      if (group == nullptr)
+	{
+	  group = std::make_shared<auto_group> ();
+	}
+      return group;
+    }
+
+    static void
+    send_idle_hint (auto_group &group)
+    {
+      std::shared_ptr<channel> ch = std::atomic_load (&group.watch_channel);
+      if (ch != nullptr)
+	{
+	  (void) send_message (*ch, msg_op::IDLE_HINT, NULL, 0);
+	}
+    }
+
+    bool
+    registry_auto_enable (std::uint32_t token, int wake_fd)
+    {
+      manager *m = adoption_Manager;
+      if (m == NULL)
+	{
+	  return false;
+	}
+      try
+	{
+	  std::lock_guard<std::mutex> guard (m->registry_mutex);
+	  auto it = m->registry.find (token);
+	  if (it == m->registry.end ())
+	    {
+	      return false;
+	    }
+	  current_group = auto_group_of (*m, it->second.broker_name);
+	  current_binding = it->second.binding;
+	  std::lock_guard<std::mutex> binding_guard (current_binding->mutex);
+	  current_binding->wake_fd = wake_fd;
+	  return true;
+	}
+      catch (const std::bad_alloc &)
+	{
+	  return false;
+	}
+    }
+
+    void
+    registry_auto_ready (void)
+    {
+      if (current_binding == nullptr)
+	{
+	  return;
+	}
+      /* idle is published before the reset and watch requests are read, and both requesters publish theirs
+       * before they look for an idle session: one side always sees the other */
+      current_binding->state.store (execution_state::idle);
+      if (current_binding->reset_requested.load ())
+	{
+	  execution_state expected = execution_state::idle;
+	  (void) current_binding->state.compare_exchange_strong (expected, execution_state::yielded);
+	  wake_session (current_binding);
+	  return;
+	}
+      if (current_group->watch_requested.load () && current_binding->state.load () == execution_state::idle
+	  && current_group->watch_requested.exchange (false))
+	{
+	  send_idle_hint (*current_group);
+	}
+    }
+
+    bool
+    registry_auto_begin_request (void)
+    {
+      if (current_binding == nullptr)
+	{
+	  return true;
+	}
+      execution_state expected = execution_state::idle;
+      /* busy already: the session waited inside a transaction and was never a candidate */
+      return current_binding->state.compare_exchange_strong (expected, execution_state::busy)
+	     || expected == execution_state::busy;
+    }
+
+    bool
+    registry_auto_is_yielded (void)
+    {
+      return current_binding != nullptr && current_binding->state.load () == execution_state::yielded;
+    }
+
+    bool
+    registry_auto_finish (void)
+    {
+      if (current_binding == nullptr)
+	{
+	  return false;
+	}
+      /* from here no YIELD_TRY or reset takes this session */
+      const bool yielded = current_binding->state.exchange (execution_state::closing) == execution_state::yielded;
+      current_binding.reset ();
+      current_group.reset ();
+      return yielded;
     }
 
     void
@@ -484,6 +624,7 @@ namespace cubconn
       std::memcpy (params.broker_info, body.broker_info, sizeof (params.broker_info));
       std::memcpy (params.driver_header, body.driver_header, sizeof (params.driver_header));
       std::memcpy (params.db_info, body.db_info, sizeof (params.db_info));
+      params.keep_con_auto = body.keep_con_auto != 0;
       params.server_name = m.db_name;
 
       /* register under registry_mutex, reading stopping again there: stop()
@@ -597,6 +738,93 @@ namespace cubconn
 	  }
       }
       (void) send_message (ch, msg_op::STATUS_REPLY, &reply, sizeof (reply));
+    }
+
+    /* YIELD_TRY: the broker's dispatcher found every slot taken.  One idle session of the broker is taken;
+     * it ends its connection and its SESSION_END frees the slot the dispatcher waits for. */
+    static void
+    handle_yield_try (manager &m, channel &ch)
+    {
+      std::shared_ptr<session_binding> binding;
+      {
+	std::lock_guard<std::mutex> guard (m.registry_mutex);
+	for (const auto &pair : m.registry)
+	  {
+	    execution_state expected = execution_state::idle;
+	    if (std::strncmp (pair.second.broker_name, ch.broker_name, BROKER_NAME_MAX) == 0
+		&& pair.second.binding->state.compare_exchange_strong (expected, execution_state::yielded))
+	      {
+		binding = pair.second.binding;
+		break;
+	      }
+	  }
+      }
+      token_body reply = { binding != nullptr ? 1u : 0u };
+      if (binding != nullptr)
+	{
+	  wake_session (binding);
+	}
+      (void) send_message (ch, msg_op::YIELD_TRY_REPLY, &reply, sizeof (reply));
+    }
+
+    /* IDLE_WATCH: no session was idle when the dispatcher tried.  The request is published before the scan,
+     * and a session publishes idle before it reads the request (registry_auto_ready). */
+    static void
+    handle_idle_watch (manager &m, const std::shared_ptr<channel> &ch, bool enabled)
+    {
+      std::shared_ptr<auto_group> group;
+      bool idle = false;
+      try
+	{
+	  std::lock_guard<std::mutex> guard (m.registry_mutex);
+	  group = auto_group_of (m, ch->broker_name);
+	  std::atomic_store (&group->watch_channel, ch);
+	  group->watch_requested.store (enabled);
+	  if (!enabled)
+	    {
+	      return;
+	    }
+	  for (const auto &pair : m.registry)
+	    {
+	      if (std::strncmp (pair.second.broker_name, ch->broker_name, BROKER_NAME_MAX) == 0
+		  && pair.second.binding->state.load () == execution_state::idle)
+		{
+		  idle = true;
+		  break;
+		}
+	    }
+	}
+      catch (const std::bad_alloc &)
+	{
+	  return;		/* no hint: the dispatcher's wait ends at its deadline */
+	}
+      if (idle && group->watch_requested.exchange (false))
+	{
+	  send_idle_hint (*group);
+	}
+    }
+
+    /* RESET (cubrid broker reset): the CAS dropped its idle client and kept the client's session.  Every
+     * session of the broker is marked; an idle one yields now, a busy one when it is next idle
+     * (registry_auto_ready).  Only an AUTO session is ever idle, so the others keep their connection. */
+    static void
+    handle_reset (manager &m, channel &ch)
+    {
+      std::lock_guard<std::mutex> guard (m.registry_mutex);
+      for (const auto &pair : m.registry)
+	{
+	  const std::shared_ptr<session_binding> &binding = pair.second.binding;
+	  if (std::strncmp (pair.second.broker_name, ch.broker_name, BROKER_NAME_MAX) != 0)
+	    {
+	      continue;
+	    }
+	  binding->reset_requested.store (true);
+	  execution_state expected = execution_state::idle;
+	  if (binding->state.compare_exchange_strong (expected, execution_state::yielded))
+	    {
+	      wake_session (binding);	/* registry -> binding is the lock order of registry_set_tran_index */
+	    }
+	}
     }
 
     static void
@@ -733,6 +961,20 @@ namespace cubconn
 	      break;
 	    case msg_op::RESYNC:
 	      handle_resync (*m, *ch);
+	      break;
+	    case msg_op::YIELD_TRY:
+	      handle_yield_try (*m, *ch);
+	      break;
+	    case msg_op::IDLE_WATCH:
+	      if (header.length == sizeof (token_body))
+		{
+		  token_body body;
+		  std::memcpy (&body, payload, sizeof (body));
+		  handle_idle_watch (*m, ch, body.token != 0);
+		}
+	      break;
+	    case msg_op::RESET:
+	      handle_reset (*m, *ch);
 	      break;
 	    default:
 	      break;		/* unknown ops are skipped for forward compatibility */

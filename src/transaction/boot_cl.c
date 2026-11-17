@@ -1742,6 +1742,77 @@ boot_finalize_client_sub (void)
 }
 #endif // #if defined(CS_MODE) && defined(MULTI_CONN_TO_A_SERVER)
 
+#if defined (SERVER_MODE)
+/*
+ * boot_resume_client () - register the client of a kept session again
+ *
+ * returns : NO_ERROR if all OK, ER_ status otherwise
+ *
+ *   client_credential(in) : the new connection's credential
+ *   password(in) : the user's password
+ *
+ * Note: The calling thread holds the bracket of the client context the session's previous connection left:
+ *       its workspace, authorization, schema and settings stay, only the transaction registration is new.
+ *       The user must be the session's and log in again. A failure unregisters and changes nothing else.
+ */
+int
+boot_resume_client (BOOT_CLIENT_CREDENTIAL * client_credential, const char *password)
+{
+  TRAN_STATE transtate;
+  const TRAN_ISOLATION tran_isolation = TM_TRAN_ISOLATION ();
+  const int tran_lock_wait_msecs = TM_TRAN_WAIT_MSECS ();
+  const int row_count = db_get_row_count_cache ();
+  MOP schema_owner = sc_current_schema_owner ();
+  int tran_index, error_code;
+
+  assert (tm_Tran_index == NULL_TRAN_INDEX);
+
+  if (!au_has_user_name ()
+      || intl_identifier_casecmp (client_credential->get_db_user (), au_get_current_user_name ()) != 0)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_AU_INVALID_USER, 1, client_credential->get_db_user ());
+      return ER_AU_INVALID_USER;
+    }
+
+  boot_check_and_fill_connection_info (client_credential, false);
+
+  tran_index =
+    boot_register_client (client_credential, tran_lock_wait_msecs, tran_isolation, &transtate, &boot_Server_credential);
+  if (tran_index == NULL_TRAN_INDEX)
+    {
+      assert (er_errid () != NO_ERROR);
+      return er_errid () != NO_ERROR ? er_errid () : ER_FAILED;
+    }
+  boot_client (tran_index, tran_lock_wait_msecs, tran_isolation);
+
+  error_code = au_login (client_credential->get_db_user (), password, true);
+  if (error_code == NO_ERROR)
+    {
+      /* attaches the transaction to the session the connection claimed */
+      error_code =
+	db_find_or_create_session (client_credential->get_db_user (), client_credential->get_program_name ());
+    }
+  if (error_code == NO_ERROR && schema_owner != NULL)
+    {
+      error_code = sc_set_current_schema (schema_owner);
+    }
+  if (error_code == NO_ERROR)
+    {
+      error_code = tran_commit (false);
+    }
+  if (error_code != NO_ERROR)
+    {
+      (void) tran_abort ();
+      (void) boot_unregister_client (tran_index);
+      tm_Tran_index = NULL_TRAN_INDEX;
+      return error_code;
+    }
+  db_update_row_count_cache (row_count);
+
+  return NO_ERROR;
+}
+#endif /* SERVER_MODE */
+
 /*
  * boot_shutdown_client () - shutdown client
  *

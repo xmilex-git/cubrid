@@ -36,6 +36,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -65,6 +66,9 @@
 #include "cas_common_execute.h"	// cas_log_error_handler_begin/end
 #include "cas_common_vars.h"	// req_info (thread_local CAS globals)
 #include "cas_dispatch.h"	// cas_process_request + server-support API
+#include "boot_cl.h"		// boot_resume_client
+#include "broker_config.h"	// KEEP_CON_AUTO
+#include "cas.h"		// is_xa_prepared
 #include "cas_error.h"
 #include "cas_execute.h"	// ux_get_default_setting
 #include "cas_handle.h"		// hm_srv_handle_free_all
@@ -286,9 +290,10 @@ namespace cubconn
       db_set_session_id (DB_EMPTY_SESSION);
     }
 
-    /* cas_make_session_for_driver translation */
+    /* cas_make_session_for_driver translation.  Only an AUTO session is given its secret: it is what lets
+     * the client take the session up again after a yield; any other connection is its session. */
     static void
-    make_session_for_driver (char *out)
+    make_session_for_driver (char *out, bool with_secret)
     {
       std::size_t size = 0;
       SESSION_ID session;
@@ -300,6 +305,10 @@ namespace cubconn
       std::memcpy (out + size, &session, sizeof (SESSION_ID));
       size += sizeof (SESSION_ID);
       std::memset (out + size, 0, DRIVER_SESSION_SIZE - size);
+      if (with_secret)
+	{
+	  std::memcpy (out + size, db_get_session_secret (), SESSION_SECRET_SIZE);
+	}
     }
 
     /* ------------------------------------------------------------------ */
@@ -310,7 +319,7 @@ namespace cubconn
      * (req_info, as_info, srv handles, net_buf scratch) are thread-local in
      * SERVER_MODE, so this thread IS the CAS process for its connection */
     static void
-    request_loop (int fd, int client_version, const char (&driver_header)[DRIVER_HEADER_SIZE])
+    request_loop (int fd, int client_version, const char (&driver_header)[DRIVER_HEADER_SIZE], int wake_fd)
     {
       T_NET_BUF net_buf;
 
@@ -336,7 +345,14 @@ namespace cubconn
 	{
 	  /* the SIGUSR1 (re)arming of the CAS loop is retired: cancel arrives
 	   * as a tran interrupt via the control channel (#117 D4) */
-	  fn_ret = cas_process_request (fd, &net_buf, &req_info, INVALID_SOCKET);
+	  if (wake_fd >= 0 && as_info->con_status == CON_STATUS_OUT_TRAN && as_info->num_holdable_results == 0
+	      && as_info->cas_change_mode == CAS_CHANGE_MODE_AUTO && !is_xa_prepared ()
+	      && !csc_has_method_callback_state ())
+	    {
+	      /* nothing of this connection outlives a detach here: the session may be yielded while it waits */
+	      registry_auto_ready ();
+	    }
+	  fn_ret = cas_process_request (fd, &net_buf, &req_info, wake_fd);
 	  cas_log_error_handler_clear ();
 	}
 
@@ -358,6 +374,9 @@ namespace cubconn
       int err;
       bool registered = false;
       bool adopted = false;
+      bool resumed = false;
+      bool yielded = false;
+      int wake_fd = -1;
       CSS_CONN_ENTRY *conn = NULL;
       client_session_context *ctx = NULL;
       driver_conn_info info;
@@ -440,11 +459,69 @@ namespace cubconn
       cas_server_session_slot_begin (params.driver_header[SRV_CON_MSG_IDX_CLIENT_TYPE],
 				     CAS_MAKE_PROTO_VER (params.driver_header), params.driver_header);
 
-      apply_driver_session_id (info.session_id);
+      if (params.keep_con_auto)
+	{
+	  SESSION_ID session_id;
 
-      /* client-half boot with the driver's credentials; serialization is the
-       * engine's own (boot_restart_client) since A5 */
-      err = db_restart_ex ("driver_session", info.db_name, info.db_user, info.db_passwd, NULL, DB_CLIENT_TYPE_DEFAULT);
+	  wake_fd = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
+	  if (wake_fd < 0 || !registry_auto_enable (params.token, wake_fd))
+	    {
+	      send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, CAS_ERROR_INDICATOR, CAS_ER_FREE_SERVER,
+				NULL);
+	      goto retire;
+	    }
+	  as_info->cur_keep_con = KEEP_CON_AUTO;
+
+	  /* the driver session the client was given before a yield: server key | session id | secret */
+	  std::memcpy (&session_id, info.session_id + SERVER_SESSION_KEY_SIZE, sizeof (SESSION_ID));
+	  session_id = ntohl (session_id);
+	  if (session_id != DB_EMPTY_SESSION)
+	    {
+	      client_session_context *kept = NULL;
+
+	      err = session_claim_kept_context (entry_p, session_id, info.session_id,
+						info.session_id + SERVER_SESSION_KEY_SIZE + sizeof (SESSION_ID),
+						&kept);
+	      if (err == NO_ERROR)
+		{
+		  /* this thread goes on in the context the session kept, once its previous connection left it */
+		  csc_deactivate ();
+		  csc_retire_and_delete (ctx);
+		  ctx = kept;
+		  csc_activate (ctx);
+		  adopted = true;
+		  resumed = true;
+		}
+	      else if (err != ER_SES_SESSION_EXPIRED)
+		{
+		  send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, DBMS_ERROR_INDICATOR, err,
+				    er_msg () != NULL ? er_msg () : "");
+		  goto retire;
+		}
+	      /* else the session is gone: a new one, as for a client whose session expired */
+	    }
+	}
+
+      if (resumed)
+	{
+	  BOOT_CLIENT_CREDENTIAL credential;
+
+	  credential.client_type = DB_CLIENT_TYPE_DEFAULT;
+	  credential.db_name = info.db_name;
+	  credential.db_user = info.db_user;
+	  credential.program_name = "driver_session";
+	  credential.process_id = -1;
+	  err = boot_resume_client (&credential, info.db_passwd);
+	}
+      else
+	{
+	  apply_driver_session_id (info.session_id);
+
+	  /* client-half boot with the driver's credentials; serialization is the
+	   * engine's own (boot_restart_client) since A5 */
+	  err = db_restart_ex ("driver_session", info.db_name, info.db_user, info.db_passwd, NULL,
+			       DB_CLIENT_TYPE_DEFAULT);
+	}
       if (err != NO_ERROR)
 	{
 	  /* cas_db_connect failure path: DBMS error straight to the driver */
@@ -460,8 +537,8 @@ namespace cubconn
       ux_adopted_identity_record (info.db_name, info.db_user, info.db_passwd);
 
       /* the session created during registration becomes the durable owner of
-       * the client context (#123 D3) */
-      if (session_adopt_client_context (entry_p, ctx) == NO_ERROR)
+       * the client context (#123 D3); a resumed session owns it already */
+      if (resumed || session_adopt_client_context (entry_p, ctx) == NO_ERROR)
 	{
 	  adopted = true;
 	}
@@ -487,7 +564,7 @@ namespace cubconn
 	      prm_get_bool_value (PRM_ID_ORACLE_COMPAT_NUMBER_BEHAVIOR) ? MASK_ORACLE_COMPAT_NUMBER_BEHAVIOR : 0;
       params.broker_info[BROKER_INFO_RESERVED3] = 0;
 
-      make_session_for_driver (session_blob);
+      make_session_for_driver (session_blob, params.keep_con_auto);
       reply_size = build_connect_reply (params.token, params.slot_idx, params.broker_info, session_blob,
 					reply, sizeof (reply));
       if (write_full (params.client_fd, reply, reply_size) != NO_ERROR)
@@ -495,10 +572,31 @@ namespace cubconn
 	  goto retire;
 	}
 
-      request_loop (params.client_fd, CAS_MAKE_PROTO_VER (params.driver_header), params.driver_header);
+      request_loop (params.client_fd, CAS_MAKE_PROTO_VER (params.driver_header), params.driver_header, wake_fd);
 
     retire:
+      /* cas.c's end of a connection: a yield (CHANGE CLIENT, a broker reset) keeps the session for the client's
+       * next connection and session_state_timeout runs from here; any other end rolls back and ends it */
+      yielded = registry_auto_finish ();
+      if (registered)
+	{
+	  if (!yielded && !is_xa_prepared ())
+	    {
+	      (void) ux_end_tran (CCI_TRAN_ROLLBACK, false, true);
+	    }
+	  db_set_keep_session (yielded);
+	  (void) ux_end_session ();
+	}
+      else if (resumed)
+	{
+	  /* the login on the claimed session failed: it stays as its client left it */
+	  session_rekeep_client_context (entry_p);
+	}
       registry_begin_session_cleanup (params.token);
+      if (wake_fd >= 0)
+	{
+	  close (wake_fd);	/* after the cleanup: no YIELD_TRY or reset still holds it */
+	}
       cas_server_session_slot_end ();
       /* teardown order inherited from the tracer (S0): unregister the tran,
        * scrub the conn entry, close the bracket, then retire the thread */

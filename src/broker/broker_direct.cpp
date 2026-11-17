@@ -62,6 +62,7 @@
 #include <vector>
 
 #include "adoption.hpp"
+#include "broker_config.h"	/* KEEP_CON_AUTO */
 #include "cas_common.h"		/* FN_STATUS_* */
 #include "cas_error.h"
 #include "cas_protocol.h"
@@ -201,6 +202,7 @@ namespace brd
   {
     std::string broker_name;
     int max_slots = 0;
+    bool keep_con_auto = false;	/* KEEP_CONNECTION=AUTO, as read at start */
     char statement_pooling = 1;
     char cci_pconnect = 0;
 
@@ -230,6 +232,7 @@ namespace brd
     std::atomic<int> slots_used { 0 };
     std::mutex slots_mutex;
     std::condition_variable slots_cv;
+    std::uint64_t idle_hint_generation = 0;	/* slots_mutex: IDLE_HINTs received */
 
     /* channels + tokens.  Token values restart with every server process and
      * differ per database, so the table is a multimap disambiguated by the
@@ -378,6 +381,16 @@ namespace brd
 	    break;
 	  }
 
+	if ((adopt::msg_op) header.op == adopt::msg_op::IDLE_HINT)
+	  {
+	    /* a session went idle after a YIELD_TRY found none: the dispatcher tries again */
+	    {
+	      std::lock_guard<std::mutex> guard (m->slots_mutex);
+	      m->idle_hint_generation++;
+	    }
+	    m->slots_cv.notify_all ();
+	    continue;
+	  }
 	if ((adopt::msg_op) header.op == adopt::msg_op::SESSION_END)
 	  {
 	    if (header.length == sizeof (adopt::token_body))
@@ -928,7 +941,7 @@ namespace brd
 using namespace brd;
 
 int
-brd_init (const char *broker_name, int max_slots, char statement_pooling, char cci_pconnect,
+brd_init (const char *broker_name, int max_slots, char keep_connection, char statement_pooling, char cci_pconnect,
 	  T_MAX_HEAP_NODE * job_queue, int job_queue_size,
 	  pthread_mutex_t * job_queue_mutex, pthread_cond_t * job_queue_cond)
 {
@@ -936,6 +949,7 @@ brd_init (const char *broker_name, int max_slots, char statement_pooling, char c
   manager *m = new manager ();
   m->broker_name = broker_name;
   m->max_slots = max_slots;
+  m->keep_con_auto = (keep_connection == KEEP_CON_AUTO);
   m->statement_pooling = statement_pooling;
   m->cci_pconnect = cci_pconnect;
   m->job_queue = job_queue;
@@ -1026,6 +1040,86 @@ brd_park_client (SOCKET clt_sock_fd, const T_MAX_HEAP_NODE * job)
   (void) write (m->wakeup_fd, &one, sizeof (one));
 }
 
+/* The admission wait.  With KEEP_CONNECTION=AUTO a dispatcher out of slots asks the servers that hold them
+ * for one idle session (YIELD_TRY, one server after another until one yields); when none is idle it asks
+ * each for a hint (IDLE_WATCH) and tries again when one arrives.  After a yield it only waits: the yielded
+ * session's SESSION_END frees the slot.  A slot's owner may be another database than the job's. */
+static bool
+brd_wait_for_slot (manager &m)
+{
+  const auto deadline = std::chrono::steady_clock::now () + std::chrono::seconds (DB_INFO_PEEK_TIMEOUT_SEC);
+  const auto ready = [&m] { return m.slots_used.load () < m.max_slots || m.stopping.load (); };
+
+  for (;;)
+    {
+      std::uint64_t seen_hint;
+      {
+	std::lock_guard<std::mutex> guard (m.slots_mutex);
+	if (ready ())
+	  {
+	    return !m.stopping.load ();
+	  }
+	seen_hint = m.idle_hint_generation;
+      }
+
+      std::vector<std::shared_ptr<channel>> owners;
+      bool claimed = false;
+      if (m.keep_con_auto)
+	{
+	  {
+	    std::lock_guard<std::mutex> guard (m.channels_mutex);
+	    for (const auto &pair : m.channels)
+	      {
+		owners.push_back (pair.second);
+	      }
+	  }
+	  for (const auto &ch : owners)
+	    {
+	      adopt::msg_header reply_header;
+	      adopt::token_body reply = { 0 };
+	      if (channel_request (*ch, adopt::msg_op::YIELD_TRY, NULL, 0, NULL, 0, -1, &reply_header, &reply,
+				   sizeof (reply)) == 0
+		  && (adopt::msg_op) reply_header.op == adopt::msg_op::YIELD_TRY_REPLY
+		  && reply_header.length == sizeof (reply) && reply.token != 0)
+		{
+		  claimed = true;
+		  break;
+		}
+	    }
+	}
+      const bool watching = !claimed && !owners.empty ();
+      if (watching)
+	{
+	  adopt::token_body on = { 1 };
+	  for (const auto &ch : owners)
+	    {
+	      (void) channel_send (*ch, adopt::msg_op::IDLE_WATCH, &on, sizeof (on));
+	    }
+	}
+
+      bool awakened;
+      {
+	std::unique_lock<std::mutex> guard (m.slots_mutex);
+	awakened = m.slots_cv.wait_until (guard, deadline, [&]
+	{
+	  return ready () || (watching && m.idle_hint_generation != seen_hint);
+	});
+      }
+      if (watching)
+	{
+	  adopt::token_body off = { 0 };
+	  for (const auto &ch : owners)
+	    {
+	      (void) channel_send (*ch, adopt::msg_op::IDLE_WATCH, &off, sizeof (off));
+	    }
+	}
+      if (!awakened)
+	{
+	  return false;
+	}
+    }
+}
+
 void
 brd_dispatch_job (T_MAX_HEAP_NODE * job)
 {
@@ -1072,18 +1166,12 @@ brd_dispatch_job (T_MAX_HEAP_NODE * job)
    * the idle-CAS wait it replaces (#117 D3), for the inherited budget */
   brd_debug ("dispatch db=%s gen=%llu slots=%d/%d", db_name, (unsigned long long) ch->generation,
 	     m->slots_used.load (), m->max_slots);
-  {
-    std::unique_lock<std::mutex> guard (m->slots_mutex);
-    if (!m->slots_cv.wait_for (guard, std::chrono::seconds (DB_INFO_PEEK_TIMEOUT_SEC),
-			       [m] { return m->slots_used.load () < m->max_slots || m->stopping.load (); })
-	|| m->stopping.load ())
-      {
-	guard.unlock ();
-	send_error_code_to_driver (job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
-	close (job->clt_sock_fd);
-	return;
-      }
-  }
+  if (!brd_wait_for_slot (*m))
+    {
+      send_error_code_to_driver (job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
+      close (job->clt_sock_fd);
+      return;
+    }
 
   adopt::handoff_body body;
   std::memset (&body, 0, sizeof (body));
@@ -1098,6 +1186,7 @@ brd_dispatch_job (T_MAX_HEAP_NODE * job)
   body.broker_info[BROKER_INFO_STATEMENT_POOLING] =
 	  m->statement_pooling ? CAS_STATEMENT_POOLING_ON : CAS_STATEMENT_POOLING_OFF;
   body.broker_info[BROKER_INFO_CCI_PCONNECT] = m->cci_pconnect ? CCI_PCONNECT_ON : CCI_PCONNECT_OFF;
+  body.keep_con_auto = m->keep_con_auto ? 1 : 0;
   std::memcpy (body.driver_header, job->driver_info, adopt::DRIVER_HEADER_SIZE);
   std::memcpy (body.db_info, db_info.get (), adopt::DRIVER_DB_INFO_SIZE);
 

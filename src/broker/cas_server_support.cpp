@@ -111,7 +111,8 @@ cas_server_session_slot_begin (int client_type, int client_version, const char *
 
   slot->service_flag = ON;
   slot->con_status = CON_STATUS_IN_TRAN;	/* connect starts in-tran (cas_common_main.c:136) */
-  slot->cur_keep_con = KEEP_CON_ON;
+  slot->cur_keep_con = KEEP_CON_ON;	/* driver_session raises it to AUTO for an AUTO broker's session */
+  slot->cas_change_mode = CAS_CHANGE_MODE_DEFAULT;
   slot->cur_statement_pooling = shm_appl->statement_pooling ? ON : OFF;
   slot->cci_default_autocommit = shm_appl->cci_default_autocommit;
   slot->auto_commit_mode = FALSE;

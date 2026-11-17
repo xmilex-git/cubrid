@@ -83,6 +83,7 @@ namespace cubconn
       char broker_info[DRIVER_BROKER_INFO_SIZE];
       char driver_header[DRIVER_HEADER_SIZE];
       char db_info[DRIVER_DB_INFO_SIZE];
+      bool keep_con_auto;	/* the broker's KEEP_CONNECTION is AUTO */
       std::string server_name;	/* this server's database name */
     };
 

@@ -56,6 +56,9 @@ namespace cubconn
       CANCEL = 3,		/* query cancel; body: token_body */
       STATUS = 4,		/* "ST" status probe; body: token_body */
       RESYNC = 5,		/* restart re-sync; no body */
+      YIELD_TRY = 6,		/* every slot is taken: yield one idle AUTO session of this broker; no body */
+      IDLE_WATCH = 7,		/* ask for (1) or withdraw (0) one IDLE_HINT; body: token_body */
+      RESET = 8,		/* cubrid broker reset: every AUTO session of this broker yields; no body */
 
       /* server -> broker */
       HELLO_ACK = 9,		/* body: hello_ack_body */
@@ -64,7 +67,9 @@ namespace cubconn
       HANDOFF_REJECT = 11,	/* body: reject_body */
       STATUS_REPLY = 12,	/* body: status_reply_body */
       RESYNC_REPLY = 13,	/* body: resync_reply_body + live_count resync_token_body */
-      SESSION_END = 14		/* async; body: token_body (frees a broker slot, #117 D3) */
+      SESSION_END = 14,		/* async; body: token_body (frees a broker slot, #117 D3) */
+      YIELD_TRY_REPLY = 15,	/* body: token_body (1: a session yields and will end, 0: none was idle) */
+      IDLE_HINT = 16		/* async; no body: a session of this broker is idle, YIELD_TRY may find it */
     };
 
     struct msg_header
@@ -102,7 +107,8 @@ namespace cubconn
       char broker_info[DRIVER_BROKER_INFO_SIZE];	/* echoed in the connect reply */
       char driver_header[DRIVER_HEADER_SIZE];	/* the peeked 10-byte client header */
       char db_info[DRIVER_DB_INFO_SIZE];	/* the peeked db_info packet */
-      char pad[2];
+      char keep_con_auto;	/* the broker's KEEP_CONNECTION is AUTO: the session may yield and be resumed */
+      char pad;
     };
 
     struct token_body
@@ -164,6 +170,19 @@ namespace cubconn
      * pinned it, and no later cancel or stop() reaches it */
     void registry_begin_session_cleanup (std::uint32_t token);
     void registry_session_finished (std::uint32_t token);
+
+    /* KEEP_CONNECTION=AUTO, called by the session thread only.  A session that waits for a request at a
+     * boundary where it may leave its client (no transaction, no holdable cursor, no XA prepare, no callback
+     * resource) is idle; a dispatcher out of slots or a broker reset yields an idle session, which then
+     * closes the connection and keeps its server session for the client's next connection. */
+    bool registry_auto_enable (std::uint32_t token, int wake_fd);
+    /* the session waits for a request at such a boundary */
+    void registry_auto_ready (void);
+    /* a request header arrived; false when the session was yielded first, and the request must not run */
+    bool registry_auto_begin_request (void);
+    bool registry_auto_is_yielded (void);
+    /* the connection ends; true when a yield ended it */
+    bool registry_auto_finish (void);
 #endif
   }				/* namespace adoption */
 }				/* namespace cubconn */

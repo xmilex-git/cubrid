@@ -80,6 +80,9 @@ extern int session_state_increase_ref_count (THREAD_ENTRY * thread_p, struct ses
 extern int session_state_decrease_ref_count (THREAD_ENTRY * thread_p, struct session_state *state_p);
 class client_session_context;
 extern int session_adopt_client_context (THREAD_ENTRY * thread_p, client_session_context * csc);
+extern int session_claim_kept_context (THREAD_ENTRY * thread_p, const SESSION_ID id, const char *server_key,
+				       const char *secret, client_session_context ** csc);
+extern void session_rekeep_client_context (THREAD_ENTRY * thread_p);
 #endif
 extern int session_get_trace_stats (THREAD_ENTRY * thread_p, DB_VALUE * result);
 extern int session_set_trace_stats (THREAD_ENTRY * thread_p, char *scan_stats, int format);

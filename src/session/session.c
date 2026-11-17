@@ -34,6 +34,7 @@
 #include "session.h"
 
 #include "boot_sr.h"
+#include "xserver_interface.h"	// xboot_get_server_session_key
 #include "crypt_opfunc.h"
 #include "json_builder.h"
 #include "critical_section.h"
@@ -154,6 +155,8 @@ struct session_state
   /* the folded client half's context of this session: the session owns it,
    * threads reach it only through activation brackets */
   client_session_context *csc_p;
+  /* its client left on a yield and may take the context up again on its next connection (KEEP_CONNECTION=AUTO) */
+  bool csc_kept;
 #endif
 
   // *INDENT-OFF*
@@ -340,6 +343,7 @@ session_state_init (void *st)
   session_p->pl_session_p = NULL;
 #if defined (SERVER_MODE)
   session_p->csc_p = NULL;
+  session_p->csc_kept = false;
 #endif
   memset (session_p->secret, 0, SESSION_SECRET_SIZE);
 
@@ -863,6 +867,9 @@ session_state_destroy (THREAD_ENTRY * thread_p, const SESSION_ID id, bool is_kee
       /* the client leaves the session for now (CAS restart, RESET, ...). session_state_timeout runs from here, not
        * from when the client connected. */
       session_p->active_time = time (NULL);
+#if defined (SERVER_MODE)
+      session_p->csc_kept = (session_p->csc_p != NULL);
+#endif
       pthread_mutex_unlock (&session_p->mutex);
       return NO_ERROR;
     }
@@ -2995,6 +3002,83 @@ session_adopt_client_context (THREAD_ENTRY * thread_p, client_session_context * 
   state_p->csc_p = csc;
 
   return NO_ERROR;
+}
+
+/*
+ * session_claim_kept_context () - a new connection takes up the session its client was yielded from
+ *   return : NO_ERROR, ER_SES_SESSION_EXPIRED when the session is gone (the connection starts a new one),
+ *            another error when the session may not be taken
+ *   thread_p(in) : the connection's thread; its conn entry gets the session
+ *   id(in), server_key(in), secret(in) : the driver session the client presents
+ *   csc(out) : the session's client context
+ *
+ * Under the state mutex: only a session that was kept by a yield and has no connection is taken, by one
+ * connection, and only with its secret. active_time is renewed as for any reattach, so the expiry check that
+ * read the connection list before this claim does not remove the session.
+ */
+int
+session_claim_kept_context (THREAD_ENTRY * thread_p, const SESSION_ID id, const char *server_key, const char *secret,
+			    client_session_context ** csc)
+{
+  SESSION_STATE *state_p;
+
+  *csc = NULL;
+  assert (thread_p != NULL && thread_p->conn_entry != NULL && thread_p->conn_entry->session_p == NULL);
+
+  if (memcmp (server_key, xboot_get_server_session_key (), SERVER_SESSION_KEY_SIZE) != 0)
+    {
+      /* a session of another run of the server */
+      return ER_SES_SESSION_EXPIRED;
+    }
+
+  SESSION_ID key_id = id;
+  state_p = sessions.states_hashmap.find (thread_p, key_id);
+  if (state_p == NULL)
+    {
+      return ER_SES_SESSION_EXPIRED;
+    }
+
+  if (CRYPTO_memcmp (state_p->secret, secret, SESSION_SECRET_SIZE) != 0)
+    {
+      pthread_mutex_unlock (&state_p->mutex);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_SES_SESSION_SECRET_MISMATCH, 1, id);
+      return ER_SES_SESSION_SECRET_MISMATCH;
+    }
+  if (!state_p->csc_kept || state_p->ref_count != 0)
+    {
+      pthread_mutex_unlock (&state_p->mutex);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_SES_SESSION_NOT_ATTACHED, 1, id);
+      return ER_SES_SESSION_NOT_ATTACHED;
+    }
+
+  state_p->csc_kept = false;
+  state_p->active_time = time (NULL);
+  session_state_increase_ref_count (thread_p, state_p);
+  session_set_conn_entry_data (thread_p, state_p);
+  *csc = state_p->csc_p;
+
+  pthread_mutex_unlock (&state_p->mutex);
+
+  return NO_ERROR;
+}
+
+/*
+ * session_rekeep_client_context () - the connection that claimed the session leaves it as it found it
+ *   thread_p(in) : the connection's thread
+ *
+ * For a claim whose login failed: the session stays for its client, its timeout is not counted again.
+ */
+void
+session_rekeep_client_context (THREAD_ENTRY * thread_p)
+{
+  SESSION_STATE *state_p = session_get_session_state (thread_p);
+
+  if (state_p != NULL)
+    {
+      pthread_mutex_lock (&state_p->mutex);
+      state_p->csc_kept = true;
+      pthread_mutex_unlock (&state_p->mutex);
+    }
 }
 #endif /* SERVER_MODE */
 

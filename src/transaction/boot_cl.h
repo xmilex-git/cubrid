@@ -66,6 +66,9 @@ extern int boot_initialize_client_modules (void);
 extern void boot_finalize_client_modules (void);
 #endif /* SERVER_MODE */
 extern int boot_restart_client (BOOT_CLIENT_CREDENTIAL * client_credential);
+#if defined (SERVER_MODE)
+extern int boot_resume_client (BOOT_CLIENT_CREDENTIAL * client_credential, const char *password);
+#endif
 #if defined(CS_MODE) && defined(MULTI_CONN_TO_A_SERVER)
 extern int boot_restart_client_sub (BOOT_CLIENT_CREDENTIAL * client_credential);
 extern int boot_shutdown_client_sub (void);
