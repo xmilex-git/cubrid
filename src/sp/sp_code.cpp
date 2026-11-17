@@ -210,21 +210,25 @@ sp_load_sp_code_attribute_info (THREAD_ENTRY *thread_p)
 #undef MAP_LIST_ITEM
   };
 
+  /* filled here and stored whole: the first callers load at once, and or_get_attrid clears its output first */
+  ATTR_ID attrs_id[NUM_SP_CODE_ATTR];
+
   for (int attr_idx = 0; attr_idx < NUM_SP_CODE_ATTR; attr_idx++)
     {
-      error = or_get_attrid (&class_record, sp_code_attr_names[attr_idx], &spcode_Attrs_id[attr_idx]);
+      error = or_get_attrid (&class_record, sp_code_attr_names[attr_idx], &attrs_id[attr_idx]);
       if (error != NO_ERROR)
 	{
 	  ASSERT_ERROR ();
 	  goto exit_on_error;
 	}
-      if (spcode_Attrs_id[attr_idx] == NULL_ATTRID)
+      if (attrs_id[attr_idx] == NULL_ATTRID)
 	{
 	  assert (false);
 	  error = ER_FAILED;
 	  goto exit_on_error;
 	}
     }
+  memcpy (spcode_Attrs_id, attrs_id, sizeof (attrs_id));
   spcode_Num_attrs = attr_info.num_values;
 
   heap_attrinfo_end (thread_p, &attr_info);
