@@ -656,10 +656,16 @@ static const char *perfmon_stat_thread_stat_name (size_t index);
 
 STATIC_INLINE void perfmon_get_peek_stats (UINT64 * stats) __attribute__ ((ALWAYS_INLINE));
 
-static CUB_THREAD_LOCAL bool perfmon_Iscollecting_stats = false;
+/* in the server the client half is a driver session's thread, which resets these when it connects */
+#if defined (SERVER_MODE)
+#define PERFMON_CLIENT_TLS thread_local
+#else
+#define PERFMON_CLIENT_TLS CUB_THREAD_LOCAL
+#endif
+static PERFMON_CLIENT_TLS bool perfmon_Iscollecting_stats = false;
 
 /* Client execution statistics */
-static CUB_THREAD_LOCAL PERFMON_CLIENT_STAT_INFO perfmon_Stat_info;
+static PERFMON_CLIENT_TLS PERFMON_CLIENT_STAT_INFO perfmon_Stat_info;
 
 void
 disable_perfmon_start_stats ()

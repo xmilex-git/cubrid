@@ -54,6 +54,10 @@
 #include "hide_password.h"
 #include "cas_optimization.h"
 #include "cas_common_vars.h"
+#if defined (SERVER_MODE)
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
+#endif
 
 #if defined(WINDOWS)
 typedef int mode_t;
@@ -66,18 +70,38 @@ typedef int mode_t;
 #define CAS_LOG_HIDE_PW        1
 
 static const char *get_access_log_type_string (ACCESS_LOG_TYPE type);
-static char cas_log_buffer[CAS_LOG_BUFFER_SIZE];	/* 8K buffer */
+static CAS_TLS char cas_log_buffer[CAS_LOG_BUFFER_SIZE];	/* 8K buffer */
+#if defined (SERVER_MODE)
+/* a session's thread allocates the two buffers when it opens a log: as thread-local arrays every thread of
+ * the server would carry them */
+struct cas_log_buffers
+{
+  char *sql = NULL;
+  char *slow = NULL;
+   ~cas_log_buffers ()
+  {
+    free (sql);
+    free (slow);
+  }
+};
+static thread_local cas_log_buffers log_buffers;
+#define sql_log_buffer NULL
+#define slow_log_buffer NULL
+#else
 static char sql_log_buffer[SQL_LOG_BUFFER_SIZE];
+#endif
 
 /*
  * SQL / slow logs bypass stdio to buffer writes and reduce flushes.
  * In ON(=ALL) mode a one-shot SIGUSR2 timer flushes the SQL log with pwrite ().
  */
 #define SLOW_LOG_BUFFER_SIZE (SQL_LOG_BUFFER_SIZE)
+#if !defined (SERVER_MODE)
 static char slow_log_buffer[SLOW_LOG_BUFFER_SIZE];
+#endif
 
 /* SQL_LOG=ERROR, TIMEOUT or NOTICE put the current unit in this scratch file and append it to the log when cas_log_end () keeps it */
-static char scratch_filepath[BROKER_PATH_MAX];
+static CAS_TLS char scratch_filepath[BROKER_PATH_MAX];
 
 /*
  * Log buffer layout.
@@ -118,9 +142,9 @@ struct cas_log_fd
 /* buf_used / buf_flushed must hold the entire buffer size. */
 static_assert (SIG_ATOMIC_MAX >= SQL_LOG_BUFFER_SIZE, "SQL_LOG_BUFFER_SIZE does not fit in sig_atomic_t");
 
-static CAS_LOG_FD sql_log_fd = { -1, sql_log_buffer, SQL_LOG_BUFFER_SIZE, 0, 0, 0, 0 };
-static CAS_LOG_FD slow_log_fd = { -1, slow_log_buffer, SLOW_LOG_BUFFER_SIZE, 0, 0, 0, 0 };
-static CAS_LOG_FD scratch_log_fd = { -1, sql_log_buffer, SQL_LOG_BUFFER_SIZE, 0, 0, 0, 0 };	/* SQL log unit outside ON(=ALL) mode */
+static CAS_TLS CAS_LOG_FD sql_log_fd = { -1, sql_log_buffer, SQL_LOG_BUFFER_SIZE, 0, 0, 0, 0 };
+static CAS_TLS CAS_LOG_FD slow_log_fd = { -1, slow_log_buffer, SLOW_LOG_BUFFER_SIZE, 0, 0, 0, 0 };
+static CAS_TLS CAS_LOG_FD scratch_log_fd = { -1, sql_log_buffer, SQL_LOG_BUFFER_SIZE, 0, 0, 0, 0 };	/* SQL log unit outside ON(=ALL) mode */
 
 #define CAS_LOG_COMPILER_BARRIER() __asm__ __volatile__ ("" ::: "memory")
 /* the barriers keep the compiler from moving buffer accesses across the flag update */
@@ -155,10 +179,10 @@ static void cas_log_write_query_string_internal (char *query, int size, bool new
 static void cas_log_compile_begin_internal (char *query, bool newline);
 static void cas_log_compile_end_internal (char *query, bool newline, HIDE_PWD_INFO_PTR hide_pwd_info_ptr);
 
-static CAS_LOG_FD *log_fp = NULL, *slow_log_fp = NULL;
-static char log_filepath[BROKER_PATH_MAX], slow_log_filepath[BROKER_PATH_MAX];
-static INT64 saved_log_fpos = 0;
-static CAS_LOG_FD_STATUS cas_log_fd_status = CAS_LOG_FD_NONE;
+static CAS_TLS CAS_LOG_FD *log_fp = NULL, *slow_log_fp = NULL;
+static CAS_TLS char log_filepath[BROKER_PATH_MAX], slow_log_filepath[BROKER_PATH_MAX];
+static CAS_TLS INT64 saved_log_fpos = 0;
+static CAS_TLS CAS_LOG_FD_STATUS cas_log_fd_status = CAS_LOG_FD_NONE;
 
 static inline size_t cas_fwrite (const void *ptr, size_t size, size_t nmemb, CAS_LOG_FD * lfd);
 static inline void cas_fwrite_oneline (CAS_LOG_FD * lfd, const char *str);
@@ -179,8 +203,8 @@ static int cas_rename (const char *oldpath, const char *newpath);
 static int cas_mkdir (const char *pathname, mode_t mode);
 static void access_log_backup (char *access_log_file, struct tm *ct);
 
-static volatile sig_atomic_t sql_log_writing = 0;
-static volatile sig_atomic_t sql_log_write_flush_pending = 0;
+static CAS_TLS volatile sig_atomic_t sql_log_writing = 0;
+static CAS_TLS volatile sig_atomic_t sql_log_write_flush_pending = 0;
 
 /*
  * One of the following indicates how the statement between compile_begin and compile_end is handled.
@@ -190,12 +214,12 @@ static volatile sig_atomic_t sql_log_write_flush_pending = 0;
 #define SQL_LOG_UNMASKED_NONE      0
 #define SQL_LOG_UNMASKED_BUFFERED  1
 #define SQL_LOG_UNMASKED_OVERFLOW  2
-static volatile sig_atomic_t sql_log_unmasked = SQL_LOG_UNMASKED_NONE;
-static volatile sig_atomic_t sql_log_unmask_flush_pending = 0;
-static timer_t sql_log_timer;	/* SQL log only, cas_slow_log_end () flushes the slow log */
-static bool sql_log_timer_created = false;
+static CAS_TLS volatile sig_atomic_t sql_log_unmasked = SQL_LOG_UNMASKED_NONE;
+static CAS_TLS volatile sig_atomic_t sql_log_unmask_flush_pending = 0;
+static CAS_TLS timer_t sql_log_timer;	/* SQL log only, cas_slow_log_end () flushes the slow log */
+static CAS_TLS bool sql_log_timer_created = false;
 /* a flush is scheduled, so do not arm another timer until it fires */
-static volatile sig_atomic_t sql_log_timer_armed = 0;
+static CAS_TLS volatile sig_atomic_t sql_log_timer_armed = 0;
 
 static void arm_flush_timer (void);
 static void cas_log_timer_init (void);
@@ -204,9 +228,9 @@ static int ftruncate_all (int fd, INT64 len);
 static void cas_log_start_unit (void);
 static void copy_scratch_to_sql_log (void);
 
-static INT64 saved_temp_stmt_fpos = 0;
-static char *saved_temp_stmt_query = NULL;	/* the statement being compiled, written masked on exit */
-static bool saved_temp_stmt_newline = false;
+static CAS_TLS INT64 saved_temp_stmt_fpos = 0;
+static CAS_TLS char *saved_temp_stmt_query = NULL;	/* the statement being compiled, written masked on exit */
+static CAS_TLS bool saved_temp_stmt_newline = false;
 
 static char *
 make_sql_log_filename (T_CUBRID_FILE_ID fid, char *filename_buf, size_t buf_size, const char *br_name)
@@ -217,7 +241,13 @@ make_sql_log_filename (T_CUBRID_FILE_ID fid, char *filename_buf, size_t buf_size
 
   assert (filename_buf != NULL);
 
+#if defined (SERVER_MODE)
+  /* the directory of the session's broker; the path table of broker_filename.c is the process's */
+  snprintf (dirname, sizeof (dirname), "%s/",
+	    fid == FID_SQL_LOG_DIR ? CAS_SHM_CFG (log_dir) : CAS_SHM_CFG (slow_log_dir));
+#else
   get_cubrid_file (fid, dirname, BROKER_PATH_MAX);
+#endif
   switch (fid)
     {
     case FID_SQL_LOG_DIR:
@@ -270,10 +300,12 @@ cas_log_open (char *br_name)
     {
       if (br_name != NULL)
 	{
+#if !defined (SERVER_MODE)
 	  if (as_info->cas_log_reset == CAS_LOG_RESET_REOPEN)
 	    {
-	      set_cubrid_file (FID_SQL_LOG_DIR, shm_appl->log_dir);
+	      set_cubrid_file (FID_SQL_LOG_DIR, CAS_SHM_CFG (log_dir));
 	    }
+#endif
 
 	  make_sql_log_filename (FID_SQL_LOG_DIR, log_filepath, BROKER_PATH_MAX, br_name);
 	}
@@ -477,7 +509,7 @@ cas_log_end (int mode, int run_time_sec, int run_time_msec)
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL)
@@ -508,7 +540,7 @@ cas_log_end (int mode, int run_time_sec, int run_time_msec)
 		   || as_info->cur_sql_log_mode == SQL_LOG_MODE_NOTICE)
 	    {
 	      /* check timeout */
-	      if ((run_time_sec * 1000 + run_time_msec) < shm_appl->long_transaction_time)
+	      if ((run_time_sec * 1000 + run_time_msec) < CAS_SHM_CFG (long_transaction_time))
 		{
 		  abandon = true;
 		}
@@ -551,7 +583,7 @@ cas_log_end (int mode, int run_time_sec, int run_time_msec)
 	      sql_log_logical_end = saved_log_fpos;
 	    }
 
-	  if ((sql_log_logical_end / 1000) > shm_appl->sql_log_max_size)
+	  if ((sql_log_logical_end / 1000) > CAS_SHM_CFG (sql_log_max_size))
 	    {
 	      cas_log_close (true);
 	      cas_log_backup (FID_SQL_LOG_DIR);
@@ -675,7 +707,7 @@ cas_log_write_nonl (unsigned int seq_num, bool unit_start, const char *fmt, ...)
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL)
@@ -699,7 +731,7 @@ cas_log_write_nonl_noflush (unsigned int seq_num, bool unit_start, const char *f
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL)
@@ -761,7 +793,7 @@ cas_log_write (unsigned int seq_num, bool unit_start, const char *fmt, ...)
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   cas_log_query_cancel (0);
@@ -788,7 +820,7 @@ cas_log_write_and_end (unsigned int seq_num, bool unit_start, const char *fmt, .
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL)
@@ -895,7 +927,7 @@ cas_log_write2_nonl_noflush (const char *fmt, ...)
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL)
@@ -915,7 +947,7 @@ cas_log_write2 (const char *fmt, ...)
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL)
@@ -936,7 +968,7 @@ cas_log_write_value_string (char *value, int size)
 
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL)
@@ -975,7 +1007,7 @@ cas_log_compile_begin_internal (char *query, bool newline)
 {
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   assert (!sql_log_unmasked);	/* every compile_begin is followed by compile_end */
@@ -1001,7 +1033,7 @@ cas_log_compile_end_internal (char *query, bool newline, HIDE_PWD_INFO_PTR hide_
 {
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL && query != NULL)
@@ -1073,7 +1105,7 @@ cas_log_write_query_string_internal (char *query, int size, bool newline, HIDE_P
 {
   if (log_fp == NULL && as_info->cur_sql_log_mode != SQL_LOG_MODE_NONE)
     {
-      cas_log_open (shm_appl->broker_name);
+      cas_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (log_fp != NULL && query != NULL)
@@ -1112,7 +1144,7 @@ cas_access_log (struct timeval *start_time, int as_index, int client_ip_addr, ch
 {
 
   FILE *fp;
-  char *access_log_file = shm_appl->access_log_file;
+  char *access_log_file = CAS_SHM_CFG (access_log_file);
   char clt_ip_str[16];
   struct tm start_tm;
   time_t start_sec;
@@ -1133,7 +1165,7 @@ cas_access_log (struct timeval *start_time, int as_index, int client_ip_addr, ch
   if (ACCESS_LOG_IS_DENIED_TYPE (log_type))
     {
       int n;
-      n = snprintf (log_file_buf, PATH_MAX, "%s%s", shm_appl->access_log_file, ACCESS_LOG_DENIED_FILENAME_POSTFIX);
+      n = snprintf (log_file_buf, PATH_MAX, "%s%s", CAS_SHM_CFG (access_log_file), ACCESS_LOG_DENIED_FILENAME_POSTFIX);
       if (n >= PATH_MAX)
 	{
 	  return -1;
@@ -1149,7 +1181,7 @@ cas_access_log (struct timeval *start_time, int as_index, int client_ip_addr, ch
     }
 
   fseek (fp, 0, SEEK_END);
-  if ((ftell (fp) / ONE_K) > shm_appl->access_log_max_size)
+  if ((ftell (fp) / ONE_K) > CAS_SHM_CFG (access_log_max_size))
     {
       time_t backup_sec = time (NULL);
       struct tm backup_tm;
@@ -1209,10 +1241,15 @@ cas_log_query_info_init (int id, char is_only_query_plan)
 char *
 cas_log_query_plan_file (int id)
 {
-  static char plan_file_name[BROKER_PATH_MAX];
+  static CAS_TLS char plan_file_name[BROKER_PATH_MAX];
   char dirname[BROKER_PATH_MAX];
   get_cubrid_file (FID_CAS_TMP_DIR, dirname, BROKER_PATH_MAX);
+#if defined (SERVER_MODE)
+  /* handle ids are a session's: the thread id tells the sessions of the server apart */
+  if (snprintf (plan_file_name, BROKER_PATH_MAX - 1, "%s/%d.%d.plan", dirname, (int) syscall (SYS_gettid), id) < 0)
+#else
   if (snprintf (plan_file_name, BROKER_PATH_MAX - 1, "%s/%d.%d.plan", dirname, (int) getpid (), id) < 0)
+#endif
     {
       assert (false);
       return NULL;
@@ -1289,10 +1326,12 @@ cas_slow_log_open (char *br_name)
     {
       if (br_name != NULL)
 	{
+#if !defined (SERVER_MODE)
 	  if (as_info->cas_slow_log_reset == CAS_LOG_RESET_REOPEN)
 	    {
-	      set_cubrid_file (FID_SLOW_LOG_DIR, shm_appl->slow_log_dir);
+	      set_cubrid_file (FID_SLOW_LOG_DIR, CAS_SHM_CFG (slow_log_dir));
 	    }
+#endif
 
 	  make_sql_log_filename (FID_SLOW_LOG_DIR, slow_log_filepath, BROKER_PATH_MAX, br_name);
 	}
@@ -1349,7 +1388,7 @@ cas_slow_log_end ()
 
   if (slow_log_fp == NULL && as_info->cur_slow_log_mode != SLOW_LOG_MODE_OFF)
     {
-      cas_slow_log_open (shm_appl->broker_name);
+      cas_slow_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (slow_log_fp != NULL)
@@ -1357,7 +1396,7 @@ cas_slow_log_end ()
       long slow_log_fpos;
       slow_log_fpos = cas_ftell (slow_log_fp);
 
-      if ((slow_log_fpos / 1000) > shm_appl->sql_log_max_size)
+      if ((slow_log_fpos / 1000) > CAS_SHM_CFG (sql_log_max_size))
 	{
 	  cas_slow_log_close ();
 	  cas_log_backup (FID_SLOW_LOG_DIR);
@@ -1378,7 +1417,7 @@ cas_slow_log_write_and_end (struct timeval *log_time, unsigned int seq_num, cons
 
   if (slow_log_fp == NULL && as_info->cur_slow_log_mode != SLOW_LOG_MODE_OFF)
     {
-      cas_slow_log_open (shm_appl->broker_name);
+      cas_slow_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (slow_log_fp != NULL)
@@ -1401,7 +1440,7 @@ cas_slow_log_write (struct timeval *log_time, unsigned int seq_num, bool unit_st
 
   if (slow_log_fp == NULL && as_info->cur_slow_log_mode != SLOW_LOG_MODE_OFF)
     {
-      cas_slow_log_open (shm_appl->broker_name);
+      cas_slow_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (slow_log_fp != NULL)
@@ -1421,7 +1460,7 @@ cas_slow_log_write2 (const char *fmt, ...)
 
   if (slow_log_fp == NULL && as_info->cur_slow_log_mode != SLOW_LOG_MODE_OFF)
     {
-      cas_slow_log_open (shm_appl->broker_name);
+      cas_slow_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (slow_log_fp != NULL)
@@ -1441,7 +1480,7 @@ cas_slow_log_write_value_string (char *value, int size)
 
   if (slow_log_fp == NULL && as_info->cur_slow_log_mode != SLOW_LOG_MODE_OFF)
     {
-      cas_slow_log_open (shm_appl->broker_name);
+      cas_slow_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (slow_log_fp != NULL)
@@ -1457,7 +1496,7 @@ cas_slow_log_write_query_string (char *query, int size, HIDE_PWD_INFO_PTR hide_p
 
   if (slow_log_fp == NULL && as_info->cur_slow_log_mode != SLOW_LOG_MODE_OFF)
     {
-      cas_slow_log_open (shm_appl->broker_name);
+      cas_slow_log_open (CAS_LOG_BROKER_NAME);
     }
 
   if (slow_log_fp != NULL && query != NULL)
@@ -1494,6 +1533,31 @@ cas_log_timer_init (void)
   /* If timer creation fails, the buffer is still flushed when full, at close and on exit.
    * arm_flush_timer () retries timer creation. */
 }
+
+#if defined (SERVER_MODE)
+/*
+ * cas_log_is_open () - whether the session has its SQL log open
+ */
+bool
+cas_log_is_open (void)
+{
+  return log_fp != NULL;
+}
+
+/*
+ * cas_log_timer_final () - a session's thread ends: its flush timer goes with it.
+ *   Called after the session closed its logs, which disarmed the timer.
+ */
+void
+cas_log_timer_final (void)
+{
+  if (sql_log_timer_created)
+    {
+      (void) timer_delete (sql_log_timer);
+      sql_log_timer_created = false;
+    }
+}
+#endif
 
 /*
  * cas_log_sigusr2_handler () - flush the SQL log from the flush timer.
@@ -1566,7 +1630,7 @@ arm_flush_timer (void)
   if (!sql_log_timer_created)
     {
       /* timer_create () failed earlier.  Retry at most once a second. */
-      static time_t last_try = 0;
+      static CAS_TLS time_t last_try = 0;
       time_t now = time (NULL);
 
       if (now == last_try)
@@ -1852,6 +1916,27 @@ cas_fopen (CAS_LOG_FD * lfd, const char *path, const char *mode)
       assert (false);
       return lfd;
     }
+
+#if defined (SERVER_MODE)
+  if (lfd->buf == NULL)
+    {
+      char *&buffer = (lfd == &slow_log_fd) ? log_buffers.slow : log_buffers.sql;
+
+      if (buffer == NULL)
+	{
+	  buffer = (char *) malloc (SQL_LOG_BUFFER_SIZE);
+	  if (buffer == NULL)
+	    {
+	      return NULL;	/* a failed log open: the next log call tries again */
+	    }
+	}
+      lfd->buf = buffer;
+      if (lfd == &sql_log_fd)
+	{
+	  scratch_log_fd.buf = buffer;
+	}
+    }
+#endif
 
   flags = O_WRONLY | O_CREAT;	/* not O_APPEND, or pwrite () would ignore its offset */
   if (mode != NULL && mode[0] == 'w')

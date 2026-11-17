@@ -69,6 +69,7 @@
 #include "broker_env_def.h"
 #include "broker_process_size.h"
 #include "broker_admin_pub.h"
+#include "broker_direct.h"
 #include "broker_filename.h"
 #include "broker_error.h"
 #include "cas_sql_log2.h"
@@ -1201,6 +1202,55 @@ admin_off_cmd (int master_shm_id, const char *broker_name)
   return 0;
 }
 
+#if !defined (WINDOWS)
+/*
+ * admin_session_control () - ask a DIRECT_HANDOFF broker to give its conf to its sessions, or to reset them
+ *   return: 0, or -1 with admin_err_msg set
+ *   shm_key(in): the broker's appl shm key, which names its session control socket
+ *   op(in): BRD_CONTROL_CONFIG or BRD_CONTROL_RESET
+ */
+static int
+admin_session_control (int shm_key, unsigned int op)
+{
+  char directory[BROKER_PATH_MAX];
+  struct sockaddr_un address;
+  struct timeval timeout = { 60, 0 };
+  int fd, result = -1;
+
+  memset (&address, 0, sizeof (address));
+  address.sun_family = AF_UNIX;
+  get_cubrid_file (FID_SOCK_DIR, directory, sizeof (directory));
+  if ((size_t) snprintf (address.sun_path, sizeof (address.sun_path), BRD_CONTROL_SOCKET_FORMAT, directory, shm_key)
+      >= sizeof (address.sun_path))
+    {
+      sprintf (admin_err_msg, "The broker's session control socket path is too long");
+      return -1;
+    }
+  fd = socket (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    {
+      sprintf (admin_err_msg, "Cannot open the broker's session control socket: %s", strerror (errno));
+      return -1;
+    }
+  (void) setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof (timeout));
+  (void) setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof (timeout));
+  if (connect (fd, (struct sockaddr *) &address, sizeof (address)) != 0
+      || send (fd, &op, sizeof (op), MSG_NOSIGNAL) != (ssize_t) sizeof (op)
+      || recv (fd, &result, sizeof (result), MSG_WAITALL) != (ssize_t) sizeof (result))
+    {
+      sprintf (admin_err_msg, "The broker did not answer on its session control socket: %s", strerror (errno));
+      result = -1;
+    }
+  else if (result < 0)
+    {
+      /* the shared memory holds the new value: sessions handed over from now on have it */
+      sprintf (admin_err_msg, "A database server did not answer: some sessions keep the previous setting");
+    }
+  close (fd);
+  return result < 0 ? -1 : 0;
+}
+#endif /* !WINDOWS */
+
 int
 admin_reset_cmd (int master_shm_id, const char *broker_name)
 {
@@ -1252,6 +1302,17 @@ admin_reset_cmd (int master_shm_id, const char *broker_name)
       uw_shm_detach (shm_br);
       return -1;
     }
+
+#if !defined (WINDOWS)
+  if (shm_br->br_info[br_index].direct_handoff == ON)
+    {
+      /* no CAS to flag: the broker tells the servers that hold its sessions */
+      int result = admin_session_control (shm_br->br_info[br_index].appl_server_shm_id, BRD_CONTROL_RESET);
+
+      uw_shm_detach (shm_br);
+      return result;
+    }
+#endif /* !WINDOWS */
 
   shm_as_p =
     (T_SHM_APPL_SERVER *) uw_shm_open (shm_br->br_info[br_index].appl_server_shm_id, SHM_APPL_SERVER, SHM_MODE_ADMIN);
@@ -1902,6 +1963,12 @@ admin_conf_change (int master_shm_id, const char *br_name, const char *conf_name
 	  SHM_OPEN_ERR_MSG (admin_err_msg, uw_get_error_code (), uw_get_os_error_code ());
 	  goto set_conf_error;
 	}
+    }
+
+  if (br_info_p->direct_handoff == ON && as_number > 0)
+    {
+      sprintf (admin_err_msg, "A DIRECT_HANDOFF broker has no CAS: the setting is changed for the whole broker");
+      goto set_conf_error;
     }
 
   if (strcasecmp (conf_name, "SQL_LOG") == 0)
@@ -2691,6 +2758,13 @@ admin_conf_change (int master_shm_id, const char *br_name, const char *conf_name
       sprintf (admin_err_msg, "unknown keyword %s", conf_name);
       goto set_conf_error;
     }
+
+#if !defined (WINDOWS)
+  if (br_info_p->direct_handoff == ON && admin_session_control (br_info_p->appl_server_shm_id, BRD_CONTROL_CONFIG) < 0)
+    {
+      goto set_conf_error;
+    }
+#endif /* !WINDOWS */
 
   if (shm_proxy_p)
     {

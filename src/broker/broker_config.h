@@ -310,6 +310,9 @@ struct t_broker_info
   /* stage B1 (#117): dispatch driver connections to the database server's
    * adoption socket instead of a CAS pool */
   char direct_handoff;
+  /* an SSL client's db_info is encrypted, so the broker cannot route by it: every SSL client of a
+   * DIRECT_HANDOFF broker goes to this database's server */
+  char direct_handoff_ssl_db[SRV_CON_DBNAME_SIZE];
 
   char cgw_link_server[CGW_LINK_SERVER_NAME_LEN];
   char cgw_link_server_ip[CGW_LINK_SERVER_IP_LEN];

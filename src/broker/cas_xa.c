@@ -42,7 +42,8 @@ static void net_buf_cp_xid (T_NET_BUF * net_buf, XID * xid);
 static int compare_xid (XID * xid1, XID * xid2);
 #endif /* CAS_SUPPORT_XA */
 
-static bool xa_prepare_flag = false;
+/* of the connection: in the server, of the session's thread */
+static CAS_TLS bool xa_prepare_flag = false;
 
 FN_RETURN
 fn_xa_prepare (SOCKET sock_fd, int argc, void **argv, T_NET_BUF * net_buf, T_REQ_INFO * req_info)

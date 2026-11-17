@@ -865,7 +865,7 @@ void
 set_net_buf_size ()
 {
   _net_buf_size = (shm_appl == NULL
-		   || shm_appl->net_buf_size <= 0) ? INT_DEFAULE_NET_BUF_SIZE : shm_appl->net_buf_size * ONE_K;
+		   || CAS_SHM_CFG (net_buf_size) <= 0) ? INT_DEFAULE_NET_BUF_SIZE : CAS_SHM_CFG (net_buf_size) * ONE_K;
 
   return;
 }

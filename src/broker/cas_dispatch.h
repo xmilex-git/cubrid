@@ -36,8 +36,7 @@ extern "C"
 
 /* one full request: header read, dispatch through server_fn_table, reply.
  * Serves both the cub_cas process loop and the in-server CAS speaker. */
-  extern FN_RETURN cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
-					SOCKET srv_sock_fd);
+  extern FN_RETURN cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info, SOCKET srv_sock_fd);
 
 /* the shard reconnect cluster (moved from cas.c; cas.c's main loop and
  * process_request share this state) */
@@ -56,8 +55,18 @@ extern "C"
 #if defined (SERVER_MODE)
 /* cas_server_support.cpp: the environment the folded speaker expects */
 extern void cas_server_speaker_boot_init (const char *db_name);
-extern void cas_server_session_slot_begin (int client_type, int client_version, const char *driver_info);
+extern void cas_server_session_slot_begin (int client_type, int client_version, const char *driver_info,
+					   const char *broker, const cubconn::adoption::session_config * config);
+/* the session takes the configuration its broker sent since it last took one, if any */
+extern void cas_server_session_config_take (void);
+/* takes the session's index among its broker's SQL, slow and DDL log files; -1 when it cannot */
+extern int cas_server_session_log_begin (void);
 extern void cas_server_session_slot_end (void);
+extern int cas_server_access_log (struct timeval *start_time, int client_ip_addr, char *dbname, char *dbuser,
+				  int log_type);
+extern int cas_server_acl_check (const char *broker, const char *dbname, const char *dbuser,
+				 const unsigned char *address);
+extern void cas_server_acl_reload (void);
 #endif
 
 #endif /* _CAS_DISPATCH_H_ */

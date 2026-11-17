@@ -147,7 +147,7 @@ static int is_top_level_class (MOBJ mobj);
 //
 // enter_server_no_thread_entry () - enter server mode without getting a thread entry (e.g. when "starting" server).
 //
-/* SERVER_MODE (tracer): the calling thread is already a server worker
+/* SERVER_MODE (a session thread of the folded client half): the calling thread is already a server worker
  * with its own private heap; only the boundary flag and error stack change.
  */
 static void
@@ -7746,6 +7746,50 @@ qmgr_server_db_values (THREAD_ENTRY * thread_p, int dbval_cnt, const DB_VALUE * 
 
 #endif /* !CS_MODE */
 
+#if defined (SERVER_MODE)
+/*
+ * qmgr_attach_first_page_copy - give a driver session's client half the first page of its result, as
+ *                               sqmgr_execute_query sends it to a client
+ *
+ *   list_id(in/out): the copy goes to last_pgptr, which cursor_copy_list_id duplicates and cursor_free_list_id
+ *                    frees
+ *
+ * NOTE: the cursor reads that page after the query ended (the generated keys of an autocommit insert), when
+ *       the page of the list file is gone.  Without the copy the read goes to the list file, which works
+ *       while the query is alive.
+ */
+static void
+qmgr_attach_first_page_copy (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id)
+{
+  PAGE_PTR page_ptr;
+  char *page_copy;
+
+  if (list_id == NULL || VPID_ISNULL (&list_id->first_vpid) || list_id->tfile_vfid == NULL
+      || list_id->last_pgptr != NULL)
+    {
+      return;
+    }
+
+  page_copy = (char *) malloc (DB_PAGESIZE);
+  if (page_copy == NULL)
+    {
+      return;
+    }
+
+  page_ptr = qmgr_get_old_page (thread_p, &list_id->first_vpid, list_id->tfile_vfid);
+  if (page_ptr == NULL)
+    {
+      free (page_copy);
+      return;
+    }
+
+  memcpy (page_copy, page_ptr, DB_PAGESIZE);
+  qmgr_free_old_page_and_init (thread_p, page_ptr, list_id->tfile_vfid);
+
+  list_id->last_pgptr = page_copy;
+}
+#endif /* SERVER_MODE */
+
 /*
  * qmgr_execute_query - Send a SERVER_QM_EXECUTE request to the server
  *
@@ -7962,6 +8006,11 @@ qmgr_execute_query (const XASL_ID * xasl_id, QUERY_ID * query_idp, int dbval_cnt
   QFILE_LIST_ID *list_id = NULL;
   bool error;
 
+#if defined (SERVER_MODE)
+  char *query_info = NULL;
+  int query_info_length = 0;
+#endif
+
   THREAD_ENTRY *thread_p = enter_server ();
 
   /* reallocate dbvals to use server allocation */
@@ -7969,9 +8018,16 @@ qmgr_execute_query (const XASL_ID * xasl_id, QUERY_ID * query_idp, int dbval_cnt
   if (!error)
     {
       /* call the server routine of query execute */
+#if defined (SERVER_MODE)
+      list_id =
+	sqmgr_execute_query_inprocess (thread_p, xasl_id, query_idp, dbval_cnt, server_db_values, &flag, clt_cache_time,
+				       srv_cache_time, query_timeout, &query_info, &query_info_length);
+      qmgr_attach_first_page_copy (thread_p, list_id);
+#else
       list_id =
 	xqmgr_execute_query (thread_p, xasl_id, query_idp, dbval_cnt, server_db_values, &flag, clt_cache_time,
 			     srv_cache_time, query_timeout, NULL);
+#endif
     }
   qmgr_free_server_db_values (thread_p, dbval_cnt, server_db_values);
 
@@ -7982,6 +8038,15 @@ qmgr_execute_query (const XASL_ID * xasl_id, QUERY_ID * query_idp, int dbval_cnt
 #endif
 
   exit_server (*thread_p);
+
+#if defined (SERVER_MODE)
+  if (query_info != NULL)
+    {
+      /* the slow query text of the reply, which the driver session writes to its SQL log */
+      db_set_execution_plan (query_info, query_info_length);
+      free_and_init (query_info);
+    }
+#endif
 
   return list_id;
 #endif /* !CS_MODE */
@@ -8099,6 +8164,9 @@ qmgr_prepare_and_execute_query (char *xasl_stream, int xasl_stream_size, QUERY_I
       regu_result =
 	xqmgr_prepare_and_execute_query (thread_p, xasl_stream, xasl_stream_size, query_idp, dbval_cnt,
 					 server_db_values, &flag, query_timeout);
+#if defined (SERVER_MODE)
+      qmgr_attach_first_page_copy (thread_p, regu_result);
+#endif
     }
   qmgr_free_server_db_values (thread_p, dbval_cnt, server_db_values);
 

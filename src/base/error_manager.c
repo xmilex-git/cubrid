@@ -299,7 +299,10 @@ static FILE *er_Accesslog_fh = NULL;
 static ER_FMT er_Fmt_list[(-ER_LAST_ERROR) + 1];
 static int er_Fmt_msg_fail_count = -ER_LAST_ERROR;
 static int er_Errid_not_initialized = 0;
-#if !defined (SERVER_MODE)
+#if defined (SERVER_MODE)
+/* a driver session's thread registers its own, to write the error ids of a request to its SQL log */
+static thread_local er_log_handler_t er_Handler = NULL;
+#else
 static er_log_handler_t er_Handler = NULL;
 #endif /* !SERVER_MODE */
 static unsigned int er_Eid = 0;
@@ -1842,17 +1845,11 @@ er_log (int err_id)
 er_log_handler_t
 er_register_log_handler (er_log_handler_t handler)
 {
-#if !defined (SERVER_MODE)
   er_log_handler_t prev;
 
   prev = er_Handler;
   er_Handler = handler;
   return prev;
-#else
-  assert (0);
-
-  return NULL;
-#endif
 }
 
 /*

@@ -36,10 +36,14 @@
 #include "broker_direct.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -63,6 +67,8 @@
 
 #include "adoption.hpp"
 #include "broker_config.h"	/* KEEP_CON_AUTO */
+#include "broker_filename.h"	/* get_cubrid_file, FID_SOCK_DIR */
+#include "broker_shm.h"
 #include "cas_common.h"		/* FN_STATUS_* */
 #include "cas_error.h"
 #include "cas_protocol.h"
@@ -202,9 +208,18 @@ namespace brd
   {
     std::string broker_name;
     int max_slots = 0;
-    bool keep_con_auto = false;	/* KEEP_CONNECTION=AUTO, as read at start */
-    char statement_pooling = 1;
-    char cci_pconnect = 0;
+    T_SHM_APPL_SERVER *shm = NULL;	/* the broker's conf, as broker_changer changes it */
+    int shm_key = 0;
+    std::string ssl_db;		/* DIRECT_HANDOFF_SSL_DB: where every SSL client goes */
+
+    /* broker_changer and broker reset reach the sessions through this socket */
+    int control_fd = -1;
+    std::string control_path;
+    std::thread control_thread;
+    /* a copy of the conf and its seq are taken together, so a larger seq is a later conf; the servers
+     * order the copies by it (adoption.hpp), whatever order the messages that carry them arrive in */
+    std::mutex config_mutex;
+    std::uint64_t config_seq = 0;
 
     /* job queue plumbing owned by broker.c */
     T_MAX_HEAP_NODE *job_queue = NULL;
@@ -764,7 +779,7 @@ namespace brd
     /* cas_common_main.c:225-233 verbatim: int 0, then active cas_info */
     int zero = 0;
     char cas_info[CAS_INFO_SIZE] =
-      { CAS_INFO_STATUS_ACTIVE, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
+    { CAS_INFO_STATUS_ACTIVE, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
     (void) send_all (pc->fd, &zero, sizeof (int));
     (void) send_all (pc->fd, cas_info, sizeof (cas_info));
   }
@@ -851,7 +866,7 @@ namespace brd
 		  std::lock_guard<std::mutex> guard (m->park_inbox_mutex);
 		  inbox.swap (m->park_inbox);
 		}
-		for (parked_client * pc : inbox)
+		for (parked_client *pc : inbox)
 		  {
 		    struct epoll_event ev;
 		    ev.events = EPOLLIN;
@@ -932,6 +947,182 @@ namespace brd
     close (m->epoll_fd);
     close (m->wakeup_fd);
   }
+
+  static void
+  config_path (char *out, std::size_t size, const char *path)
+  {
+    snprintf (out, size, "%s%s%s", IS_ABS_PATH (path) ? "" : get_cubrid_home (), IS_ABS_PATH (path) ? "" : "/", path);
+  }
+
+  static void
+  config_snapshot (manager &m, adopt::session_config &config)
+  {
+    const T_SHM_APPL_SERVER *shm = m.shm;
+    std::lock_guard<std::mutex> guard (m.config_mutex);
+
+    std::memset (&config, 0, sizeof (config));
+    config.seq = ++m.config_seq;
+    config.sql_log_mode = shm->sql_log_mode;
+    config.slow_log_mode = shm->slow_log_mode;
+    config.sql_log_max_size = shm->sql_log_max_size;
+    config.access_log = shm->access_log;
+    config.access_log_max_size = shm->access_log_max_size;
+    config.long_query_time = shm->long_query_time;
+    config.long_transaction_time = shm->long_transaction_time;
+    config.jdbc_cache = shm->jdbc_cache;
+    config.jdbc_cache_only_hint = shm->jdbc_cache_only_hint;
+    config.jdbc_cache_life_time = shm->jdbc_cache_life_time;
+    config.statement_pooling = shm->statement_pooling;
+    config.cci_default_autocommit = shm->cci_default_autocommit;
+    config.max_prepared_stmt_count = shm->max_prepared_stmt_count;
+    config.session_timeout = shm->session_timeout;
+    config.query_timeout = shm->query_timeout;
+    config.max_string_length = shm->max_string_length;
+    config.trigger_action_flag = shm->trigger_action_flag;
+    config.stripped_column_name = shm->stripped_column_name;
+    config.net_buf_size = shm->net_buf_size;
+    config.query_replace_shm_key = shm->query_replace_shm_key;
+    config.broker_shm_id = m.shm_key;
+    config_path (config.log_dir, sizeof (config.log_dir), shm->log_dir);
+    config_path (config.slow_log_dir, sizeof (config.slow_log_dir), shm->slow_log_dir);
+    config_path (config.err_log_dir, sizeof (config.err_log_dir), shm->err_log_dir);
+    config_path (config.access_log_file, sizeof (config.access_log_file), shm->access_log_file);
+  }
+
+  /* A change or a reset goes to every server that may hold a session of this broker: the channels it has,
+   * and the servers whose sessions outlived this broker's restart and to which no client was routed since.
+   * Returns the sessions reached, or -1 when a server did not answer. */
+  static int
+  control_broadcast (manager &m, std::uint32_t op)
+  {
+    std::string socket_prefix = adoption_socket_path ("");
+    const std::size_t slash = socket_prefix.rfind ('/');
+    const std::string directory = socket_prefix.substr (0, slash);
+    const std::string prefix = socket_prefix.substr (slash + 1);
+    bool incomplete = false;
+    int affected = 0;
+
+    DIR *dir = opendir (directory.c_str ());
+    if (dir != NULL)
+      {
+	struct dirent *entry;
+	while ((entry = readdir (dir)) != NULL)
+	  {
+	    if (std::strncmp (entry->d_name, prefix.c_str (), prefix.size ()) == 0
+		&& entry->d_name[prefix.size ()] != '\0')
+	      {
+		/* a socket nobody listens on is a server that stopped: it holds no session */
+		(void) channel_get_or_dial (m, entry->d_name + prefix.size ());
+	      }
+	  }
+	closedir (dir);
+      }
+
+    std::vector<std::shared_ptr<channel>> targets;
+    {
+      std::lock_guard<std::mutex> guard (m.channels_mutex);
+      for (const auto &pair : m.channels)
+	{
+	  if (!pair.second->dead.load ())
+	    {
+	      targets.push_back (pair.second);
+	    }
+	}
+    }
+
+    adopt::session_config config;
+    config_snapshot (m, config);
+    for (const auto &ch : targets)
+      {
+	if (op == BRD_CONTROL_RESET)
+	  {
+	    if (channel_send (*ch, adopt::msg_op::RESET, NULL, 0) != 0)
+	      {
+		incomplete = true;
+	      }
+	    continue;
+	  }
+	adopt::msg_header header;
+	adopt::session_change_reply reply = { 0 };
+	if (channel_request (*ch, adopt::msg_op::SESSION_CONFIG, &config, sizeof (config), NULL, 0, -1, &header,
+			     &reply, sizeof (reply)) != 0
+	    || (adopt::msg_op) header.op != adopt::msg_op::SESSION_CONFIG_REPLY || header.length != sizeof (reply))
+	  {
+	    incomplete = true;
+	    continue;
+	  }
+	affected += reply.affected;
+      }
+    return incomplete ? -1 : affected;
+  }
+
+  static void
+  control_thread_run (manager *m)
+  {
+    while (!m->stopping.load ())
+      {
+	struct pollfd pending = { m->control_fd, POLLIN, 0 };
+	if (poll (&pending, 1, 1000) <= 0)
+	  {
+	    continue;
+	  }
+	int fd = accept4 (m->control_fd, NULL, NULL, SOCK_CLOEXEC);
+	if (fd < 0)
+	  {
+	    continue;
+	  }
+	struct ucred peer;
+	socklen_t size = sizeof (peer);
+	struct timeval timeout = { 5, 0 };
+	std::uint32_t op = 0;
+	(void) setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof (timeout));
+	(void) setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof (timeout));
+	/* the socket file is 0600; the peer check keeps another user out when the directory is shared */
+	if (getsockopt (fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) == 0 && peer.uid == geteuid ()
+	    && recv_all (fd, &op, sizeof (op)) == 0 && (op == BRD_CONTROL_CONFIG || op == BRD_CONTROL_RESET))
+	  {
+	    std::int32_t result = control_broadcast (*m, op);
+	    (void) send_all (fd, &result, sizeof (result));
+	  }
+	close (fd);
+      }
+  }
+
+  static int
+  control_start (manager &m)
+  {
+    char path[BROKER_PATH_MAX];
+    struct sockaddr_un address;
+
+    char directory[BROKER_PATH_MAX];
+
+    get_cubrid_file (FID_SOCK_DIR, directory, sizeof (directory));
+    if ((std::size_t) snprintf (path, sizeof (path), BRD_CONTROL_SOCKET_FORMAT, directory, m.shm_key)
+	>= sizeof (address.sun_path))
+      {
+	return -1;
+      }
+    std::memset (&address, 0, sizeof (address));
+    address.sun_family = AF_UNIX;
+    std::strcpy (address.sun_path, path);
+    int fd = socket (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+      {
+	return -1;
+      }
+    (void) unlink (path);	/* this broker owns the shm key the name is made of */
+    if (bind (fd, (struct sockaddr *) &address, sizeof (address)) != 0 || chmod (path, 0600) != 0
+	|| listen (fd, 8) != 0)
+      {
+	close (fd);
+	unlink (path);
+	return -1;
+      }
+    m.control_fd = fd;
+    m.control_path = path;
+    m.control_thread = std::thread (control_thread_run, &m);
+    return 0;
+  }
 }				/* namespace brd */
 
 /* -------------------------------------------------------------------- */
@@ -941,17 +1132,25 @@ namespace brd
 using namespace brd;
 
 int
-brd_init (const char *broker_name, int max_slots, char keep_connection, char statement_pooling, char cci_pconnect,
-	  T_MAX_HEAP_NODE * job_queue, int job_queue_size,
-	  pthread_mutex_t * job_queue_mutex, pthread_cond_t * job_queue_cond)
+brd_init (const char *broker_name, int max_slots, T_SHM_APPL_SERVER *shm_appl, int shm_key, const char *ssl_db,
+	  T_MAX_HEAP_NODE *job_queue, int job_queue_size,
+	  pthread_mutex_t *job_queue_mutex, pthread_cond_t *job_queue_cond)
 {
   assert (brd_Manager == NULL);
   manager *m = new manager ();
   m->broker_name = broker_name;
   m->max_slots = max_slots;
-  m->keep_con_auto = (keep_connection == KEEP_CON_AUTO);
-  m->statement_pooling = statement_pooling;
-  m->cci_pconnect = cci_pconnect;
+  m->shm = shm_appl;
+  m->shm_key = shm_key;
+  m->ssl_db = ssl_db;
+  {
+    /* above every seq of a broker of this name that ran before: shortcut: holds while the clock does not go
+     * back across a restart; a seq kept in the broker's files would not depend on it */
+    struct timeval now;
+
+    gettimeofday (&now, NULL);
+    m->config_seq = (std::uint64_t) now.tv_sec * 1000000 + (std::uint64_t) now.tv_usec;
+  }
   m->job_queue = job_queue;
   m->job_queue_size = job_queue_size;
   m->job_queue_mutex = job_queue_mutex;
@@ -962,7 +1161,8 @@ brd_init (const char *broker_name, int max_slots, char keep_connection, char sta
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.ptr = NULL;		/* NULL tags the wakeup fd */
-  if (m->epoll_fd < 0 || m->wakeup_fd < 0 || epoll_ctl (m->epoll_fd, EPOLL_CTL_ADD, m->wakeup_fd, &ev) != 0)
+  if (m->epoll_fd < 0 || m->wakeup_fd < 0 || epoll_ctl (m->epoll_fd, EPOLL_CTL_ADD, m->wakeup_fd, &ev) != 0
+      || control_start (*m) != 0)
     {
       if (m->epoll_fd >= 0)
 	{
@@ -1000,17 +1200,40 @@ brd_final (void)
     {
       m->peek_thread.join ();
     }
+  if (m->control_thread.joinable ())
+    {
+      m->control_thread.join ();
+    }
+  close (m->control_fd);
+  unlink (m->control_path.c_str ());
   brd_Manager = NULL;
   /* channels/threads are detached; the process is exiting */
 }
 
 void
-brd_park_client (SOCKET clt_sock_fd, const T_MAX_HEAP_NODE * job)
+brd_park_client (SOCKET clt_sock_fd, const T_MAX_HEAP_NODE *job)
 {
   manager *m = brd_Manager;
   if (m == NULL)
     {
       close (clt_sock_fd);
+      return;
+    }
+
+  if (IS_SSL_CLIENT (job->driver_info))
+    {
+      /* The db_info of an SSL client is encrypted: it goes to DIRECT_HANDOFF_SSL_DB, whose server ends TLS
+       * and reads the packet.  No ack here: the driver starts TLS on the ack and gives the ServerHello one
+       * second, so the ack is sent once a server holds the connection (brd_dispatch_job), as the CAS sent
+       * it right before its SSL_accept. */
+      parked_client *ssl_pc = new parked_client ();
+      ssl_pc->fd = clt_sock_fd;
+      ssl_pc->job = *job;
+      ssl_pc->got = 0;
+      ssl_pc->deadline = 0;
+      std::memset (ssl_pc->db_info, 0, sizeof (ssl_pc->db_info));
+      std::strncpy (ssl_pc->db_info, m->ssl_db.c_str (), 32);
+      park_complete (*m, ssl_pc);
       return;
     }
 
@@ -1064,7 +1287,7 @@ brd_wait_for_slot (manager &m)
 
       std::vector<std::shared_ptr<channel>> owners;
       bool claimed = false;
-      if (m.keep_con_auto)
+      if (m.shm->keep_connection == KEEP_CON_AUTO)
 	{
 	  {
 	    std::lock_guard<std::mutex> guard (m.channels_mutex);
@@ -1121,7 +1344,7 @@ brd_wait_for_slot (manager &m)
 }
 
 void
-brd_dispatch_job (T_MAX_HEAP_NODE * job)
+brd_dispatch_job (T_MAX_HEAP_NODE *job)
 {
   manager *m = brd_Manager;
   if (m == NULL)
@@ -1175,6 +1398,7 @@ brd_dispatch_job (T_MAX_HEAP_NODE * job)
 
   adopt::handoff_body body;
   std::memset (&body, 0, sizeof (body));
+  config_snapshot (*m, body.config);
   std::memcpy (&body.client_ip, job->ip_addr, 4);
   body.client_port = job->port;
   body.slot_idx = 0;	/* per-slot identity retired with the CAS pool */
@@ -1184,17 +1408,19 @@ brd_dispatch_job (T_MAX_HEAP_NODE * job)
   body.broker_info[BROKER_INFO_DBMS_TYPE] = CAS_DBMS_CUBRID;
   body.broker_info[BROKER_INFO_KEEP_CONNECTION] = CAS_KEEP_CONNECTION_ON;
   body.broker_info[BROKER_INFO_STATEMENT_POOLING] =
-	  m->statement_pooling ? CAS_STATEMENT_POOLING_ON : CAS_STATEMENT_POOLING_OFF;
-  body.broker_info[BROKER_INFO_CCI_PCONNECT] = m->cci_pconnect ? CCI_PCONNECT_ON : CCI_PCONNECT_OFF;
-  body.keep_con_auto = m->keep_con_auto ? 1 : 0;
+	  m->shm->statement_pooling ? CAS_STATEMENT_POOLING_ON : CAS_STATEMENT_POOLING_OFF;
+  body.broker_info[BROKER_INFO_CCI_PCONNECT] = m->shm->cci_pconnect ? CCI_PCONNECT_ON : CCI_PCONNECT_OFF;
+  body.keep_con_auto = m->shm->keep_connection == KEEP_CON_AUTO ? 1 : 0;
   std::memcpy (body.driver_header, job->driver_info, adopt::DRIVER_HEADER_SIZE);
   std::memcpy (body.db_info, db_info.get (), adopt::DRIVER_DB_INFO_SIZE);
 
   adopt::msg_header reply_header;
   char reply_body[64];
   bool fd_transferred = false;
-  if (channel_request (*ch, adopt::msg_op::HANDOFF, &body, sizeof (body), NULL, 0, job->clt_sock_fd,
-		       &reply_header, reply_body, sizeof (reply_body), &fd_transferred) != 0)
+  const int handoff_result = channel_request (*ch, adopt::msg_op::HANDOFF, &body, sizeof (body), NULL, 0,
+			     job->clt_sock_fd, &reply_header, reply_body, sizeof (reply_body),
+			     &fd_transferred);
+  if (handoff_result != 0)
     {
       brd_debug ("handoff db=%s: request failed/timeout", db_name);
       if (!fd_transferred)
@@ -1213,6 +1439,12 @@ brd_dispatch_job (T_MAX_HEAP_NODE * job)
     {
       /* the channel reader admitted the token (slot + table) before it
        * released this reply */
+      if (IS_SSL_CLIENT (job->driver_info))
+	{
+	  /* the ack brd_park_client held back: the TLS handshake starts against the session that has the fd */
+	  int zero = 0;
+	  (void) send_all (job->clt_sock_fd, &zero, sizeof (int));
+	}
       close (job->clt_sock_fd);	/* the server owns the connection now */
       return;
     }
@@ -1365,16 +1597,16 @@ void
 brd_status_reply_async (SOCKET clt_sock_fd, unsigned int token)
 {
   brd_detach_or_inline<std::function<void ()>> (
-    [clt_sock_fd, token] ()
-    {
-      brd_send_code (clt_sock_fd, brd_status (token));
-      close (clt_sock_fd);
-    },
-    [clt_sock_fd] ()
-    {
-      brd_send_code (clt_sock_fd, FN_STATUS_NONE);
-      close (clt_sock_fd);
-    });
+	      [clt_sock_fd, token] ()
+  {
+    brd_send_code (clt_sock_fd, brd_status (token));
+    close (clt_sock_fd);
+  },
+  [clt_sock_fd] ()
+  {
+    brd_send_code (clt_sock_fd, FN_STATUS_NONE);
+    close (clt_sock_fd);
+  });
 }
 
 void
@@ -1398,12 +1630,12 @@ brd_cancel_reply_async (SOCKET clt_sock_fd, unsigned int token, const unsigned c
     close (clt_sock_fd);
   };
   brd_detach_or_inline<std::function<void ()>> (
-    [reply, token, ip, clt_port] ()
-    {
-      reply (brd_cancel (token, ip, clt_port) == 0 ? 0 : CAS_ER_QUERY_CANCEL);
-    },
-    [reply] ()
-    {
-      reply (CAS_ER_QUERY_CANCEL);
-    });
+	      [reply, token, ip, clt_port] ()
+  {
+    reply (brd_cancel (token, ip, clt_port) == 0 ? 0 : CAS_ER_QUERY_CANCEL);
+  },
+  [reply] ()
+  {
+    reply (CAS_ER_QUERY_CANCEL);
+  });
 }

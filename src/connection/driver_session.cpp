@@ -16,18 +16,13 @@
  */
 
 /*
- * driver_session.cpp - adopted driver connection session thread (stage B1)
+ * driver_session.cpp - adopted driver connection session thread
  *
- * Faithful translation of the CAS per-connection sequence (cas_common_main.c
- * main loop body + cas.c connect reply) onto a server thread.  The session
- * skeleton (thread-manager ritual, csc bracket, socketless conn entry, boot,
- * session adoption, teardown order) is inherited verbatim from the tracer's
- * in_process_session (server_compile_tracer.cpp, stage S0-A8 harness).
- *
- * B1 scope: connect handshake (reply with the server-issued cancel token in
- * the CAS pid slot) and connection teardown.  The request loop answers every
- * function code with CAS_ER_NOT_IMPLEMENTED and closes — the CAS function
- * dispatch lands with the b1-cas-speaker PR (B1-D9).
+ * The CAS per-connection sequence (cas_common_main.c main loop body and the
+ * cas.c connect reply) on a server thread: the thread registers with the
+ * thread manager, takes a client session context and a socketless conn
+ * entry, boots the in-process client half, serves the driver's requests and
+ * tears the session down.
  */
 
 #if defined (SERVER_MODE)
@@ -72,8 +67,14 @@
 #include "cas_error.h"
 #include "cas_execute.h"	// ux_get_default_setting
 #include "cas_handle.h"		// hm_srv_handle_free_all
+#include "cas_log.h"		// the session's SQL, slow and access logs
 #include "cas_net_buf.h"
 #include "cas_protocol.h"
+#include "cas_ssl.h"
+#include "broker_util.h"	// ut_get_ipv4_string
+#include "ddl_log.h"
+#include "query_replace.h"
+#include "trigger_manager.h"	// tr_set_execution_state
 
 extern thread_local unsigned int db_on_server;	/* network_interface_sr.cpp */
 
@@ -104,13 +105,18 @@ namespace cubconn
       const char *p = static_cast<const char *> (buf);
       while (len > 0)
 	{
-	  ssize_t n = send (fd, p, len, MSG_NOSIGNAL);
+	  /* after cas_init_ssl the connection's bytes go through its TLS channel, as in cas_network.c */
+	  ssize_t n = ssl_client ? cas_ssl_write (fd, p, (int) len) : send (fd, p, len, MSG_NOSIGNAL);
 	  if (n < 0)
 	    {
-	      if (errno == EINTR)
+	      if (errno == EINTR && !ssl_client)
 		{
 		  continue;
 		}
+	      return ER_FAILED;
+	    }
+	  if (n == 0 && ssl_client)
+	    {
 	      return ER_FAILED;
 	    }
 	  p += n;
@@ -125,10 +131,14 @@ namespace cubconn
       char *p = static_cast<char *> (buf);
       while (len > 0)
 	{
-	  ssize_t n = recv (fd, p, len, 0);
+	  ssize_t n = ssl_client ? cas_ssl_read (fd, p, (int) len) : recv (fd, p, len, 0);
 	  if (n == 0)
 	    {
 	      return ER_FAILED;	/* peer closed */
+	    }
+	  if (n < 0 && ssl_client)
+	    {
+	      return ER_FAILED;
 	    }
 	  if (n < 0)
 	    {
@@ -176,6 +186,19 @@ namespace cubconn
       copy_field (out.db_passwd, sizeof (out.db_passwd), p, SRV_CON_DBPASSWD_SIZE);
       p += SRV_CON_DBPASSWD_SIZE;
       copy_field (out.url, sizeof (out.url), p, SRV_CON_URL_SIZE);
+      /* a V5+ driver puts its version behind the url's NUL, with its length in front */
+      out.driver_version[0] = '\0';
+      const std::size_t url_size = std::strlen (out.url);
+      if (url_size + 2 <= SRV_CON_URL_SIZE)
+	{
+	  const std::size_t version_size = (unsigned char) p[url_size + 1];
+	  if (version_size > 0 && version_size < sizeof (out.driver_version)
+	      && version_size <= SRV_CON_URL_SIZE - url_size - 2)
+	    {
+	      std::memcpy (out.driver_version, p + url_size + 2, version_size);
+	      out.driver_version[version_size] = '\0';
+	    }
+	}
       p += SRV_CON_URL_SIZE;
       std::memcpy (out.session_id, p, SRV_CON_DBSESS_ID_SIZE);
 
@@ -219,7 +242,7 @@ namespace cubconn
       p += sizeof (int);
 
       char cas_info[CAS_INFO_SIZE] =
-	{ CAS_INFO_STATUS_ACTIVE, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
+      { CAS_INFO_STATUS_ACTIVE, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
       std::memcpy (p, cas_info, CAS_INFO_SIZE);
       p += CAS_INFO_SIZE;
 
@@ -252,7 +275,7 @@ namespace cubconn
       std::size_t msg_len = (msg != NULL && msg[0] != '\0') ? std::strlen (msg) + 1 : 0;
       int len = htonl ((int) (2 * sizeof (int) + msg_len));
       char cas_info[CAS_INFO_SIZE] =
-	{ status, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
+      { status, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
 
       if (write_full (fd, &len, sizeof (int)) != NO_ERROR || write_full (fd, cas_info, CAS_INFO_SIZE) != NO_ERROR)
 	{
@@ -283,7 +306,7 @@ namespace cubconn
     apply_driver_session_id (const char (&session_20b)[20])
     {
       static const char empty_key[SERVER_SESSION_KEY_SIZE] =
-	{ (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF };
+      { (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF, (char) 0xFF };
 
       (void) session_20b;
       db_set_server_session_key (empty_key);
@@ -318,8 +341,59 @@ namespace cubconn
     /* cas_common_main.c's inner request loop, translated: the CAS globals
      * (req_info, as_info, srv handles, net_buf scratch) are thread-local in
      * SERVER_MODE, so this thread IS the CAS process for its connection */
+    /* SHOW SESSION STATUS's Client_type */
+    static const char *
+    driver_client_name (int kind)
+    {
+      switch (kind)
+	{
+	case CAS_CLIENT_CCI:
+	  return "CCI";
+	case CAS_CLIENT_ODBC:
+	  return "ODBC";
+	case CAS_CLIENT_JDBC:
+	  return "JDBC";
+	case CAS_CLIENT_PHP:
+	  return "PHP";
+	case CAS_CLIENT_OLEDB:
+	  return "OLEDB";
+	case CAS_CLIENT_SERVER_SIDE_JDBC:
+	  return "INTERNAL_JDBC";
+	case CAS_CLIENT_GATEWAY:
+	  return "GATEWAY";
+	default:
+	  return "UNKNOWN";
+	}
+    }
+
+    /* the session's SHOW SESSION STATUS row: its statistics of now, published as one row */
     static void
-    request_loop (int fd, int client_version, const char (&driver_header)[DRIVER_HEADER_SIZE], int wake_fd)
+    publish_stats (session_stat_row &row)
+    {
+      row.session_id = as_info->session_id;
+      row.tran_index = tm_Tran_index;
+      row.num_requests = as_info->num_requests_received;
+      row.num_transactions = as_info->num_transactions_processed;
+      row.num_queries = as_info->num_queries_processed;
+      row.num_selects = as_info->num_select_queries;
+      row.num_inserts = as_info->num_insert_queries;
+      row.num_updates = as_info->num_update_queries;
+      row.num_deletes = as_info->num_delete_queries;
+      row.num_errors = as_info->num_error_queries;
+      row.num_long_queries = as_info->num_long_queries;
+      row.num_long_transactions = as_info->num_long_transactions;
+      row.num_query_replace_prepare = as_info->num_query_replace_prepare;
+      row.num_query_replace_execute = as_info->num_query_replace_execute;
+      row.num_query_replace_fallback = as_info->num_query_replace_fallback;
+      snprintf (row.db_user, sizeof (row.db_user), "%s", as_info->database_user);
+      snprintf (row.last_activity, sizeof (row.last_activity), "%.*s", (int) sizeof (row.last_activity) - 1,
+		as_info->log_msg);
+      registry_publish_stats (row);
+    }
+
+    static void
+    request_loop (int fd, int client_version, const char (&driver_header)[DRIVER_HEADER_SIZE], int wake_fd,
+		  session_stat_row &stats)
     {
       T_NET_BUF net_buf;
 
@@ -353,13 +427,13 @@ namespace cubconn
 	      registry_auto_ready ();
 	    }
 	  fn_ret = cas_process_request (fd, &net_buf, &req_info, wake_fd);
+	  /* as the CAS main loop: only the connection's first request is answered as out of a transaction
+	   * whatever it found; later a request that starts none (a cursor close) leaves the status as it was */
+	  is_first_request = false;
 	  cas_log_error_handler_clear ();
+	  publish_stats (stats);
 	}
 
-      if (as_info != NULL && as_info->cur_statement_pooling)
-	{
-	  hm_srv_handle_free_all (true);
-	}
       cas_log_error_handler_end ();
       net_buf_destroy (&net_buf);
     }
@@ -383,6 +457,14 @@ namespace cubconn
       char session_blob[DRIVER_SESSION_SIZE];
       char reply[CONNECT_REPLY_BUF_SIZE];
       std::size_t reply_size;
+      const bool is_ssl = IS_SSL_CLIENT (params.driver_header);
+      const unsigned char *const client_ip = (const unsigned char *) &params.client_ip;
+      char client_ip_str[16];
+      struct timeval session_start;
+      session_stat_row stats;
+
+      gettimeofday (&session_start, NULL);	/* the access log's time of the connection */
+      ut_get_ipv4_string (client_ip_str, sizeof (client_ip_str), client_ip);
 
       /* the broker's peek engine set O_NONBLOCK, and an SCM_RIGHTS-passed fd
        * shares the open file description — restore blocking mode, this
@@ -396,7 +478,7 @@ namespace cubconn
       }
 
       /* register this foreign thread with the thread manager (same ritual as
-       * the tracer / connection_worker.cpp) */
+       * connection_worker.cpp) */
       cubthread::entry *entry_p = cubthread::get_manager ()->claim_entry ();
       if (entry_p == NULL)
 	{
@@ -419,7 +501,7 @@ namespace cubconn
       csc_activate (ctx);
 
       /* socketless conn entry: the CAS wire lives on params.client_fd, the
-       * in-process client half anchors on thread_p->conn_entry (tracer S0) */
+       * in-process client half anchors on thread_p->conn_entry */
       conn = css_make_conn (INVALID_SOCKET);
       if (conn == NULL)
 	{
@@ -435,12 +517,65 @@ namespace cubconn
       /* this thread now acts as the in-process client (D5) */
       db_on_server = 0;
 
-      if (parse_db_info (params.db_info, sizeof (params.db_info), info) != NO_ERROR || info.is_health_check)
+      /* The session's CAS slot with its broker's conf, and its log files, first: what goes wrong from here
+       * is written to the session's SQL log, as a CAS wrote it to its own. */
+      (void) registry_session_begin (params.token);
+      cas_server_session_slot_begin (params.driver_header[SRV_CON_MSG_IDX_CLIENT_TYPE],
+				     CAS_MAKE_PROTO_VER (params.driver_header), params.driver_header,
+				     params.broker_name.c_str (), &params.config);
+      std::memcpy (as_info->cas_clt_ip, client_ip, sizeof (as_info->cas_clt_ip));
+      as_info->cas_clt_port = params.client_port;
+      if (cas_server_session_log_begin () != 0)
 	{
-	  /* the broker absorbs health checks and validates db_info; reaching
-	   * here means a malformed handoff */
+	  if (!is_ssl)
+	    {
+	      send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, CAS_ERROR_INDICATOR, CAS_ER_INTERNAL,
+				"Cannot take a session log index");
+	    }
+	  goto retire;
+	}
+      cas_log_open (broker_name);
+      cas_slow_log_open (broker_name);
+      cas_log_write_client_ip (client_ip);
+
+      if (is_ssl)
+	{
+	  /* the broker could not read the encrypted db_info: TLS ends here and the packet is read here.
+	   * cas_init_ssl writes a certificate or handshake problem to the SQL log. */
+	  if (cas_init_ssl (params.client_fd) < 0
+	      || read_full (params.client_fd, params.db_info, sizeof (params.db_info)) != NO_ERROR)
+	    {
+	      goto retire;
+	    }
+	}
+
+      if (parse_db_info (params.db_info, sizeof (params.db_info), info) != NO_ERROR)
+	{
+	  /* the broker validates a cleartext db_info: a malformed handoff, or a malformed encrypted packet */
 	  send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, CAS_ERROR_INDICATOR, CAS_ER_COMMUNICATION,
 			    NULL);
+	  goto retire;
+	}
+      if (info.is_health_check)
+	{
+	  if (is_ssl)
+	    {
+	      /* the broker answers a cleartext health check; an encrypted one arrives here */
+	      const int zero = 0;
+	      const char cas_info[CAS_INFO_SIZE] =
+	      { CAS_INFO_STATUS_ACTIVE, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
+
+	      cas_log_write_and_end (0, false, "Incoming health check request from client.");
+	      if (write_full (params.client_fd, &zero, sizeof (zero)) == NO_ERROR)
+		{
+		  (void) write_full (params.client_fd, cas_info, sizeof (cas_info));
+		}
+	    }
+	  else
+	    {
+	      send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, CAS_ERROR_INDICATOR, CAS_ER_COMMUNICATION,
+				NULL);
+	    }
 	  goto retire;
 	}
 
@@ -452,12 +587,54 @@ namespace cubconn
 	  goto retire;
 	}
 
-      /* the broker routed by dbname; a mismatch is its bug, not the driver's */
-      assert (params.server_name == info.db_name);
+      /* The broker routed a cleartext client by its dbname: a mismatch is the broker's bug.  It sent an SSL
+       * client here without reading the name (DIRECT_HANDOFF_SSL_DB), so that client may ask for another. */
+      if (params.server_name != info.db_name)
+	{
+	  assert (is_ssl);
+	  send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, CAS_ERROR_INDICATOR, CAS_ER_FREE_SERVER,
+			    "this broker sends SSL connections to another database");
+	  goto retire;
+	}
 
-      /* point the CAS globals at this thread's slot (cas_server_support) */
-      cas_server_session_slot_begin (params.driver_header[SRV_CON_MSG_IDX_CLIENT_TYPE],
-				     CAS_MAKE_PROTO_VER (params.driver_header), params.driver_header);
+      if (info.driver_version[0] != '\0')
+	{
+	  snprintf (as_info->driver_version, sizeof (as_info->driver_version), "%s", info.driver_version);
+	}
+      else
+	{
+	  snprintf (as_info->driver_version, sizeof (as_info->driver_version), "PROTOCOL V%d",
+		    parse_driver_protocol (params.driver_header));
+	}
+      cas_log_write_and_end (0, false, "CLIENT VERSION %s", as_info->driver_version);
+      {
+	/* cas_set_session_id's line: the session the driver asks for, 0 for a new one */
+	SESSION_ID asked;
+
+	std::memcpy (&asked, info.session_id + SERVER_SESSION_KEY_SIZE, sizeof (asked));
+	cas_log_write_and_end (0, false, "session id for connection %u", ntohl (asked));
+      }
+
+      /* the db:dbuser:ip check a CAS made before it connected to the database */
+      if (cas_server_acl_check (broker_name, info.db_name, info.db_user, client_ip) < 0)
+	{
+	  as_info->num_connect_rejected++;
+	  send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, DBMS_ERROR_INDICATOR,
+			    CAS_ER_NOT_AUTHORIZED_CLIENT, "Authorization error.(Address is rejected)");
+	  cas_log_write_and_end (0, false, "connect db %s user %s url %s - rejected", info.db_name, info.db_user,
+				 info.url);
+	  if (CAS_SHM_CFG (access_log) == ON)
+	    {
+	      (void) cas_server_access_log (&session_start, (int) params.client_ip, info.db_name, info.db_user,
+					    ACL_REJECTED);
+	    }
+	  goto retire;
+	}
+
+      logddl_init (APP_NAME_CAS);
+      logddl_check_ddl_audit_param ();
+      logddl_set_broker_info (shm_as_index, broker_name);
+      logddl_set_ip (client_ip_str);
 
       if (params.keep_con_auto)
 	{
@@ -524,12 +701,20 @@ namespace cubconn
 	}
       if (err != NO_ERROR)
 	{
-	  /* cas_db_connect failure path: DBMS error straight to the driver */
-	  send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, DBMS_ERROR_INDICATOR, err,
-			    er_msg () != NULL ? er_msg () : "");
+	  /* cas_db_connect failure path: DBMS error straight to the driver, and its line in the SQL and slow
+	   * logs */
+	  const char *const message = er_msg () != NULL ? er_msg () : "";
+	  char msg_buf[LINE_MAX];
+
+	  send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, DBMS_ERROR_INDICATOR, err, message);
+	  snprintf (msg_buf, sizeof (msg_buf), "connect db %s user %s url %s, error:%d%s%s", info.db_name,
+		    info.db_user, info.url, err, message[0] != '\0' ? ", " : ".", message);
+	  cas_log_write_and_end (0, false, "%s", msg_buf);
+	  cas_slow_log_write_and_end (NULL, 0, "%s", msg_buf);
 	  goto retire;
 	}
       registered = true;
+      db_set_client_ip_addr (client_ip_str);
 
       /* replay ux_database_connect's connected-identity bookkeeping the
        * direct db_restart_ex boot skipped, so CHECK_CAS answers correctly
@@ -554,6 +739,24 @@ namespace cubconn
       /* the new-connection defaults capture ux_database_connect performs
        * (cas_execute.c:493): isolation/lock-timeout baselines + sys params */
       ux_get_default_setting ();
+      (void) tr_set_execution_state (CAS_SHM_CFG (trigger_action_flag) != 0);
+
+      /* the broker's query replace rules: the segment is the broker's, the lookup state the session's */
+      (void) qr_init_key (CAS_SHM_CFG (query_replace_shm_key));
+      qr_load_dbuser_has_rules (as_info->database_name, info.db_user);
+
+      /* cas_post_db_connect: the access log's line and the SQL log's.  A resume goes on with a connection
+       * the access log has, as a CAS's CHANGE CLIENT did. */
+      as_info->session_id = db_get_session_id ();
+      if (CAS_SHM_CFG (access_log) == ON && !resumed)
+	{
+	  (void) cas_server_access_log (&session_start, (int) params.client_ip, info.db_name, info.db_user,
+					NEW_CONNECTION);
+	}
+      cas_log_write_and_end (0, false, "connect db %s@%s user %s url %s session id %u", as_info->database_name,
+			     as_info->database_host, info.db_user, info.url, as_info->session_id);
+      cas_log_write_and_end (0, false, "DEFAULT isolation_level %d, lock_timeout %d", cas_default_isolation_level,
+			     cas_default_lock_timeout);
 
       /* the broker filled its own connect-reply facts (bytes 0-3:
        * dbms/keep_con/statement pooling/pconnect); the server owns the
@@ -565,16 +768,27 @@ namespace cubconn
       params.broker_info[BROKER_INFO_RESERVED3] = 0;
 
       make_session_for_driver (session_blob, params.keep_con_auto);
-      reply_size = build_connect_reply (params.token, params.slot_idx, params.broker_info, session_blob,
+      reply_size = build_connect_reply (params.token, shm_as_index, params.broker_info, session_blob,
 					reply, sizeof (reply));
       if (write_full (params.client_fd, reply, reply_size) != NO_ERROR)
 	{
 	  goto retire;
 	}
 
-      request_loop (params.client_fd, CAS_MAKE_PROTO_VER (params.driver_header), params.driver_header, wake_fd);
+      std::memset (&stats, 0, sizeof (stats));
+      stats.token = params.token;
+      stats.log_index = shm_as_index + 1;
+      stats.client_ip = params.client_ip;
+      snprintf (stats.broker_name, sizeof (stats.broker_name), "%.*s", (int) sizeof (stats.broker_name) - 1, broker_name);
+      snprintf (stats.client_type, sizeof (stats.client_type), "%s",
+		driver_client_name ((unsigned char) params.driver_header[SRV_CON_MSG_IDX_CLIENT_TYPE]));
+      snprintf (stats.client_version, sizeof (stats.client_version), "%s", as_info->driver_version);
+      publish_stats (stats);
 
-    retire:
+      request_loop (params.client_fd, CAS_MAKE_PROTO_VER (params.driver_header), params.driver_header, wake_fd,
+		    stats);
+
+retire:
       /* cas.c's end of a connection: a yield (CHANGE CLIENT, a broker reset) keeps the session for the client's
        * next connection and session_state_timeout runs from here; any other end rolls back and ends it */
       yielded = registry_auto_finish ();
@@ -602,8 +816,22 @@ namespace cubconn
 	{
 	  close (wake_fd);	/* after the cleanup: no YIELD_TRY or reset still holds it */
 	}
+      qr_final ();
+      if (as_info != NULL)
+	{
+	  hm_srv_handle_table_final ();
+	  /* a CAS closed its logs when its client left; the session's files are its own until then.  A
+	   * CON_CLOSE request wrote the line and closed the SQL log before its reply. */
+	  if (cas_log_is_open ())
+	    {
+	      cas_log_write_and_end (0, true, "disconnect");
+	    }
+	  logddl_destroy ();
+	  cas_log_close (true);
+	  cas_slow_log_close ();
+	}
       cas_server_session_slot_end ();
-      /* teardown order inherited from the tracer (S0): unregister the tran,
+      /* teardown order: unregister the tran,
        * scrub the conn entry, close the bracket, then retire the thread */
       if (registered)
 	{
@@ -635,6 +863,11 @@ namespace cubconn
        * fds it finds in the registry, and a closed (possibly reused) number
        * must never be visible there */
       registry_session_finished (params.token);
+      if (ssl_client)
+	{
+	  cas_ssl_close (params.client_fd);
+	  ssl_client = false;
+	}
       close (params.client_fd);
     }
   }				/* namespace adoption */

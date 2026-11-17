@@ -109,6 +109,14 @@ namespace cubconn
       int wake_fd = -1;		/* AUTO: wakes the session's wait for a request */
       std::atomic<execution_state> state { execution_state::busy };
       std::atomic<bool> reset_requested { false };	/* a broker reset, until the session yields */
+
+      /* what the channel threads and SHOW SESSION STATUS share with the session's thread */
+      std::mutex control_mutex;
+      session_config config;	/* the broker's conf for the session, as last sent */
+      /* a writer of config sets it after the write; the session clears it before it reads config */
+      std::atomic<bool> config_changed { false };
+      session_stat_row stats;	/* the session's row as its thread last published it */
+      bool stats_published = false;
     };
 
     class binding_pin
@@ -188,6 +196,9 @@ namespace cubconn
       std::condition_variable registry_cv;	/* signaled when a session signs off */
       std::unordered_map<std::uint32_t, session_entry> registry;
       std::unordered_map<std::string, std::shared_ptr<auto_group>> auto_groups;	/* per broker name */
+      /* per broker name, the conf with the largest seq a handoff or a SESSION_CONFIG of that broker brought:
+       * the conf of a session handed over with an older one (registry_mutex) */
+      std::unordered_map<std::string, session_config> latest_config;
       std::uint32_t next_token = 1;
 
       /* sign-off callbacks still touching this manager after their registry
@@ -199,6 +210,8 @@ namespace cubconn
     /* the AUTO session of this thread */
     static thread_local std::shared_ptr<session_binding> current_binding;
     static thread_local std::shared_ptr<auto_group> current_group;
+    /* the session of this thread, AUTO or not */
+    static thread_local std::shared_ptr<session_binding> current_session;
 
     /* ------------------------------------------------------------------ */
     /* wire helpers                                                       */
@@ -382,6 +395,104 @@ namespace cubconn
 	}
     }
 
+    void
+    acl_reload (void)
+    {
+      cas_server_acl_reload ();
+    }
+
+    bool
+    registry_session_begin (std::uint32_t token)
+    {
+      manager *m = adoption_Manager;
+      if (m == NULL)
+	{
+	  return false;
+	}
+      std::lock_guard<std::mutex> guard (m->registry_mutex);
+      auto it = m->registry.find (token);
+      if (it == m->registry.end ())
+	{
+	  return false;
+	}
+      current_session = it->second.binding;
+      return true;
+    }
+
+    bool
+    registry_take_config (session_config &config)
+    {
+      /* the flag is cleared before config is read: a change written after this read sets it again */
+      if (current_session == nullptr || !current_session->config_changed.exchange (false))
+	{
+	  return false;
+	}
+      std::lock_guard<std::mutex> guard (current_session->control_mutex);
+      config = current_session->config;
+      return true;
+    }
+
+    void
+    registry_publish_stats (const session_stat_row &row)
+    {
+      if (current_session != nullptr)
+	{
+	  std::lock_guard<std::mutex> guard (current_session->control_mutex);
+	  current_session->stats = row;
+	  current_session->stats_published = true;
+	}
+    }
+
+    std::size_t
+    registry_stats_snapshot (session_stat_row *rows, std::size_t max_rows)
+    {
+      manager *m = adoption_Manager;
+      std::size_t count = 0;
+
+      if (m == NULL)
+	{
+	  return 0;
+	}
+      std::lock_guard<std::mutex> guard (m->registry_mutex);
+      for (const auto &pair : m->registry)
+	{
+	  if (count >= max_rows)
+	    {
+	      break;
+	    }
+	  session_binding &binding = *pair.second.binding;
+	  std::lock_guard<std::mutex> control_guard (binding.control_mutex);
+	  if (binding.stats_published)
+	    {
+	      rows[count++] = binding.stats;
+	    }
+	}
+      return count;
+    }
+
+    bool
+    registry_shutdown_session (int tran_index)
+    {
+      manager *m = adoption_Manager;
+      if (m == NULL)
+	{
+	  return false;
+	}
+      std::lock_guard<std::mutex> guard (m->registry_mutex);
+      for (const auto &pair : m->registry)
+	{
+	  /* the pin holds the session's cleanup back: the descriptor is still the session's connection */
+	  binding_pin pin (pair.second.binding);
+	  if (pin.tran_index == tran_index && pin.client_fd >= 0)
+	    {
+	      /* the read side only: a statement the kill interrupted still sends its error to the driver */
+	      shutdown (pin.client_fd, SHUT_RD);
+	      return true;
+	    }
+	}
+      return false;
+    }
+
     static void
     wake_session (const std::shared_ptr<session_binding> &binding)
     {
@@ -487,6 +598,12 @@ namespace cubconn
     }
 
     bool
+    registry_auto_is_reset (void)
+    {
+      return current_binding != nullptr && current_binding->reset_requested.load ();
+    }
+
+    bool
     registry_auto_finish (void)
     {
       if (current_binding == nullptr)
@@ -509,6 +626,7 @@ namespace cubconn
 	  return;
 	}
       m->active_finishers.fetch_add (1);
+      current_session.reset ();
 
       char owner_broker[BROKER_NAME_MAX];
       bool found = false;
@@ -604,6 +722,7 @@ namespace cubconn
 	  return;
 	}
       binding->client_fd = client_fd;
+      binding->config = body.config;
 
       /* adopted connections take normal seats (#117 D5/D6); the decrement
        * runs in the session thread's css_free_conn */
@@ -625,6 +744,8 @@ namespace cubconn
       std::memcpy (params.driver_header, body.driver_header, sizeof (params.driver_header));
       std::memcpy (params.db_info, body.db_info, sizeof (params.db_info));
       params.keep_con_auto = body.keep_con_auto != 0;
+      params.config = body.config;
+      params.broker_name = ch.broker_name;
       params.server_name = m.db_name;
 
       /* register under registry_mutex, reading stopping again there: stop()
@@ -650,6 +771,18 @@ namespace cubconn
 		  }
 	      }
 	    while (token == 0 || m.registry.count (token) > 0);
+
+	    /* a handoff that carries an older conf than the broker has sent since takes the newer */
+	    session_config &latest = m.latest_config[ch.broker_name];
+	    if (latest.seq > params.config.seq)
+	      {
+		params.config = latest;
+		binding->config = latest;
+	      }
+	    else
+	      {
+		latest = params.config;
+	      }
 
 	    session_entry entry;
 	    entry.token = token;
@@ -827,6 +960,47 @@ namespace cubconn
 	}
     }
 
+    /* SESSION_CONFIG: broker_changer changed the broker's conf.  Every session of the broker whose conf is
+     * older gets it and takes it at its next request boundary (registry_take_config); a session handed over
+     * later takes the newer of this and what its HANDOFF carries. */
+    static void
+    handle_session_config (manager &m, channel &ch, const session_config &config)
+    {
+      session_change_reply reply = { 0 };
+      try
+	{
+	  std::lock_guard<std::mutex> guard (m.registry_mutex);
+	  session_config &latest = m.latest_config[ch.broker_name];
+	  if (config.seq > latest.seq)
+	    {
+	      latest = config;
+	    }
+	  for (const auto &pair : m.registry)
+	    {
+	      session_binding &binding = *pair.second.binding;
+	      if (std::strncmp (pair.second.broker_name, ch.broker_name, BROKER_NAME_MAX) != 0)
+		{
+		  continue;
+		}
+	      reply.affected++;
+	      {
+		std::lock_guard<std::mutex> control_guard (binding.control_mutex);
+		if (config.seq <= binding.config.seq)
+		  {
+		    continue;	/* the session has this conf or a later one */
+		  }
+		binding.config = config;
+	      }
+	      binding.config_changed.store (true);
+	    }
+	}
+      catch (const std::bad_alloc &)
+	{
+	  return;		/* no reply: the broker reports the change as not delivered */
+	}
+      (void) send_message (ch, msg_op::SESSION_CONFIG_REPLY, &reply, sizeof (reply));
+    }
+
     static void
     handle_resync (manager &m, channel &ch)
     {
@@ -975,6 +1149,14 @@ namespace cubconn
 	      break;
 	    case msg_op::RESET:
 	      handle_reset (*m, *ch);
+	      break;
+	    case msg_op::SESSION_CONFIG:
+	      if (header.length == sizeof (session_config))
+		{
+		  session_config config;
+		  std::memcpy (&config, payload, sizeof (config));
+		  handle_session_config (*m, *ch, config);
+		}
 	      break;
 	    default:
 	      break;		/* unknown ops are skipped for forward compatibility */

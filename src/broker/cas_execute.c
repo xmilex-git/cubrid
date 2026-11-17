@@ -485,7 +485,7 @@ ux_database_connect (char *db_name, char *db_user, char *db_passwd, char **db_er
 	  goto connect_error;
 	}
 
-      if (shm_appl->trigger_action_flag == false)
+      if (CAS_SHM_CFG (trigger_action_flag) == false)
 	{
 	  db_disable_trigger ();
 	}
@@ -568,6 +568,8 @@ ux_adopted_identity_record (const char *db_name, const char *db_user, const char
     }
   memcpy (as_info->database_name, db_name, name_len);
   as_info->database_name[name_len] = '\0';
+  strncpy (as_info->database_user, db_user, sizeof (as_info->database_user) - 1);
+  as_info->database_user[sizeof (as_info->database_user) - 1] = '\0';
   strncpy (as_info->database_host, host_connected, sizeof (as_info->database_host) - 1);
   as_info->last_connect_time = time (NULL);
 
@@ -7266,11 +7268,11 @@ prepare_column_list_info_set (DB_SESSION * session, char prepare_flag, T_QUERY_R
 	   *   precision = 0;
 	   */
 
-	  if (shm_appl->max_string_length >= 0)
+	  if (CAS_SHM_CFG (max_string_length) >= 0)
 	    {
-	      if (precision < 0 || precision > shm_appl->max_string_length)
+	      if (precision < 0 || precision > CAS_SHM_CFG (max_string_length))
 		{
-		  precision = shm_appl->max_string_length;
+		  precision = CAS_SHM_CFG (max_string_length);
 		}
 	    }
 
@@ -10291,11 +10293,11 @@ ux_make_out_rs (DB_BIGINT query_id, T_NET_BUF * net_buf, T_REQ_INFO * req_info)
 	}
 
 
-      if (shm_appl->max_string_length >= 0)
+      if (CAS_SHM_CFG (max_string_length) >= 0)
 	{
-	  if (precision < 0 || precision > shm_appl->max_string_length)
+	  if (precision < 0 || precision > CAS_SHM_CFG (max_string_length))
 	    {
-	      precision = shm_appl->max_string_length;
+	      precision = CAS_SHM_CFG (max_string_length);
 	    }
 	}
 
@@ -10320,9 +10322,9 @@ static int
 get_client_result_cache_lifetime (DB_SESSION * session, int stmt_id)
 {
   bool jdbc_cache_is_hint;
-  int jdbc_cache_life_time = shm_appl->jdbc_cache_life_time;
+  int jdbc_cache_life_time = CAS_SHM_CFG (jdbc_cache_life_time);
 
-  if (shm_appl->jdbc_cache == 0 || db_get_statement_type (session, stmt_id) != CUBRID_STMT_SELECT
+  if (CAS_SHM_CFG (jdbc_cache) == 0 || db_get_statement_type (session, stmt_id) != CUBRID_STMT_SELECT
       || cas_default_isolation_level == TRAN_REPEATABLE_READ || cas_default_isolation_level == TRAN_SERIALIZABLE)
     {
       return -1;
@@ -10330,7 +10332,7 @@ get_client_result_cache_lifetime (DB_SESSION * session, int stmt_id)
 
   jdbc_cache_is_hint = db_get_jdbccachehint (session, stmt_id, &jdbc_cache_life_time);
 
-  if (shm_appl->jdbc_cache_only_hint && !jdbc_cache_is_hint)
+  if (CAS_SHM_CFG (jdbc_cache_only_hint) && !jdbc_cache_is_hint)
     {
       return -1;
     }
@@ -10377,7 +10379,7 @@ ux_auto_commit (T_NET_BUF * net_buf, T_REQ_INFO * req_info)
     }
 
   tran_timeout =
-    ut_check_timeout (&tran_start_time, NULL, shm_appl->long_transaction_time, &elapsed_sec, &elapsed_msec);
+    ut_check_timeout (&tran_start_time, NULL, CAS_SHM_CFG (long_transaction_time), &elapsed_sec, &elapsed_msec);
   if (tran_timeout >= 0)
     {
       as_info->num_long_transactions %= MAX_DIAG_DATA_VALUE;

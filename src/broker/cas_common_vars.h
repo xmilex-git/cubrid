@@ -28,6 +28,9 @@
 #include "broker_shm.h"
 #include "cas_protocol.h"
 #include "cas_error.h"
+#if defined (SERVER_MODE)
+#include "adoption.hpp"
+#endif
 
 
 /* stage B1 (#117): in the merged server the CAS speaker runs as one dedicated
@@ -79,8 +82,20 @@ extern int shm_shard_cas_id;
 extern int cas_shard_flag;
 
 /* Shared memory variables */
-extern int shm_as_index;
+extern CAS_TLS int shm_as_index;	/* in the server, the session's index among its broker's log files */
 extern T_SHM_APPL_SERVER *shm_appl;
+#if defined (SERVER_MODE)
+/* What a CAS read from its broker's shared memory.  A session of the server has its own copy, which its
+ * broker gave with the handoff and gives again when broker_changer changes it; only the session's thread
+ * reads and writes the copy. */
+#define CAS_SESSION_CONFIG cubconn::adoption::session_config
+extern CAS_TLS CAS_SESSION_CONFIG cas_session_cfg;
+#define CAS_SHM_CFG(field) (cas_session_cfg.field)
+#define CAS_LOG_BROKER_NAME broker_name
+#else
+#define CAS_SHM_CFG(field) (shm_appl->field)
+#define CAS_LOG_BROKER_NAME shm_appl->broker_name
+#endif
 extern CAS_TLS T_APPL_SERVER_INFO *as_info;
 
 /* Transaction and query timing */
@@ -109,7 +124,7 @@ extern int cas_req_count;
 
 /* Program info */
 extern const char *program_name;
-extern char broker_name[BROKER_NAME_LEN];
+extern CAS_TLS char broker_name[BROKER_NAME_LEN];	/* in the server, the broker that handed the session over */
 
 /* CAS configuration */
 extern CAS_TLS int cas_default_isolation_level;

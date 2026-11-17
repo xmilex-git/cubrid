@@ -51,6 +51,7 @@ namespace cubconn
       char db_passwd[33];
       char url[513];
       char session_id[20];
+      char driver_version[20];	/* empty when the driver sent none */
       bool is_health_check;
     };
 
@@ -84,6 +85,8 @@ namespace cubconn
       char driver_header[DRIVER_HEADER_SIZE];
       char db_info[DRIVER_DB_INFO_SIZE];
       bool keep_con_auto;	/* the broker's KEEP_CONNECTION is AUTO */
+      session_config config;	/* the broker's conf for the session */
+      std::string broker_name;	/* the broker that hands the connection over */
       std::string server_name;	/* this server's database name */
     };
 

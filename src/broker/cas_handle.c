@@ -63,7 +63,7 @@ hm_new_srv_handle (T_SRV_HANDLE ** new_handle, unsigned int seq_num)
   T_SRV_HANDLE **new_srv_handle_table = NULL;
   T_SRV_HANDLE *srv_handle;
 
-  if (cas_shard_flag == OFF && current_handle_count >= shm_appl->max_prepared_stmt_count)
+  if (cas_shard_flag == OFF && current_handle_count >= CAS_SHM_CFG (max_prepared_stmt_count))
     {
       return ERROR_INFO_SET (CAS_ER_MAX_PREPARED_STMT_COUNT_EXCEEDED, CAS_ERROR_INDICATOR);
     }
@@ -218,6 +218,27 @@ hm_srv_handle_free_all (bool free_holdable)
       as_info->num_holdable_results = 0;
     }
 }
+
+#if defined (SERVER_MODE)
+/*
+ * hm_srv_handle_table_final () - a session ends: its handles and the table that held them are freed
+ *
+ * NOTE: a CAS kept its table for its next client.
+ */
+void
+hm_srv_handle_table_final (void)
+{
+  if (srv_handle_table != NULL)
+    {
+      hm_srv_handle_free_all (true);
+      FREE_MEM (srv_handle_table);
+    }
+  max_srv_handle = 0;
+  max_handle_id = 0;
+  current_handle_count = 0;
+  current_handle_id = -1;
+}
+#endif
 
 void
 hm_srv_handle_unset_prepare_flag_all (void)

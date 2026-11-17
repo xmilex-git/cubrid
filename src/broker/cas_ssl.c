@@ -62,6 +62,7 @@
 #endif
 
 #include "cas_common.h"
+#include "cas_common_vars.h"	/* CAS_TLS */
 #include "cas_log.h"
 #include "cas_network.h"
 #include "cas_common_main.h"
@@ -81,8 +82,9 @@
 #define CAS_SSL_CIPHERSUITES	"TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256"
 #define CAS_SSL_TIME_STR_LEN	32
 
-static SSL *ssl = NULL;
-bool ssl_client = false;
+/* a CAS serves one connection at a time; in the server a session's thread does, and this is the thread's */
+static CAS_TLS SSL *ssl = NULL;
+CAS_TLS bool ssl_client = false;
 
 static int cas_ssl_load_cert_and_key (SSL_CTX * ctx, const char *cert, const char *key);
 static int cas_ssl_passwd_cb (char *buf, int size, int rwflag, void *userdata);

@@ -180,6 +180,9 @@ struct t_srv_handle
 extern int hm_new_srv_handle (T_SRV_HANDLE ** new_handle, unsigned int seq_num);
 extern void hm_srv_handle_free (int h_id);
 extern void hm_srv_handle_free_all (bool free_holdable);
+#if defined (SERVER_MODE)
+extern void hm_srv_handle_table_final (void);
+#endif
 extern void hm_srv_handle_qresult_end_all (bool end_holdable);
 extern bool hm_has_result_tied_to_tran (void);
 extern void hm_srv_handle_end_transaction_all (void);

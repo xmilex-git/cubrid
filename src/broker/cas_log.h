@@ -53,6 +53,10 @@ extern void cas_log_close (bool flag);
 extern void cas_log_flush_on_exit (void);
 extern void cas_log_sigusr2_handler (int signo, siginfo_t * info, void *ctx);
 extern void cas_log_flush_from_signal (void);
+#if defined (SERVER_MODE)
+extern void cas_log_timer_final (void);
+extern bool cas_log_is_open (void);
+#endif
 
 extern int cas_access_log (struct timeval *start_time, int as_index, int client_ip_addr, char *dbname, char *dbuser,
 			   ACCESS_LOG_TYPE log_type);

@@ -111,12 +111,18 @@ net_read_header_keep_con_on (SOCKET clt_sock_fd, MSG_HEADER * client_msg_header)
 
   if (as_info->con_status == CON_STATUS_IN_TRAN)
     {
-      net_timeout_set (shm_appl->session_timeout);
+      net_timeout_set (CAS_SHM_CFG (session_timeout));
     }
   else
     {
       net_timeout_set (DEFAULT_CHECK_INTERVAL);
-      timeout = shm_appl->session_timeout;
+#if defined (SERVER_MODE)
+      /* the connection is the session: an idle client keeps both.  A CAS left its client after
+       * SESSION_TIMEOUT and the client took its session up again on another CAS. */
+      timeout = 0;
+#else
+      timeout = CAS_SHM_CFG (session_timeout);
+#endif
       remained_timeout = timeout;
     }
 
@@ -176,7 +182,7 @@ net_read_int_keep_con_auto (SOCKET clt_sock_fd, MSG_HEADER * client_msg_header, 
   if (as_info->con_status == CON_STATUS_IN_TRAN)
     {
       /* holdable results have the same lifespan of a normal session */
-      net_timeout_set (shm_appl->session_timeout);
+      net_timeout_set (CAS_SHM_CFG (session_timeout));
     }
   else
     {

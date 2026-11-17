@@ -770,7 +770,10 @@ boot_connect_to_server (BOOT_CLIENT_CREDENTIAL * client_credential, DB_INFO * db
   bool skip_db_info = false;
 
   /* Initialize the communication subsystem */
+#if !defined (SERVER_MODE)
+  /* the status of the hosts tried: a driver session of the server tries none, and the list is the process's */
   db_clear_host_status ();
+#endif
 
   for (i = 0; i < 2; i++)
     {

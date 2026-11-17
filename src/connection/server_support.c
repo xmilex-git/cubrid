@@ -280,6 +280,105 @@ css_job_queues_start_scan (THREAD_ENTRY * thread_p, int show_type, DB_VALUE ** a
 
   return NO_ERROR;
 }
+
+/*
+ * css_session_status_start_scan() - start scan function for 'SHOW SESSION STATUS'
+ *   return: NO_ERROR, or ER_code
+ *
+ * One row per driver session, each as the session published it at its last request boundary.
+ */
+int
+css_session_status_start_scan (THREAD_ENTRY * thread_p, int show_type, DB_VALUE ** arg_values, int arg_cnt, void **ptr)
+{
+  const int column_count = 23;
+  int error = NO_ERROR;
+  SHOWSTMT_ARRAY_CONTEXT *ctx = NULL;
+  cubconn::adoption::session_stat_row * rows;
+  std::size_t max_rows, row_count;
+
+  (void) show_type;
+  (void) arg_values;
+  (void) arg_cnt;
+
+  *ptr = NULL;
+
+  max_rows = css_get_max_connections () + 1;
+  rows = (cubconn::adoption::session_stat_row *) malloc (max_rows * sizeof (*rows));
+  if (rows == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, max_rows * sizeof (*rows));
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  row_count = cubconn::adoption::registry_stats_snapshot (rows, max_rows);
+
+  ctx = showstmt_alloc_array_context (thread_p, (int) row_count, column_count);
+  if (ctx == NULL)
+    {
+      free (rows);
+      ASSERT_ERROR_AND_SET (error);
+      return error;
+    }
+
+  for (std::size_t i = 0; i < row_count && error == NO_ERROR; i++)
+    {
+      const cubconn::adoption::session_stat_row & r = rows[i];
+      const unsigned char *ip = (const unsigned char *) &r.client_ip;
+      char ip_buf[20];
+      int idx = 0;
+      DB_VALUE *vals = showstmt_alloc_tuple_in_context (thread_p, ctx);
+
+      if (vals == NULL)
+	{
+	  ASSERT_ERROR_AND_SET (error);
+	  break;
+	}
+      snprintf (ip_buf, sizeof (ip_buf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+
+      /* a failed copy leaves its value NULL and ends the scan with the error */
+      (void) db_make_bigint (&vals[idx++], (DB_BIGINT) r.token);
+      (void) db_make_int (&vals[idx++], r.log_index);
+      error = db_make_string_copy (&vals[idx++], r.broker_name);
+      error = (error != NO_ERROR) ? error : db_make_string_copy (&vals[idx++], ip_buf);
+      error = (error != NO_ERROR) ? error : db_make_string_copy (&vals[idx++], r.db_user);
+      if (error != NO_ERROR)
+	{
+	  break;
+	}
+      (void) db_make_bigint (&vals[idx++], (DB_BIGINT) r.session_id);
+      (void) db_make_int (&vals[idx++], r.tran_index);
+      (void) db_make_bigint (&vals[idx++], r.num_requests);
+      (void) db_make_bigint (&vals[idx++], r.num_transactions);
+      (void) db_make_bigint (&vals[idx++], r.num_queries);
+      (void) db_make_bigint (&vals[idx++], r.num_selects);
+      (void) db_make_bigint (&vals[idx++], r.num_inserts);
+      (void) db_make_bigint (&vals[idx++], r.num_updates);
+      (void) db_make_bigint (&vals[idx++], r.num_deletes);
+      (void) db_make_bigint (&vals[idx++], r.num_errors);
+      (void) db_make_bigint (&vals[idx++], r.num_long_queries);
+      (void) db_make_bigint (&vals[idx++], r.num_long_transactions);
+      error = db_make_string_copy (&vals[idx++], r.last_activity);
+      error = (error != NO_ERROR) ? error : db_make_string_copy (&vals[idx++], r.client_type);
+      if (error != NO_ERROR)
+	{
+	  break;
+	}
+      (void) db_make_bigint (&vals[idx++], r.num_query_replace_prepare);
+      (void) db_make_bigint (&vals[idx++], r.num_query_replace_execute);
+      (void) db_make_bigint (&vals[idx++], r.num_query_replace_fallback);
+      error = db_make_string_copy (&vals[idx++], r.client_version);
+      assert (idx == column_count);
+    }
+
+  free (rows);
+  if (error != NO_ERROR)
+    {
+      showstmt_free_array_context (thread_p, ctx);
+      return error;
+    }
+  *ptr = ctx;
+
+  return NO_ERROR;
+}
 #endif // SERVER_MODE
 
 /*
@@ -2067,6 +2166,9 @@ xacl_dump (THREAD_ENTRY * thread_p, FILE * outfp)
 int
 xacl_reload (THREAD_ENTRY * thread_p)
 {
+  /* cubrid server acl reload: the server's ip list, and the db:dbuser:ip table of the driver sessions */
+  cubconn::adoption::acl_reload ();
+
   return css_set_accessible_ip_info ();
 }
 #endif

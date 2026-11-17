@@ -197,7 +197,7 @@ net_read_process (SOCKET proxy_sock_fd, MSG_HEADER * client_msg_header, T_REQ_IN
 
   if (as_info->con_status == CON_STATUS_IN_TRAN)
     {
-      net_timeout_set (shm_appl->session_timeout);
+      net_timeout_set (CAS_SHM_CFG (session_timeout));
     }
   else
     {
@@ -466,6 +466,10 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
     }
   else
     {
+#if defined (SERVER_MODE)
+      const bool out_of_tran = (as_info->con_status == CON_STATUS_OUT_TRAN);
+#endif
+
       unset_hang_check_time ();
       if (as_info->cur_keep_con == KEEP_CON_AUTO)
 	{
@@ -488,6 +492,14 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
 
 	  fn_ret = FN_CLOSE_CONN;
 
+#if defined (SERVER_MODE)
+	  /* a yield that a broker reset asked for is the CAS's RESET in the log, any other its CHANGE CLIENT */
+	  if (as_info->con_status == CON_STATUS_CLOSE_AND_CONNECT && cubconn::adoption::registry_auto_is_reset ())
+	    {
+	      as_info->reset_flag = TRUE;
+	      as_info->con_status = CON_STATUS_OUT_TRAN;
+	    }
+#endif
 	  if (as_info->reset_flag)
 	    {
 	      cas_log_msg = "RESET";
@@ -527,6 +539,23 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
 	  cas_log_write_and_end (0, true, cas_log_msg);
 	  return fn_ret;
 	}
+#if defined (SERVER_MODE)
+      /* what broker_changer changed since the last request.  A CAS waiting outside a transaction opened its
+       * logs again within a second of the change; a session does when its next transaction starts.  Inside
+       * a transaction both wait for its end. */
+      cas_server_session_config_take ();
+      if (out_of_tran)
+	{
+	  if (as_info->cas_log_reset)
+	    {
+	      cas_log_reset (broker_name);
+	    }
+	  if (as_info->cas_slow_log_reset)
+	    {
+	      cas_slow_log_reset (broker_name);
+	    }
+	}
+#endif
     }
 
 #if !defined(WINDOWS)
@@ -544,10 +573,10 @@ cas_process_request (SOCKET sock_fd, T_NET_BUF * net_buf, T_REQ_INFO * req_info,
       set_db_parameter ();
     }
 
-  if (shm_appl->session_timeout < 0)
+  if (CAS_SHM_CFG (session_timeout) < 0)
     net_timeout_set (NET_DEFAULT_TIMEOUT);
   else
-    net_timeout_set (MIN (shm_appl->session_timeout, NET_DEFAULT_TIMEOUT));
+    net_timeout_set (MIN (CAS_SHM_CFG (session_timeout), NET_DEFAULT_TIMEOUT));
 
   if (cas_shard_flag == ON && req_info->client_version == 0)
     {

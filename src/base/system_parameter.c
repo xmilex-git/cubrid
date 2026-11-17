@@ -841,6 +841,11 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_NUMERIC_EMPTY_STRING_AS_NULL "numeric_empty_string_as_null"
 
+/* the db:dbuser:ip check of a broker's ACCESS_CONTROL_FILE, made by the server for the driver sessions */
+#define PRM_NAME_CAS_ACCESS_CONTROL "cas_access_control"
+#define PRM_NAME_CAS_ACCESS_CONTROL_FILE "cas_access_control_file"
+#define PRM_NAME_CAS_ACCESS_CONTROL_DEFAULT_ALLOW "cas_access_control_default_allow"
+
 /*
  * Note about ERROR_LIST and INTEGER_LIST type
  * ERROR_LIST type is an array of bool type with the size of -(ER_LAST_ERROR)
@@ -4741,7 +4746,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_DDL_AUDIT_LOG,
    PRM_NAME_DDL_AUDIT_LOG,
-   (PRM_FOR_CLIENT),
+   (PRM_FOR_CLIENT | PRM_FOR_SERVER),	/* the server writes the audit log of its driver sessions */
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},
@@ -4752,7 +4757,7 @@ SYSPRM_PARAM prm_Def[] = {
    (DUP_PRM_FUNC) NULL},
   {PRM_ID_DDL_AUDIT_LOG_SIZE,
    PRM_NAME_DDL_AUDIT_LOG_SIZE,
-   (PRM_FOR_CLIENT | PRM_SIZE_UNIT),
+   (PRM_FOR_CLIENT | PRM_FOR_SERVER | PRM_SIZE_UNIT),
    PRM_BIGINT,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.bi = 10485760ULL /* 10M */ }},
@@ -5787,6 +5792,42 @@ SYSPRM_PARAM prm_Def[] = {
   {PRM_ID_NUMERIC_EMPTY_STRING_AS_NULL,
    PRM_NAME_NUMERIC_EMPTY_STRING_AS_NULL,
    (PRM_FOR_SERVER | PRM_FOR_CLIENT | PRM_FOR_QRY_STRING | PRM_FORCE_SERVER | PRM_FOR_PL_CONTEXT | PRM_HIDDEN),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE,
+   NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_CAS_ACCESS_CONTROL,
+   PRM_NAME_CAS_ACCESS_CONTROL,
+   (PRM_USER_CHANGE | PRM_FOR_SERVER),
+   PRM_BOOLEAN,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.b = false}},
+   {false, {.b = false}},
+   NULL_SYSPRM_PARAM_VALUE,
+   NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_CAS_ACCESS_CONTROL_FILE,
+   PRM_NAME_CAS_ACCESS_CONTROL_FILE,
+   (PRM_USER_CHANGE | PRM_FOR_SERVER),
+   PRM_STRING,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.str = (char *) ""}},
+   {false, {.str = (char *) ""}},
+   NULL_SYSPRM_PARAM_VALUE,
+   NULL_SYSPRM_PARAM_VALUE,
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+  {PRM_ID_CAS_ACCESS_CONTROL_DEFAULT_ALLOW,
+   PRM_NAME_CAS_ACCESS_CONTROL_DEFAULT_ALLOW,
+   (PRM_USER_CHANGE | PRM_FOR_SERVER),
    PRM_BOOLEAN,
    PRM_CLEAR_DYNAMIC_FLAG,
    {false, {.b = false}},

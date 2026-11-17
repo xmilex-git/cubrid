@@ -38,8 +38,11 @@ int shm_shard_cas_id = -1;
 int cas_shard_flag = OFF;
 
 /* Shared memory variables */
-int shm_as_index;
+CAS_TLS int shm_as_index;
 T_SHM_APPL_SERVER *shm_appl;
+#if defined (SERVER_MODE)
+CAS_TLS CAS_SESSION_CONFIG cas_session_cfg;
+#endif
 CAS_TLS T_APPL_SERVER_INFO *as_info;
 
 /* Transaction and query timing */
@@ -68,7 +71,7 @@ int cas_req_count = 0;
 
 /* Program info */
 const char *program_name;
-char broker_name[BROKER_NAME_LEN];
+CAS_TLS char broker_name[BROKER_NAME_LEN];
 
 /* CAS configuration */
 CAS_TLS int cas_default_isolation_level = 0;

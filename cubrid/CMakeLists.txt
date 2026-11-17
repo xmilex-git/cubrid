@@ -758,7 +758,6 @@ set(CLIENT_HALF_SOURCES
   ${STORAGE_DIR}/statistics_cl.c
   ${TRANSACTION_DIR}/boot_cl.c
   ${TRANSACTION_DIR}/locator_cl.c
-  ${TRANSACTION_DIR}/server_compile_tracer.cpp
   ${TRANSACTION_DIR}/transaction_cl.c
   )
 
@@ -775,8 +774,8 @@ endif(UNIX)
 # (driver_session.cpp).  The per-CAS-process globals in these files are
 # thread-local under SERVER_MODE (CAS_TLS, cas_common_vars.h); shm reads are
 # served by the stub in cas_server_support.cpp.  cas_sql_log2.c (dup2 on fd 1)
-# and cas_ssl.c (B2) are deliberately NOT folded — cas_server_support.cpp
-# carries their no-op/assert stubs.
+# is deliberately NOT folded — cas_server_support.cpp carries its no-op stubs.
+# cas_ssl.c ends TLS for the driver sessions; OpenSSL comes with EP_LIBS.
 set(CAS_SPEAKER_SOURCES
   ${BROKER_DIR}/cas_dispatch.c
   ${BROKER_DIR}/cas_conn_helpers.c
@@ -796,6 +795,7 @@ set(CAS_SPEAKER_SOURCES
   ${BROKER_DIR}/cas_optimization.c
   ${BROKER_DIR}/cas_xa.c
   ${BROKER_DIR}/cas_log.c
+  ${BROKER_DIR}/cas_ssl.c
   ${BROKER_DIR}/query_replace.c
   ${BROKER_DIR}/cas_server_support.cpp
   ${BROKER_DIR}/broker_filename.c
