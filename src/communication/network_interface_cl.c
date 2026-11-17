@@ -9453,7 +9453,8 @@ thread_kill_or_interrupt_tran (int *tran_index_list, int num_tran_index, bool is
   *num_killed = 0;
   for (i = 0; i < num_tran_index; i++)
     {
-      int error = xlogtb_kill_or_interrupt_tran (thread_p, tran_index_list[i], is_dba_group_member, interrupt_only);
+      /* the server decides the DBA group membership from the session's registered user (CBRD-27447) */
+      int error = xlogtb_kill_or_interrupt_tran (thread_p, tran_index_list[i], interrupt_only);
       if (error == ER_KILL_TR_NOT_ALLOWED)
 	{
 	  success = error;
