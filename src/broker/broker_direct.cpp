@@ -1411,6 +1411,8 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
 	  m->shm->statement_pooling ? CAS_STATEMENT_POOLING_ON : CAS_STATEMENT_POOLING_OFF;
   body.broker_info[BROKER_INFO_CCI_PCONNECT] = m->shm->cci_pconnect ? CCI_PCONNECT_ON : CCI_PCONNECT_OFF;
   body.keep_con_auto = m->shm->keep_connection == KEEP_CON_AUTO ? 1 : 0;
+  body.access_mode = (std::uint8_t) m->shm->access_mode;
+  body.replica_only = m->shm->replica_only_flag ? 1 : 0;
   std::memcpy (body.driver_header, job->driver_info, adopt::DRIVER_HEADER_SIZE);
   std::memcpy (body.db_info, db_info.get (), adopt::DRIVER_DB_INFO_SIZE);
 

@@ -1808,6 +1808,11 @@ boot_resume_client (BOOT_CLIENT_CREDENTIAL * client_credential, const char *pass
     }
   boot_client (tran_index, tran_lock_wait_msecs, tran_isolation);
 
+  /* the new connection's broker may be of another access mode than the one the session was made through */
+  db_set_client_type (client_credential->client_type);
+  db_Client_disable_modifications =
+    (prm_get_bool_value (PRM_ID_READ_ONLY_MODE) || BOOT_READ_ONLY_CLIENT_TYPE (client_credential->client_type)) ? 1 : 0;
+
   error_code = au_login (client_credential->get_db_user (), password, true);
   if (error_code == NO_ERROR)
     {

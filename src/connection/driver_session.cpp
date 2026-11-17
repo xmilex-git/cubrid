@@ -47,6 +47,7 @@
 #include "db_client_type.hpp"
 #include "error_manager.h"
 #include "network_interface_cl.h"	// boot_unregister_client
+#include "server_support.h"	// css_ha_server_state
 #include "session.h"		// session_adopt_client_context
 #include "storage_common.h"	// NULL_TRAN_INDEX
 #include "system_parameter.h"	// PRM_ID_ORACLE_COMPAT_NUMBER_BEHAVIOR
@@ -61,6 +62,7 @@
 #include "cas_common_execute.h"	// cas_log_error_handler_begin/end
 #include "cas_common_vars.h"	// req_info (thread_local CAS globals)
 #include "cas_dispatch.h"	// cas_process_request + server-support API
+#include "boot.h"			// client type classes
 #include "boot_cl.h"		// boot_resume_client
 #include "broker_config.h"	// KEEP_CON_AUTO
 #include "cas.h"		// is_xa_prepared
@@ -208,6 +210,62 @@ namespace cubconn
 	}
       out.is_health_check = (std::strcmp (out.db_name, HEALTH_CHECK_DUMMY_DB) == 0);
       return NO_ERROR;
+    }
+
+    int
+    synthesize_client_type (int access_mode, int replica_only)
+    {
+      if (access_mode == READ_ONLY_ACCESS_MODE)
+	{
+	  return replica_only ? DB_CLIENT_TYPE_RO_BROKER_REPLICA_ONLY : DB_CLIENT_TYPE_READ_ONLY_BROKER;
+	}
+      if (access_mode == SLAVE_ONLY_ACCESS_MODE)
+	{
+	  return replica_only ? DB_CLIENT_TYPE_SO_BROKER_REPLICA_ONLY : DB_CLIENT_TYPE_SLAVE_ONLY_BROKER;
+	}
+      return replica_only ? DB_CLIENT_TYPE_RW_BROKER_REPLICA_ONLY : DB_CLIENT_TYPE_BROKER;
+    }
+
+    const char *
+    admission_check (int client_type, int ha_state, bool is_replica_server, bool repl_delayed)
+    {
+      /* A CAS ran its host list again after every reset and its first pass refused these, so it ended on a host
+       * of the right state; the driver's altHosts do that now.  A server without HA is active: it refuses a
+       * slave-only broker, as that broker's CAS failed to connect to it. */
+      if (BOOT_REPLICA_ONLY_BROKER_CLIENT_TYPE (client_type) && !is_replica_server)
+	{
+	  return "a replica-only broker needs a replica server";
+	}
+      switch (ha_state)
+	{
+	case HA_SERVER_STATE_MAINTENANCE:
+	  return "the server is in maintenance mode";
+	case HA_SERVER_STATE_TO_BE_STANDBY:
+	  if (BOOT_NORMAL_CLIENT_TYPE (client_type))
+	    {
+	      return "the server is changing to standby mode";
+	    }
+	  break;
+	case HA_SERVER_STATE_STANDBY:
+	  if (client_type == DB_CLIENT_TYPE_BROKER)
+	    {
+	      return "a read-write broker on a standby server";
+	    }
+	  if (repl_delayed)
+	    {
+	      return "replication is delayed on this standby server";
+	    }
+	  break;
+	case HA_SERVER_STATE_ACTIVE:
+	  if (client_type == DB_CLIENT_TYPE_SLAVE_ONLY_BROKER)
+	    {
+	      return "a slave-only broker on an active server";
+	    }
+	  break;
+	default:
+	  break;
+	}
+      return NULL;
     }
 
     int
@@ -483,7 +541,7 @@ namespace cubconn
       if (entry_p == NULL)
 	{
 	  registry_begin_session_cleanup (params.token);
-	  css_decrement_num_conn (DB_CLIENT_TYPE_DEFAULT);	/* the adoption channel's increment */
+	  css_decrement_num_conn ((BOOT_CLIENT_TYPE) params.client_type);	/* the adoption channel's increment */
 	  registry_session_finished (params.token);
 	  close (params.client_fd);
 	  return;
@@ -510,7 +568,7 @@ namespace cubconn
 	}
       /* pairs with the adoption channel's css_increment_num_conn: css_free_conn
        * decrements by conn->client_type on every exit path */
-      conn->client_type = DB_CLIENT_TYPE_DEFAULT;
+      conn->client_type = (BOOT_CLIENT_TYPE) params.client_type;
       css_insert_into_active_conn_list (conn);
       entry_p->conn_entry = conn;
 
@@ -631,6 +689,20 @@ namespace cubconn
 	  goto retire;
 	}
 
+      {
+	const char *const deny = admission_check (params.client_type, (int) css_ha_server_state (),
+				 HA_GET_MODE () == HA_MODE_REPLICA, css_is_ha_repl_delayed ());
+	if (deny != NULL)
+	  {
+	    /* CAS_ER_FREE_SERVER is one of the errors a driver goes to its next altHost on */
+	    send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, CAS_ERROR_INDICATOR, CAS_ER_FREE_SERVER,
+			      deny);
+	    cas_log_write_and_end (0, false, "connect db %s user %s url %s - refused: %s", info.db_name,
+				   info.db_user, info.url, deny);
+	    goto retire;
+	  }
+      }
+
       logddl_init (APP_NAME_CAS);
       logddl_check_ddl_audit_param ();
       logddl_set_broker_info (shm_as_index, broker_name);
@@ -683,7 +755,7 @@ namespace cubconn
 	{
 	  BOOT_CLIENT_CREDENTIAL credential;
 
-	  credential.client_type = DB_CLIENT_TYPE_DEFAULT;
+	  credential.client_type = (BOOT_CLIENT_TYPE) params.client_type;
 	  credential.db_name = info.db_name;
 	  credential.db_user = info.db_user;
 	  credential.program_name = "driver_session";
@@ -697,7 +769,7 @@ namespace cubconn
 	  /* client-half boot with the driver's credentials; serialization is the
 	   * engine's own (boot_restart_client) since A5 */
 	  err = db_restart_ex ("driver_session", info.db_name, info.db_user, info.db_passwd, NULL,
-			       DB_CLIENT_TYPE_DEFAULT);
+			       params.client_type);
 	}
       if (err != NO_ERROR)
 	{
@@ -706,7 +778,18 @@ namespace cubconn
 	  const char *const message = er_msg () != NULL ? er_msg () : "";
 	  char msg_buf[LINE_MAX];
 
-	  send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, DBMS_ERROR_INDICATOR, err, message);
+	  if (err == ERR_CSS_ERROR_FROM_SERVER)
+	    {
+	      /* the server went to to-be-standby after the admission check and refused the registration
+	       * (css_check_ha_server_state_for_client): the driver goes to its next altHost on this, on a DBMS
+	       * error it would not */
+	      send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, CAS_ERROR_INDICATOR, CAS_ER_FREE_SERVER,
+				message);
+	    }
+	  else
+	    {
+	      send_error_reply (params.client_fd, CAS_INFO_STATUS_INACTIVE, DBMS_ERROR_INDICATOR, err, message);
+	    }
 	  snprintf (msg_buf, sizeof (msg_buf), "connect db %s user %s url %s, error:%d%s%s", info.db_name,
 		    info.db_user, info.url, err, message[0] != '\0' ? ", " : ".", message);
 	  cas_log_write_and_end (0, false, "%s", msg_buf);
@@ -846,7 +929,7 @@ retire:
       else
 	{
 	  /* never got a conn entry: pair the adoption channel's increment here */
-	  css_decrement_num_conn (DB_CLIENT_TYPE_DEFAULT);
+	  css_decrement_num_conn ((BOOT_CLIENT_TYPE) params.client_type);
 	}
       entry_p->tran_index = NULL_TRAN_INDEX;
       entry_p->m_status = cubthread::entry::status::TS_DEAD;

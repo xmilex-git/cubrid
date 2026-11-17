@@ -78,6 +78,7 @@ struct db_cl_context
   char program_name[PATH_MAX] = {};
   char client_ip_addr[16] = {};
   int client_type = 1;		/* DB_CLIENT_TYPE_DEFAULT (db_client_type.hpp) */
+  int disable_modifications = 0;	/* what db_Disable_modifications was to a client process */
   CUBRID_STMT_TYPE client_statement_type = CUBRID_STMT_NONE;
   int is_doing_end_session = -1;
   db_qres_table qres_table;
@@ -102,6 +103,15 @@ extern CUB_THREAD_LOCAL SESSION_ID db_Session_id;
 #define _DB_DISABLE_MODIFICATIONS_
 extern CUB_THREAD_LOCAL int db_Disable_modifications;
 #endif /* _DB_DISABLE_MODIFICATIONS_ */
+
+/* The gate of the db_ entry points: a client's own (a read-only client type, read_only, a builtin method call in
+ * progress).  A session of the folded server has its own, as a CAS process had; db_Disable_modifications there
+ * is the server's (logtb_disable_update), which the transaction's gate is seeded from. */
+#if defined (SERVER_MODE)
+#define db_Client_disable_modifications (csc_db ()->disable_modifications)
+#else
+#define db_Client_disable_modifications db_Disable_modifications
+#endif
 
 #if defined (SERVER_MODE)
 #define db_Database_name (csc_db ()->database_name)
@@ -160,14 +170,14 @@ extern char db_Program_name[];
 /* CHECK MODIFICATION */
 #define CHECK_MODIFICATION_VOID()                                            \
   do {                                                                       \
-    if (db_Disable_modifications) {                                          \
+    if (db_Client_disable_modifications) {                                          \
       er_set(ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_DB_NO_MODIFICATIONS, 0);   \
       return;                                                                \
     }                                                                        \
   } while (0)
 
 #define CHECK_MODIFICATION_AND_RETURN_EXPR(return_expr_)                     \
-  if (db_Disable_modifications) {                                            \
+  if (db_Client_disable_modifications) {                                            \
     er_set(ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_DB_NO_MODIFICATIONS, 0);     \
     return (return_expr_);                                                   \
   }
@@ -187,10 +197,10 @@ extern char db_Program_name[];
   error = NO_ERROR;
 #else /* SA_MODE */
 #define CHECK_MODIFICATION_NO_RETURN(error)                                  \
-  if (db_Disable_modifications) {                                            \
+  if (db_Client_disable_modifications) {                                            \
     er_set(ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_DB_NO_MODIFICATIONS, 0);     \
     er_log_debug (ARG_FILE_LINE, "db_Disable_modification = %d\n",           \
-		  db_Disable_modifications);                                  \
+		  db_Client_disable_modifications);                                  \
     error = ER_DB_NO_MODIFICATIONS;                                          \
   } else {                                                                   \
     error = NO_ERROR;                                                        \

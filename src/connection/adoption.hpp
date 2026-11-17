@@ -145,7 +145,8 @@ namespace cubconn
     {
       std::uint32_t client_ip;	/* network byte order, as read from the peer */
       std::uint16_t client_port;
-      std::uint16_t reserved;
+      std::uint8_t access_mode;	/* the broker's ACCESS_MODE */
+      std::uint8_t replica_only;	/* the broker's REPLICA_ONLY */
       std::int32_t slot_idx;	/* broker slot index; echoed in the connect reply */
       char broker_info[DRIVER_BROKER_INFO_SIZE];	/* echoed in the connect reply */
       char driver_header[DRIVER_HEADER_SIZE];	/* the peeked 10-byte client header */

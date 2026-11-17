@@ -66,6 +66,15 @@ namespace cubconn
      * not carried over, #116 D3) */
     int parse_driver_protocol (const char (&driver_header)[DRIVER_HEADER_SIZE]);
 
+    /* the DB_CLIENT_TYPE a CAS of a broker with this ACCESS_MODE and REPLICA_ONLY connected as
+     * (ux_database_connect) */
+    int synthesize_client_type (int access_mode, int replica_only);
+
+    /* The client type and HA state combinations xtran_should_connection_reset closes at a transaction boundary,
+     * and a replica-only broker on a server that is no replica, are refused when the session is established.
+     * ha_state is an HA_SERVER_STATE.  Returns NULL to admit, else the reason. */
+    const char *admission_check (int client_type, int ha_state, bool is_replica_server, bool repl_delayed);
+
     /* build the V4+ CAS connect reply (36 payload bytes + 4-byte length
      * prefix + 4-byte cas_info = 44 bytes total).  session_20b is the
      * DRIVER_SESSION_SIZE driver session blob.  Returns bytes written. */
@@ -85,6 +94,7 @@ namespace cubconn
       char driver_header[DRIVER_HEADER_SIZE];
       char db_info[DRIVER_DB_INFO_SIZE];
       bool keep_con_auto;	/* the broker's KEEP_CONNECTION is AUTO */
+      int client_type;		/* the DB_CLIENT_TYPE of the broker's ACCESS_MODE and REPLICA_ONLY */
       session_config config;	/* the broker's conf for the session */
       std::string broker_name;	/* the broker that hands the connection over */
       std::string server_name;	/* this server's database name */

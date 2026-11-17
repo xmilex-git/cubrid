@@ -224,6 +224,11 @@ exit_server (const THREAD_ENTRY & thread_ref)
       int errid;
 
       (void) abort_tran_on_error (const_cast < THREAD_ENTRY * >(&thread_ref), TRAN_UNACTIVE_UNKNOWN, &errid);
+      if (errid == ER_DB_NO_MODIFICATIONS && thread_ref.conn_entry != NULL)
+	{
+	  /* as return_error_to_client: the reset table closes a normal client on a standby at its next boundary */
+	  thread_ref.conn_entry->reset_on_commit = true;
+	}
     }
 #else
   (void) thread_ref;		// not really used; just to force caller declare obtain thread entry
@@ -231,6 +236,37 @@ exit_server (const THREAD_ENTRY & thread_ref)
 
   exit_server_no_thread_entry ();
 }
+
+#if defined (SERVER_MODE)
+/*
+ * modification_is_refused () - the check net_server_request makes before a request marked CHECK_DB_MODIFICATION
+ *
+ * return : true when the transaction may not write; ER_DB_NO_MODIFICATIONS is set, and exit_server rolls back
+ *
+ * thread_p (in) : the thread that entered the server half
+ */
+static bool
+modification_is_refused (THREAD_ENTRY * thread_p)
+{
+  int error;
+
+  CHECK_MODIFICATION_NO_RETURN (thread_p, error);
+  return error != NO_ERROR;
+}
+
+#define RETURN_IF_MODIFICATION_REFUSED(thread_p, ret) \
+  do \
+    { \
+      if (modification_is_refused (thread_p)) \
+	{ \
+	  exit_server (*(thread_p)); \
+	  return ret; \
+	} \
+    } \
+  while (0)
+#else
+#define RETURN_IF_MODIFICATION_REFUSED(thread_p, ret)
+#endif
 #endif /* !CS_MODE */
 
 #if defined(CS_MODE)
@@ -840,7 +876,16 @@ locator_force (LC_COPYAREA * copy_area, int num_ignore_error_list, int *ignore_e
 
   THREAD_ENTRY *thread_p = enter_server ();
 
-  error_code = xlocator_force (thread_p, copy_area, num_ignore_error_list, ignore_error_list);
+#if defined (SERVER_MODE)
+  if (modification_is_refused (thread_p))
+    {
+      error_code = ER_DB_NO_MODIFICATIONS;
+    }
+  else
+#endif
+    {
+      error_code = xlocator_force (thread_p, copy_area, num_ignore_error_list, ignore_error_list);
+    }
 
   exit_server (*thread_p);
 
@@ -1169,6 +1214,7 @@ locator_reserve_class_names (const int num_classes, const char **class_names, OI
   LC_FIND_CLASSNAME reserved = LC_CLASSNAME_ERROR;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, LC_CLASSNAME_ERROR);
 
   reserved = xlocator_reserve_class_names (thread_p, num_classes, class_names, class_oids);
 
@@ -1229,6 +1275,7 @@ locator_get_reserved_class_name_oid (const char *classname, OID * class_oid)
   int is_reserved;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_DB_NO_MODIFICATIONS);
 
   is_reserved = xlocator_get_reserved_class_name_oid (thread_p, classname, class_oid);
 
@@ -1284,6 +1331,7 @@ locator_delete_class_name (const char *class_name)
   LC_FIND_CLASSNAME deleted = LC_CLASSNAME_ERROR;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, LC_CLASSNAME_ERROR);
 
   deleted = xlocator_delete_class_name (thread_p, class_name);
 
@@ -1344,6 +1392,7 @@ locator_rename_class_name (const char *old_name, const char *new_name, OID * cla
   LC_FIND_CLASSNAME renamed = LC_CLASSNAME_ERROR;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, LC_CLASSNAME_ERROR);
 
   renamed = xlocator_rename_class_name (thread_p, old_name, new_name, class_oid);
 
@@ -1406,6 +1455,7 @@ locator_assign_oid (const HFID * hfid, OID * perm_oid, int expected_length, OID 
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xlocator_assign_oid (thread_p, hfid, perm_oid, expected_length, class_oid, class_name);
 
@@ -1478,6 +1528,7 @@ locator_assign_oid_batch (LC_OIDSET * oidset)
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xlocator_assign_oid_batch (thread_p, oidset);
 
@@ -1757,6 +1808,7 @@ heap_create (HFID * hfid, const OID * class_oid, bool reuse_oid)
   int success;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xheap_create (thread_p, hfid, class_oid, reuse_oid);
 
@@ -1806,6 +1858,7 @@ heap_destroy (const HFID * hfid)
   int success;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xheap_destroy (thread_p, hfid, NULL);
 
@@ -1857,6 +1910,7 @@ heap_destroy_newly_created (const HFID * hfid, const OID * class_oid, const bool
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xheap_destroy_newly_created (thread_p, hfid, class_oid, force);
 
@@ -2010,6 +2064,7 @@ heap_reclaim_addresses (const HFID * hfid)
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xheap_reclaim_addresses (thread_p, hfid);
 
@@ -2098,6 +2153,7 @@ file_apply_tde_to_class_files (const OID * class_oid)
   int success;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xfile_apply_tde_to_class_files (thread_p, class_oid);
 
@@ -3065,11 +3121,27 @@ tran_server_commit (bool retain_lock)
   THREAD_ENTRY *thread_p = enter_server ();
 
 #if defined (SERVER_MODE)
+  const bool has_updated = logtb_has_updated (thread_p);
+
+  /* net_server_request refuses the commit of a transaction that wrote and may not write any more */
+  if (has_updated)
+    {
+      RETURN_IF_MODIFICATION_REFUSED (thread_p, TRAN_UNACTIVE_UNKNOWN);
+    }
+
   /* the row count rides the commit request on the wire path (see stran_server_commit) */
   (void) xsession_set_row_count (thread_p, db_get_row_count_cache ());
 #endif /* SERVER_MODE */
 
   tran_state = xtran_server_commit (thread_p, retain_lock);
+
+#if defined (SERVER_MODE)
+  /* the reply of a CS commit carries this; its client is reset, and a session is that client */
+  if (xtran_should_connection_reset (thread_p, has_updated))
+    {
+      db_Connect_status = DB_CONNECTION_STATUS_RESET;
+    }
+#endif /* SERVER_MODE */
 
   exit_server (*thread_p);
 
@@ -3125,7 +3197,18 @@ tran_server_abort (void)
 
   THREAD_ENTRY *thread_p = enter_server ();
 
+#if defined (SERVER_MODE)
+  const bool has_updated = logtb_has_updated (thread_p);
+#endif /* SERVER_MODE */
+
   tran_state = xtran_server_abort (thread_p);
+
+#if defined (SERVER_MODE)
+  if (xtran_should_connection_reset (thread_p, has_updated))
+    {
+      db_Connect_status = DB_CONNECTION_STATUS_RESET;
+    }
+#endif /* SERVER_MODE */
 
   exit_server (*thread_p);
 
@@ -3716,6 +3799,7 @@ tran_server_start_topop (LOG_LSA * topop_lsa)
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   if (xtran_server_start_topop (thread_p, topop_lsa) != NO_ERROR)
     {
@@ -3772,6 +3856,7 @@ tran_server_end_topop (LOG_RESULT_TOPOP result, LOG_LSA * topop_lsa)
   TRAN_STATE tran_state = TRAN_UNACTIVE_UNKNOWN;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, TRAN_UNACTIVE_UNKNOWN);
 
   tran_state = xtran_server_end_topop (thread_p, result, topop_lsa);
 
@@ -3828,6 +3913,7 @@ tran_server_savepoint (const char *savept_name, LOG_LSA * savept_lsa)
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xtran_server_savepoint (thread_p, savept_name, savept_lsa);
 
@@ -6469,7 +6555,16 @@ end:
   class_attr_ndv.total_rows = prov_rows;
 
   thread_p = enter_server ();
-  error = xstats_update_statistics (thread_p, WS_OID (classop), with_fullscan, &class_attr_ndv);
+#if defined (SERVER_MODE)
+  if (modification_is_refused (thread_p))
+    {
+      error = ER_DB_NO_MODIFICATIONS;
+    }
+  else
+#endif
+    {
+      error = xstats_update_statistics (thread_p, WS_OID (classop), with_fullscan, &class_attr_ndv);
+    }
   exit_server (*thread_p);
 
 end:
@@ -6841,6 +6936,7 @@ btree_add_index (BTID * btid, TP_DOMAIN * key_type, OID * class_oid, int attr_id
   int error = NO_ERROR;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_DB_NO_MODIFICATIONS);
 
   btid = xbtree_add_index (thread_p, btid, key_type, class_oid, attr_id, unique_pk, 0, 0, 0);
   if (btid == NULL)
@@ -7087,6 +7183,7 @@ btree_load_index (BTID * btid, const char *bt_name, TP_DOMAIN * key_type, OID * 
 #endif
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_DB_NO_MODIFICATIONS);
 
   if (index_status == SM_ONLINE_INDEX_BUILDING_IN_PROGRESS)
     {
@@ -7167,6 +7264,7 @@ btree_delete_index (BTID * btid)
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xbtree_delete_index (thread_p, btid);
 
@@ -7246,6 +7344,7 @@ locator_remove_class_from_index (OID * oid, BTID * btid, HFID * hfid)
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xlocator_remove_class_from_index (thread_p, oid, btid, hfid);
 
@@ -7609,6 +7708,7 @@ btree_compact_overflow (BTID * btid, int fill_factor, INT64 * keys_compacted, IN
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xbtree_compact_overflow (thread_p, btid, fill_factor, keys_compacted, pages_freed, pairs_skipped);
 
@@ -8888,6 +8988,7 @@ serial_get_next_value (DB_VALUE * value, OID * oid_p, int cached_num, int num_al
   int error;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_DB_NO_MODIFICATIONS);
 
   /*
    * If a client wants to generate AUTO_INCREMENT value during client-side
@@ -9215,6 +9316,7 @@ catalog_check_rep_dir (OID * class_id, OID * rep_dir_p)
   int success = ER_FAILED;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_FAILED);
 
   success = xcatalog_check_rep_dir (thread_p, class_id, rep_dir_p);
 
@@ -10367,6 +10469,7 @@ locator_check_fk_validity (OID * cls_oid, HFID * hfid, TP_DOMAIN * key_type, int
   int error = NO_ERROR;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_DB_NO_MODIFICATIONS);
 
   error =
     xlocator_check_fk_validity (thread_p, cls_oid, hfid, key_type, n_attrs, attr_ids, pk_cls_oid, pk_btid, fk_name);
@@ -11213,6 +11316,7 @@ locator_upgrade_instances_domain (OID * class_oid, int attribute_id)
   int error = NO_ERROR;
 
   THREAD_ENTRY *thread_p = enter_server ();
+  RETURN_IF_MODIFICATION_REFUSED (thread_p, ER_DB_NO_MODIFICATIONS);
 
   error = xlocator_upgrade_instances_domain (thread_p, class_oid, attribute_id);
 

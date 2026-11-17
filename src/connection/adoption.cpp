@@ -724,9 +724,10 @@ namespace cubconn
       binding->client_fd = client_fd;
       binding->config = body.config;
 
-      /* adopted connections take normal seats (#117 D5/D6); the decrement
-       * runs in the session thread's css_free_conn */
-      if (css_increment_num_conn (DB_CLIENT_TYPE_DEFAULT) != NO_ERROR)
+      /* the session is the client type a CAS of this broker was (ux_database_connect); it takes that type's
+       * seat, and css_free_conn of the session's thread gives it back by conn->client_type */
+      const int client_type = synthesize_client_type (body.access_mode, body.replica_only);
+      if (css_increment_num_conn ((BOOT_CLIENT_TYPE) client_type) != NO_ERROR)
 	{
 	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_CSS_CLIENTS_EXCEEDED, 1, NUM_NORMAL_TRANS);
 	  reject.reason = (std::int32_t) reject_reason::CLIENTS_EXCEEDED;
@@ -744,6 +745,7 @@ namespace cubconn
       std::memcpy (params.driver_header, body.driver_header, sizeof (params.driver_header));
       std::memcpy (params.db_info, body.db_info, sizeof (params.db_info));
       params.keep_con_auto = body.keep_con_auto != 0;
+      params.client_type = client_type;
       params.config = body.config;
       params.broker_name = ch.broker_name;
       params.server_name = m.db_name;
@@ -796,7 +798,7 @@ namespace cubconn
       }
       if (refused)
 	{
-	  css_decrement_num_conn (DB_CLIENT_TYPE_DEFAULT);
+	  css_decrement_num_conn ((BOOT_CLIENT_TYPE) client_type);
 	  reject.reason = (std::int32_t) reject_reason::SHUTDOWN;
 	  (void) send_message (ch, msg_op::HANDOFF_REJECT, &reject, sizeof (reject));
 	  close (client_fd);
@@ -829,7 +831,7 @@ namespace cubconn
 	    }
 	}
       registry_begin_session_cleanup (token);
-      css_decrement_num_conn (DB_CLIENT_TYPE_DEFAULT);
+      css_decrement_num_conn ((BOOT_CLIENT_TYPE) client_type);
       registry_session_finished (token);
       close (client_fd);
     }

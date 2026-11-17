@@ -1358,7 +1358,7 @@ db_shutdown (void)
 #if !defined(WINDOWS) && !defined (SERVER_MODE)
   (void) os_set_signal_handler (SIGFPE, prev_sigfpe_handler);
 #endif
-  db_Disable_modifications = 0;
+  db_Client_disable_modifications = 0;
 
   db_free_execution_plan ();
 
@@ -1456,8 +1456,8 @@ int
 db_disable_modification (void)
 {
   /* CHECK_CONNECT_ERROR (); */
-  assert (db_Disable_modifications >= 0);
-  db_Disable_modifications++;
+  assert (db_Client_disable_modifications >= 0);
+  db_Client_disable_modifications++;
   return NO_ERROR;
 }
 
@@ -1471,8 +1471,8 @@ int
 db_enable_modification (void)
 {
   /* CHECK_CONNECT_ERROR (); */
-  db_Disable_modifications--;
-  assert (db_Disable_modifications >= 0);
+  db_Client_disable_modifications--;
+  assert (db_Client_disable_modifications >= 0);
   return NO_ERROR;
 }
 
