@@ -91,11 +91,7 @@ namespace cubpl
     char *auth;
     int result_type; // DB_TYPE
 
-#if defined (CS_MODE) || defined (SERVER_MODE)
-    /* compile side only, not packed: the folded server compiles as a CS client does */
-    bool is_deterministic; // DETERMINISTIC
-#endif
-    /* PARALLEL_ENABLE. Unlike is_deterministic this one is packed, because the server has to
+    /* PARALLEL_ENABLE. Packed, because the server has to
      * refuse the client callbacks of a declared SP (see execution_stack::send_data_to_client_recv).
      * pl_signature travels on the XASL stream only, so this is not a Java or broker wire change. */
     bool is_parallel_enabled;

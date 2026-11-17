@@ -246,6 +246,9 @@ set(COMMUNICATION_SOURCES
   ${COMMUNICATION_DIR}/network_callback_sr.cpp
   ${COMMUNICATION_DIR}/network_interface_sr.cpp
   ${COMMUNICATION_DIR}/network_sr.c
+  ${COMMUNICATION_DIR}/stream_session.cpp
+  ${COMMUNICATION_DIR}/stream_handle.cpp
+  ${COMMUNICATION_DIR}/stream_debug_echo.cpp
   )
 
 set(DEBUGGING_HEADERS
@@ -660,6 +663,7 @@ set(CLIENT_HALF_SOURCES
   ${COMMUNICATION_DIR}/network_callback_cl.cpp
   ${COMMUNICATION_DIR}/network_histogram.cpp
   ${COMMUNICATION_DIR}/network_interface_cl.c
+  ${COMMUNICATION_DIR}/stream_client.c
   ${COMPAT_DIR}/db_admin.c
   ${COMPAT_DIR}/db_class.c
   ${COMPAT_DIR}/db_info.c

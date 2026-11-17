@@ -67,10 +67,9 @@
 #include "broker_process_size.h"
 #include "cas_ssl.h"
 
+// XXX: SHOULD BE THE LAST INCLUDE HEADER
+#include "memory_wrapper.hpp"
 
-/* ========================================================================
- * Function Tables
- * ======================================================================== */
 
 
 
@@ -375,6 +374,8 @@ cas_cleanup_session (void)
   if (cas_main_fn_ret != FN_KEEP_SESS)
     {
       ux_end_session ();
+      /* the server session, and with it any stream session it held, is gone */
+      ux_stream_reset ();
     }
 
   if (is_xa_prepared ())

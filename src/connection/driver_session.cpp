@@ -586,6 +586,11 @@ namespace cubconn
 	    }
 	  db_set_keep_session (yielded);
 	  (void) ux_end_session ();
+	  if (!yielded)
+	    {
+	      /* the server session, and with it any stream session it held, is gone */
+	      ux_stream_reset ();
+	    }
 	}
       else if (resumed)
 	{
