@@ -1231,6 +1231,17 @@ appl_monitor (char *br_vector, double elapsed_time)
 	    {
 	      shard_flag = shm_appl->shard_flag;
 	      print_newline ();
+	      if (shm_br->br_info[i].direct_handoff == ON)
+		{
+		  /* no CAS rows: the sessions are the servers' (SHOW SESSION STATUS) */
+		  str_out ("  ACCEPTED : %lld, HANDOFFS : %lld, REJECTED : %lld, SLOTS : %d/%d",
+			   (long long) shm_appl->brd_num_accepted, (long long) shm_appl->brd_num_handoffs,
+			   (long long) shm_appl->brd_num_rejected, shm_appl->brd_slots_used,
+			   shm_br->br_info[i].appl_server_max_num);
+		  print_newline ();
+		  print_newline ();
+		  continue;
+		}
 #if defined (WINDOWS)
 	      print_appl_header (shm_appl->use_pdh_flag);
 #else
@@ -1420,6 +1431,17 @@ set_monitor_items (BR_MONITORING_ITEM * mnt_items, T_BROKER_INFO * br_info_p, T_
   assert (mnt_type <= MONITOR_T_LAST);
 
   mnt_item_p = mnt_items;
+
+  if (br_info_p->direct_handoff == ON)
+    {
+      /* no CAS rows: the counters cub_broker keeps of its clients */
+      mnt_item_p->num_appl_server = shm_appl->brd_slots_used;
+      mnt_item_p->num_connect = shm_appl->brd_num_accepted;
+      mnt_item_p->num_connect_reject = shm_appl->brd_num_rejected;
+      mnt_item_p->num_request = shm_appl->brd_num_handoffs;
+      mnt_item_p->num_busy = shm_appl->brd_slots_used;
+      return;
+    }
 
   mnt_item_p->num_appl_server = br_info_p->appl_server_num;
   for (i = 0; i < br_info_p->appl_server_max_num; i++)

@@ -817,7 +817,9 @@ namespace cubconn
 	}
 
       /* cancel arrives on the control channel as a tran interrupt (#117 D4) */
-      registry_set_tran_index (params.token, tm_Tran_index);
+      registry_set_tran_index (params.token, tm_Tran_index, db_get_session_id (),
+			       DOES_CLIENT_UNDERSTAND_THE_PROTOCOL (CAS_MAKE_PROTO_VER (params.driver_header),
+								    PROTOCOL_V13));
 
       /* the new-connection defaults capture ux_database_connect performs
        * (cas_execute.c:493): isolation/lock-timeout baselines + sys params */

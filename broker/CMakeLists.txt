@@ -352,18 +352,13 @@ else(UNIX)
   list(APPEND CUB_CAS_SOURCES ${CMAKE_BINARY_DIR}/version.rc)
 endif(UNIX)
 
-add_executable(cub_cas WIN32 ${CUB_CAS_SOURCES})
-target_compile_definitions(cub_cas PRIVATE ${BROKER_DEFS} CAS_CUBRID)
-target_include_directories(cub_cas PRIVATE ${EP_INCLUDES})
-target_link_libraries(cub_cas LINK_PRIVATE cas_common_lib cubridcs)
-if(UNIX)
-  target_link_libraries(cub_cas LINK_PRIVATE rt ${LIBOPENSSL_LIBS})
-  if(TARGET ${LIBOPENSSL_TARGET})
-    add_dependencies(cub_cas ${LIBOPENSSL_TARGET})
-  endif()
-else(UNIX)
-  target_link_libraries(cub_cas LINK_PRIVATE ws2_32 dbghelp ${LIBOPENSSL_LIBS})
-endif(UNIX)
+# on UNIX a broker hands its connections to the database server (DIRECT_HANDOFF): no CAS process
+if(WIN32)
+  add_executable(cub_cas WIN32 ${CUB_CAS_SOURCES})
+  target_compile_definitions(cub_cas PRIVATE ${BROKER_DEFS} CAS_CUBRID)
+  target_include_directories(cub_cas PRIVATE ${EP_INCLUDES})
+  target_link_libraries(cub_cas LINK_PRIVATE cas_common_lib cubridcs ws2_32 dbghelp ${LIBOPENSSL_LIBS})
+endif(WIN32)
 
 set(CUB_CAS_CGW_SOURCES
   ${BROKER_DIR}/cas_cgw.c
@@ -656,7 +651,6 @@ install(TARGETS
   broker_changer
   cubrid_broker
   cubrid_gateway
-  cub_cas
   cub_cas_cgw
   cub_proxy
   broker_log_top
@@ -665,6 +659,9 @@ install(TARGETS
   LIBRARY DESTINATION ${CUBRID_LIBDIR} COMPONENT Library
   PUBLIC_HEADER DESTINATION ${CUBRID_INCLUDEDIR} COMPONENT Header
   )
+if(WIN32)
+  install(TARGETS cub_cas RUNTIME DESTINATION ${CUBRID_BINDIR} COMPONENT Application)
+endif(WIN32)
 
 
 # TODO: compat uc script?

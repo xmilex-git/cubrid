@@ -31,6 +31,7 @@
 #include "driver_session.hpp"
 
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -105,6 +106,8 @@ namespace cubconn
       int users = 0;
       bool closing = false;
       int tran_index = NULL_TRAN_INDEX;
+      unsigned int session_id = 0;	/* with tran_index: what a cancel or status probe must name */
+      bool session_id_required = false;
       int client_fd = -1;
       int wake_fd = -1;		/* AUTO: wakes the session's wait for a request */
       std::atomic<execution_state> state { execution_state::busy };
@@ -199,7 +202,6 @@ namespace cubconn
       /* per broker name, the conf with the largest seq a handoff or a SESSION_CONFIG of that broker brought:
        * the conf of a session handed over with an older one (registry_mutex) */
       std::unordered_map<std::string, session_config> latest_config;
-      std::uint32_t next_token = 1;
 
       /* sign-off callbacks still touching this manager after their registry
        * erase; stop() must not free the manager under them (codex review F2) */
@@ -333,7 +335,7 @@ namespace cubconn
     /* ------------------------------------------------------------------ */
 
     void
-    registry_set_tran_index (std::uint32_t token, int tran_index)
+    registry_set_tran_index (std::uint32_t token, int tran_index, unsigned int session_id, bool session_id_required)
     {
       manager *m = adoption_Manager;
       if (m == NULL)
@@ -346,7 +348,23 @@ namespace cubconn
 	{
 	  std::lock_guard<std::mutex> binding_guard (it->second.binding->mutex);
 	  it->second.binding->tran_index = tran_index;
+	  it->second.binding->session_id = session_id;
+	  it->second.binding->session_id_required = session_id_required;
 	}
+    }
+
+    /* broker.c's check of a query cancel and of a status probe: a session id the request carries must be the
+     * session's, and a session whose driver always sends one is not reached without it (the token alone is a
+     * thread id any client of the same address can try) */
+    static bool
+    binding_is_named_by (const std::shared_ptr<session_binding> &binding, const session_ref_body &ref)
+    {
+      std::lock_guard<std::mutex> guard (binding->mutex);
+      if (ref.has_session_id)
+	{
+	  return ref.session_id == binding->session_id;
+	}
+      return !binding->session_id_required;
     }
 
     void
@@ -677,6 +695,46 @@ namespace cubconn
     /* control-channel message handlers                                   */
     /* ------------------------------------------------------------------ */
 
+    /* a session's thread between its creation and the HANDOFF_ACK of its session */
+    struct session_start
+    {
+      std::mutex mutex;
+      std::condition_variable cv;
+      int tid = 0;		/* set by the thread */
+      int go = 0;		/* set by the channel thread: 1 run the session of params, -1 leave */
+      session_params params;
+    };
+
+    static void
+    session_thread_run (std::shared_ptr<session_start> start)
+    {
+      std::unique_lock<std::mutex> guard (start->mutex);
+      start->tid = (int) syscall (SYS_gettid);
+      start->cv.notify_all ();
+      start->cv.wait (guard, [&start] { return start->go != 0; });
+      if (start->go > 0)
+	{
+	  session_params params = std::move (start->params);
+	  guard.unlock ();
+	  driver_session_run (std::move (params));
+	}
+    }
+
+    /* the ACK is out: the thread runs the session; or the adoption was refused or undone: it leaves */
+    static void
+    session_start_release (const std::shared_ptr<session_start> &start, session_params *params)
+    {
+      {
+	std::lock_guard<std::mutex> guard (start->mutex);
+	if (params != NULL)
+	  {
+	    start->params = std::move (*params);
+	  }
+	start->go = params != NULL ? 1 : -1;
+      }
+      start->cv.notify_all ();
+    }
+
     static void
     handle_handoff (manager &m, channel &ch, const handoff_body &body, int client_fd)
     {
@@ -750,10 +808,34 @@ namespace cubconn
       params.broker_name = ch.broker_name;
       params.server_name = m.db_name;
 
+      /* The session's thread is made first and waits for the ACK below.  Its kernel thread id is the session's
+       * token: the number a driver shows as its CAS's pid and names in a query cancel.  No live thread of the
+       * host has the same id, so the sessions of two databases behind one broker have different tokens, as two
+       * CAS processes had different pids. */
+      std::shared_ptr<session_start> start;
+      try
+	{
+	  start = std::make_shared<session_start> ();
+	  std::thread (session_thread_run, start).detach ();
+	}
+      catch (const std::exception &)
+	{
+	  css_decrement_num_conn ((BOOT_CLIENT_TYPE) client_type);
+	  reject.reason = (std::int32_t) reject_reason::NO_RESOURCES;
+	  (void) send_message (ch, msg_op::HANDOFF_REJECT, &reject, sizeof (reject));
+	  close (client_fd);
+	  return;
+	}
+      std::uint32_t token;
+      {
+	std::unique_lock<std::mutex> start_guard (start->mutex);
+	start->cv.wait (start_guard, [&start] { return start->tid != 0; });
+	token = (std::uint32_t) start->tid;
+      }
+
       /* register under registry_mutex, reading stopping again there: stop()
        * sets it before it walks the registry under the same mutex, so a
        * session is either refused here or seen (and shut down) by stop() */
-      std::uint32_t token = 0;
       bool refused = false;
       {
 	std::lock_guard<std::mutex> guard (m.registry_mutex);
@@ -763,16 +845,8 @@ namespace cubconn
 	  }
 	else
 	  {
-	    /* the driver's PID field is signed; never recycle a live token */
-	    do
-	      {
-		token = m.next_token++;
-		if (m.next_token > INT_MAX)
-		  {
-		    m.next_token = 1;
-		  }
-	      }
-	    while (token == 0 || m.registry.count (token) > 0);
+	    /* a thread that had this id signed its session off (registry_session_finished) before it ended */
+	    assert (m.registry.count (token) == 0);
 
 	    /* a handoff that carries an older conf than the broker has sent since takes the newer */
 	    session_config &latest = m.latest_config[ch.broker_name];
@@ -798,6 +872,7 @@ namespace cubconn
       }
       if (refused)
 	{
+	  session_start_release (start, NULL);
 	  css_decrement_num_conn ((BOOT_CLIENT_TYPE) client_type);
 	  reject.reason = (std::int32_t) reject_reason::SHUTDOWN;
 	  (void) send_message (ch, msg_op::HANDOFF_REJECT, &reject, sizeof (reject));
@@ -819,25 +894,18 @@ namespace cubconn
       ack.client_port = params.client_port;
       if (send_message (ch, msg_op::HANDOFF_ACK, &ack, sizeof (ack)) == NO_ERROR)
 	{
-	  try
-	    {
-	      std::thread session_thread (driver_session_run, std::move (params));
-	      session_thread.detach ();
-	      return;
-	    }
-	  catch (const std::system_error &)
-	    {
-	      /* no thread: sign the token off like a session would */
-	    }
+	  session_start_release (start, &params);
+	  return;
 	}
       registry_begin_session_cleanup (token);
       css_decrement_num_conn ((BOOT_CLIENT_TYPE) client_type);
       registry_session_finished (token);
+      session_start_release (start, NULL);	/* after the sign-off: the thread's id is free once it ends */
       close (client_fd);
     }
 
     static void
-    handle_cancel (manager &m, const token_body &body)
+    handle_cancel (manager &m, const session_ref_body &body)
     {
       std::shared_ptr<session_binding> binding;
       {
@@ -851,7 +919,7 @@ namespace cubconn
       /* the pin keeps the session from releasing this transaction index (and
        * another session from taking it) until the interrupt is set */
       binding_pin pin (binding);
-      if (pin.tran_index != NULL_TRAN_INDEX)
+      if (pin.tran_index != NULL_TRAN_INDEX && binding_is_named_by (binding, body))
 	{
 	  /* the query_cancel(SIGUSR1) successor (#117 D4): interrupt the
 	   * session's transaction directly */
@@ -860,14 +928,14 @@ namespace cubconn
     }
 
     static void
-    handle_status (manager &m, channel &ch, const token_body &body)
+    handle_status (manager &m, channel &ch, const session_ref_body &body)
     {
       status_reply_body reply;
       reply.fn_status = FN_STATUS_PROBE_NONE;
       {
 	std::lock_guard<std::mutex> guard (m.registry_mutex);
 	auto it = m.registry.find (body.token);
-	if (it != m.registry.end ())
+	if (it != m.registry.end () && binding_is_named_by (it->second.binding, body))
 	  {
 	    reply.fn_status = it->second.fn_status;
 	  }
@@ -1120,17 +1188,17 @@ namespace cubconn
 		}
 	      break;
 	    case msg_op::CANCEL:
-	      if (header.length == sizeof (token_body))
+	      if (header.length == sizeof (session_ref_body))
 		{
-		  token_body body;
+		  session_ref_body body;
 		  std::memcpy (&body, payload, sizeof (body));
 		  handle_cancel (*m, body);
 		}
 	      break;
 	    case msg_op::STATUS:
-	      if (header.length == sizeof (token_body))
+	      if (header.length == sizeof (session_ref_body))
 		{
-		  token_body body;
+		  session_ref_body body;
 		  std::memcpy (&body, payload, sizeof (body));
 		  handle_status (*m, *ch, body);
 		}

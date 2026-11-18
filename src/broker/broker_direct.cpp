@@ -73,6 +73,9 @@
 #include "cas_error.h"
 #include "cas_protocol.h"
 #include "environment_variable.h"
+#include "error_code.h"
+#include "language_support.h"
+#include "message_catalog.h"
 
 namespace brd
 {
@@ -178,6 +181,65 @@ namespace brd
     (void) send_all (fd, &write_val, sizeof (int));
   }
 
+  /* A cleartext driver got the broker's ack of its header (brd_park_client) and waits for the connect reply:
+   * an error goes in that reply's frame, as a CAS wrote it (net_write_error).  A bare code would be read as
+   * a length. */
+  static void
+  send_connect_error (SOCKET fd, int indicator, int code, const char *message)
+  {
+    const std::size_t msg_len = std::strlen (message) + 1;
+    std::vector<char> reply (sizeof (int) + CAS_INFO_SIZE + 2 * sizeof (int) + msg_len);
+    const char cas_info[CAS_INFO_SIZE] =
+    { CAS_INFO_STATUS_INACTIVE, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT, CAS_INFO_RESERVED_DEFAULT };
+    char *ptr = reply.data ();
+    int value = htonl ((int) (2 * sizeof (int) + msg_len));
+
+    std::memcpy (ptr, &value, sizeof (value));
+    ptr += sizeof (value);
+    std::memcpy (ptr, cas_info, sizeof (cas_info));
+    ptr += sizeof (cas_info);
+    value = htonl (indicator);
+    std::memcpy (ptr, &value, sizeof (value));
+    ptr += sizeof (value);
+    value = htonl (code);
+    std::memcpy (ptr, &value, sizeof (value));
+    ptr += sizeof (value);
+    std::memcpy (ptr, message, msg_len);
+    (void) send_all (fd, reply.data (), reply.size ());
+  }
+
+  /* the hosts of a database in databases.txt, "localhost" for one the file does not have: what a CAS named in
+   * its connect failure.  Read here because cfg_find_db reports through an error module the broker never
+   * starts. */
+  static std::string
+  database_hosts (const char *db_name)
+  {
+    std::string hosts = "localhost";
+    const char *dir = envvar_get ("DATABASES");
+    if (dir == NULL || *dir == '\0')
+      {
+	return hosts;
+      }
+    FILE *fp = fopen ((std::string (dir) + "/databases.txt").c_str (), "r");
+    if (fp == NULL)
+      {
+	return hosts;
+      }
+    char line[4096];
+    while (fgets (line, sizeof (line), fp) != NULL)
+      {
+	char name[256], vol[1024], host[1024];
+	if (line[0] != '#' && sscanf (line, "%255s %1023s %1023s", name, vol, host) == 3
+	    && std::strcmp (name, db_name) == 0)
+	  {
+	    hosts = host;
+	    break;
+	  }
+      }
+    fclose (fp);
+    return hosts;
+  }
+
   /* ------------------------------------------------------------------ */
   /* state                                                              */
   /* ------------------------------------------------------------------ */
@@ -245,6 +307,10 @@ namespace brd
      * HANDOFF_ACK and RESYNC_REPLY entries admit (+1), SESSION_END releases
      * (-1), the channel's death drops its admissions */
     std::atomic<int> slots_used { 0 };
+    /* the slots count the sessions of every database: after this broker started, or a channel died, a server
+     * may run sessions the table does not have, so every listening server is asked again (RESYNC) before the
+     * next slot is given */
+    std::atomic<bool> resync_pending { true };
     std::mutex slots_mutex;
     std::condition_variable slots_cv;
     std::uint64_t idle_hint_generation = 0;	/* slots_mutex: IDLE_HINTs received */
@@ -282,6 +348,48 @@ namespace brd
     std::atomic<bool> dead { false };
   };
 
+  /* a client the dispatcher turns away after the header's ack.  An SSL client has no ack yet (the TLS
+   * handshake starts on it), so it gets the bare code where it waits for the ack. */
+  static void
+  reject_client (manager &m, SOCKET fd, int error, const char *driver_info)
+  {
+    __atomic_add_fetch (&m.shm->brd_num_rejected, 1, __ATOMIC_RELAXED);
+    if (IS_SSL_CLIENT (driver_info))
+      {
+	send_error_code_to_driver (fd, error, driver_info);
+	return;
+      }
+    send_connect_error (fd, CAS_ERROR_INDICATOR, error, "Cannot hand off the connection to the database server");
+  }
+
+  /* no server listens for the database: the CAS's db_restart_ex failed with ER_BO_CONNECT_FAILED, the error a
+   * driver goes to its next altHost on, with the message of the broker's own language */
+  static void
+  reject_client_no_server (manager &m, SOCKET fd, const char *db_name, const char *driver_info)
+  {
+    static std::once_flag once;
+    static const char *format = NULL;
+
+    if (IS_SSL_CLIENT (driver_info))
+      {
+	reject_client (m, fd, CAS_ER_FREE_SERVER, driver_info);
+	return;
+      }
+    __atomic_add_fetch (&m.shm->brd_num_rejected, 1, __ATOMIC_RELAXED);
+    std::call_once (once, [] ()
+    {
+      (void) lang_init_builtin ();
+      format = msgcat_message (MSGCAT_CATALOG_CUBRID, MSGCAT_SET_ERROR, -ER_BO_CONNECT_FAILED);
+      if (format == NULL || *format == '\0')
+	{
+	  format = "Failed to connect to database server, '%1$s', on the following host(s): %2$s";
+	}
+    });
+    char message[1024];
+    snprintf (message, sizeof (message), format, db_name, database_hosts (db_name).c_str ());
+    send_connect_error (fd, DBMS_ERROR_INDICATOR, ER_BO_CONNECT_FAILED, message);
+  }
+
   /* ------------------------------------------------------------------ */
   /* token table (channel reader threads only, under tokens_mutex)      */
   /* ------------------------------------------------------------------ */
@@ -290,7 +398,7 @@ namespace brd
   slots_add (manager &m, int delta)
   {
     std::lock_guard<std::mutex> guard (m.slots_mutex);
-    m.slots_used.fetch_add (delta);
+    m.shm->brd_slots_used = m.slots_used.fetch_add (delta) + delta;
     if (delta < 0)
       {
 	m.slots_cv.notify_all ();
@@ -476,6 +584,7 @@ namespace brd
 	}
     }
     tokens_drop_for_channel (*m, *ch);
+    m->resync_pending.store (true);
   }
 
   /* mark the channel dead and wake its reader; the reader closes the fd.
@@ -989,18 +1098,15 @@ namespace brd
     config_path (config.access_log_file, sizeof (config.access_log_file), shm->access_log_file);
   }
 
-  /* A change or a reset goes to every server that may hold a session of this broker: the channels it has,
-   * and the servers whose sessions outlived this broker's restart and to which no client was routed since.
-   * Returns the sessions reached, or -1 when a server did not answer. */
-  static int
-  control_broadcast (manager &m, std::uint32_t op)
+  /* a channel to every server that listens on this host: one whose sessions outlived this broker's restart, or
+   * its channel's death, is in the token table again (RESYNC) */
+  static void
+  dial_listening_servers (manager &m)
   {
     std::string socket_prefix = adoption_socket_path ("");
     const std::size_t slash = socket_prefix.rfind ('/');
     const std::string directory = socket_prefix.substr (0, slash);
     const std::string prefix = socket_prefix.substr (slash + 1);
-    bool incomplete = false;
-    int affected = 0;
 
     DIR *dir = opendir (directory.c_str ());
     if (dir != NULL)
@@ -1017,6 +1123,18 @@ namespace brd
 	  }
 	closedir (dir);
       }
+  }
+
+  /* A change or a reset goes to every server that may hold a session of this broker: the channels it has,
+   * and the servers whose sessions outlived this broker's restart and to which no client was routed since.
+   * Returns the sessions reached, or -1 when a server did not answer. */
+  static int
+  control_broadcast (manager &m, std::uint32_t op)
+  {
+    bool incomplete = false;
+    int affected = 0;
+
+    dial_listening_servers (m);
 
     std::vector<std::shared_ptr<channel>> targets;
     {
@@ -1141,6 +1259,8 @@ brd_init (const char *broker_name, int max_slots, T_SHM_APPL_SERVER *shm_appl, i
   m->broker_name = broker_name;
   m->max_slots = max_slots;
   m->shm = shm_appl;
+  shm_appl->brd_num_accepted = shm_appl->brd_num_handoffs = shm_appl->brd_num_rejected = 0;
+  shm_appl->brd_slots_used = 0;
   m->shm_key = shm_key;
   m->ssl_db = ssl_db;
   {
@@ -1219,6 +1339,8 @@ brd_park_client (SOCKET clt_sock_fd, const T_MAX_HEAP_NODE *job)
       close (clt_sock_fd);
       return;
     }
+
+  m->shm->brd_num_accepted++;	/* the receiver thread only */
 
   if (IS_SSL_CLIENT (job->driver_info))
     {
@@ -1364,7 +1486,7 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
   }
   if (db_info == NULL)
     {
-      send_error_code_to_driver (job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
+      reject_client (*m, job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
       close (job->clt_sock_fd);
       return;
     }
@@ -1374,13 +1496,17 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
   std::memcpy (db_name, db_info.get (), len);
   db_name[len] = '\0';
 
-  /* the channel first: its RESYNC may admit survivors of a broker restart,
-   * and the admission below must count them */
+  /* the channels first: a RESYNC may admit survivors of a broker restart or of a dead channel, of this
+   * database or of another, and the admission below must count them */
+  if (m->resync_pending.exchange (false))
+    {
+      dial_listening_servers (*m);
+    }
   std::shared_ptr<channel> ch = channel_get_or_dial (*m, db_name);
   if (ch == NULL)
     {
       /* server not up: immediate retryable rejection (#117 D5/D7) */
-      send_error_code_to_driver (job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
+      reject_client_no_server (*m, job->clt_sock_fd, db_name, job->driver_info);
       close (job->clt_sock_fd);
       return;
     }
@@ -1391,7 +1517,7 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
 	     m->slots_used.load (), m->max_slots);
   if (!brd_wait_for_slot (*m))
     {
-      send_error_code_to_driver (job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
+      reject_client (*m, job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
       close (job->clt_sock_fd);
       return;
     }
@@ -1427,7 +1553,7 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
       brd_debug ("handoff db=%s: request failed/timeout", db_name);
       if (!fd_transferred)
 	{
-	  send_error_code_to_driver (job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
+	  reject_client (*m, job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
 	}
       /* else the server holds the connection: it serves the driver, or drops
        * it when this broker no longer reads the channel */
@@ -1447,6 +1573,7 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
 	  int zero = 0;
 	  (void) send_all (job->clt_sock_fd, &zero, sizeof (int));
 	}
+      m->shm->brd_num_handoffs++;	/* the dispatch thread only */
       close (job->clt_sock_fd);	/* the server owns the connection now */
       return;
     }
@@ -1454,7 +1581,7 @@ brd_dispatch_job (T_MAX_HEAP_NODE *job)
   /* HANDOFF_REJECT: shutting down, the server's client capacity (#117 D3
    * backstop), or a malformed handoff — a negative ACK proves no session
    * was started, so the driver gets the retryable error */
-  send_error_code_to_driver (job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
+  reject_client (*m, job->clt_sock_fd, CAS_ER_FREE_SERVER, job->driver_info);
   close (job->clt_sock_fd);
 }
 
@@ -1491,7 +1618,8 @@ brd_token_channel (manager &m, unsigned int token, const unsigned char *clt_ip, 
 }
 
 int
-brd_cancel (unsigned int token, const unsigned char *clt_ip, unsigned short clt_port)
+brd_cancel (unsigned int token, const unsigned char *clt_ip, unsigned short clt_port, bool has_session_id,
+	    unsigned int session_id)
 {
   manager *m = brd_Manager;
   if (m == NULL)
@@ -1504,13 +1632,12 @@ brd_cancel (unsigned int token, const unsigned char *clt_ip, unsigned short clt_
     {
       return -1;
     }
-  adopt::token_body body;
-  body.token = token;
+  adopt::session_ref_body body = { token, session_id, (std::uint8_t) (has_session_id ? 1 : 0), { 0, 0, 0 } };
   return channel_send (*ch, adopt::msg_op::CANCEL, &body, sizeof (body)) == 0 ? 0 : -1;
 }
 
 int
-brd_status (unsigned int token)
+brd_status (unsigned int token, unsigned int session_id)
 {
   manager *m = brd_Manager;
   if (m == NULL)
@@ -1523,8 +1650,7 @@ brd_status (unsigned int token)
     {
       return FN_STATUS_NONE;
     }
-  adopt::token_body body;
-  body.token = token;
+  adopt::session_ref_body body = { token, session_id, 1, { 0, 0, 0 } };
   adopt::msg_header reply_header;
   adopt::status_reply_body status;
   if (channel_request (*ch, adopt::msg_op::STATUS, &body, sizeof (body), NULL, 0, -1,
@@ -1596,12 +1722,12 @@ namespace
 }
 
 void
-brd_status_reply_async (SOCKET clt_sock_fd, unsigned int token)
+brd_status_reply_async (SOCKET clt_sock_fd, unsigned int token, unsigned int session_id)
 {
   brd_detach_or_inline<std::function<void ()>> (
-	      [clt_sock_fd, token] ()
+	      [clt_sock_fd, token, session_id] ()
   {
-    brd_send_code (clt_sock_fd, brd_status (token));
+    brd_send_code (clt_sock_fd, brd_status (token, session_id));
     close (clt_sock_fd);
   },
   [clt_sock_fd] ()
@@ -1613,7 +1739,8 @@ brd_status_reply_async (SOCKET clt_sock_fd, unsigned int token)
 
 void
 brd_cancel_reply_async (SOCKET clt_sock_fd, unsigned int token, const unsigned char *clt_ip,
-			unsigned short clt_port, bool new_frame, const char *cas_req_header)
+			unsigned short clt_port, bool has_session_id, unsigned int session_id, bool new_frame,
+			const char *cas_req_header)
 {
   unsigned char ip[4];
   std::memcpy (ip, clt_ip, sizeof (ip));
@@ -1632,9 +1759,9 @@ brd_cancel_reply_async (SOCKET clt_sock_fd, unsigned int token, const unsigned c
     close (clt_sock_fd);
   };
   brd_detach_or_inline<std::function<void ()>> (
-	      [reply, token, ip, clt_port] ()
+	      [reply, token, ip, clt_port, has_session_id, session_id] ()
   {
-    reply (brd_cancel (token, ip, clt_port) == 0 ? 0 : CAS_ER_QUERY_CANCEL);
+    reply (brd_cancel (token, ip, clt_port, has_session_id, session_id) == 0 ? 0 : CAS_ER_QUERY_CANCEL);
   },
   [reply] ()
   {

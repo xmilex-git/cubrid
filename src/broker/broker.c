@@ -893,6 +893,7 @@ receiver_thr_f (void *arg)
 
 	  if (uw_acl_check (ip_addr) < 0)
 	    {
+	      __atomic_add_fetch (&shm_appl->brd_num_rejected, 1, __ATOMIC_RELAXED);
 	      send_error_to_driver (clt_sock_fd, CAS_ER_NOT_AUTHORIZED_CLIENT, cas_req_header);
 	      CLOSE_SOCKET (clt_sock_fd);
 	      continue;
@@ -928,7 +929,7 @@ receiver_thr_f (void *arg)
 	      /* the pid slot carries the server-issued token (#117 D4); the
 	       * control-channel wait happens off the receiver thread and the
 	       * helper owns the socket from here on */
-	      brd_status_reply_async (clt_sock_fd, (unsigned int) pid);
+	      brd_status_reply_async (clt_sock_fd, (unsigned int) pid, session_id);
 	      clt_sock_fd = INVALID_SOCKET;
 	      continue;
 	    }
@@ -1029,8 +1030,8 @@ receiver_thr_f (void *arg)
 	       * reply wait runs off the receiver thread; the helper replies
 	       * and closes the socket. */
 	      brd_cancel_reply_async (clt_sock_fd, (unsigned int) pid, (const unsigned char *) &clt_sock_addr.sin_addr,
-				      cas_req_header[0] == 'Q' ? client_port : 0, cas_req_header[0] == 'X',
-				      cas_req_header);
+				      cas_req_header[0] == 'Q' ? client_port : 0, has_session_id, req_session_id,
+				      cas_req_header[0] == 'X', cas_req_header);
 	      clt_sock_fd = INVALID_SOCKET;
 	      continue;
 	    }
@@ -1166,6 +1167,7 @@ receiver_thr_f (void *arg)
 
       if (job_queue[0].id == job_queue_size)
 	{
+	  __atomic_add_fetch (&shm_appl->brd_num_rejected, 1, __ATOMIC_RELAXED);
 	  send_error_to_driver (clt_sock_fd, CAS_ER_FREE_SERVER, cas_req_header);
 	  CLOSE_SOCKET (clt_sock_fd);
 	  continue;

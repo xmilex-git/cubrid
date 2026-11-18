@@ -1282,6 +1282,15 @@ broker_config_read_internal (const char *conf_file, T_BROKER_INFO * br_info, int
 	  goto conf_error;
 	}
 
+#if !defined (WINDOWS)
+      /* there is no CAS process on UNIX: a broker hands every connection to its database's server.  A gateway
+       * keeps its own processes. */
+      if (br_info[num_brs].appl_server == APPL_SERVER_CAS && br_info[num_brs].shard_flag == OFF)
+	{
+	  br_info[num_brs].direct_handoff = ON;
+	}
+#endif
+
       num_brs++;
     }
 
@@ -1356,10 +1365,18 @@ broker_config_read_internal (const char *conf_file, T_BROKER_INFO * br_info, int
 		}
 	    }
 
-	  /* SHARD is not supported in the new architecture (#116 D2) */
-	  if (br_info[i].direct_handoff == ON && br_info[i].shard_flag == ON)
+#if !defined (WINDOWS)
+	  /* a broker has no CAS processes to hand a shard's connections to */
+	  if (br_info[i].shard_flag == ON)
 	    {
-	      PRINTERROR ("config error, %s, DIRECT_HANDOFF cannot be combined with SHARD\n", br_info[i].name);
+	      PRINTERROR ("config error, %s, SHARD is not supported\n", br_info[i].name);
+	      error_flag = TRUE;
+	    }
+#endif
+	  /* a gateway keeps its own processes */
+	  if (br_info[i].direct_handoff == ON && br_info[i].appl_server != APPL_SERVER_CAS)
+	    {
+	      PRINTERROR ("config error, %s, DIRECT_HANDOFF requires APPL_SERVER=CAS\n", br_info[i].name);
 	      error_flag = TRUE;
 	    }
 	  if (br_info[i].direct_handoff == ON && br_info[i].use_SSL == ON

@@ -46,7 +46,7 @@ namespace cubconn
     /* ------------------------------------------------------------------ */
 
     static const std::uint32_t PROTO_MAGIC = 0x41444F50;	/* "ADOP" */
-    static const std::uint32_t PROTO_VERSION = 1;
+    static const std::uint32_t PROTO_VERSION = 2;
 
     enum class msg_op : std::uint32_t
     {
@@ -161,6 +161,16 @@ namespace cubconn
       std::uint32_t token;
     };
 
+    /* a CANCEL or STATUS names its session by the token and, when the client sent one, by the session id the
+     * session's connect reply gave it */
+    struct session_ref_body
+    {
+      std::uint32_t token;
+      std::uint32_t session_id;
+      std::uint8_t has_session_id;
+      std::uint8_t reserved[3];
+    };
+
     enum class reject_reason : std::int32_t
     {
       CLIENTS_EXCEEDED = 1,	/* css_Conn_rules refused; broker requeues (#117 D3) */
@@ -210,7 +220,9 @@ namespace cubconn
     void acl_reload (void);
 
     /* adopted-session registry hooks (driver_session.cpp) */
-    void registry_set_tran_index (std::uint32_t token, int tran_index);
+    /* session_id_required: the session's driver sends its session id with a cancel (PROTOCOL_V13) */
+    void registry_set_tran_index (std::uint32_t token, int tran_index, unsigned int session_id,
+				  bool session_id_required);
     void registry_set_fn_status (std::uint32_t token, int fn_status);
     /* session thread signs off: notify SESSION_END and drop the entry */
     /* before the session releases its transaction: waits out cancels that

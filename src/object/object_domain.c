@@ -91,7 +91,15 @@
           )
 
 
-#define TP_NUM_MIDXKEY_DOMAIN_LIST      (10)
+/* a sub-client keeps the domains that refer to its class MOPs in its own lists (see tp_Sub_client_domains);
+ * the client half of a session of the server is one */
+#if defined (SERVER_MODE)
+#define TP_HAS_SUB_CLIENT_DOMAINS
+#define tp_is_sub_client() csc_bracket_is_active ()
+#elif defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
+#define TP_HAS_SUB_CLIENT_DOMAINS
+#define tp_is_sub_client() boot_is_sub_client ()
+#endif
 
 
 typedef enum tp_coersion_mode
@@ -617,7 +625,7 @@ static void fprint_domain (FILE * fp, TP_DOMAIN * domain);
 #endif
 static INLINE TP_DOMAIN **tp_domain_get_list_ptr (DB_TYPE type, TP_DOMAIN * setdomain) __attribute__ ((ALWAYS_INLINE));
 static INLINE TP_DOMAIN *tp_domain_get_list (DB_TYPE type, TP_DOMAIN * setdomain) __attribute__ ((ALWAYS_INLINE));
-#if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
+#if defined (TP_HAS_SUB_CLIENT_DOMAINS)
 static bool tp_domain_list_has_class_mop (const TP_DOMAIN * domain_list);
 static TP_DOMAIN **tp_sub_client_domain_list_ptr (DB_TYPE type, TP_DOMAIN * setdomain);
 static TP_DOMAIN *tp_domain_cache_for_sub_client (TP_DOMAIN * transient);
@@ -1898,7 +1906,7 @@ tp_domain_get_list (DB_TYPE type, TP_DOMAIN * setdomain)
   return *dlist;
 }
 
-#if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
+#if defined (TP_HAS_SUB_CLIENT_DOMAINS)
 /*
  * Domain lists of a sub-client.
  *
@@ -1908,8 +1916,14 @@ tp_domain_get_list (DB_TYPE type, TP_DOMAIN * setdomain)
  *       shared by all threads, and they are freed by tp_free_sub_client_domains () when the sub-client is shut down.
  *       The shared lists are searched without a lock, so their entries cannot be freed while the process runs.
  */
+#if defined (SERVER_MODE)
+/* a session moves between threads (a kept session is resumed on another), so its lists are the session's */
+#define tp_Sub_client_domains (csc_current ()->tp_domains)
+#define tp_Sub_client_midxkey_domains (csc_current ()->tp_midxkey_domains)
+#else
 static CUB_THREAD_LOCAL TP_DOMAIN *tp_Sub_client_domains[DB_TYPE_LAST + 1];
 static CUB_THREAD_LOCAL TP_DOMAIN *tp_Sub_client_midxkey_domains[TP_NUM_MIDXKEY_DOMAIN_LIST];
+#endif
 
 /*
  * tp_domain_list_has_class_mop - whether a domain list refers to a class MOP
@@ -2030,7 +2044,7 @@ void
 tp_free_sub_client_domains (void)
 {
   TP_DOMAIN **lists[] = { tp_Sub_client_domains, tp_Sub_client_midxkey_domains };
-  size_t counts[] = { DIM (tp_Sub_client_domains), DIM (tp_Sub_client_midxkey_domains) };
+  size_t counts[] = { DB_TYPE_LAST + 1, TP_NUM_MIDXKEY_DOMAIN_LIST };
   TP_DOMAIN *dom, *next;
   size_t i, k;
 
@@ -2049,7 +2063,7 @@ tp_free_sub_client_domains (void)
 	}
     }
 }
-#endif /* CS_MODE && MULTI_CONN_TO_A_SERVER */
+#endif /* TP_HAS_SUB_CLIENT_DOMAINS */
 
 /*
  * tp_is_domain_cached - find matching domain from domain list
@@ -2131,8 +2145,13 @@ tp_is_domain_cached (TP_DOMAIN * dlist, TP_DOMAIN * transient, TP_MATCH exact, T
     case DB_TYPE_SUB:
 
 #if defined (SERVER_MODE)
-      /* not match for these types on server... fall through. */
-#else /* !defined (SERVER_MODE) */
+      /* no match for these types on a server thread; the client half of a session matches them as a client does,
+       * or every resolve of an object domain would add a node */
+      if (!csc_bracket_is_active ())
+	{
+	  break;
+	}
+#endif /* SERVER_MODE */
 
       while (domain)
 	{
@@ -2180,7 +2199,6 @@ tp_is_domain_cached (TP_DOMAIN * dlist, TP_DOMAIN * transient, TP_MATCH exact, T
 	  *ins_pos = domain;
 	  domain = domain->next_list;
 	}
-#endif /* !defined (SERVER_MODE) */
       break;
 
     case DB_TYPE_VARIABLE:
@@ -2866,8 +2884,8 @@ tp_domain_find_object (DB_TYPE type, OID * class_oid, struct db_object * class_m
   /* tp_domain_find_with_classinfo */
 
   dom = tp_domain_get_list (type, NULL);
-#if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
-  if (class_mop != NULL && boot_is_sub_client ())
+#if defined (TP_HAS_SUB_CLIENT_DOMAINS)
+  if (class_mop != NULL && tp_is_sub_client ())
     {
       /* the domain refers to a class MOP of this sub-client; see tp_Sub_client_domains */
       dom = *tp_sub_client_domain_list_ptr (type, NULL);
@@ -2944,8 +2962,8 @@ tp_domain_find_set (DB_TYPE type, TP_DOMAIN * setdomain, bool is_desc)
   src_dsize = tp_domain_size (setdomain);
 
   dom = tp_domain_get_list (type, setdomain);
-#if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
-  if (boot_is_sub_client () && tp_domain_list_has_class_mop (setdomain))
+#if defined (TP_HAS_SUB_CLIENT_DOMAINS)
+  if (tp_is_sub_client () && tp_domain_list_has_class_mop (setdomain))
     {
       /* the domain refers to a class MOP of this sub-client; see tp_Sub_client_domains */
       dom = *tp_sub_client_domain_list_ptr (type, setdomain);
@@ -3108,12 +3126,16 @@ tp_domain_cache (TP_DOMAIN * transient)
   tp_swizzle_oid (transient);
 #endif /* !SERVER_MODE */
 
-#if defined (CS_MODE) && defined (MULTI_CONN_TO_A_SERVER)
-  if (boot_is_sub_client () && tp_domain_list_has_class_mop (transient))
+#if defined (TP_HAS_SUB_CLIENT_DOMAINS)
+  if (tp_is_sub_client () && tp_domain_list_has_class_mop (transient))
     {
       /* the domain refers to a class MOP of this sub-client; see tp_Sub_client_domains */
       return tp_domain_cache_for_sub_client (transient);
     }
+#endif
+#if defined (SERVER_MODE)
+  /* the shared lists outlive every workspace: a domain that refers to a MOP never gets there */
+  assert (!tp_domain_list_has_class_mop (transient));
 #endif
 
   /*

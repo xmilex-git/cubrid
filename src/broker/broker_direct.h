@@ -65,13 +65,15 @@ extern "C"
   void brd_dispatch_job (T_MAX_HEAP_NODE * job);
 
 /* receiver thread, "QC" path: token in the reply's pid slot; anti-spoof by
- * client ip/port as today.  Returns 0 on forwarded cancel, -1 when the token
+ * client ip/port as today, and the session checks the session id the request carries (has_session_id) as
+ * broker.c does for a CAS.  Returns 0 on forwarded cancel, -1 when the token
  * is unknown or spoofed (caller replies CAS_ER_QUERY_CANCEL). */
-  int brd_cancel (unsigned int token, const unsigned char *clt_ip, unsigned short clt_port);
+  int brd_cancel (unsigned int token, const unsigned char *clt_ip, unsigned short clt_port, bool has_session_id,
+		  unsigned int session_id);
 
-/* receiver thread, "ST" path: fn_status of the adopted session, or
+/* receiver thread, "ST" path: fn_status of the adopted session of this token and session id, or
  * FN_STATUS_NONE when unknown */
-  int brd_status (unsigned int token);
+  int brd_status (unsigned int token, unsigned int session_id);
 
 /* receiver thread, non-blocking "ST"/"QC" variants (workspace#259 axis 3):
  * brd_status/brd_cancel may dial the server (10 s) or wait for a control
@@ -81,9 +83,10 @@ extern "C"
  * the socket.  The caller must not touch clt_sock_fd afterwards.  new_frame
  * selects the "X1" reply encoding (driver_info bytes 2-3 of the header) over
  * the legacy 4-byte CAS_CONV_ERROR_TO_OLD code. */
-  void brd_status_reply_async (SOCKET clt_sock_fd, unsigned int token);
+  void brd_status_reply_async (SOCKET clt_sock_fd, unsigned int token, unsigned int session_id);
   void brd_cancel_reply_async (SOCKET clt_sock_fd, unsigned int token, const unsigned char *clt_ip,
-			       unsigned short clt_port, bool new_frame, const char *cas_req_header);
+			       unsigned short clt_port, bool has_session_id, unsigned int session_id, bool new_frame,
+			       const char *cas_req_header);
 
 #ifdef __cplusplus
 }

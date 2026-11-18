@@ -656,6 +656,12 @@ struct t_shm_appl_server
   T_APPL_SERVER_INFO as_info[APPL_SERVER_NUM_LIMIT];
 
   T_DB_SERVER unusable_databases[PAIR_LIST][UNUSABLE_DATABASE_MAX];
+
+  /* a DIRECT_HANDOFF broker has no CAS rows: what `cubrid broker status` shows of it, written by cub_broker */
+  INT64 brd_num_accepted;	/* clients taken for the db_info read */
+  INT64 brd_num_handoffs;	/* connections a server acknowledged */
+  INT64 brd_num_rejected;	/* clients turned away (ACL, job queue, no server, no slot, a server's refusal) */
+  int brd_slots_used;		/* sessions that hold a slot */
 };
 
 /* shared memory information */

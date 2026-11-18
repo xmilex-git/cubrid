@@ -37,6 +37,7 @@
 #include "authenticate_context.hpp"
 #include "boot.h"
 #include "db.h"
+#include "object_domain.h"
 #include "object_template.h"
 #include "schema_manager.h"
 #include "transaction_cl.h"
@@ -112,6 +113,11 @@ class client_session_context
     /* query_method.cpp: error-stack depth at the innermost method dispatch; the client half's clear-all
      * (transaction_cl.c) stops there, the frames below belong to the server executor that raised the callback */
     int er_dispatch_floor = 0;
+
+    /* object_domain.c: the cached domains that refer to a class MOP of this session's workspace; freed after it
+     * (tp_free_sub_client_domains) */
+    TP_DOMAIN *tp_domains[DB_TYPE_LAST + 1] = {};
+    TP_DOMAIN *tp_midxkey_domains[TP_NUM_MIDXKEY_DOMAIN_LIST] = {};
 
     /* set when the session ended from inside this very context (its last
      * reference was dropped by the bracket's own thread): the bracket exit

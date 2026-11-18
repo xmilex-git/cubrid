@@ -217,6 +217,8 @@ csc_teardown (client_session_context *ctx)
       /* the MOP table, classname cache, resident classes and the session's
        * lea heap; the process-shared areas stay */
       ws_final (false);
+      /* after ws_final (): the workspace's classes point at these domains, and the domains at its MOPs */
+      tp_free_sub_client_domains ();
     }
   else if (ctx->ws.heap_id != 0)
     {

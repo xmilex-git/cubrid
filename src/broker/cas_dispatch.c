@@ -60,9 +60,9 @@
 #include "cas_execute.h"
 #include "query_replace.h"
 
-/* protocol violation bound for a single request body (mirrors
- * driver_session.cpp REQUEST_BODY_MAX) */
-#define CAS_DISPATCH_REQUEST_BODY_MAX (16 * 1024 * 1024)
+/* protocol violation bound for a single request body: above the largest value a driver binds
+ * (DB_MAX_STRING_LENGTH), which a CAS took without a bound */
+#define CAS_DISPATCH_REQUEST_BODY_MAX (1024 * 1024 * 1024)
 
 static void set_db_parameter (void);
 
