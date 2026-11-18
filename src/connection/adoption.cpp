@@ -106,6 +106,7 @@ namespace cubconn
       int users = 0;
       bool closing = false;
       int tran_index = NULL_TRAN_INDEX;
+      std::uint16_t client_port = 0;	/* the driver's port, as the handoff carried it */
       unsigned int session_id = 0;	/* with tran_index: what a cancel or status probe must name */
       bool session_id_required = false;
       int client_fd = -1;
@@ -360,6 +361,10 @@ namespace cubconn
     binding_is_named_by (const std::shared_ptr<session_binding> &binding, const session_ref_body &ref)
     {
       std::lock_guard<std::mutex> guard (binding->mutex);
+      if (ref.client_port != 0 && ref.client_port != binding->client_port)
+	{
+	  return false;
+	}
       if (ref.has_session_id)
 	{
 	  return ref.session_id == binding->session_id;
@@ -780,6 +785,7 @@ namespace cubconn
 	  return;
 	}
       binding->client_fd = client_fd;
+      binding->client_port = body.client_port;
       binding->config = body.config;
 
       /* the session is the client type a CAS of this broker was (ux_database_connect); it takes that type's

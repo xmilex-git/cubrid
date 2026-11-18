@@ -575,16 +575,23 @@ namespace brd
       close (ch->fd);
       ch->fd = -1;
     }
+    bool published = false;
     {
       std::lock_guard<std::mutex> guard (m->channels_mutex);
       auto it = m->channels.find (ch->db_name);
       if (it != m->channels.end () && it->second.get () == ch.get ())
 	{
 	  m->channels.erase (it);
+	  published = true;
 	}
     }
     tokens_drop_for_channel (*m, *ch);
-    m->resync_pending.store (true);
+    if (published)
+      {
+	/* a dial that got no answer leaves the flag alone: its server is asked again by its own next client,
+	 * not by every client of the other databases */
+	m->resync_pending.store (true);
+      }
   }
 
   /* mark the channel dead and wake its reader; the reader closes the fd.
@@ -1632,7 +1639,7 @@ brd_cancel (unsigned int token, const unsigned char *clt_ip, unsigned short clt_
     {
       return -1;
     }
-  adopt::session_ref_body body = { token, session_id, (std::uint8_t) (has_session_id ? 1 : 0), { 0, 0, 0 } };
+  adopt::session_ref_body body = { token, session_id, clt_port, (std::uint8_t) (has_session_id ? 1 : 0), 0 };
   return channel_send (*ch, adopt::msg_op::CANCEL, &body, sizeof (body)) == 0 ? 0 : -1;
 }
 
@@ -1650,7 +1657,7 @@ brd_status (unsigned int token, unsigned int session_id)
     {
       return FN_STATUS_NONE;
     }
-  adopt::session_ref_body body = { token, session_id, 1, { 0, 0, 0 } };
+  adopt::session_ref_body body = { token, session_id, 0, 1, 0 };
   adopt::msg_header reply_header;
   adopt::status_reply_body status;
   if (channel_request (*ch, adopt::msg_op::STATUS, &body, sizeof (body), NULL, 0, -1,

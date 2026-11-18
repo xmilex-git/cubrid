@@ -161,14 +161,16 @@ namespace cubconn
       std::uint32_t token;
     };
 
-    /* a CANCEL or STATUS names its session by the token and, when the client sent one, by the session id the
-     * session's connect reply gave it */
+    /* a CANCEL or STATUS names its session by the token and, when the client sent them, by its own port and
+     * by the session id the session's connect reply gave it.  The server checks both again: a token is a
+     * thread id, and another session may have it by the time the message arrives. */
     struct session_ref_body
     {
       std::uint32_t token;
       std::uint32_t session_id;
+      std::uint16_t client_port;	/* 0: the request has none */
       std::uint8_t has_session_id;
-      std::uint8_t reserved[3];
+      std::uint8_t reserved;
     };
 
     enum class reject_reason : std::int32_t
