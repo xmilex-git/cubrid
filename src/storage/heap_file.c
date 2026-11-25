@@ -8767,6 +8767,74 @@ heap_page_collect_visible (THREAD_ENTRY * thread_p, const VPID * vpid, const OID
   oid.volid = vpid->volid;
   oid.pageid = vpid->pageid;
   oid.slotid = *slot;		/* 0: the walk starts at slot 1 */
+  {
+    /* PoC (not for merge): the row walk compiled for one combination -- a judged page, a known representation, not the
+     * root class's page -- with the slot walk in the loop; anything else leaves to the generic walk below */
+    static int og15_fast = -1;
+
+    if (og15_fast < 0)
+      {
+	og15_fast = (getenv ("CUBRID_OG15_FAST") != NULL) ? 1 : 0;
+      }
+    if (og15_fast == 1 && page_precedes_snapshot && !root_page)
+      {
+	const SPAGE_HEADER *sphdr = (const SPAGE_HEADER *) pgptr;
+	const int num_slots = sphdr->num_slots;
+	int sid = oid.slotid + 1;
+	const SPAGE_SLOT *sp;
+
+	if (sid < 1)
+	  {
+	    sid = 1;
+	  }
+	sp = (const SPAGE_SLOT *) (pgptr + DB_PAGESIZE - sizeof (SPAGE_SLOT)) - sid;
+	for (; sid < num_slots; sid++, sp--)
+	  {
+	    const char *data;
+	    int w;
+
+	    if (sp->offset_to_record == 0)
+	      {
+		continue;
+	      }
+	    if (sp->record_type != REC_HOME)
+	      {
+		break;
+	      }
+	    data = pgptr + sp->offset_to_record;
+	    w = OR_GET_INT (data);
+	    if ((w & word_mask) != word_want)
+	      {
+		if ((w & delid_bit) != 0)
+		  {
+		    continue;
+		  }
+		break;
+	      }
+	    rows[n].oid.volid = oid.volid;
+	    rows[n].oid.pageid = oid.pageid;
+	    rows[n].oid.slotid = (PGSLOTID) sid;
+	    rows[n].recdes.length = sp->record_length;
+	    rows[n].recdes.area_size = -1;
+	    rows[n].recdes.type = REC_HOME;
+	    rows[n].recdes.data = (char *) data;
+	    rows[n].hdr_size = mvcc_header_size_lookup[(w >> OR_RECORD_FLAG_SHIFT_BITS) & OR_RECORD_MVCC_FLAG_MASK];
+	    n++;
+	    if (n == cap)
+	      {
+		*slot = (PGSLOTID) sid;
+		*n_rows = n;
+		return S_SUCCESS;
+	      }
+	  }
+	if (sid >= num_slots)
+	  {
+	    *n_rows = n;
+	    return S_END;
+	  }
+	oid.slotid = (PGSLOTID) (sid - 1);
+      }
+  }
   while (true)
     {
       bool is_exception = false;
