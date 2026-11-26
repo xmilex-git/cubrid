@@ -935,6 +935,10 @@ retire:
 	}
       entry_p->tran_index = NULL_TRAN_INDEX;
       entry_p->m_status = cubthread::entry::status::TS_DEAD;
+      /* the session's private LRU list must not reach the thread that claims this entry next (a request worker
+       * serving a connection that has no session yet) */
+      entry_p->private_lru_index = -1;
+      entry_p->m_is_private_lru_enabled = false;
       csc_deactivate ();
       if (!adopted)
 	{
